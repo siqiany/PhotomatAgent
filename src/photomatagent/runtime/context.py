@@ -6,7 +6,8 @@ The first version injects the full scientific state as a system section.
 
 from __future__ import annotations
 
-from photomatagent.runtime.state import ConversationState, Message
+from photomatagent.models.types import ModelMessage, SystemMessage
+from photomatagent.runtime.state import ConversationState
 from photomatagent.scientific.state import ScientificState
 
 
@@ -60,10 +61,11 @@ def format_scientific_state(state: ScientificState) -> str:
 class ContextBuilder:
     """Build the model context from conversation + scientific state."""
 
-    def build(self, conversation: ConversationState, scientific: ScientificState) -> list[Message]:
+    def build(
+        self, conversation: ConversationState, scientific: ScientificState
+    ) -> list[ModelMessage]:
         scientific_section = format_scientific_state(scientific)
-        system = Message(
-            role="system",
+        system = SystemMessage(
             content=f"{SYSTEM_PROMPT}\n\n--- Current scientific state ---\n{scientific_section}",
         )
         return [system, *conversation.messages]

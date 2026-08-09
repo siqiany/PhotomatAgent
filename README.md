@@ -1,136 +1,254 @@
-# PhotomatAgent
+# PhotomatAgent V0.2
 
-一个最小、清晰、可测试、可扩展的 **Scientific Agent Runtime** —— 面向材料科学研究（尤其是红外光电探测材料）的本地科学智能体骨架。
+PhotomatAgent 是一个面向材料科学、尤其是红外光电探测材料研究的本地 **Scientific Agent Runtime**。它不是 SDK 自带的 agent，也不是聊天机器人外壳；项目的核心是一个由我们自己控制、可直接阅读和修改的 Agent Loop。
 
-> 注意：这是 **Scientific Agent Runtime**，不是聊天机器人。它的核心产物是「受控的 agent loop + 结构化的科学状态 + 可审计的事件流」，而模型、工具、UI 都是可替换的插槽。
+V0.2 是第一个真实模型 vertical slice：同一个 runtime 可以驱动 Fake、OpenAI Responses API 或 Anthropic Messages API，并由自己的 loop 完成 streaming、工具审批、执行、结果回填和下一轮模型调用。
 
-## 1. 这是什么
-
-PhotomatAgent 的目标是让你像研究 Claude Code / Codex 的 loop 一样，研究 **Scientific Agent 的 loop engineering**：
-
-- 自然语言科研交互
-- 把 VASP、Materials Project、文献检索、结构分析包装成 Tools / MCP Servers
-- 用 Skills 保存材料科学 SOP
-- 管理 scientific state / evidence / provenance
-- 根据结果 verification，根据失败 diagnose → retry → replan
-- 计算预算、人工审批
-
-当前迭代**只实现最小骨架**：一个我们自己写的、事件驱动的 agent loop，加上最小但边界清晰的科学状态、工具系统、权限、预算、Skills、MCP 预留接口与 JSONL 事件日志。
-
-## 2. 架构
+## 架构
 
 ```text
-CLI (Rich + prompt_toolkit)
-        ↓ 消费 RuntimeEvent 事件流
-Event Stream (Pydantic discriminated union, 可序列化为 JSONL)
-        ↓
-Agent Runtime (runtime/loop.py —— 全项目唯一的 loop)
-   ├─ Model Provider     (models/)         模型抽象，运行时不知道后端是谁
-   ├─ Tool Registry      (tools/)          统一 Tool 接口 + schema 校验
-   ├─ Context Builder    (runtime/context.py)  融合会话 + 科学状态
-   ├─ Permission Policy  (runtime/permissions.py)  allow / deny / ask
-   ├─ Stop Policy        (runtime/stop_policy.py)  何时停止
-   ├─ Scientific State   (scientific/)      claims / evidence / calculations
-   └─ Budget             (runtime/budget.py)  模型调用 / 工具调用计数
+                         CLI
+                          │
+                          ▼
+                     Event Stream ──────► JSONL trace / session stats
+                          │
+                          ▼
+                    Agent Runtime
+                          │
+             ┌────────────┼─────────────┐
+             ▼            ▼             ▼
+          Context      ModelProvider    ToolRegistry
+                          │             │
+                  ┌───────┼───────┐     ├─ read / glob / grep
+                  ▼               ▼     ├─ write / edit / bash
+          OpenAI Responses   Anthropic  └─ scientific mock tools
+                  │            Messages
+                  └──── canonical stream ────┘
 ```
 
-### 几个容易混淆的概念
+`src/photomatagent/runtime/loop.py` 仍然包含完整控制流，不使用 LangChain、LangGraph、CrewAI、AutoGen、OpenAI Agents SDK 或任何自动 tool execution。
 
-| 概念 | 位置 | 是什么 |
-| --- | --- | --- |
-| Agent Loop | `runtime/loop.py` | 上下文 → 模型 → 工具 → 状态 → 停止的循环，自己实现 |
-| ConversationState | `runtime/state.py` | 模型真正看到的消息历史（system/user/assistant/tool） |
-| ScientificState | `scientific/state.py` | 科学事实：目标、假说、claim、evidence、calculation、待办任务 |
-| Skills | `skills/` + `skills/loader.py` | 科研方法与 SOP 的静态文档，本阶段只加载不选择 |
-| Tools | `tools/` | 统一 `Tool` 接口；echo / calculator / 状态检查 / mock 计算 |
-| MCP | `mcp/client.py` | 未来把 MCP server 工具包成 `Tool` 的接缝，本阶段仅接口 + TODO |
-| Scientific Backend | `scientific/backends/` | 未来 VASP/Slurm 的边界，本阶段只有 mock backend |
+## Provider boundary
 
-## 3. Agent Loop 的执行路径
+Runtime 只认识 `models/types.py` 中的 canonical 类型：
+
+- `ModelRequest`
+- `SystemMessage` / `UserMessage` / `AssistantMessage` / `ToolResultMessage`
+- `ToolCall` / `ToolDefinition`
+- `ModelTextDelta`
+- `ModelToolCallStarted` / `ModelToolCallArgumentsDelta` / `ModelToolCallCompleted`
+- `ModelUsageUpdated`
+- `ModelCompleted` / `ModelResponse`
+
+OpenAI 和 Anthropic SDK 类型只存在于各自 adapter 中。Runtime、ConversationState、ToolRegistry、event logger 与 CLI 都不会看到 vendor content block 或 SDK object。
+
+### OpenAI Responses API 映射
 
 ```text
-User Goal
-   ↓
-Prepare Context (ConversationState + ScientificState → system/user 消息)
-   ↓
-Model
-   ↓
-Tool Calls?
- ┌─┴────────────┐
- No             Yes
- ↓               ↓
-Finish       Validate Tool Call (schema)
-                 ↓
-             Permission (allow / deny / ask)
-                 ↓
-             Execute Tool (async)
-                 ↓
-             Tool Result → 更新 ScientificState
-                 ↓
-             Next Iteration
+response.created                         → ModelStreamStarted
+response.output_text.delta               → ModelTextDelta
+response.output_item.added(function)     → ModelToolCallStarted
+response.function_call_arguments.delta   → ModelToolCallArgumentsDelta
+response.function_call_arguments.done    → JSON parse → ModelToolCallCompleted
+response.completed                       → usage + ModelCompleted
 ```
 
-每一步都发出一个 `RuntimeEvent`（见 `runtime/events.py`）：`LoopStarted`、`LoopIterationStarted`、`ModelRequestStarted`、`TextDelta`、`ToolRequested`、`ToolApprovalRequired`、`ToolStarted`、`ToolCompleted`、`ToolFailed`、`ScientificStateUpdated`、`BudgetUpdated`、`LoopCompleted`、`LoopFailed` 等。
+工具参数 delta 只累计字符串；只有收到完成事件才解析 JSON。`call_id` 原样进入 `ToolCall.id`，工具结果再以相同 ID 转成 `function_call_output`。
 
-CLI 只是 `async for event in runtime.run(goal)` 的消费者。未来可以换成 Textual TUI、Web、API、JSONL logger 而不用改 loop。
+Adapter 采用无状态续接：每一轮都把完整 canonical 对话作为 `input` 回传（`function_call` 与对应的 `function_call_output` 成对出现且 `call_id` 一致），不使用 `previous_response_id`。这样在官方 Responses API 和只实现 `/v1/responses` 子集、不支持 `previous_response_id` 链式回填的 OpenAI-compatible 服务上都能正确完成多轮工具调用。每轮仍由 ContextBuilder 重新生成 instructions。
 
-## 4. 为什么不用 LangChain / CrewAI / LangGraph / AutoGen
+PhotomatAgent 内部允许 `mock.run_calculation` 这类 namespaced tool name。OpenAI adapter 会在 provider boundary 将其编码为只包含字母、数字、下划线和连字符的合法名称，并在模型返回 tool call 时可逆地恢复 canonical name；合法名称保持不变，哈希后缀用于避免替换后的名称冲突。
 
-这个项目的目标之一就是**自己实现并理解 Agent Loop**。这些框架会替你隐藏 loop 的控制流、状态流转和事件语义。PhotomatAgent 坚持：
+### Anthropic Messages API 映射
 
-- core is explicit：loop 在单个文件里可通读
-- control flow is readable：没有 decorator / middleware 迷宫
-- state transition is visible：每一步都有事件流出
+```text
+message_start                            → ModelStreamStarted + input usage
+content_block_delta(text_delta)          → ModelTextDelta
+content_block_start(tool_use)            → ModelToolCallStarted
+content_block_delta(input_json_delta)    → ModelToolCallArgumentsDelta
+content_block_stop                       → JSON parse → ModelToolCallCompleted
+message_delta                            → stop reason + output usage
+message_stop                             → ModelCompleted
+```
 
-模型调用只允许通过 `ModelProvider` 协议（`models/base.py`），当前只有 `FakeModelProvider`，未来可加 OpenAI/Anthropic adapter 而不影响 runtime。
+Canonical assistant tool calls 被映射为 `tool_use` blocks；连续的 canonical tool results 被组合为下一条 user message 中的 `tool_result` blocks，并保持 `tool_use_id`。
 
-## 5. 快速开始
+## Tool loop
+
+```text
+User input
+  → ContextBuilder
+  → ModelRequest
+  → ModelProvider.stream()
+  → TextDelta / ToolCall
+  → PermissionPolicy
+  → ToolRegistry validation
+  → Tool.execute()
+  → ToolResultMessage(tool_call_id preserved)
+  → ConversationState
+  → ContextBuilder
+  → 下一次 ModelProvider.stream()
+  → Final Response
+```
+
+一个模型响应可以包含多个 tool calls；V0.2 按输出顺序串行执行。Assistant tool call message 先进入 conversation，随后每个 tool result 按相同 call ID 写入，下一轮 context 因而能无损回填。
+
+## Streaming
+
+Provider 输出的是 PhotomatAgent canonical stream，而不是 SDK 原始事件。Runtime 将文本 delta 立即转成 `RuntimeEvent.TextDelta`，CLI 逐片打印，不等待完整 response。工具参数 delta 会进入 JSONL trace，但不会在未完成时执行或解析。
+
+## Workspace tools
+
+默认 registry 包含：
+
+- `read`：UTF-8 文本、行范围、输出上限
+- `glob`：workspace 内 glob、结果数量上限
+- `grep`：正则搜索、path/glob 过滤、结果上限
+- `write`：只创建新文件，拒绝覆盖
+- `edit`：只允许一次明确的 `old_text → new_text` 替换
+- `bash`：cwd 固定为 workspace，timeout，stdout/stderr/exit code，输出上限
+- `echo`、`calculator`、`scientific_state_inspect`、`mock.run_calculation`
+
+`Workspace.resolve()` 会解析 `..` 和符号链接后的真实路径，普通文件工具拒绝访问 root 之外的路径。
+
+## Permission
+
+默认规则：
+
+```text
+read / glob / grep                ALLOW
+write / edit / bash               ASK
+mock.run_calculation              ASK
+其他低风险内置工具                ALLOW
+```
+
+CLI 只实现 allow once / deny。Runtime 依赖 `ApprovalHandler` protocol，不导入 Rich 或 prompt_toolkit。
+
+> **Permission is not a security sandbox.**
+
+权限提示只是 agent harness 的交互控制。V0.2 没有 OS-level sandbox；特别是获批后的 `bash` 进程拥有当前用户本来具备的权限。
+
+## 安装与运行
 
 ```bash
-uv sync --extra dev
+uv sync
 uv run pytest
+uv run photomatagent
+```
+
+第一次执行 `photomatagent` 时，程序会在当前 workspace 创建 `.env`。如果供应商偏好、对应模型名称或 API Key 缺失，终端会逐项询问；API Key 输入不会回显。配置完整后，以后无参数启动会直接进入对话模式。
+
+```dotenv
+# PhotomatAgent LLM configuration
+PHOTOMATAGENT_PROVIDER='openai'
+
+OPENAI_MODEL='your-openai-model'
+OPENAI_BASE_URL='https://api.openai.com/v1'
+OPENAI_API_KEY='your-openai-api-key'
+
+ANTHROPIC_MODEL=''
+ANTHROPIC_API_KEY=''
+```
+
+支持的偏好是 `openai` 和 `anthropic`。程序只要求当前偏好对应的模型名称与密钥；选择 OpenAI SDK 时还会询问 Base URL，直接回车使用官方默认值 `https://api.openai.com/v1`，也可以填写其他 OpenAI-compatible 服务地址。另一家供应商可以留空。`.env` 已加入 `.gitignore`，创建时会尽可能设置为仅当前用户可读写，但它仍是本地明文密钥文件，请勿分享或提交。
+
+也可以只完成或更新配置而不启动对话：
+
+```bash
+uv run photomatagent configure
+uv run photomatagent configure --provider openai --model your-openai-model
+uv run photomatagent configure --provider anthropic --model your-anthropic-model
+```
+
+配置优先级为：命令行参数、当前进程环境变量、workspace `.env`。因此 CI 或临时终端仍可用 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`ANTHROPIC_API_KEY`、`OPENAI_MODEL`、`ANTHROPIC_MODEL` 覆盖文件值，而不会把覆盖后的密钥自动写回文件。
+
+诊断与辅助命令：
+
+```bash
 uv run photomatagent doctor
 uv run photomatagent tools list
-uv run photomatagent skills list
+uv run photomatagent sessions list
+uv run photomatagent sessions stats latest
+```
+
+离线 Fake provider：
+
+```bash
+uv run photomatagent chat --provider fake
+uv run photomatagent chat --provider fake --goal "investigate material InAs" --approval auto
+```
+
+OpenAI（官方 Python SDK + Responses API）：
+
+```bash
+uv run photomatagent configure --provider openai --model your-openai-model
+uv run photomatagent doctor
 uv run photomatagent chat
 ```
 
-`photomatagent chat` 使用 fake model（自动模式）：第一轮请求 `mock.run_calculation`，第二轮总结工具结果。默认工具调用需要 y/n 确认（`--approval ask`），可切换 `--approval auto`。
+OpenAI-compatible 服务示例配置：
 
-单轮非交互执行：
+```dotenv
+PHOTOMATAGENT_PROVIDER='openai'
+OPENAI_MODEL='compatible-model-name'
+OPENAI_BASE_URL='https://your-provider.example/v1'
+OPENAI_API_KEY='your-provider-api-key'
+```
+
+当前 OpenAI adapter 调用的是 Responses API。第三方服务不仅要接受 OpenAI Python SDK，还需要兼容 `/v1/responses`、streaming 和 function calling；只实现 `/v1/chat/completions` 的服务暂不兼容。
+
+Anthropic（官方 Python SDK + Messages API）：
 
 ```bash
-uv run photomatagent chat --goal "investigate material GaAs" --approval auto
+uv run photomatagent configure --provider anthropic --model your-anthropic-model
+uv run photomatagent doctor
+uv run photomatagent chat
 ```
 
-每次会话的事件会追加到 `.photomatagent/sessions/<session-id>/events.jsonl`，可用 `EventLogger.read_events()` 回放。
+`doctor` 会读取 workspace `.env`，但只显示 API Key 为 `configured` / `missing`，不会输出密钥明文。它验证配置是否存在，不会产生付费模型请求。
 
-## 6. 目录结构
+## JSONL trace 与 Session Statistics
+
+事件写入：
 
 ```text
-photomatagent/
-├── pyproject.toml
-├── README.md
-├── src/photomatagent/
-│   ├── cli/            # Typer + Rich + prompt_toolkit（纯事件消费者）
-│   ├── runtime/        # loop / events / state / context / budget / permissions / stop_policy
-│   ├── models/         # ModelProvider 协议 + FakeModelProvider
-│   ├── tools/          # Tool 抽象 + ToolRegistry + 内置工具
-│   ├── scientific/     # ScientificState / Evidence / Claim / Calculation / Task / backends
-│   ├── skills/         # SkillLoader（扫描 SKILL.md）
-│   ├── mcp/            # MCP 集成接缝（TODO）
-│   └── logging/        # JSONL 事件日志
-├── skills/             # 示例科研 SOP
-│   └── electronic-structure-analysis/SKILL.md
-└── tests/              # pytest + pytest-asyncio
+.photomatagent/sessions/<session-id>/events.jsonl
 ```
 
-## 7. 当前明确没有实现
+trace 包含 session id、iteration、provider、model、模型流开始/完成、工具请求/成功/失败、permission denial、usage、timestamp 和 duration。默认 redactor 会遮盖常见 API key/header 字段和 key 字符串；`EventLogger` 也允许注入自定义 redaction hook。
 
-Multi-Agent、Subagent、Planner、RAG、向量库、记忆系统、Web UI、Textual TUI、真实 VASP、Slurm、真实 Materials Project、自主材料发现、复杂 MCP 生态、插件市场、数据库服务 —— 全部留到后续迭代。
+```bash
+uv run photomatagent sessions list
+uv run photomatagent sessions stats latest
+```
 
-## 8. 下一阶段建议（3 项）
+统计包括 iterations、model calls、tool calls、tool failures、permission denials、input/output tokens 和 duration。这只是 JSONL 派生统计，不是 replay 或 benchmark framework。
 
-1. **Loop Engineering 实验台**：用 `events.jsonl` 做 replay + 可视化，观察不同 prompt / stop policy / context 组合下的行为。
-2. **OpenAI/Anthropic provider adapter**：在 `models/base.py` 协议后加真实 provider，让 loop 接上真实模型。
-3. **scientific StopPolicy**：基于 confidence 阈值、未解决矛盾、信息增益的停止条件（`stop_policy.py` 已留好接口）。
+## ConversationState 与 ScientificState
+
+`ConversationState` 保存 provider-neutral 的对话协议；`ScientificState` 独立保存 goal、hypotheses、claims、evidence、calculations、open questions、contradictions 和 pending tasks。`ContextBuilder` 是两者合并进入模型上下文的唯一位置。
+
+## 当前限制
+
+- 未做 OS sandbox；bash 获批后是普通本地 shell
+- 未做 automatic retry、context compaction 或完整 replay
+- 未接 VASP、Slurm、Materials Project、文献 API 或真实 MCP server
+- 未做 scientific StopPolicy、Evidence Graph、Planner、Multi-Agent、RAG 或 memory system
+- 文件工具面向文本和单 workspace，不是虚拟文件系统
+- 当前配置前端是终端引导，尚未提供桌面/Web 设置页或系统密钥链集成
+- 默认 pytest 完全离线；仓库不自动运行付费 live API test
+
+## Loop Engineering 阅读入口
+
+建议依次阅读：
+
+1. `runtime/loop.py`：完整控制流；重点看 `run()` 与 `_handle_tool_call()`
+2. `models/types.py`：canonical protocol 与 streaming event vocabulary
+3. `runtime/context.py`：ConversationState + ScientificState 如何进入 ModelRequest
+4. `models/openai.py`：Responses event mapper 与 call ID round-trip
+5. `models/anthropic.py`：content block mapper 与 tool_result grouping
+6. `runtime/permissions.py`：ALLOW / DENY / ASK 和 ApprovalHandler
+7. `tools/registry.py`：工具定义、注册与参数校验
+8. `logging/event_logger.py`、`logging/session_stats.py`：可审计 trace 与最小 loop metrics
+
+如果只有 30 分钟，先读 `runtime/loop.py`、`models/types.py`、`runtime/context.py`。

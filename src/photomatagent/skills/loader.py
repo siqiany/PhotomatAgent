@@ -37,7 +37,7 @@ def _parse_frontmatter(content: str) -> dict[str, str]:
 
 def default_skills_dir() -> Path:
     """Resolve the skills directory: env override, then cwd, then repo root."""
-    env = os.environ.get("MATAGENT_SKILLS_DIR")
+    env = os.environ.get("PHOTOMATAGENT_SKILLS_DIR") or os.environ.get("MATAGENT_SKILLS_DIR")
     if env:
         return Path(env)
     cwd_skills = Path.cwd() / "skills"

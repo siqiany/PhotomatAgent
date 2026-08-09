@@ -19,12 +19,16 @@ class BudgetState(BaseModel):
     iterations: int = 0
     max_iterations: int = 10
     total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     compute_cost: float = 0.0
 
     def record_model_call(self, usage: ModelUsage | None = None) -> None:
         self.model_calls += 1
         if usage is not None:
-            self.total_tokens += usage.total_tokens
+            self.input_tokens += usage.input_tokens
+            self.output_tokens += usage.output_tokens
+            self.total_tokens += usage.resolved_total_tokens
 
     def record_tool_call(self) -> None:
         self.tool_calls += 1

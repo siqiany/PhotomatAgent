@@ -7,9 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-
-class ToolError(Exception):
-    """Raised when a tool cannot execute; surfaced as ToolFailed."""
+from photomatagent.errors import ToolError
 
 
 class ToolResult(BaseModel):
@@ -21,6 +19,7 @@ class ToolResult(BaseModel):
     """
 
     output: str
+    is_error: bool = False
     data: dict[str, Any] = Field(default_factory=dict)
     state_updates: list[BaseModel] = Field(default_factory=list)
 

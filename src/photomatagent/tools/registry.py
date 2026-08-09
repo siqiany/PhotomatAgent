@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import TypeAdapter, ValidationError
-
-from photomatagent.tools.base import Tool, ToolError
+from photomatagent.errors import ToolValidationError
+from photomatagent.models.types import ToolDefinition
+from photomatagent.tools.base import Tool
 
 
 class ToolRegistry:
@@ -33,6 +33,16 @@ class ToolRegistry:
     def tool_metadata_list(self) -> list[dict[str, Any]]:
         return [t.tool_metadata() for t in self.list_tools()]
 
+    def definitions(self) -> list[ToolDefinition]:
+        return [
+            ToolDefinition(
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.input_schema,
+            )
+            for tool in self.list_tools()
+        ]
+
     def validate_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Validate arguments against the tool's JSON Schema.
 
@@ -42,20 +52,42 @@ class ToolRegistry:
         tool = self.get(name)
         schema = tool.input_schema
         if not isinstance(schema, dict) or schema.get("type") != "object":
-            raise ToolError(f"tool {name} has an invalid input_schema")
-        adapter = TypeAdapter(dict[str, Any])
-        try:
-            adapter.validate_python(arguments)
-        except ValidationError as exc:
-            raise ToolError(f"invalid arguments for {name}: {exc.errors()[:3]}") from exc
+            raise ToolValidationError(f"tool {name} has an invalid input_schema")
         if not isinstance(arguments, dict):
-            raise ToolError(f"arguments for {name} must be an object")
+            raise ToolValidationError(f"arguments for {name} must be an object")
         required = schema.get("required", [])
         for key in required:
             if key not in arguments:
-                raise ToolError(f"missing required argument {key!r} for {name}")
+                raise ToolValidationError(f"missing required argument {key!r} for {name}")
         properties = schema.get("properties", {})
         for key in arguments:
             if key not in properties:
-                raise ToolError(f"unexpected argument {key!r} for {name}")
+                raise ToolValidationError(f"unexpected argument {key!r} for {name}")
+            self._validate_value(name, key, arguments[key], properties[key])
         return arguments
+
+    def _validate_value(
+        self, tool_name: str, key: str, value: Any, schema: dict[str, Any]
+    ) -> None:
+        expected = schema.get("type")
+        checks = {
+            "string": lambda item: isinstance(item, str),
+            "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+            "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+            "boolean": lambda item: isinstance(item, bool),
+            "array": lambda item: isinstance(item, list),
+            "object": lambda item: isinstance(item, dict),
+        }
+        if expected in checks and not checks[expected](value):
+            raise ToolValidationError(
+                f"argument {key!r} for {tool_name} must be {expected}"
+            )
+        if "enum" in schema and value not in schema["enum"]:
+            raise ToolValidationError(
+                f"argument {key!r} for {tool_name} must be one of {schema['enum']}"
+            )
+        if isinstance(value, (int, float)):
+            if schema.get("minimum") is not None and value < schema["minimum"]:
+                raise ToolValidationError(f"argument {key!r} is below minimum")
+            if schema.get("maximum") is not None and value > schema["maximum"]:
+                raise ToolValidationError(f"argument {key!r} is above maximum")

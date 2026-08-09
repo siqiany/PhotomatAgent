@@ -1,26 +1,17 @@
-"""ModelProvider protocol."""
+"""Provider-neutral streaming model interface."""
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Protocol
 
-from photomatagent.models.types import ModelResponse
-from photomatagent.runtime.state import Message
-from photomatagent.tools.base import Tool
+from photomatagent.models.types import ModelRequest, ModelStreamEvent
 
 
 class ModelProvider(Protocol):
-    """A model the runtime can call.
+    provider: str
+    model: str
 
-    The runtime only knows this protocol; it never sees OpenAI/Anthropic
-    objects. A provider maps its native streaming/tool-calling semantics into
-    the unified ModelResponse.
-    """
-
-    name: str
-
-    async def complete(
-        self,
-        messages: list[Message],
-        tools: list[Tool],
-    ) -> ModelResponse: ...
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        """Stream canonical events; never execute tools inside the provider."""
+        ...

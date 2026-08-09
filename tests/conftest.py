@@ -8,6 +8,7 @@ from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
 from photomatagent.scientific.state import ScientificState
 from photomatagent.tools.factory import create_default_registry
+from photomatagent.workspace import Workspace
 
 
 def make_runtime(
@@ -17,14 +18,17 @@ def make_runtime(
     permission_policy=None,
     approval_handler=None,
     event_sinks=None,
+    workspace=None,
 ) -> AgentRuntime:
     """Build a standard test runtime: default tools, allow-all, fresh state."""
     scientific = ScientificState()
-    registry = create_default_registry(scientific)
+    boundary = workspace or Workspace(".")
+    registry = create_default_registry(scientific, boundary)
     budget = BudgetState(max_iterations=max_iterations)
     return AgentRuntime(
         model=model,
         tools=registry,
+        workspace=boundary,
         scientific_state=scientific,
         permission_policy=permission_policy or AllowAllPolicy(),
         approval_handler=approval_handler,

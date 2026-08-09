@@ -1,6 +1,6 @@
 [project]
 name = "photomatagent"
-version = "0.1.0"
+version = "0.2.0"
 description = "A minimal, extensible Scientific Agent Runtime for materials science research."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,10 +9,14 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.7",
     "prompt-toolkit>=3.0",
+    "python-dotenv>=1.0",
+    "openai>=1.100",
+    "anthropic>=0.60",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    "mypy>=1.11",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
@@ -28,6 +32,7 @@ build-backend = "hatchling.build"
 packages = ["src/photomatagent"]
 
 [tool.pytest.ini_options]
+addopts = "--capture=no"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 

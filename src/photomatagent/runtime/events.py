@@ -1,9 +1,4 @@
-"""RuntimeEvent hierarchy.
-
-Every event is a Pydantic model, so each one can be serialized to JSON
-(``model_dump_json``) for logging / replay, and can be routed through a
-discriminated union for type-safe consumption.
-"""
+"""Serializable event protocol emitted by the PhotomatAgent runtime."""
 
 from __future__ import annotations
 
@@ -18,15 +13,17 @@ def _now() -> datetime:
 
 
 class RuntimeEvent(BaseModel):
-    """Base class for all runtime events."""
-
     kind: str
     timestamp: datetime = Field(default_factory=_now)
+    session_id: str | None = None
 
 
 class LoopStarted(RuntimeEvent):
     kind: Literal["loop_started"] = "loop_started"
     goal: str
+    provider: str
+    model: str
+    workspace: str
 
 
 class LoopIterationStarted(RuntimeEvent):
@@ -38,52 +35,117 @@ class ModelRequestStarted(RuntimeEvent):
     kind: Literal["model_request_started"] = "model_request_started"
     iteration: int
     message_count: int
+    provider: str
+    model: str
+
+
+class ModelStreamStarted(RuntimeEvent):
+    kind: Literal["model_stream_started"] = "model_stream_started"
+    iteration: int
+    provider: str
+    model: str
+    response_id: str | None = None
 
 
 class TextDelta(RuntimeEvent):
     kind: Literal["text_delta"] = "text_delta"
+    iteration: int
     text: str
+
+
+class ToolCallStarted(RuntimeEvent):
+    kind: Literal["tool_call_started"] = "tool_call_started"
+    iteration: int
+    tool_call_id: str
+    tool_name: str
+    index: int
+
+
+class ToolCallArgumentsDelta(RuntimeEvent):
+    kind: Literal["tool_call_arguments_delta"] = "tool_call_arguments_delta"
+    iteration: int
+    tool_call_id: str
+    delta: str
+    index: int
+
+
+class ToolCallCompleted(RuntimeEvent):
+    kind: Literal["tool_call_completed"] = "tool_call_completed"
+    iteration: int
+    tool_call_id: str
+    tool_name: str
+    arguments: dict[str, object]
+    index: int
 
 
 class ModelResponseCompleted(RuntimeEvent):
     kind: Literal["model_response_completed"] = "model_response_completed"
     iteration: int
+    provider: str
+    model: str
+    response_id: str | None = None
     finish_reason: str
     tool_call_count: int
-    usage: dict[str, int] = Field(default_factory=dict)
+    usage: dict[str, int | None] = Field(default_factory=dict)
+    duration_ms: float
+
+
+class ProviderFailed(RuntimeEvent):
+    kind: Literal["provider_failed"] = "provider_failed"
+    iteration: int
+    provider: str
+    model: str
+    error: str
 
 
 class ToolRequested(RuntimeEvent):
     kind: Literal["tool_requested"] = "tool_requested"
+    iteration: int
+    tool_call_id: str
     tool_name: str
     arguments: dict[str, object] = Field(default_factory=dict)
 
 
 class ToolApprovalRequired(RuntimeEvent):
     kind: Literal["tool_approval_required"] = "tool_approval_required"
+    iteration: int
+    tool_call_id: str
     tool_name: str
     arguments: dict[str, object] = Field(default_factory=dict)
     reason: str = "permission policy requires approval"
 
 
+class ToolPermissionDenied(RuntimeEvent):
+    kind: Literal["tool_permission_denied"] = "tool_permission_denied"
+    iteration: int
+    tool_call_id: str
+    tool_name: str
+    reason: str
+
+
 class ToolStarted(RuntimeEvent):
     kind: Literal["tool_started"] = "tool_started"
+    iteration: int
     tool_name: str
     tool_call_id: str
 
 
 class ToolCompleted(RuntimeEvent):
     kind: Literal["tool_completed"] = "tool_completed"
+    iteration: int
     tool_name: str
     tool_call_id: str
     output: str
+    duration_ms: float
 
 
 class ToolFailed(RuntimeEvent):
     kind: Literal["tool_failed"] = "tool_failed"
+    iteration: int
     tool_name: str
     tool_call_id: str
     error: str
+    duration_ms: float = 0.0
 
 
 class ScientificStateUpdated(RuntimeEvent):
@@ -96,30 +158,38 @@ class BudgetUpdated(RuntimeEvent):
     model_calls: int
     tool_calls: int
     iteration: int
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class LoopCompleted(RuntimeEvent):
     kind: Literal["loop_completed"] = "loop_completed"
     iterations: int
     reason: str
+    duration_ms: float
 
 
 class LoopFailed(RuntimeEvent):
     kind: Literal["loop_failed"] = "loop_failed"
     error: str
+    duration_ms: float
 
 
-#: Discriminated union over every event type, for type-safe consumption
-#: and uniform JSON serialization.
 AnyRuntimeEvent = Annotated[
     Union[
         LoopStarted,
         LoopIterationStarted,
         ModelRequestStarted,
+        ModelStreamStarted,
         TextDelta,
+        ToolCallStarted,
+        ToolCallArgumentsDelta,
+        ToolCallCompleted,
         ModelResponseCompleted,
+        ProviderFailed,
         ToolRequested,
         ToolApprovalRequired,
+        ToolPermissionDenied,
         ToolStarted,
         ToolCompleted,
         ToolFailed,
@@ -131,7 +201,8 @@ AnyRuntimeEvent = Annotated[
     Field(discriminator="kind"),
 ]
 
+_EVENT_ADAPTER: TypeAdapter[AnyRuntimeEvent] = TypeAdapter(AnyRuntimeEvent)
+
 
 def parse_event(payload: dict[str, object]) -> RuntimeEvent:
-    """Parse a serialized event payload back into a typed RuntimeEvent."""
-    return TypeAdapter(AnyRuntimeEvent).validate_python(payload)
+    return _EVENT_ADAPTER.validate_python(payload)

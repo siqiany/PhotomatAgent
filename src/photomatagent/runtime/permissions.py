@@ -1,15 +1,10 @@
-"""Permission policies: allow / deny / ask.
-
-The runtime never hard-codes which tools are permitted. It asks the policy
-for a decision and, for ``ask``, delegates the interactive prompt to an
-injected async approval handler.
-"""
+"""Permission decisions and UI-neutral approval handlers."""
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import Protocol
 
 
 class PermissionDecision(str, Enum):
@@ -24,9 +19,28 @@ class PermissionResult:
     reason: str = ""
 
 
-class PermissionPolicy:
-    """Base class. Subclasses decide per-tool-call permissions."""
+@dataclass(frozen=True)
+class ApprovalRequest:
+    tool_name: str
+    arguments: dict[str, object]
+    reason: str
 
+
+class ApprovalHandler(Protocol):
+    async def request_approval(self, request: ApprovalRequest) -> bool: ...
+
+
+class AutoApproveHandler:
+    async def request_approval(self, request: ApprovalRequest) -> bool:
+        return True
+
+
+class DenyHandler:
+    async def request_approval(self, request: ApprovalRequest) -> bool:
+        return False
+
+
+class PermissionPolicy:
     async def check(self, tool_name: str, arguments: dict[str, object]) -> PermissionResult:
         raise NotImplementedError
 
@@ -42,15 +56,11 @@ class DenyAllPolicy(PermissionPolicy):
 
 
 class AskPolicy(PermissionPolicy):
-    """Ask the user for every tool call."""
-
     async def check(self, tool_name: str, arguments: dict[str, object]) -> PermissionResult:
         return PermissionResult(PermissionDecision.ASK, "ask policy")
 
 
 class PolicyRule(PermissionPolicy):
-    """Static allow/deny/ask rules keyed by tool name; default rule applies otherwise."""
-
     def __init__(
         self,
         rules: dict[str, PermissionDecision] | None = None,
@@ -64,4 +74,17 @@ class PolicyRule(PermissionPolicy):
         return PermissionResult(decision, f"policy rule: {decision.value}")
 
 
-ApprovalHandler = Callable[[str, dict[str, object]], Awaitable[bool]]
+def default_permission_policy() -> PermissionPolicy:
+    """Safe default UX: inspection is allowed; mutation/process tools ask."""
+    return PolicyRule(
+        rules={
+            "read": PermissionDecision.ALLOW,
+            "glob": PermissionDecision.ALLOW,
+            "grep": PermissionDecision.ALLOW,
+            "write": PermissionDecision.ASK,
+            "edit": PermissionDecision.ASK,
+            "bash": PermissionDecision.ASK,
+            "mock.run_calculation": PermissionDecision.ASK,
+        },
+        default=PermissionDecision.ALLOW,
+    )
