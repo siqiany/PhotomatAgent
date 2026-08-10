@@ -38,6 +38,7 @@ def _eval(node: ast.AST) -> float:
 class CalculatorTool(Tool):
     name = "calculator"
     description = "Evaluate a simple arithmetic expression (e.g. '2.5 * (3 + 4)')."
+    tags = ("math", "arithmetic", "calculate")
     input_schema = {
         "type": "object",
         "properties": {"expression": {"type": "string"}},

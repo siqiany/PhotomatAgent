@@ -9,6 +9,9 @@ from rich.panel import Panel
 from rich.text import Text
 
 from photomatagent.runtime.events import (
+    ContextCompactionCompleted,
+    ContextCompactionFailed,
+    ContextPruneCompleted,
     LoopCompleted,
     LoopFailed,
     LoopStarted,
@@ -16,6 +19,7 @@ from photomatagent.runtime.events import (
     ProviderFailed,
     RuntimeEvent,
     ScientificStateUpdated,
+    SensitiveAccessBlocked,
     TextDelta,
     ToolApprovalRequired,
     ToolCompleted,
@@ -61,6 +65,25 @@ class ChatRenderer:
             self._console.print(
                 f"[yellow]– {event.tool_name} denied: {event.reason}[/]"
             )
+        elif isinstance(event, SensitiveAccessBlocked):
+            self._console.print(
+                f"[bold red]Blocked access to sensitive file: {event.path}[/]"
+            )
+        elif isinstance(event, ContextPruneCompleted):
+            self._console.print(
+                f"[dim]context pruned {event.tool_results_pruned} old tool result(s): "
+                f"~{event.tokens_before} → ~{event.tokens_after} tokens[/]"
+            )
+        elif isinstance(event, ContextCompactionCompleted):
+            self._console.print(
+                f"[dim]context compacted: ~{event.tokens_before} → "
+                f"~{event.tokens_after} tokens[/]"
+            )
+        elif isinstance(event, ContextCompactionFailed):
+            self._console.print(
+                f"[yellow]context compaction failed; working history retained: "
+                f"{event.error}[/]"
+            )
         elif isinstance(event, ToolCompleted):
             self._console.print(
                 f"[green]✓ {event.tool_name} completed[/] [dim]({event.duration_ms:.1f} ms)[/]"
@@ -80,6 +103,10 @@ class ChatRenderer:
                 f"[dim]loop finished: {event.reason} ({event.iterations} iterations, "
                 f"{event.duration_ms / 1000:.2f}s)[/]"
             )
+            if event.reason == "max_iterations":
+                self._console.print(
+                    "[dim]提示：可调大上限，例如 photomatagent chat --max-iterations 50[/]"
+                )
         elif isinstance(event, LoopFailed):
             self._finish_text()
             self._console.print(f"[red]loop failed: {event.error}[/]")

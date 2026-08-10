@@ -23,6 +23,7 @@ class ToolDefinition(BaseModel):
     name: str
     description: str = ""
     input_schema: dict[str, object] = Field(default_factory=_empty_schema)
+    namespace: str = "core"
 
 
 class ToolCall(BaseModel):
@@ -59,6 +60,7 @@ class ToolResultMessage(BaseModel):
     tool_name: str
     content: str
     is_error: bool = False
+    protected: bool = False
 
 
 ModelMessage = Annotated[

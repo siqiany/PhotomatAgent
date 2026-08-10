@@ -1,0 +1,36 @@
+{
+  "name": "context-lifecycle-v05",
+  "variant": {
+    "max_iterations": 10,
+    "approval": "auto",
+    "label": "v0.5-context-lifecycle",
+    "tool_surface": "progressive"
+  },
+  "tasks": [
+    {
+      "id": "locate-loop",
+      "prompt": "找到当前项目负责 Agent Loop 的核心文件，并简要解释主要执行路径。",
+      "expect": {"answer_contains": ["loop"], "tools_used": ["read"], "max_tool_calls": 10, "max_iterations": 6}
+    },
+    {
+      "id": "inspect-provider-config",
+      "prompt": "找到当前项目 provider 配置在哪里加载，并指出主要入口函数。",
+      "expect": {"answer_contains": ["config"], "tools_not_used": ["write", "edit"], "max_tool_calls": 10, "max_iterations": 6}
+    },
+    {
+      "id": "inspect-stop-policy",
+      "prompt": "检查当前 StopPolicy，只说明现有停止条件，不修改文件。",
+      "expect": {"answer_contains": ["max_iterations", "final_response"], "tools_not_used": ["write", "edit"], "max_tool_calls": 8, "max_iterations": 5}
+    },
+    {
+      "id": "trace-path",
+      "prompt": "找到 RuntimeEvent 到 JSONL logger 的代码路径，并说明事件如何落盘。",
+      "expect": {"answer_contains": ["JSONL"], "tools_used": ["read"], "max_tool_calls": 10, "max_iterations": 6}
+    },
+    {
+      "id": "mock-band-gap",
+      "prompt": "使用可用工具为 material GaAs 运行一次 mock band_structure calculation，并明确说明结果只是占位数据。",
+      "expect": {"answer_contains": ["GaAs", "0.31 eV", "placeholder"], "tools_used": ["mock.run_calculation"], "max_tool_calls": 8, "max_iterations": 6}
+    }
+  ]
+}

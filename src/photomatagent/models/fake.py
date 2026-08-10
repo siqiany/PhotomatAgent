@@ -100,7 +100,8 @@ class FakeModelProvider:
         user_messages = [m for m in request.messages if isinstance(m, UserMessage)]
         goal = user_messages[-1].content if user_messages else ""
         material = _extract_material(goal)
-        if any(isinstance(m, ToolResultMessage) for m in request.messages):
+        results = [m for m in request.messages if isinstance(m, ToolResultMessage)]
+        if results and results[-1].tool_name in {"mock.run_calculation", "tool_call"}:
             return ModelResponse(
                 text=(
                     f"The mock calculation for {material} suggests a direct band gap "
@@ -108,6 +109,43 @@ class FakeModelProvider:
                     "validate with a real calculation before drawing conclusions."
                 ),
                 finish_reason="stop",
+            )
+        if results and results[-1].tool_name == "tool_search":
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="tool_describe",
+                        arguments={"name": "mock.run_calculation"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        if results and results[-1].tool_name == "tool_describe":
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="tool_call",
+                        arguments={
+                            "name": "mock.run_calculation",
+                            "arguments": {
+                                "material": material,
+                                "calculation_type": "band_structure",
+                            },
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        visible_names = {tool.name for tool in request.tools}
+        if "mock.run_calculation" not in visible_names:
+            return ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="tool_search",
+                        arguments={"query": "mock scientific material calculation"},
+                    )
+                ],
+                finish_reason="tool_calls",
             )
         return ModelResponse(
             tool_calls=[

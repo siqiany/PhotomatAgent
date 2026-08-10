@@ -20,12 +20,33 @@ from conftest import collect, make_runtime
 
 
 @pytest.mark.asyncio
+async def test_each_run_has_a_distinct_run_id_within_one_session():
+    model = FakeModelProvider([FakeResponse(text="one"), FakeResponse(text="two")])
+    runtime = make_runtime(model)
+
+    first = await collect(runtime, "first")
+    second = await collect(runtime, "second")
+
+    assert {event.run_id for event in first} == {first[0].run_id}
+    assert {event.run_id for event in second} == {second[0].run_id}
+    assert first[0].run_id is not None
+    assert first[0].run_id != second[0].run_id
+    assert first[0].session_id == second[0].session_id
+
+
+@pytest.mark.asyncio
 async def test_full_streaming_tool_loop_event_order():
     model = FakeModelProvider(
         [
             scripted_tool_call(
-                "mock.run_calculation",
-                {"material": "GaAs", "calculation_type": "band_structure"},
+                "tool_call",
+                {
+                    "name": "mock.run_calculation",
+                    "arguments": {
+                        "material": "GaAs",
+                        "calculation_type": "band_structure",
+                    },
+                },
                 tool_call_id="provider-call-1",
             ),
             FakeResponse(
@@ -68,7 +89,9 @@ async def test_full_streaming_tool_loop_event_order():
 async def test_tool_call_id_round_trips_into_next_model_request():
     model = FakeModelProvider(
         [
-            scripted_tool_call("echo", {"text": "hello"}, tool_call_id="call_vendor_123"),
+            scripted_tool_call(
+                "glob", {"pattern": "pyproject.toml"}, tool_call_id="call_vendor_123"
+            ),
             FakeResponse(text="done"),
         ]
     )
@@ -79,7 +102,7 @@ async def test_tool_call_id_round_trips_into_next_model_request():
     result = next(message for message in second_request.messages if isinstance(message, ToolResultMessage))
     assert assistant.tool_calls[0].id == "call_vendor_123"
     assert result.tool_call_id == "call_vendor_123"
-    assert result.tool_name == "echo"
+    assert result.tool_name == "glob"
 
 
 @pytest.mark.asyncio
@@ -149,6 +172,37 @@ async def test_max_iterations_stops_loop():
     completed = next(event for event in events if event.kind == "loop_completed")
     assert completed.reason == "max_iterations"
     assert completed.iterations == 2
+
+
+@pytest.mark.asyncio
+async def test_next_turn_drops_unfulfilled_tool_calls_after_max_iterations():
+    model = FakeModelProvider(
+        [
+            scripted_tool_call("echo", {"text": "loop"}, tool_call_id="call_pending"),
+            FakeResponse(text="second run answer"),
+        ]
+    )
+    runtime = make_runtime(model, max_iterations=1)
+    await collect(runtime, "first goal")
+
+    # First model request of the second user turn must not replay the
+    # assistant tool call that was never executed (no tool result exists),
+    # otherwise providers reject the unmatched function_call.
+    await collect(runtime, "second goal")
+    second_turn_first_request = model.requests[1]
+    assistant_calls = [
+        call
+        for message in second_turn_first_request.messages
+        if isinstance(message, AssistantMessage)
+        for call in message.tool_calls
+    ]
+    assert {call.id for call in assistant_calls} == set()
+    pending_results = [
+        message
+        for message in second_turn_first_request.messages
+        if isinstance(message, ToolResultMessage)
+    ]
+    assert pending_results == []
 
 
 @pytest.mark.asyncio

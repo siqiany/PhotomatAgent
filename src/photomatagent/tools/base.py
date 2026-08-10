@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from photomatagent.errors import ToolError
+from photomatagent.tools.exposure import ToolExposure
 
 
 class ToolResult(BaseModel):
@@ -25,12 +26,20 @@ class ToolResult(BaseModel):
 
 
 class Tool(ABC):
-    """A callable capability. Name, description and input schema are exposed
-    to the model as tool metadata."""
+    """A callable capability in the registry's authorized universe.
+
+    Registration does not imply that the full schema is exposed to the model.
+    ``exposure`` is consumed by the provider-independent surface planner.
+    """
 
     name: str
     description: str = ""
+    short_description: str = ""
     input_schema: dict[str, Any] = {"type": "object", "properties": {}}
+    exposure: ToolExposure = ToolExposure.DEFERRED
+    namespace: str = "core"
+    source: str = "builtin"
+    tags: tuple[str, ...] = ()
 
     @abstractmethod
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
@@ -41,4 +50,8 @@ class Tool(ABC):
             "name": self.name,
             "description": self.description,
             "input_schema": self.input_schema,
+            "exposure": self.exposure.value,
+            "namespace": self.namespace,
+            "source": self.source,
+            "tags": list(self.tags),
         }

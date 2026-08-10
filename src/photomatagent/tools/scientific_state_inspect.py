@@ -10,6 +10,8 @@ from photomatagent.tools.base import Tool, ToolResult
 class ScientificStateInspectTool(Tool):
     name = "scientific_state_inspect"
     description = "Inspect the current scientific state (goal, claims, evidence, calculations)."
+    namespace = "scientific"
+    tags = ("scientific", "state", "evidence", "claims")
     input_schema = {
         "type": "object",
         "properties": {"section": {"type": "string", "enum": ["all", "evidence", "claims", "calculations"]}},

@@ -17,7 +17,7 @@ class BudgetState(BaseModel):
     model_calls: int = 0
     tool_calls: int = 0
     iterations: int = 0
-    max_iterations: int = 10
+    max_iterations: int = 25
     total_tokens: int = 0
     input_tokens: int = 0
     output_tokens: int = 0

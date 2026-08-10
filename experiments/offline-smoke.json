@@ -1,0 +1,23 @@
+{
+  "name": "offline-smoke",
+  "variant": {
+    "provider": "fake",
+    "model": "fake",
+    "max_iterations": 5,
+    "approval": "auto",
+    "label": "v0.3-offline-smoke"
+  },
+  "tasks": [
+    {
+      "id": "mock-material-loop",
+      "prompt": "investigate material InAs",
+      "expect": {
+        "answer_contains": ["InAs", "0.31 eV"],
+        "tools_used": ["mock.run_calculation"],
+        "tools_not_used": ["write", "edit", "bash"],
+        "max_tool_calls": 3,
+        "max_iterations": 4
+      }
+    }
+  ]
+}

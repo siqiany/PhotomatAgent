@@ -7,6 +7,7 @@ from typing import Any
 from photomatagent.errors import ToolValidationError
 from photomatagent.models.types import ToolDefinition
 from photomatagent.tools.base import Tool
+from photomatagent.tools.exposure import ToolExposure
 
 
 class ToolRegistry:
@@ -33,15 +34,26 @@ class ToolRegistry:
     def tool_metadata_list(self) -> list[dict[str, Any]]:
         return [t.tool_metadata() for t in self.list_tools()]
 
-    def definitions(self) -> list[ToolDefinition]:
+    def definition(self, name: str) -> ToolDefinition:
+        tool = self.get(name)
+        return ToolDefinition(
+            name=tool.name,
+            description=tool.description,
+            input_schema=tool.input_schema,
+            namespace=tool.namespace,
+        )
+
+    def definitions(
+        self, exposure: ToolExposure | None = None
+    ) -> list[ToolDefinition]:
         return [
-            ToolDefinition(
-                name=tool.name,
-                description=tool.description,
-                input_schema=tool.input_schema,
-            )
+            self.definition(tool.name)
             for tool in self.list_tools()
+            if exposure is None or tool.exposure is exposure
         ]
+
+    def tools_for_exposure(self, exposure: ToolExposure) -> list[Tool]:
+        return [tool for tool in self.list_tools() if tool.exposure is exposure]
 
     def validate_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Validate arguments against the tool's JSON Schema.

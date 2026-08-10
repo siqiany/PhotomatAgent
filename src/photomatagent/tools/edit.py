@@ -6,12 +6,15 @@ from typing import Any
 
 from photomatagent.errors import ToolError
 from photomatagent.tools.base import Tool, ToolResult
+from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
 
 class EditTool(Tool):
     name = "edit"
     description = "Replace exactly one occurrence of old_text in an existing workspace file."
+    exposure = ToolExposure.DIRECT
+    tags = ("file", "edit", "workspace")
     input_schema = {
         "type": "object",
         "properties": {

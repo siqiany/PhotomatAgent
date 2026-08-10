@@ -6,12 +6,16 @@ from typing import Any
 
 from photomatagent.errors import ToolError
 from photomatagent.tools.base import Tool, ToolResult
+from photomatagent.tools.exposure import ToolExposure
+from photomatagent.runtime.sensitive import SensitiveAccessError, SensitivePathPolicy
 from photomatagent.workspace import Workspace
 
 
 class ReadTool(Tool):
     name = "read"
     description = "Read a UTF-8 text file inside the workspace, optionally by line range."
+    exposure = ToolExposure.DIRECT
+    tags = ("file", "inspect", "text")
     input_schema = {
         "type": "object",
         "properties": {
@@ -22,12 +26,20 @@ class ReadTool(Tool):
         "required": ["path"],
     }
 
-    def __init__(self, workspace: Workspace, *, max_chars: int = 50_000) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        *,
+        max_chars: int = 50_000,
+        sensitive_paths: SensitivePathPolicy | None = None,
+    ) -> None:
         self.workspace = workspace
         self.max_chars = max_chars
+        self.sensitive_paths = sensitive_paths or SensitivePathPolicy()
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         try:
+            self.sensitive_paths.check_path(str(arguments["path"]))
             path = self.workspace.resolve(str(arguments["path"]))
             if not path.is_file():
                 raise ToolError(f"not a file: {arguments['path']}")
@@ -38,9 +50,14 @@ class ReadTool(Tool):
                 raise ToolError("end_line must be greater than or equal to start_line")
             selected = lines[start - 1 : end]
             content = "\n".join(f"{number}: {line}" for number, line in enumerate(selected, start))
+            original_chars = len(content)
             truncated = len(content) > self.max_chars
             if truncated:
-                content = content[: self.max_chars] + "\n... [truncated]"
+                marker = (
+                    f"\n... [truncated: read bounded from {original_chars} chars; "
+                    "request start_line/end_line to continue]"
+                )
+                content = content[: self.max_chars] + marker
             return ToolResult(
                 output=content,
                 data={
@@ -48,7 +65,9 @@ class ReadTool(Tool):
                     "start_line": start,
                     "end_line": min(end, len(lines)),
                     "truncated": truncated,
+                    "original_chars": original_chars,
+                    "delivered_chars": len(content),
                 },
             )
-        except (OSError, UnicodeError, ToolError) as exc:
+        except (OSError, UnicodeError, ToolError, SensitiveAccessError) as exc:
             return ToolResult(output=f"read failed: {exc}", is_error=True)

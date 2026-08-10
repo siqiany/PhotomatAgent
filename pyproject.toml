@@ -1,6 +1,6 @@
 [project]
 name = "photomatagent"
-version = "0.2.0"
+version = "0.5.0"
 description = "A minimal, extensible Scientific Agent Runtime for materials science research."
 readme = "README.md"
 requires-python = ">=3.12"

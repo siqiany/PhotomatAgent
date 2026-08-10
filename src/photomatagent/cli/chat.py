@@ -33,7 +33,7 @@ def build_runtime(
     model: str | None = None,
     workspace_root: Path | str | None = None,
     approval: ApprovalMode = "ask",
-    max_iterations: int = 10,
+    max_iterations: int = 25,
     prompt_session: PromptSession | None = None,
     session_dir: Path | str | None = None,
     log_events: bool = True,
@@ -89,7 +89,10 @@ async def run_goal(console: Console, runtime: AgentRuntime, goal: str) -> None:
 async def run_interactive_chat(
     console: Console, runtime: AgentRuntime, session: PromptSession
 ) -> None:
-    console.print("[dim]Type your research goal. [/][bold]/exit[/][dim] to quit.[/]")
+    console.print(
+        "[dim]Type your research goal. [/][bold]/compact[/][dim] compacts old context; "
+        "[/][bold]/exit[/][dim] quits.[/]"
+    )
     while True:
         try:
             goal = await session.prompt_async("❯ ")
@@ -97,6 +100,13 @@ async def run_interactive_chat(
             break
         if goal.strip().lower() in {"/exit", "/quit", "exit", "quit"}:
             break
+        if goal.strip().lower() == "/compact":
+            events = await runtime.compact_working_context()
+            for event in events:
+                ChatRenderer(console).handle(event)
+            if not events:
+                console.print("[dim]No eligible old turns to compact.[/]")
+            continue
         if goal.strip():
             await run_goal(console, runtime, goal)
 
@@ -107,7 +117,7 @@ async def run_chat(
     model: str | None = None,
     workspace_root: Path | str | None = None,
     approval: ApprovalMode = "ask",
-    max_iterations: int = 10,
+    max_iterations: int = 25,
     log_events: bool = True,
     goal: str | None = None,
 ) -> None:

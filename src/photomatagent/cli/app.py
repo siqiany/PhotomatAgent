@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import sys
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from photomatagent import __version__
 from photomatagent.cli.chat import run_chat
 from photomatagent.cli.render import print_skill_list
 from photomatagent.config import DotEnvConfig, read_preferred_config, resolve_llm_config
+from photomatagent.experiments.compare import compare_summaries
+from photomatagent.experiments.loader import (
+    ExperimentConfigError,
+    load_experiment_config,
+)
+from photomatagent.experiments.runner import run_experiment
+from photomatagent.experiments.storage import (
+    load_experiment_summary,
+    save_experiment,
+)
 from photomatagent.logging.event_logger import default_sessions_dir
 from photomatagent.logging.session_stats import (
     latest_session,
@@ -26,9 +38,13 @@ from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
+from photomatagent.observability.replay import build_replay
+from photomatagent.observability.trace import TraceError, load_trace
 from photomatagent.scientific.state import ScientificState
 from photomatagent.skills.loader import SkillLoader
 from photomatagent.tools.factory import create_default_registry
+from photomatagent.tools.exposure import ToolExposure
+from photomatagent.tools.surface import ToolSurfacePlanner
 from photomatagent.workspace import Workspace
 
 app = typer.Typer(
@@ -48,7 +64,7 @@ def default_command(ctx: typer.Context) -> None:
             model=None,
             workspace=Path.cwd(),
             approval="ask",
-            max_iterations=10,
+            max_iterations=25,
             log_events=True,
         )
 
@@ -64,7 +80,7 @@ def chat(
     model: str | None = typer.Option(None, "--model"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
     approval: str = typer.Option("ask", "--approval", help="ask | auto | deny"),
-    max_iterations: int = typer.Option(10, "--max-iterations", min=1),
+    max_iterations: int = typer.Option(25, "--max-iterations", min=1),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
 ) -> None:
     """Start an interactive or one-goal scientific agent session."""
@@ -170,9 +186,70 @@ def tools_list(
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
 ) -> None:
     registry = create_default_registry(ScientificState(), Workspace(workspace))
-    table = Table("name", "description")
+    table = Table("name", "namespace", "exposure", "description")
     for tool in registry.list_tools():
-        table.add_row(tool.name, tool.description)
+        table.add_row(tool.name, tool.namespace, tool.exposure.value, tool.description)
+    console.print(table)
+
+
+@tools_app.command("surface")
+def tools_surface(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Show the registered universe and current model-visible tool surface."""
+    registry = create_default_registry(ScientificState(), Workspace(workspace))
+    surface = ToolSurfacePlanner(registry).plan()
+    console.print(Panel("Tool Surface", border_style="cyan"))
+    for exposure in ToolExposure:
+        console.print(f"\n[bold]{exposure.value.title()}[/]")
+        tools = registry.tools_for_exposure(exposure)
+        if tools:
+            for tool in tools:
+                console.print(f"- {tool.name}")
+        else:
+            console.print("[dim]- none[/]")
+    stats = surface.stats
+    table = Table("Estimated Context Cost", "Value")
+    for label, value in [
+        ("Registered tools", stats.registered_tools),
+        ("Direct tools", stats.direct_tools),
+        ("Deferred tools", stats.deferred_tools),
+        ("Hidden tools", stats.hidden_tools),
+        ("Model-visible schema", f"~{stats.estimated_visible_schema_tokens} tokens"),
+        ("Direct schemas", f"~{stats.estimated_direct_schema_tokens} tokens"),
+        ("Bridge schemas", f"~{stats.estimated_bridge_schema_tokens} tokens"),
+        ("Manifest", f"~{stats.estimated_manifest_tokens} tokens"),
+        (
+            "Deferred schemas avoided / call",
+            f"~{stats.estimated_avoided_tokens} tokens",
+        ),
+    ]:
+        table.add_row(label, str(value))
+    console.print(table)
+    console.print("[dim]All token figures above are chars/4 estimates.[/]")
+
+
+@tools_app.command("search")
+def tools_search(
+    query: str = typer.Argument(...),
+    limit: int = typer.Option(5, "--limit", min=1, max=20),
+    namespace: str | None = typer.Option(None, "--namespace"),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Debug deferred-tool BM25 search without making a model request."""
+    registry = create_default_registry(ScientificState(), Workspace(workspace))
+    matches = ToolSurfacePlanner(registry).catalog.search(
+        query, limit=limit, namespace=namespace
+    )
+    table = Table("name", "namespace", "score", "description", "required")
+    for match in matches:
+        table.add_row(
+            match.entry.name,
+            match.entry.namespace,
+            f"{match.score:.3f}",
+            match.entry.short_description,
+            ", ".join(match.entry.required_parameters) or "—",
+        )
     console.print(table)
 
 
@@ -183,7 +260,7 @@ app.add_typer(skills_app, name="skills")
 @skills_app.command("list")
 def skills_list() -> None:
     loader = SkillLoader()
-    skills = loader.load_all()
+    skills = loader.load_index()
     console.print(f"[dim]{len(skills)} skill(s) from {loader.skills_dir}[/]")
     print_skill_list(console, skills)
 
@@ -195,42 +272,298 @@ app.add_typer(sessions_app, name="sessions")
 @sessions_app.command("list")
 def sessions_list() -> None:
     sessions = list_sessions()
-    table = Table("session", "provider", "model", "iterations", "duration")
+    table = Table("Session ID", "Model", "Iterations", "Tools", "Duration", "Stop")
     for session in sessions:
         stats = read_session_stats(session)
         table.add_row(
             session.name,
-            stats.provider,
-            stats.model,
+            f"{stats.provider}/{stats.model}",
             str(stats.iterations),
-            f"{stats.duration_seconds:.2f}s",
+            str(stats.tool_calls),
+            f"{stats.duration_seconds:.1f}s",
+            stats.stop_reason or "—",
         )
+    console.print(table)
+
+
+@sessions_app.command("show")
+def sessions_show(target: str = typer.Argument("latest")) -> None:
+    try:
+        trace = load_trace(target)
+        stats = read_session_stats(trace.session_dir)
+    except TraceError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    starts = [event for event in trace.events if event.kind == "loop_started"]
+    table = Table("Session Metadata", "Value")
+    rows = [
+        ("Session ID", stats.session_id),
+        ("Trace", str(trace.events_path)),
+        ("Schema versions", ", ".join(sorted({event.schema_version for event in trace.events}))),
+        ("Provider", stats.provider),
+        ("Model", stats.model),
+        ("Runs", len(stats.run_ids) or len(starts)),
+        ("Events", stats.event_count),
+        ("Started", stats.started_at.isoformat() if stats.started_at else "—"),
+        ("Ended", stats.ended_at.isoformat() if stats.ended_at else "—"),
+        ("Workspace", getattr(starts[0], "workspace", "—") if starts else "—"),
+        ("Goal(s)", "\n".join(getattr(event, "goal", "") for event in starts)),
+    ]
+    for label, value in rows:
+        table.add_row(str(label), str(value))
     console.print(table)
 
 
 @sessions_app.command("stats")
 def sessions_stats(target: str = typer.Argument("latest")) -> None:
-    session = latest_session() if target == "latest" else default_sessions_dir() / target
-    if session is None or not (session / "events.jsonl").is_file():
-        raise typer.BadParameter(f"session not found: {target}")
-    stats = read_session_stats(session)
+    try:
+        stats = read_session_stats(target)
+    except TraceError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     table = Table("Session Statistics", "Value")
     rows = [
-        ("Session", session.name),
+        ("Session", stats.session_id),
         ("Provider", stats.provider),
         ("Model", stats.model),
         ("Iterations", stats.iterations),
         ("Model calls", stats.model_calls),
         ("Tool calls", stats.tool_calls),
+        ("Unique tools", stats.unique_tools),
         ("Tool failures", stats.tool_failures),
+        ("Repeated calls", stats.repeated_tool_calls),
+        ("Consecutive repeats", stats.consecutive_repeat_count),
         ("Permission denied", stats.permission_denials),
-        ("Input tokens", stats.input_tokens),
-        ("Output tokens", stats.output_tokens),
+        ("Tool failure rate", f"{stats.tool_failure_rate:.1%}"),
+        ("Tools / iteration", _format_number(stats.tools_per_iteration)),
+        ("Input tokens", _format_optional(stats.input_tokens)),
+        ("Output tokens", _format_optional(stats.output_tokens)),
+        ("Total tokens", _format_optional(stats.total_tokens)),
         ("Duration", f"{stats.duration_seconds:.3f}s"),
+        ("Model latency", f"{stats.model_latency_seconds:.3f}s"),
+        ("Tool latency", f"{stats.tool_latency_seconds:.3f}s"),
+        ("Stop reason", stats.stop_reason or "—"),
+        ("Registered tools", stats.registered_tools or "—"),
+        ("Direct tools", stats.direct_tools or "—"),
+        ("Deferred tools", stats.deferred_tools or "—"),
+        ("Hidden tools", stats.hidden_tools),
+        (
+            "Direct schema tokens (estimated)",
+            _format_optional(stats.direct_schema_estimated_tokens),
+        ),
+        (
+            "Manifest tokens / call (estimated)",
+            _format_optional(stats.manifest_estimated_tokens_per_call),
+        ),
+        (
+            "Deferred schemas avoided / call (estimated)",
+            _format_optional(
+                stats.deferred_schemas_avoided_estimated_tokens_per_call
+            ),
+        ),
+        (
+            "Deferred schemas avoided total (estimated)",
+            stats.cumulative_deferred_schemas_avoided_estimated_tokens,
+        ),
+        (
+            "Bridge schema tokens (estimated)",
+            _format_optional(stats.bridge_schema_estimated_tokens),
+        ),
+        ("tool_search calls", stats.tool_search_calls),
+        ("tool_describe calls", stats.tool_describe_calls),
+        ("tool_call bridge calls", stats.tool_call_bridge_calls),
     ]
     for label, value in rows:
         table.add_row(str(label), str(value))
     console.print(table)
+    console.print("\n[bold]Loop anomalies:[/]")
+    if stats.anomalies:
+        for anomaly in stats.anomalies:
+            console.print(f"- [yellow]{anomaly.code}[/]: {anomaly.detail}")
+    else:
+        console.print("[dim]- none[/]")
+
+
+@sessions_app.command("context")
+def sessions_context(target: str = typer.Argument("latest")) -> None:
+    """Show working-context lifecycle diagnostics from an immutable trace."""
+    try:
+        stats = read_session_stats(target)
+    except TraceError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    table = Table("Context Lifecycle", "Value")
+    rows = [
+        ("Session", stats.session_id),
+        ("Working tokens (last, estimated)", _format_optional(stats.last_working_context_tokens)),
+        ("Working tokens (peak, estimated)", _format_optional(stats.peak_working_context_tokens)),
+        ("Working chars (last)", _format_optional(stats.last_working_context_chars)),
+        ("Durable JSONL transcript chars", stats.durable_transcript_chars),
+        ("Pruned tool outputs", stats.pruned_tool_results),
+        ("Compaction count", stats.compaction_count),
+        ("Compaction failures", stats.compaction_failures),
+        (
+            "Last compaction tokens before / after",
+            f"{_format_optional(stats.last_compaction_tokens_before)} / "
+            f"{_format_optional(stats.last_compaction_tokens_after)}",
+        ),
+        (
+            "Last compaction chars before / after",
+            f"{_format_optional(stats.last_compaction_chars_before)} / "
+            f"{_format_optional(stats.last_compaction_chars_after)}",
+        ),
+    ]
+    for label, value in rows:
+        table.add_row(str(label), str(value))
+    console.print(table)
+    console.print("[dim]Token figures are chars/4 estimates unless provider usage says otherwise.[/]")
+
+
+@sessions_app.command("replay")
+def sessions_replay(
+    target: str = typer.Argument("latest"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    try:
+        replay = build_replay(load_trace(target))
+    except TraceError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(Panel(f"Offline Trace Replay · {replay.session_id}", border_style="cyan"))
+    for item in replay.items:
+        if item.kind == "goal":
+            console.print(f"[bold cyan]USER[/] {item.content}")
+        elif item.kind == "iteration":
+            console.rule(f"[bold]Iteration {item.iteration}")
+        elif item.kind == "model":
+            console.print("[yellow]→ MODEL[/]")
+        elif item.kind == "tool":
+            arguments = item.metadata.get("arguments", {})
+            console.print(f"[magenta]→ TOOL[/] [bold]{item.label}[/]")
+            console.print(json.dumps(arguments, ensure_ascii=False, indent=2), markup=False)
+        elif item.kind == "tool_result":
+            console.print(f"[green]← RESULT[/] {item.label}")
+            if item.content:
+                console.print(item.content, markup=False)
+        elif item.kind == "final_response":
+            console.print("[bold green]✓ FINAL RESPONSE[/]")
+            console.print(item.content, markup=False)
+        elif item.kind == "model_text":
+            console.print("[green]MODEL TEXT[/]")
+            console.print(item.content, markup=False)
+        elif item.kind == "stop":
+            console.print(f"[dim]STOP: {item.content}[/]")
+        else:
+            console.print(f"[red]✗ {item.label}: {item.content}[/]")
+        if verbose and item.metadata:
+            console.print_json(data=item.metadata)
+
+
+experiments_app = typer.Typer(help="Run and compare deterministic loop experiments.")
+app.add_typer(experiments_app, name="experiments")
+
+
+@experiments_app.command("run")
+def experiments_run(
+    config_path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    try:
+        experiment = load_experiment_config(config_path)
+        provider, model = _resolve_experiment_model(experiment.variant.provider, experiment.variant.model, workspace)
+        result = asyncio.run(
+            run_experiment(
+                experiment,
+                provider=provider,
+                model=model,
+                workspace_root=workspace,
+            )
+        )
+        path = save_experiment(result)
+    except (ExperimentConfigError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    summary = result.summary
+    table = Table("Experiment Summary", "Value")
+    for label, value in [
+        ("Experiment ID", result.experiment_id),
+        ("Name", summary.name),
+        ("Provider / model", f"{provider} / {model}"),
+        ("Tasks", summary.tasks_total),
+        ("Runtime completed", summary.tasks_completed),
+        ("Expectations passed", summary.expectations_passed),
+        ("Expectations failed", summary.expectations_failed),
+        ("Unevaluated", summary.tasks_unevaluated),
+        ("Avg iterations", f"{summary.average_iterations:.2f}"),
+        ("Avg tool calls", f"{summary.average_tool_calls:.2f}"),
+        ("Tool failure rate", f"{summary.tool_failure_rate:.1%}"),
+        ("Repeated calls", summary.repeated_tool_calls),
+        (
+            "Estimated tool-schema tokens / call",
+            _format_optional(summary.estimated_tool_schema_tokens_per_call),
+        ),
+        ("tool_search calls", summary.tool_search_calls),
+        ("tool_describe calls", summary.tool_describe_calls),
+        ("tool_call bridge calls", summary.tool_call_bridge_calls),
+        ("Peak working context (estimated)", _format_optional(summary.peak_working_context_tokens)),
+        ("Pruned tool results", summary.pruned_tool_results),
+        ("Compaction count", summary.compaction_count),
+        ("Compaction failures", summary.compaction_failures),
+        ("Duration", f"{summary.duration_seconds:.3f}s"),
+        ("Stored at", str(path)),
+    ]:
+        table.add_row(str(label), str(value))
+    console.print(table)
+
+
+@experiments_app.command("compare")
+def experiments_compare(
+    experiment_a: str = typer.Argument(...),
+    experiment_b: str = typer.Argument(...),
+) -> None:
+    try:
+        summary_a = load_experiment_summary(experiment_a)
+        summary_b = load_experiment_summary(experiment_b)
+        rows = compare_summaries(summary_a, summary_b)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    table = Table("Metric", summary_a.experiment_id, summary_b.experiment_id, "Delta (B-A)")
+    for row in rows:
+        table.add_row(
+            row.metric,
+            _format_optional(row.a),
+            _format_optional(row.b),
+            _format_delta(row.delta),
+        )
+    console.print(table)
+
+
+def _resolve_experiment_model(
+    provider: str | None, model: str | None, workspace: Path
+) -> tuple[str, str]:
+    config = read_preferred_config(
+        DotEnvConfig(workspace), provider=provider, model=model
+    )
+    if config is None:
+        raise ValueError("experiment variant must select a provider or workspace .env must configure one")
+    if not config.model:
+        raise ValueError(f"experiment provider {config.provider} has no configured model")
+    if config.provider != "fake" and config.api_key_env is None:
+        raise ValueError(f"experiment provider {config.provider} has no configured API key")
+    return config.provider, config.model
+
+
+def _format_optional(value: object | None) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
+def _format_number(value: float | None) -> str:
+    return "—" if value is None else f"{value:.2f}"
+
+
+def _format_delta(value: float | int | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.3f}" if isinstance(value, float) else f"{value:+d}"
 
 
 @app.command()
@@ -305,7 +638,10 @@ def _smoke_loop() -> tuple[bool, str]:
         workspace = Workspace(Path.cwd())
         runtime = AgentRuntime(
             model=FakeModelProvider(
-                [scripted_tool_call("echo", {"text": "hello"}), FakeResponse(text="ok")]
+                [
+                    scripted_tool_call("glob", {"pattern": "pyproject.toml"}),
+                    FakeResponse(text="ok"),
+                ]
             ),
             tools=create_default_registry(scientific, workspace),
             workspace=workspace,

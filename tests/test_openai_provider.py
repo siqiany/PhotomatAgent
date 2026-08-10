@@ -338,7 +338,7 @@ def test_default_registry_tool_names_are_openai_safe(tmp_path):
     registry = create_default_registry(ScientificState(), Workspace(tmp_path))
     codec = OpenAIToolNameCodec(registry.definitions())
     definitions = openai_tools(registry.definitions(), codec)
-    assert len(definitions) == 10
+    assert len(definitions) == len(registry.list_tools()) == 14
     for definition in definitions:
         assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", definition["name"])
     for definition in registry.definitions():

@@ -17,6 +17,8 @@ class MockCalculationTool(Tool):
         "Returns placeholder results (e.g. band gap) and records evidence "
         "in the scientific state. Types: band_structure, dos, relaxation."
     )
+    namespace = "mock"
+    tags = ("scientific", "materials", "calculation", "band structure", "dos")
     input_schema = {
         "type": "object",
         "properties": {

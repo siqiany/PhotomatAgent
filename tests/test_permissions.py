@@ -5,12 +5,15 @@ import pytest
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
 from photomatagent.runtime.permissions import AskPolicy, AutoApproveHandler, DenyAllPolicy, DenyHandler
 from photomatagent.tools.echo import EchoTool
+from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
 from conftest import collect, make_runtime
 
 
 class SpyEcho(EchoTool):
+    exposure = ToolExposure.DIRECT
+
     def __init__(self) -> None:
         self.executions = 0
 

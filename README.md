@@ -1,8 +1,103 @@
-# PhotomatAgent V0.2
+# PhotomatAgent V0.5 — Context Lifecycle & Safety
 
 PhotomatAgent 是一个面向材料科学、尤其是红外光电探测材料研究的本地 **Scientific Agent Runtime**。它不是 SDK 自带的 agent，也不是聊天机器人外壳；项目的核心是一个由我们自己控制、可直接阅读和修改的 Agent Loop。
 
-V0.2 是第一个真实模型 vertical slice：同一个 runtime 可以驱动 Fake、OpenAI Responses API 或 Anthropic Messages API，并由自己的 loop 完成 streaming、工具审批、执行、结果回填和下一轮模型调用。
+V0.5 保留 V0.4 的 Progressive Tool/Skill Disclosure，并完成 Generic Agent Harness 的 bounded working context、安全 observation 和轻量 trajectory lifecycle。完整事实仍进入 durable session/JSONL；模型每轮只看到由 `ContextEngine` 构建的 working representation，裁剪或压缩不会回写、删改 durable conversation。
+
+## Context lifecycle
+
+```text
+Durable Conversation / JSONL (append-only factual history)
+                    │
+                    ▼
+              ContextEngine
+         ┌──────────┼───────────┐
+         ▼          ▼           ▼
+   WorkingLedger  Stage A     Stage B
+     (derived)   old result   structured semantic
+                  pruning      compaction
+         └──────────┼───────────┘
+                    ▼
+             Working Context
+                    ▼
+                  Model
+```
+
+`ContextEngineConfig` 集中定义 `context_limit_tokens=128000` 的安全 fallback、`prune_trigger_ratio=0.70`、`compact_trigger_ratio=0.82`、`target_ratio=0.60` 与 `protect_recent_turns=2`。调用方知道真实 model context window 时可显式覆盖；未知时不猜 provider billing/tokenizer 行为。
+
+生命周期严格分两级：Stage A 先按体积从旧 observation 开始确定性回收，将 `ToolResultMessage.content` 的工作副本替换为包含 tool、参数摘要、成功/失败和 `session://.../tool-call/...` provenance 的占位符，不虚构语义摘要。只有 Stage A 后仍达到 compact threshold，才用同一普通 provider 发出一次无工具 compaction request，并要求返回 schema-validated `CompactionState`。
+
+`CompactionState` 包含 `goal`、`standing_instructions`、`progress`、`key_findings`、`decisions`、`failed_approaches`、`relevant_resources`、`open_questions` 和 `next_actions`。成功后 working context 变为 initial/system context + structured summary + protected recent turns；失败时不提交 state、不删除 working history，并发出失败事件。
+
+工具协议是 correctness invariant：assistant tool call 与 result 作为 logical atomic group，边界只落在 user-turn 起点；旧 result 被裁剪时仍留下同 call ID 的 placeholder result。`has_inflight_tool_transaction()` 检测尚无 result 的 call，存在时禁止 semantic compaction。因 iteration limit 放弃的 call/result 只在下次 working copy 中成对隐藏，durable history 不被原地重写。
+
+## Progressive capability flow
+
+```text
+Registered Tool
+      ↓
+ToolExposure (DIRECT / DEFERRED / HIDDEN)
+      ↓
+ToolSurfacePlanner
+      ├── direct canonical ToolDefinition[] ──→ Provider Adapter
+      ├── deferred ToolCatalog ──→ compact CapabilityManifest
+      └── hidden ──→ nowhere model-visible
+                              ↓
+                 tool_search / tool_describe / tool_call
+                              ↓
+                  underlying registered Tool
+                              ↓
+        existing permission → validation → execution → events
+                              ↓
+                    ObservationPolicy
+                              ↓
+                  next model-visible turn
+```
+
+核心不变量是：
+
+```text
+registered capability != model-visible capability
+raw tool result != model-visible observation
+```
+
+Provider 不理解 exposure、catalog 或 BM25，只接收普通 canonical function specs。`tool_call` 也不是第二套 executor：runtime 先把它解成 underlying tool，再进入原有 PermissionPolicy、ToolRegistry validation、执行、RuntimeEvent 和 tool-call-ID 配对路径。
+
+## Root-cause audit
+
+V0.3 的注入点位于 `AgentRuntime.run()`：每轮直接构造 `ModelRequest(messages=..., tools=self._tools.definitions())`。默认 registry 有 10 个工具，canonical compact JSON 为 2,799 chars，即约 700 estimated tokens/call；OpenAI wire shape 约 3,109 chars，即约 778 estimated tokens/call。`mock.run_calculation`、`edit`、`grep` 是最大的三个 canonical schema。
+
+历史 session `20260809T112843_fbd772` 有 13 model calls、29 tool calls、306,228 provider-reported input tokens。旧 schema 每轮重发的理论累计贡献约为 9,097 canonical estimated tokens，或 10,104 OpenAI-wire estimated tokens，后者约为真实累计 input 的 3.3%。这证明 eager schema 注入存在，但它不是该 session 的主因。
+
+同一 session 的 tool-result text 合计 137,410 chars；在无状态完整对话逐轮重发下，后续请求累计再次暴露约 991,432 chars（约 247,858 estimated tokens）。这只是 `chars/4` 诊断估算，不是 provider billing，也不表示 cached token 计费方式。V0.4 因而同时实现 capability surface 和 observation budget，而不是用 schema 优化掩盖 history/result 膨胀。
+
+当前默认 V0.4 registry 为 14 个工具：10 direct、4 deferred、0 hidden。progressive surface 约 703 schema tokens，manifest 约 101 tokens，并避免约 282 deferred-schema tokens/call。因为当前 deferred catalog 很小，bridge + manifest 开销会让总估算略高于旧 10-tool surface；收益会随 MCP/科学工具数量增长。这个版本首先建立正确边界和可观测性，不宣称当前小 registry 已获得 token 净节省。
+
+## Loop Observatory
+
+```text
+Agent Run
+   ↓
+typed RuntimeEvent
+   ↓
+JSONL Agent Execution Trace
+   ↓
+Trace Analyzer ──────→ SessionSummary / anomaly flags
+   ↓
+Offline Replay
+   ↓
+Deterministic Experiment Compare
+```
+
+依赖方向是单向的：`runtime/` 不导入 observability、experiments 或 CLI。Analyzer 只观察 trace，不干预 StopPolicy；Replay 只读取 JSONL，不会重新调用 LLM 或执行工具。
+
+仍必须区分三个概念：
+
+- **Runtime Completion**：Agent loop 正常到达一个 runtime stop reason。
+- **Task Evaluation**：回答和 loop 是否满足 experiment 中的 deterministic expectations。
+- **Scientific Correctness**：V0.4 尚未评估；没有 LLM-as-Judge，也没有 scientific quality score。
+
+因此：`runtime completed != task correct != scientifically correct`。
 
 ## 架构
 
@@ -10,7 +105,7 @@ V0.2 是第一个真实模型 vertical slice：同一个 runtime 可以驱动 Fa
                          CLI
                           │
                           ▼
-                     Event Stream ──────► JSONL trace / session stats
+                     Event Stream ──────► JSONL Agent Execution Trace
                           │
                           ▼
                     Agent Runtime
@@ -77,21 +172,80 @@ Canonical assistant tool calls 被映射为 `tool_use` blocks；连续的 canoni
 
 ```text
 User input
-  → ContextBuilder
-  → ModelRequest
+  → ContextEngine(ContextBuilder + WorkingLedger)
+  → Stage A prune → optional Stage B compaction
+  → ToolSurfacePlanner / ContextBudget
+  → ModelRequest(direct tools + compact manifest)
   → ModelProvider.stream()
   → TextDelta / ToolCall
+  → optional tool_call bridge unwrap
   → PermissionPolicy
   → ToolRegistry validation
   → Tool.execute()
-  → ToolResultMessage(tool_call_id preserved)
+  → ObservationPolicy
+  → ToolResultMessage(tool_call_id preserved, bounded output)
   → ConversationState
-  → ContextBuilder
+  → ContextEngine
   → 下一次 ModelProvider.stream()
   → Final Response
 ```
 
-一个模型响应可以包含多个 tool calls；V0.2 按输出顺序串行执行。Assistant tool call message 先进入 conversation，随后每个 tool result 按相同 call ID 写入，下一轮 context 因而能无损回填。
+一个模型响应可以包含多个 tool calls；V0.4 按输出顺序串行执行。Assistant tool call message 先进入 conversation，随后每个 tool result 按相同 call ID 写入，下一轮 context 因而能无损回填。bridge call 的 conversation protocol name 保持 `tool_call`，trace execution event 同时记录 `bridge_tool=tool_call` 与真实 `underlying_tool`。
+
+## Exposure、catalog 与 manifest
+
+默认 deterministic policy：
+
+- `read / glob / grep / write / edit / bash` 是高频基础 primitive，标记为 `DIRECT`。
+- `calculator / echo / scientific_state_inspect / mock.run_calculation` 代表当前 deferred 示例；未来 MCP、literature、Materials、VASP、HPC 和 plugin tools 默认 `DEFERRED`。
+- disabled/unavailable capability 标记为 `HIDDEN`，不会进入 tool specs、manifest 或 search，并拒绝执行。
+- `tool_search / tool_describe / tool_call / skill_view` 是稳定 direct helpers；search 不会永久修改 registry 或以后请求的 schemas。
+
+`ToolCatalogEntry` 引用 registry 中原始 `ToolDefinition`，不复制完整 schema。BM25 文档只组合 name、短/长描述、namespace、source、tags 和 parameter names；不索引 JSON Schema body，不使用 embedding、向量库、LLM router 或网络依赖。search 默认返回 5 张 compact cards，硬上限 20；describe 才返回完整调用说明。
+
+CapabilityManifest 有 `manifest_max_tokens=2000` 的 chars/4 预算。小 catalog 展示 `name + one sentence`，中型 catalog 降级为 namespace + names，大型 catalog 只显示 namespace counts；任何形式都不会突破预算。
+
+开发者诊断：
+
+```bash
+uv run photomatagent tools list
+uv run photomatagent tools surface
+uv run photomatagent tools search "submit calculation"
+uv run photomatagent tools search "scientific literature" --namespace literature
+```
+
+## Progressive skills
+
+初始 system context 只注入 skill index：name、short description、category/tags；不会注入所有 `SKILL.md` 正文，也不会递归读取 `references/`。需要时模型调用：
+
+```text
+skill_view(name)                  → primary SKILL.md
+skill_view(name, path)            → one path inside that skill directory
+```
+
+reference path 在 resolve 后必须仍位于 skill root 内，避免目录逃逸。架构路径是 `index → skill_view → reference`，不是启动时 eager-load everything。
+
+## ObservationPolicy、SensitivePathPolicy 与 ContextBudget
+
+所有成功/失败的 raw tool output 在进入 conversation 与 trace 前经过统一 `ObservationPolicy`。Secret redaction 在这个 model-visible boundary 首先执行，随后才做大小预算；因此 dotenv、已知环境变量密钥、token/password 字段不会先进入模型再仅在日志中脱敏。默认模型可见上限为 12,000 chars；`read` / `bash` 为 16,000，`grep` 为 12,000，`glob` 为 8,000。截断始终显式包含：
+
+```text
+truncated=true
+original_chars
+delivered_chars
+redacted
+[output truncated: original ... ~... estimated tokens]
+```
+
+`bash` 保留 head + marker + tail；`read` 提示用 line range 继续，`grep` 提示缩小 pattern/path，`glob` 保留 result limit。JSONL 保存 model-visible observation 而不是重复保存超大 raw stdout。
+
+每次 `ModelRequestStarted` 还保存薄的 ContextBudget accounting：visible schema、manifest、message/history、tool-result 和 estimated current prompt tokens，以及可选的 model context limit。所有 estimate 都是 `ceil(chars/4)`；真实 usage 仍只采用 provider 回传值，二者不可混用。
+
+`SensitivePathPolicy` 在 permission/execution 前拒绝明显 credential path：`.env`、`.env.*`、`*.pem`、`*.key`、`.git-credentials`、`.netrc`、`.ssh/`、`.aws/`、`credentials*`、`secrets*`。`read(".env")` 默认直接产生 `SensitiveAccessBlocked`；grep/glob 遍历也过滤这些路径。bash 对命令中的显式敏感路径做 lexical blocking，但这不是 shell sandbox；复杂间接访问仍由 workspace/OS 隔离负责。
+
+所有 bash stdout/stderr 在首次进入模型上下文前做 defense-in-depth redaction，覆盖 `*_API_KEY=...`、`*_TOKEN=...`、`*_SECRET=...`、password 和 `Authorization: Bearer ...`。事件日志继续做独立脱敏；redaction 与 sandbox 是两个不同边界。
+
+`WorkingLedger` 不新增持久状态，而是从 durable messages 推导并去重 `searched_queries`、`inspected_paths`、`executed_commands` 与短 `key_observations`，默认总计最多 1,200 chars。它作为短 `Investigation state` 注入，帮助模型发现已经检索/读取过的路径。System prompt 同时加入 evidence-sufficiency 原则，但没有 deterministic StopPolicy 或 planner。
 
 ## Streaming
 
@@ -99,7 +253,7 @@ Provider 输出的是 PhotomatAgent canonical stream，而不是 SDK 原始事�
 
 ## Workspace tools
 
-默认 registry 包含：
+完整 registry 包含：
 
 - `read`：UTF-8 文本、行范围、输出上限
 - `glob`：workspace 内 glob、结果数量上限
@@ -107,7 +261,8 @@ Provider 输出的是 PhotomatAgent canonical stream，而不是 SDK 原始事�
 - `write`：只创建新文件，拒绝覆盖
 - `edit`：只允许一次明确的 `old_text → new_text` 替换
 - `bash`：cwd 固定为 workspace，timeout，stdout/stderr/exit code，输出上限
-- `echo`、`calculator`、`scientific_state_inspect`、`mock.run_calculation`
+- deferred `echo`、`calculator`、`scientific_state_inspect`、`mock.run_calculation`
+- direct bridge `tool_search`、`tool_describe`、`tool_call`、`skill_view`
 
 `Workspace.resolve()` 会解析 `..` 和符号链接后的真实路径，普通文件工具拒绝访问 root 之外的路径。
 
@@ -124,9 +279,9 @@ mock.run_calculation              ASK
 
 CLI 只实现 allow once / deny。Runtime 依赖 `ApprovalHandler` protocol，不导入 Rich 或 prompt_toolkit。
 
-> **Permission is not a security sandbox.**
+> **Permission is not a security sandbox.** `tool_call` 按 underlying tool name 检查 policy，因此 deferred dangerous tool 不会借 bridge 绕过审批。
 
-权限提示只是 agent harness 的交互控制。V0.2 没有 OS-level sandbox；特别是获批后的 `bash` 进程拥有当前用户本来具备的权限。
+权限提示只是 agent harness 的交互控制。V0.4 没有 OS-level sandbox；特别是获批后的 `bash` 进程拥有当前用户本来具备的权限。
 
 ## 安装与运行
 
@@ -169,6 +324,7 @@ uv run photomatagent doctor
 uv run photomatagent tools list
 uv run photomatagent sessions list
 uv run photomatagent sessions stats latest
+uv run photomatagent sessions context latest
 ```
 
 离线 Fake provider：
@@ -177,6 +333,8 @@ uv run photomatagent sessions stats latest
 uv run photomatagent chat --provider fake
 uv run photomatagent chat --provider fake --goal "investigate material InAs" --approval auto
 ```
+
+单轮 goal 默认最多迭代 25 次，达到上限会输出 `loop finished: max_iterations`。可通过 `--max-iterations` 调整，例如 `uv run photomatagent chat --max-iterations 50`。交互模式可输入 `/compact` 手动测试结构化 compaction；无可压缩旧轮次时不会改变默认对话体验。达到上限时若模型最后一条回复还带有未执行的工具调用，下次 working context 会成对隐藏该 abandoned transaction，durable conversation 仍完整保留。
 
 OpenAI（官方 Python SDK + Responses API）：
 
@@ -207,7 +365,7 @@ uv run photomatagent chat
 
 `doctor` 会读取 workspace `.env`，但只显示 API Key 为 `configured` / `missing`，不会输出密钥明文。它验证配置是否存在，不会产生付费模型请求。
 
-## JSONL trace 与 Session Statistics
+## Agent Execution Trace schema
 
 事件写入：
 
@@ -215,40 +373,149 @@ uv run photomatagent chat
 .photomatagent/sessions/<session-id>/events.jsonl
 ```
 
-trace 包含 session id、iteration、provider、model、模型流开始/完成、工具请求/成功/失败、permission denial、usage、timestamp 和 duration。默认 redactor 会遮盖常见 API key/header 字段和 key 字符串；`EventLogger` 也允许注入自定义 redaction hook。
+所有事件共享 typed envelope：
+
+```text
+schema_version   当前为 1.0
+kind             event_type discriminator
+timestamp        UTC timestamp
+session_id       一个 CLI/runtime session
+run_id           session 内的一次 AgentRuntime.run()
+```
+
+字段按 event 类型出现，不强迫所有行拥有同一组 nullable 字段：
+
+- `LoopStarted`：goal、provider、model、workspace
+- `LoopIterationStarted`：iteration
+- `ModelRequestStarted`：iteration、provider/model、message_count；registered/direct/deferred/hidden counts；visible schema/manifest chars；estimated schema/manifest/avoided/bridge/history/tool-result/current-prompt tokens
+- `ContextPruneStarted/Completed`：before/after tokens/chars/messages、pruned results、protected turns、duration
+- `ContextCompactionStarted/Completed/Failed`：before/after、protected turns、duration 或失败原因
+- `SensitiveAccessBlocked`：tool/call ID、被阻断的路径显示值，不包含文件内容
+- `ModelResponseCompleted`：finish_reason、tool_call_count、usage、duration_ms
+- `ToolRequested`：tool_call_id、tool_name、arguments，以及可选 bridge_tool/underlying_tool
+- `ToolCompleted` / `ToolFailed` / `ToolPermissionDenied`：tool status、latency、output 或 error/error_type、bridge identity 与 observation truncation metadata
+- `ProviderFailed`：provider/model、error/error_type、failed request duration_ms
+- `LoopCompleted` / `LoopFailed`：stop reason 或 error/error_type、duration_ms
+
+`kind` 就是 trace schema 的 `event_type`。流式 `TextDelta` 仅保存模型向用户公开的文本；不存在隐藏 chain-of-thought 字段。
+
+Redaction boundary 在写 JSONL 前运行：常见 secret key 字段、Authorization/token/password 字段、已加载的 secret 环境变量、典型 API key 字符串和完整 dotenv 形态文本会被替换。不会保存 Authorization header 或 `.env` 原文；`EventLogger` 仍允许注入轻量自定义 redactor。
 
 ```bash
 uv run photomatagent sessions list
+uv run photomatagent sessions show latest
 uv run photomatagent sessions stats latest
+uv run photomatagent sessions context latest
+uv run photomatagent sessions replay latest
+uv run photomatagent sessions replay latest --verbose
 ```
 
-统计包括 iterations、model calls、tool calls、tool failures、permission denials、input/output tokens 和 duration。这只是 JSONL 派生统计，不是 replay 或 benchmark framework。
+`SessionSummary` 包括 iterations、model/tool calls、unique tools、failures/denials、provider usage（不可用时为 null）、总/model/tool latency、stop reason，以及以下 loop metrics：
+
+- `repeated_tool_calls`：全 session 内相同 `tool_name + normalized_arguments` 在第一次之后的额外次数。arguments 用 sorted-key compact JSON 规范化，因此 dict key 顺序不影响 identity。
+- `consecutive_repeat_count`：相邻 action 与前一个完全相同的次数；`A,A,A` 计 2。
+- `tool_failure_rate`：failed actions / requested actions。
+- `tools_per_iteration`：tool calls / iterations。
+- `model_calls_per_completed_session`：model calls / completed runs；没有 completed run 时为 null。
+- Tool Surface：registered/direct/deferred/hidden counts，direct/bridge/manifest/model-visible schema estimated tokens，deferred schemas avoided per call / cumulative。
+- Discovery Cost：`tool_search_calls`、`tool_describe_calls`、`tool_call_bridge_calls`。
+- Context Lifecycle：last/peak working-context estimate、durable JSONL chars、pruned results、compaction success/failure 与 last before/after。
+
+默认 anomaly diagnostics（只诊断，不停止 runtime）：
+
+- `REPEATED_ACTION`：相同 action 连续出现至少 2 次。
+- `TOOL_FAILURE_LOOP`：相同 action 连续失败至少 2 次。
+- `MAX_ITERATIONS_REACHED`：stop reason 为 `max_iterations`。
+- `HIGH_TOOL_CHURN`：session tool calls 达到默认阈值 20。
+
+Replay 先构建不依赖 Rich/ANSI 的 intermediate model，再由 CLI 渲染 goal、iteration、model、tool arguments、result、final response 和 stop。它不读取或展示 reasoning delta。
+
+## Lightweight experiments
+
+V0.4 使用 JSON，避免为 YAML 新增依赖。variant 新增 `tool_surface: progressive | eager`，可在相同 provider/model/system prompt/tasks 下做控制实验。示例见 `experiments/progressive-tools-v1.json`：
+
+```json
+{
+  "name": "progressive-tools-v1",
+  "variant": {
+    "provider": "fake",
+    "model": "fake",
+    "max_iterations": 10,
+    "approval": "auto",
+    "tool_surface": "progressive"
+  },
+  "tasks": [
+    {
+      "id": "locate-loop",
+      "prompt": "找到 Agent Loop 的核心文件。",
+      "expect": {
+        "answer_contains": ["loop"],
+        "tools_used": ["read"],
+        "max_tool_calls": 10,
+        "max_iterations": 6
+      }
+    }
+  ]
+}
+```
+
+支持的 optional expectations 只有 `answer_contains`、`answer_not_contains`、`tools_used`、`tools_not_used`、`max_tool_calls`、`max_iterations`。字符串检查大小写不敏感。没有 expectations 的 task 标为 `UNEVALUATED`，不会伪装成 PASS。
+
+```bash
+uv run photomatagent experiments run experiments/offline-smoke.json
+uv run photomatagent experiments run experiments/baseline-eager-tools.json
+uv run photomatagent experiments run experiments/progressive-tools-v1.json
+uv run photomatagent experiments compare <experiment-a> <experiment-b>
+```
+
+`offline-smoke.json` 固定使用 Fake provider，并真实演练 `tool_search → tool_describe → tool_call → mock.run_calculation`，适合零网络/零费用 E2E。`baseline-eager-tools.json` 与 `progressive-tools-v1.json` 含完全相同的 5 个任务，未固定 provider/model，会使用 workspace `.env` 中的真实配置。eager control 会模拟旧版直接暴露原始工具，不发送 progressive helpers。
+
+Runner 严格顺序执行，每个 task 创建独立 session。variant 未写 provider/model 时读取现有 workspace `.env`；实验模式不交互询问 approval，只支持 `auto` 或 `deny`。每次 experiment 保存：
+
+```text
+.photomatagent/experiments/<experiment-id>/
+├── config.json      # task config + configuration snapshot
+├── runs.json        # per-task runtime/evaluation/SessionSummary
+└── summary.json     # aggregate metrics
+```
+
+configuration snapshot 记录 provider/model、system prompt SHA-256、StopPolicy、ContextBuilder 和 ToolSurfacePlanner identifier/config。Compare 除原有质量/loop 指标外，展示 model latency、estimated tool-schema tokens/call 及三类 discovery calls 的 B-A delta；不生成综合分数，也不宣称哪个 variant 更好。
+
+V0.5 回归配置 `experiments/context-lifecycle-v05.json` 与 V0.4 progressive 的五个任务逐字一致；summary 额外记录 peak working context、pruned tool results、compaction count/failures。由于 ContextEngine 和 evidence-sufficiency prompt 本身就是 treatment，跨版本结果应作为 harness bundle regression 解读，而不是仅凭单次随机模型样本推断因果。
 
 ## ConversationState 与 ScientificState
 
-`ConversationState` 保存 provider-neutral 的对话协议；`ScientificState` 独立保存 goal、hypotheses、claims、evidence、calculations、open questions、contradictions 和 pending tasks。`ContextBuilder` 是两者合并进入模型上下文的唯一位置。
+`ConversationState` 保存 provider-neutral durable conversation；`ScientificState` 独立保存 goal、hypotheses、claims、evidence、calculations、open questions、contradictions 和 pending tasks。`ContextEngine` 决定 working subset 与 lifecycle，`ContextBuilder` 只负责把选中的 messages、scientific state、skill/capability index、ledger 和可选 compaction state 渲染成 provider-neutral context。
 
 ## 当前限制
 
 - 未做 OS sandbox；bash 获批后是普通本地 shell
-- 未做 automatic retry、context compaction 或完整 replay
+- Semantic compaction 使用模型生成的结构化 state，schema 校验能约束形状但不能证明摘要事实完全无损；provenance reference 也尚不能自动 rehydrate 原 result
+- Context token trigger 使用 chars/4 估算；调用方未提供真实 model context limit 时使用 128k fallback，不等同 provider tokenizer
+- SensitivePathPolicy 对 bash 是 lexical defense，不是 OS sandbox；复杂 shell 间接访问必须依靠后续真正的 sandbox/容器边界
 - 未接 VASP、Slurm、Materials Project、文献 API 或真实 MCP server
 - 未做 scientific StopPolicy、Evidence Graph、Planner、Multi-Agent、RAG 或 memory system
+- Experiment 仅支持 JSON、顺序执行和 deterministic expectations；没有 YAML、并行 runner 或 LLM-as-Judge
+- Token usage 依赖 provider；未报告时为 null。Context surface 使用 chars/4 diagnostics estimate，明确不冒充 provider usage
 - 文件工具面向文本和单 workspace，不是虚拟文件系统
 - 当前配置前端是终端引导，尚未提供桌面/Web 设置页或系统密钥链集成
 - 默认 pytest 完全离线；仓库不自动运行付费 live API test
 
-## Loop Engineering 阅读入口
+## Generic Harness V1 源码阅读路线
 
 建议依次阅读：
 
-1. `runtime/loop.py`：完整控制流；重点看 `run()` 与 `_handle_tool_call()`
-2. `models/types.py`：canonical protocol 与 streaming event vocabulary
-3. `runtime/context.py`：ConversationState + ScientificState 如何进入 ModelRequest
-4. `models/openai.py`：Responses event mapper 与 call ID round-trip
-5. `models/anthropic.py`：content block mapper 与 tool_result grouping
-6. `runtime/permissions.py`：ALLOW / DENY / ASK 和 ApprovalHandler
-7. `tools/registry.py`：工具定义、注册与参数校验
-8. `logging/event_logger.py`、`logging/session_stats.py`：可审计 trace 与最小 loop metrics
+1. `tools/base.py`：Tool 的 exposure / namespace / source / tags 元数据
+2. `tools/registry.py`：完整 authorized capability universe 与 canonical definitions
+3. `tools/surface.py`：Exposure decision、ToolCatalog、BM25、manifest、surface stats
+4. `tools/bridges.py`：compact search cards、describe、call marker 与 skill_view
+5. `runtime/context_engine.py`：durable/working boundary、Stage A/B、tool transaction invariants、CompactionState
+6. `runtime/ledger.py`：从 durable messages 推导 bounded investigation state
+7. `runtime/sensitive.py` 与 `redaction.py`：敏感路径和 model-visible/log output 安全边界
+8. `runtime/loop.py`：ContextEngine 接入、bridge unwrap、permission/validation/execution
+9. `runtime/observation.py`：raw result 到 insertion-time bounded observation
+10. `runtime/events.py` 与 `observability/analyzer.py`：context lifecycle trace、session/experiment 聚合
 
-如果只有 30 分钟，先读 `runtime/loop.py`、`models/types.py`、`runtime/context.py`。
+沿这条路线可以手动跟踪：`Registered Tool → Exposure → ModelVisibleTools → tool_search → tool_describe → tool_call → underlying execution → Observation → next model turn`。
+
+如果只有 30 分钟，优先读 `runtime/context_engine.py` → `runtime/loop.py` → `runtime/sensitive.py`。三者分别回答“模型本轮看到什么”“生命周期如何进入主循环”“敏感 observation 在哪里被阻断”。

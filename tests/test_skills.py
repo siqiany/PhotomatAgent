@@ -33,3 +33,23 @@ def test_loader_ignores_non_skill_dirs(tmp_path):
 
 def test_loader_missing_dir_returns_empty(tmp_path):
     assert SkillLoader(tmp_path / "does-not-exist").load_all() == []
+
+
+def test_loader_ignores_symlinked_skill_directory(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(
+        "---\nname: outside\ndescription: should not load\n---\nsecret",
+        encoding="utf-8",
+    )
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    try:
+        (skills / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        return
+
+    loader = SkillLoader(skills)
+
+    assert loader.load_index() == []
+    assert loader.load_all() == []

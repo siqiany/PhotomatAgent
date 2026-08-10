@@ -3,22 +3,16 @@
 from __future__ import annotations
 
 import json
-import os
-import re
 from collections.abc import Callable
-from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from photomatagent.runtime.events import RuntimeEvent, parse_event
+from photomatagent.redaction import redact_secrets
 
 Redactor = Callable[[dict[str, Any]], dict[str, Any]]
-_SECRET_KEY = re.compile(
-    r"(?i)(api[_-]?key|authorization|password|secret|access[_-]?token|auth[_-]?token)"
-)
-_SECRET_VALUE = re.compile(r"\b(?:sk-ant-|sk-)[A-Za-z0-9_-]{8,}\b")
 
 
 def _session_id() -> str:
@@ -28,31 +22,6 @@ def _session_id() -> str:
 
 def default_sessions_dir() -> Path:
     return Path(".photomatagent") / "sessions"
-
-
-def redact_secrets(payload: dict[str, Any]) -> dict[str, Any]:
-    """Conservative default; callers can inject a domain-specific redactor."""
-    known_values = [
-        value
-        for name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
-        if (value := os.getenv(name))
-    ]
-
-    def visit(value: Any, key: str | None = None) -> Any:
-        if key and _SECRET_KEY.search(key):
-            return "[REDACTED]"
-        if isinstance(value, dict):
-            return {item_key: visit(item, item_key) for item_key, item in value.items()}
-        if isinstance(value, list):
-            return [visit(item) for item in value]
-        if isinstance(value, str):
-            redacted = _SECRET_VALUE.sub("[REDACTED]", value)
-            for secret in known_values:
-                redacted = redacted.replace(secret, "[REDACTED]")
-            return redacted
-        return value
-
-    return visit(deepcopy(payload))
 
 
 class EventLogger:

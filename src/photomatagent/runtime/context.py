@@ -1,21 +1,33 @@
-"""ContextBuilder: fuses ConversationState + ScientificState into model context.
-
-This is the single seam where future context engineering / compaction happens.
-The first version injects the full scientific state as a system section.
-"""
+"""Render initial/system context around a ContextEngine-selected message set."""
 
 from __future__ import annotations
 
 from photomatagent.models.types import ModelMessage, SystemMessage
 from photomatagent.runtime.state import ConversationState
 from photomatagent.scientific.state import ScientificState
+from photomatagent.skills.loader import SkillLoader
 
 
 SYSTEM_PROMPT = """You are PhotomatAgent, a scientific agent runtime for materials science research.
 You help scientists investigate materials, especially for infrared photodetection.
 You can call tools to inspect state and run mock scientific calculations.
 Be concise, cite evidence from your scientific state, and mark uncertainty explicitly.
+Before invoking another tool, check whether current observations already support a reliable answer.
+Use another tool only to resolve a meaningful uncertainty, verify a material claim, or obtain
+information required to complete the task. Do not gather evidence solely for completeness.
 """
+
+
+def format_skill_index(loader: SkillLoader) -> str:
+    entries = loader.load_index()
+    if not entries:
+        return "(none)"
+    lines: list[str] = []
+    for entry in entries:
+        metadata = ", ".join(part for part in (entry.category, *entry.tags) if part)
+        suffix = f" [{metadata}]" if metadata else ""
+        lines.append(f"{entry.name}{suffix}\n  {entry.description}")
+    return "\n".join(lines)
 
 
 def format_scientific_state(state: ScientificState) -> str:
@@ -61,11 +73,53 @@ def format_scientific_state(state: ScientificState) -> str:
 class ContextBuilder:
     """Build the model context from conversation + scientific state."""
 
+    def __init__(self, skill_loader: SkillLoader | None = None) -> None:
+        self.skill_loader = skill_loader or SkillLoader()
+
     def build(
-        self, conversation: ConversationState, scientific: ScientificState
+        self,
+        conversation: ConversationState,
+        scientific: ScientificState,
+        *,
+        capability_manifest: str = "",
+    ) -> list[ModelMessage]:
+        return self.build_messages(
+            conversation.messages,
+            scientific,
+            capability_manifest=capability_manifest,
+        )
+
+    def build_messages(
+        self,
+        messages: list[ModelMessage],
+        scientific: ScientificState,
+        *,
+        capability_manifest: str = "",
+        investigation_state: str = "",
+        compaction_state: object | None = None,
     ) -> list[ModelMessage]:
         scientific_section = format_scientific_state(scientific)
+        skill_index = format_skill_index(self.skill_loader)
+        capability_section = capability_manifest or "(no deferred capabilities)"
         system = SystemMessage(
-            content=f"{SYSTEM_PROMPT}\n\n--- Current scientific state ---\n{scientific_section}",
+            content=(
+                f"{SYSTEM_PROMPT}\n\n--- Current scientific state ---\n{scientific_section}"
+                f"\n\n--- Available skills (index only) ---\n{skill_index}"
+                "\nUse skill_view(name[, path]) to load a skill or one reference when needed."
+                f"\n\n--- Deferred capability manifest ---\n{capability_section}"
+                f"\n\n--- Investigation state (bounded, derived) ---\n"
+                f"{investigation_state or '(none yet)'}"
+            ),
         )
-        return [system, *conversation.messages]
+        compacted: list[ModelMessage] = []
+        if compaction_state is not None:
+            # Local import prevents ContextBuilder and ContextEngine from forming
+            # a module-import cycle while keeping rendering in this one seam.
+            from photomatagent.runtime.context_engine import (
+                CompactionState,
+                format_compaction_state,
+            )
+
+            state = CompactionState.model_validate(compaction_state)
+            compacted.append(SystemMessage(content=format_compaction_state(state)))
+        return [system, *compacted, *messages]

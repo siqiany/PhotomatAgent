@@ -8,6 +8,8 @@ import signal
 from typing import Any
 
 from photomatagent.tools.base import Tool, ToolResult
+from photomatagent.tools.exposure import ToolExposure
+from photomatagent.runtime.sensitive import SensitiveAccessError, SensitivePathPolicy
 from photomatagent.workspace import Workspace
 
 
@@ -16,6 +18,8 @@ class BashTool(Tool):
     description = (
         "Run a shell command with cwd fixed to the workspace. This is not an OS sandbox."
     )
+    exposure = ToolExposure.DIRECT
+    tags = ("shell", "process", "workspace")
     input_schema = {
         "type": "object",
         "properties": {
@@ -26,14 +30,24 @@ class BashTool(Tool):
     }
 
     def __init__(
-        self, workspace: Workspace, *, default_timeout: float = 30.0, max_output_chars: int = 50_000
+        self,
+        workspace: Workspace,
+        *,
+        default_timeout: float = 30.0,
+        max_output_chars: int = 50_000,
+        sensitive_paths: SensitivePathPolicy | None = None,
     ) -> None:
         self.workspace = workspace
         self.default_timeout = default_timeout
         self.max_output_chars = max_output_chars
+        self.sensitive_paths = sensitive_paths or SensitivePathPolicy()
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         command = str(arguments["command"])
+        try:
+            self.sensitive_paths.check_tool_call("bash", arguments)
+        except SensitiveAccessError as exc:
+            return ToolResult(output=str(exc), is_error=True)
         timeout = min(float(arguments.get("timeout_seconds", self.default_timeout)), 120.0)
         process = await asyncio.create_subprocess_shell(
             command,
@@ -96,4 +110,8 @@ class BashTool(Tool):
         output = "\n".join(sections)
         if len(output) <= self.max_output_chars:
             return output
-        return output[: self.max_output_chars] + "\n... [truncated]"
+        marker = f"\n... [tool output bounded from {len(output)} chars; middle omitted] ...\n"
+        available = max(0, self.max_output_chars - len(marker))
+        head = available * 2 // 3
+        tail = available - head
+        return output[:head] + marker + output[-tail:]

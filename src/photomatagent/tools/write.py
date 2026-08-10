@@ -6,12 +6,15 @@ from typing import Any
 
 from photomatagent.errors import ToolError
 from photomatagent.tools.base import Tool, ToolResult
+from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
 
 class WriteTool(Tool):
     name = "write"
     description = "Create a new UTF-8 file in the workspace. Refuses to overwrite existing files."
+    exposure = ToolExposure.DIRECT
+    tags = ("file", "write", "workspace")
     input_schema = {
         "type": "object",
         "properties": {
