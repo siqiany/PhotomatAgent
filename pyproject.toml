@@ -12,6 +12,35 @@ dependencies = [
     "python-dotenv>=1.0",
     "openai>=1.100",
     "anthropic>=0.60",
+    "pymatgen>=2024.10",
+]
+
+[project.optional-dependencies]
+materials = [
+    "mp-api>=0.44",
+]
+electronic = [
+    "sumo>=2.4",
+    "effmass>=1.3",
+]
+literature = [
+    "arxiv>=2.1",
+    "pypdf>=4.0",
+]
+defects = [
+    "doped>=2.0",
+]
+transport = [
+    "amset>=0.5",
+]
+device = [
+    "devsim>=2.9",
+]
+optics = [
+    "pytaser>=1.0",
+]
+science = [
+    "photomatagent[materials,electronic,literature,defects,transport,device,optics]",
 ]
 
 [dependency-groups]

@@ -23,6 +23,7 @@ from photomatagent.runtime.events import (
     ModelRequestStarted,
     ModelResponseCompleted,
     ProviderFailed,
+    ScientificTraceMeta,
     ToolCallCompleted,
     ToolCompleted,
     ToolFailed,
@@ -107,6 +108,12 @@ class SessionSummary(BaseModel):
     last_compaction_tokens_after: int | None = None
     last_compaction_chars_before: int | None = None
     last_compaction_chars_after: int | None = None
+    skills_loaded: list[str] = Field(default_factory=list)
+    scientific_tools_used: list[str] = Field(default_factory=list)
+    evidence_created: int = 0
+    evidence_sources: list[str] = Field(default_factory=list)
+    evidence_gaps_identified: list[str] = Field(default_factory=list)
+    capability_escalations: list[str] = Field(default_factory=list)
     anomalies: list[AnomalyFlag] = Field(default_factory=list)
 
 
@@ -340,6 +347,34 @@ def analyze_trace(
     run_ids = list(
         dict.fromkeys(event.run_id for event in trace.events if event.run_id)
     )
+    meta_events = [
+        event for event in trace.events if isinstance(event, ScientificTraceMeta)
+    ]
+    skills_loaded = list(
+        dict.fromkeys(skill for event in meta_events for skill in event.skills_loaded)
+    )
+    scientific_tools_used = list(
+        dict.fromkeys(
+            tool for event in meta_events for tool in event.scientific_tools_used
+        )
+    )
+    evidence_sources = list(
+        dict.fromkeys(
+            source for event in meta_events for source in event.evidence_sources
+        )
+    )
+    evidence_gaps_identified = list(
+        dict.fromkeys(
+            gap for event in meta_events for gap in event.evidence_gaps_identified
+        )
+    )
+    capability_escalations = list(
+        dict.fromkeys(
+            escalation
+            for event in meta_events
+            for escalation in event.capability_escalations
+        )
+    )
     return SessionSummary(
         session_id=trace.session_id,
         path=trace.session_dir,
@@ -451,6 +486,12 @@ def analyze_trace(
         last_compaction_chars_after=(
             last_compaction.chars_after if last_compaction else None
         ),
+        skills_loaded=skills_loaded,
+        scientific_tools_used=scientific_tools_used,
+        evidence_created=sum(event.evidence_created for event in meta_events),
+        evidence_sources=evidence_sources,
+        evidence_gaps_identified=evidence_gaps_identified,
+        capability_escalations=capability_escalations,
         anomalies=anomalies,
     )
 

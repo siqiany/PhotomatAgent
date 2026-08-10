@@ -33,6 +33,10 @@ from photomatagent.logging.session_stats import (
     list_sessions,
     read_session_stats,
 )
+from photomatagent.scientific.capabilities.status import (
+    format_status_table,
+    probe_all_capabilities,
+)
 from photomatagent.models.factory import api_key_status
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
 from photomatagent.runtime.budget import BudgetState
@@ -258,11 +262,58 @@ app.add_typer(skills_app, name="skills")
 
 
 @skills_app.command("list")
-def skills_list() -> None:
+def skills_list(
+    sources: bool = typer.Option(False, "--sources", help="Show source roots and licenses."),
+) -> None:
     loader = SkillLoader()
     skills = loader.load_index()
-    console.print(f"[dim]{len(skills)} skill(s) from {loader.skills_dir}[/]")
-    print_skill_list(console, skills)
+    source_names = ", ".join(source.name for source in loader.sources)
+    console.print(
+        f"[dim]{len(skills)} skill(s) from sources: {source_names or '(none)'}[/]"
+    )
+    if sources:
+        table = Table("name", "description", "source", "license", "priority")
+        for skill in skills:
+            table.add_row(
+                skill.name,
+                skill.description,
+                skill.source,
+                skill.license or "—",
+                str(skill.priority),
+            )
+        console.print(table)
+    else:
+        print_skill_list(console, skills)
+    for diagnostic in loader.diagnostics:
+        console.print(f"[yellow]skill diagnostic [{diagnostic.code}]: {diagnostic.message}[/]")
+
+
+scientific_app = typer.Typer(help="Inspect scientific capability packs.")
+app.add_typer(scientific_app, name="scientific")
+
+
+@scientific_app.command("status")
+def scientific_status(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Show dependency-probe status of every scientific capability pack."""
+    infos = probe_all_capabilities(workspace=Workspace(workspace))
+    table = Table("capability", "status", "version", "detail", "tools")
+    for info in sorted(infos, key=lambda item: item.name):
+        status_style = {
+            "AVAILABLE": "[green]",
+            "MISSING_DEPENDENCY": "[yellow]",
+            "UNCONFIGURED": "[yellow]",
+            "ERROR": "[red]",
+        }.get(info.status.value, "")
+        table.add_row(
+            info.name,
+            f"{status_style}{info.status.value}[/]",
+            info.version or "—",
+            info.detail,
+            ", ".join(info.tools) or "—",
+        )
+    console.print(table)
 
 
 sessions_app = typer.Typer(help="Inspect JSONL session traces.")
@@ -380,6 +431,17 @@ def sessions_stats(target: str = typer.Argument("latest")) -> None:
             console.print(f"- [yellow]{anomaly.code}[/]: {anomaly.detail}")
     else:
         console.print("[dim]- none[/]")
+    console.print("\n[bold]Scientific trace:[/]")
+    rows = [
+        ("Skills loaded", ", ".join(stats.skills_loaded) or "—"),
+        ("Scientific tools used", ", ".join(stats.scientific_tools_used) or "—"),
+        ("Evidence created", str(stats.evidence_created)),
+        ("Evidence sources", ", ".join(stats.evidence_sources) or "—"),
+        ("Evidence gaps identified", ", ".join(stats.evidence_gaps_identified) or "—"),
+        ("Capability escalations", ", ".join(stats.capability_escalations) or "—"),
+    ]
+    for label, value in rows:
+        console.print(f"- {label}: {value}")
 
 
 @sessions_app.command("context")

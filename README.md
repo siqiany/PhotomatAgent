@@ -289,6 +289,9 @@ CLI 只实现 allow once / deny。Runtime 依赖 `ApprovalHandler` protocol，�
 uv sync
 uv run pytest
 uv run photomatagent
+uv run photomatagent scientific status
+uv run photomatagent skills list --sources
+uv run photomatagent tools search "effective mass"
 ```
 
 第一次执行 `photomatagent` 时，程序会在当前 workspace 创建 `.env`。如果供应商偏好、对应模型名称或 API Key 缺失，终端会逐项询问；API Key 输入不会回显。配置完整后，以后无参数启动会直接进入对话模式。
@@ -316,6 +319,93 @@ uv run photomatagent configure --provider anthropic --model your-anthropic-model
 ```
 
 配置优先级为：命令行参数、当前进程环境变量、workspace `.env`。因此 CI 或临时终端仍可用 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`ANTHROPIC_API_KEY`、`OPENAI_MODEL`、`ANTHROPIC_MODEL` 覆盖文件值，而不会把覆盖后的密钥自动写回文件。
+
+## Scientific Sprint 1 — Infrared Photodetector Capabilities
+
+本轮把 Generic Harness 扩展为一组可真实执行的 scientific capability
+packs。所有 scientific 工具保持 `DEFERRED`，通过 `tool_search` / `tool_describe`
+/ `tool_call` 渐进暴露，复用现有 ToolRegistry / ToolExecutor /
+ObservationPolicy，不引入第二套 executor。
+
+### Capability packs（`src/photomatagent/scientific/capabilities/`）
+
+| Pack | namespace | 依赖 | 工具 |
+| --- | --- | --- | --- |
+| Materials Project | `materials` | mp-api + API key | `materials.search` / `get_summary` / `get_structure` |
+| Literature | `literature` | arxiv, pypdf | `literature.search_arxiv` / `search_local` / `list_papers` / `read_paper` |
+| Structure | `structure` | pymatgen | `structure.summary` / `symmetry` / `density` / `neighbors` / `convert` |
+| Electronic | `electronic` | sumo, effmass | `electronic.band_summary` / `dos_summary` / `plot_band` / `plot_dos` / `effective_mass` |
+| Defects | `defects` | doped | `defects.capabilities` / `generate` / `analyze` |
+| Transport | `transport` | amset | `transport.capabilities` / `analyze` |
+| Device | `device` | devsim | `device.devsim_capabilities` / `run_script` / `inspect_result` |
+| Optics | `optics` | pytaser | `optics.transient_absorption` |
+| IR constraints | `ir` | 无（纯 numpy） | `ir.compile_constraints` |
+
+每个 pack 都有 dependency probe，返回 `AVAILABLE` / `MISSING_DEPENDENCY` /
+`UNCONFIGURED`；缺失依赖只影响对应工具，绝不阻止 agent 启动。
+`photomatagent scientific status` 显示全部状态。
+
+### Third-party Scientific Capabilities（Attribution）
+
+| 名称 | 来源项目 | License | 版本（本环境） |
+| --- | --- | --- | --- |
+| pymatgen | materialsproject/pymatgen | modified BSD | 2026.5.4 |
+| mp-api | materialsproject/mp-api | modified BSD | 0.46.4 |
+| sumo | SMTG-Bham/sumo | MIT | 2.4.0.post1 |
+| effmass | lucamghini/effmass | MIT | 2.3.1 |
+| doped | birnbaum/doped | MIT | 3.2.1（本环境 import 受 coverage/numba 冲突阻断） |
+| amset | hackingmaterials/amset | MIT | 未安装 |
+| devsim | devsim/DEVSIM | MIT/BSD | 未安装 |
+| pytaser | pytaser/pytaser | Apache-2.0 | 2.3.1 |
+| arxiv | lukasa/arxiv | BSD-3-Clause | 4.0.1 |
+| pypdf | py-pdf/pypdf | BSD-3-Clause | 6.15.0 |
+| AtomisticSkills | learningmatter-mit/AtomisticSkills | MIT | 未 clone（配置已就绪） |
+| computational-chemistry-agent-skills | jinzhezenggroup/… | — | 未 clone（配置已就绪） |
+
+### Multi-root SkillLoader
+
+`SkillLoader` 现在支持多个 skill 根（`.photomatagent/skills.yaml` 的
+`skill_sources`）：native `skills/` + 外部根。每个 skill 带
+`SkillDescriptor`（name / description / path / source / license / tags /
+priority），同名校验冲突按 priority 解析；缺失根或不符合 SKILL.md 约定的
+目录产生 diagnostic 并跳过，不阻断启动。Progressive disclosure 不变：索引
+只含 name + description，正文由 `skill_view` 按需加载。
+
+### Native IR skills（`skills/`）
+
+`infrared-photodetector-design`（主领域 skill，驱动 evidence-gap 推理与
+multi-fidelity escalation）、`ir-constraint-analysis`、
+`infrared-material-screening`、`narrow-gap-electronic-analysis`、
+`defect-dark-current-analysis`、`carrier-transport-analysis`、
+`optical-response-analysis`、`detector-device-evaluation`。
+VASP/QE/phonopy/HPC 的具体执行 SOP 交给外部 skills，IR skills 只负责
+“何时需要、为什么需要、什么结果可信”。
+
+### 结果契约与 innovation logging
+
+- `ScientificEvidence`：轻量 provenance carrier（subject / property /
+  value / unit / source / source_type / method / summary / limitations /
+  provenance），自动进入 `ScientificState`，无 EvidenceGraph。
+- `ScientificToolResult`：ToolObservation + evidence[] + artifacts[]，全部
+  通过现有 state_updates 通道落地。
+- 每次 run 结束发出 `scientific_trace_meta` 事件：skills_loaded /
+  scientific_tools_used / evidence_created / evidence_sources /
+  evidence_gaps_identified / capability_escalations；
+  `photomatagent sessions stats` 直接展示。
+
+### Vertical slices（`experiments/vertical/`）
+
+三个 IR 科研回归任务（scripted 确定性 + Slice 1 的真实 LLM 变体）：
+
+```bash
+cd experiments/vertical
+uv run python slice_1_lwir_screening.py   # 8-14 um LWIR screening
+uv run python slice_2_hgte.py             # HgTe narrow-gap 分析
+uv run python slice_3_escalation.py       # 部分证据 → 能力升级 → prerequisite
+uv run python slice_1_lwir_llm.py         # 真实 LLM（deepseek-v4-flash）端到端
+```
+
+结果写入 `output/vertical/*.json`，含 evidence-gap trajectory 与 trace 路径。
 
 诊断与辅助命令：
 
@@ -493,7 +583,10 @@ V0.5 回归配置 `experiments/context-lifecycle-v05.json` 与 V0.4 progressive 
 - Semantic compaction 使用模型生成的结构化 state，schema 校验能约束形状但不能证明摘要事实完全无损；provenance reference 也尚不能自动 rehydrate 原 result
 - Context token trigger 使用 chars/4 估算；调用方未提供真实 model context limit 时使用 128k fallback，不等同 provider tokenizer
 - SensitivePathPolicy 对 bash 是 lexical defense，不是 OS sandbox；复杂 shell 间接访问必须依靠后续真正的 sandbox/容器边界
-- 未接 VASP、Slurm、Materials Project、文献 API 或真实 MCP server
+- 已接 Materials Project（mp-api，需 API key）、arXiv、pymatgen、sumo、
+  effmass、pytaser；doped / AMSET / DEVSIM 为 dependency-optional probe；
+  MCP server 支持 stdio/HTTP 配置但默认未启用；未接 Slurm，VASP 执行交由
+  外部 AtomisticSkills SOP
 - 未做 scientific StopPolicy、Evidence Graph、Planner、Multi-Agent、RAG 或 memory system
 - Experiment 仅支持 JSON、顺序执行和 deterministic expectations；没有 YAML、并行 runner 或 LLM-as-Judge
 - Token usage 依赖 provider；未报告时为 null。Context surface 使用 chars/4 diagnostics estimate，明确不冒充 provider usage

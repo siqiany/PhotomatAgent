@@ -79,6 +79,7 @@ async def test_full_streaming_tool_loop_event_order():
         "model_response_completed",
         "budget_updated",
         "loop_completed",
+        "scientific_trace_meta",
     ]
     assert len(runtime.scientific_state.evidence) == 1
     assert runtime.budget.model_calls == 2

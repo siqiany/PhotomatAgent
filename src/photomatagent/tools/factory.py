@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.capabilities.config import ScientificConfig
+from photomatagent.scientific.capabilities.registry import build_scientific_tools
 from photomatagent.skills.loader import SkillLoader
 from photomatagent.tools.bash import BashTool
 from photomatagent.tools.bridges import (
@@ -50,6 +52,8 @@ def create_default_registry(
             MockCalculationTool(),
         ]
     )
+    scientific_config = ScientificConfig.from_environment(workspace=boundary.root)
+    registry.register_all(build_scientific_tools(scientific_config, boundary))
     config = surface_config or ToolSurfaceConfig()
     catalog = ToolCatalog(registry)
     registry.register_all(

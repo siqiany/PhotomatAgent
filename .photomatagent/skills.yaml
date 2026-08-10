@@ -1,0 +1,20 @@
+# PhotoMatAgent skill sources: native + external third-party skills.
+# Missing directories are skipped with a diagnostic; startup never fails.
+skill_sources:
+  - name: photomat
+    path: ./skills
+    priority: 100
+
+  # Clone https://github.com/learningmatter-mit/AtomisticSkills next to this
+  # repository to enable its VASP/QE/phonopy/HPC SOPs.
+  - name: atomistic-skills
+    path: ../AtomisticSkills/.agents/skills
+    priority: 50
+    license: MIT
+
+  # Clone https://github.com/jinzhezenggroup/computational-chemistry-agent-skills
+  # to enable its computational chemistry SOPs (e.g. pymatgen workflows).
+  - name: computational-chemistry-skills
+    path: ../computational-chemistry-agent-skills
+    priority: 40
+    license: MIT

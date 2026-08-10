@@ -47,9 +47,18 @@ def format_scientific_state(state: ScientificState) -> str:
     if state.evidence:
         lines.append("Evidence:")
         for ev in state.evidence:
-            lines.append(
-                f"- ({ev.type} from {ev.source}) {ev.content} (confidence={ev.confidence})"
-            )
+            if hasattr(ev, "type"):
+                lines.append(
+                    f"- ({ev.type} from {ev.source}) {ev.content} "
+                    f"(confidence={ev.confidence})"
+                )
+            else:
+                lines.append(
+                    f"- ({getattr(ev, 'source_type', 'observation')} from "
+                    f"{getattr(ev, 'source', 'unknown')}) "
+                    f"{getattr(ev, 'summary', '')} ({getattr(ev, 'property', '')} "
+                    f"= {getattr(ev, 'value', '')} {getattr(ev, 'unit', '')})"
+                )
     if state.calculations:
         lines.append("Calculations:")
         for calc in state.calculations:

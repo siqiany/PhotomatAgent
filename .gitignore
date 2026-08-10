@@ -2,7 +2,10 @@
 .env
 .env.*
 !.env.example
-.photomatagent/
+.photomatagent/*
+!.photomatagent/skills.yaml
+!.photomatagent/mcp.json
+experiments/vertical/.photomatagent/
 __pycache__/
 *.pyc
 .pytest_cache/

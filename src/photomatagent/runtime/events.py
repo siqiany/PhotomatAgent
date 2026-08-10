@@ -286,6 +286,23 @@ class LoopCompleted(RuntimeEvent):
     reason: str
     duration_ms: float = 0.0
 
+
+class ScientificTraceMeta(RuntimeEvent):
+    """Per-run innovation-oriented summary for scientific task analysis.
+
+    Emitted once per run at loop completion. These fields exist for paper-level
+    analysis (skills loaded, scientific tools used, evidence created, gaps
+    identified, capability escalations); no separate ScientificState is added.
+    """
+
+    kind: Literal["scientific_trace_meta"] = "scientific_trace_meta"
+    skills_loaded: list[str] = Field(default_factory=list)
+    scientific_tools_used: list[str] = Field(default_factory=list)
+    evidence_created: int = 0
+    evidence_sources: list[str] = Field(default_factory=list)
+    evidence_gaps_identified: list[str] = Field(default_factory=list)
+    capability_escalations: list[str] = Field(default_factory=list)
+
     @property
     def stop_reason(self) -> str:
         """Semantic alias used by trace-analysis consumers."""
@@ -324,6 +341,7 @@ AnyRuntimeEvent = Annotated[
         ToolCompleted,
         ToolFailed,
         ScientificStateUpdated,
+        ScientificTraceMeta,
         BudgetUpdated,
         LoopCompleted,
         LoopFailed,

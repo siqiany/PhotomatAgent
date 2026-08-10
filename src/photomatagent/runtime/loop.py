@@ -52,6 +52,7 @@ from photomatagent.runtime.events import (
     ModelStreamStarted,
     ProviderFailed,
     RuntimeEvent,
+    ScientificTraceMeta,
     ScientificStateUpdated,
     SensitiveAccessBlocked,
     TextDelta,
@@ -79,6 +80,7 @@ from photomatagent.runtime.stop_policy import StopPolicy
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
+from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.state import ScientificState
 from photomatagent.scientific.tasks import ScientificTask
 from photomatagent.tools.registry import ToolRegistry
@@ -148,6 +150,7 @@ class AgentRuntime:
         self._conversation = ConversationState()
         self._session_id = session_id or uuid4().hex
         self._run_id: str | None = None
+        self._run_meta: dict[str, Any] = {}
 
     @property
     def scientific_state(self) -> ScientificState:
@@ -169,6 +172,14 @@ class AgentRuntime:
         """Run one user turn while preserving conversation and scientific state."""
         self._close_pending_tool_calls()
         self._run_id = uuid4().hex
+        self._run_meta = {
+            "skills_loaded": [],
+            "scientific_tools_used": [],
+            "evidence_created": 0,
+            "evidence_sources": [],
+            "evidence_gaps_identified": [],
+            "capability_escalations": [],
+        }
         run_started = time.monotonic()
         self._scientific.goal = goal
         self._conversation.add(UserMessage(content=goal))
@@ -360,6 +371,16 @@ class AgentRuntime:
                             iterations=iteration,
                             reason=decision.reason,
                             duration_ms=(time.monotonic() - run_started) * 1000,
+                        )
+                    )
+                    yield await self._emit(
+                        ScientificTraceMeta(
+                            skills_loaded=self._run_meta["skills_loaded"],
+                            scientific_tools_used=self._run_meta["scientific_tools_used"],
+                            evidence_created=self._run_meta["evidence_created"],
+                            evidence_sources=self._run_meta["evidence_sources"],
+                            evidence_gaps_identified=self._run_meta["evidence_gaps_identified"],
+                            capability_escalations=self._run_meta["capability_escalations"],
                         )
                     )
                     return
@@ -664,6 +685,7 @@ class AgentRuntime:
                 redacted=observation.redacted,
             )
         )
+        self._record_innovation_meta(name, registered.namespace, result, bridge_tool)
         if result.state_updates:
             for update in result.state_updates:
                 self._apply_state_update(update)
@@ -678,6 +700,39 @@ class AgentRuntime:
                 is_error=False,
             )
         )
+
+    def _record_innovation_meta(
+        self,
+        tool_name: str,
+        namespace: str,
+        result: ToolResult,
+        bridge_tool: str | None,
+    ) -> None:
+        """Accumulate per-run innovation telemetry without new state objects."""
+        if not self._run_meta:
+            return
+        if tool_name == "skill_view":
+            skill = str(result.data.get("skill", ""))
+            if skill and skill not in self._run_meta["skills_loaded"]:
+                self._run_meta["skills_loaded"].append(skill)
+        if namespace not in {"", "core", "skills"}:
+            if tool_name and tool_name not in self._run_meta["scientific_tools_used"]:
+                self._run_meta["scientific_tools_used"].append(tool_name)
+        if bridge_tool == "tool_call" and tool_name:
+            if tool_name not in self._run_meta["capability_escalations"]:
+                self._run_meta["capability_escalations"].append(tool_name)
+        gaps = result.data.get("evidence_gaps")
+        if isinstance(gaps, list):
+            for gap in gaps:
+                text = str(gap)
+                if text and text not in self._run_meta["evidence_gaps_identified"]:
+                    self._run_meta["evidence_gaps_identified"].append(text)
+        for update in result.state_updates:
+            if isinstance(update, ScientificEvidence):
+                self._run_meta["evidence_created"] += 1
+                source = update.source
+                if source and source not in self._run_meta["evidence_sources"]:
+                    self._run_meta["evidence_sources"].append(source)
 
     async def _deny_tool(
         self,
@@ -769,7 +824,7 @@ class AgentRuntime:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def _apply_state_update(self, update: Any) -> None:
-        if isinstance(update, Evidence):
+        if isinstance(update, (Evidence, ScientificEvidence)):
             self._scientific.add_evidence(update)
         elif isinstance(update, ScientificClaim):
             self._scientific.add_claim(update)

@@ -1,30 +1,24 @@
-"""Progressive skill index and on-demand SKILL/reference loading."""
+"""Multi-root progressive skill index and on-demand SKILL/reference loading.
+
+Skills come from one or more roots (native ``skills/`` plus external source
+directories). Only ``name + description`` (plus provenance metadata) is ever
+loaded eagerly; full SKILL.md bodies and references load on demand via
+``view()``. Third-party roots that do not follow the SKILL.md convention are
+skipped with a diagnostic instead of failing startup.
+"""
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
-
-@dataclass(frozen=True)
-class Skill:
-    name: str
-    description: str
-    path: Path
-    content: str
-    category: str = ""
-    tags: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class SkillIndexEntry:
-    name: str
-    description: str
-    category: str
-    tags: tuple[str, ...]
-    path: Path
+from photomatagent.skills.config import (
+    SkillSourceConfig,
+    load_skill_sources_config,
+)
+from photomatagent.skills.descriptor import SkillDescriptor, SkillDiagnostic
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
@@ -43,7 +37,7 @@ def _parse_frontmatter(content: str) -> dict[str, str]:
 
 
 def default_skills_dir() -> Path:
-    """Resolve the skills directory: env override, then cwd, then repo root."""
+    """Resolve the native skills directory (env override, cwd, then repo)."""
     env = os.environ.get("PHOTOMATAGENT_SKILLS_DIR") or os.environ.get("MATAGENT_SKILLS_DIR")
     if env:
         return Path(env)
@@ -55,63 +49,155 @@ def default_skills_dir() -> Path:
 
 
 class SkillLoader:
-    def __init__(self, skills_dir: Path | str | None = None) -> None:
+    """Progressive loader over multiple skill source roots.
+
+    ``skills_dir`` is retained for backwards compatibility: when provided
+    explicitly it becomes the only native root unless ``sources``/config
+    resolution finds configured external roots. Diagnostics never raise.
+    """
+
+    def __init__(
+        self,
+        skills_dir: Path | str | None = None,
+        *,
+        sources: Iterable[SkillSourceConfig] | None = None,
+        config_path: Path | str | None = None,
+    ) -> None:
         self.skills_dir = Path(skills_dir) if skills_dir is not None else default_skills_dir()
+        self._explicit_skills_dir = skills_dir is not None
+        self.diagnostics: list[SkillDiagnostic] = []
+        self._sources = self._resolve_sources(sources, config_path)
+
+    @property
+    def sources(self) -> list[SkillSourceConfig]:
+        return list(self._sources)
+
+    def _resolve_sources(
+        self,
+        sources: Iterable[SkillSourceConfig] | None,
+        config_path: Path | str | None,
+    ) -> list[SkillSourceConfig]:
+        if sources is not None:
+            resolved = [self._normalize_source(source) for source in sources]
+            return self._dedupe(resolved)
+        if self._explicit_skills_dir:
+            # Backwards-compatible isolated root: an explicit skills_dir means
+            # "only this directory", without config-file auto-discovery.
+            native = SkillSourceConfig(
+                name="native",
+                path=self.skills_dir.resolve(),
+                priority=100,
+            )
+            return self._dedupe([native])
+        loaded = load_skill_sources_config(config_path)
+        self.diagnostics.extend(loaded.diagnostics)
+        resolved = [self._normalize_source(source) for source in loaded.sources]
+        native = SkillSourceConfig(
+            name="native",
+            path=self.skills_dir.resolve(),
+            priority=100,
+        )
+        resolved.append(native)
+        return self._dedupe(resolved)
+
+    def _normalize_source(self, source: SkillSourceConfig) -> SkillSourceConfig:
+        path = source.path.expanduser().resolve()
+        if path.is_dir():
+            return SkillSourceConfig(
+                name=source.name,
+                path=path,
+                priority=source.priority,
+                license=source.license,
+            )
+        self.diagnostics.append(
+            SkillDiagnostic(
+                code="SKIPPED_MISSING_ROOT",
+                message=f"skill source '{source.name}' directory does not exist",
+                source=source.name,
+                path=path,
+            )
+        )
+        return SkillSourceConfig(name=source.name, path=path, priority=0)
+
+    @staticmethod
+    def _dedupe(sources: list[SkillSourceConfig]) -> list[SkillSourceConfig]:
+        by_path: dict[Path, SkillSourceConfig] = {}
+        for source in sources:
+            if source.path in by_path:
+                existing = by_path[source.path]
+                if source.priority > existing.priority:
+                    by_path[source.path] = source
+            else:
+                by_path[source.path] = source
+        return sorted(by_path.values(), key=lambda item: (-item.priority, item.name))
 
     def load_all(self) -> list[Skill]:
         """Compatibility API: explicitly load every primary SKILL.md."""
-        if not self.skills_dir.is_dir():
-            return []
-        skills: list[Skill] = []
-        for entry in sorted(self.skills_dir.iterdir()):
-            if not self._safe_skill_directory(entry):
-                continue
-            skill_file = entry / "SKILL.md"
-            if not self._safe_skill_file(entry, skill_file):
-                continue
-            content = skill_file.read_text(encoding="utf-8")
-            metadata = _parse_frontmatter(content)
-            name = metadata.get("name", entry.name)
-            description = metadata.get("description", "")
-            category = metadata.get("category", "")
-            tags = _parse_tags(metadata.get("tags", ""))
-            skills.append(
-                Skill(
-                    name=name,
-                    description=description,
-                    path=skill_file,
-                    content=content,
-                    category=category,
-                    tags=tags,
-                )
-            )
-        return sorted(skills, key=lambda s: s.name)
+        return sorted(
+            [entry.to_skill() for entry in self.load_index()],
+            key=lambda skill: skill.name,
+        )
 
     def get(self, name: str) -> Skill | None:
         return next((s for s in self.load_all() if s.name == name), None)
 
     def load_index(self) -> list[SkillIndexEntry]:
         """Read frontmatter only; full skill bodies are not loaded or returned."""
-        if not self.skills_dir.is_dir():
-            return []
         entries: list[SkillIndexEntry] = []
-        for directory in sorted(self.skills_dir.iterdir()):
-            skill_file = directory / "SKILL.md"
-            if not self._safe_skill_directory(directory) or not self._safe_skill_file(
-                directory, skill_file
-            ):
+        for source in self._sources:
+            root = source.path
+            if not root.is_dir():
                 continue
-            metadata = _read_frontmatter(skill_file)
-            entries.append(
-                SkillIndexEntry(
-                    name=metadata.get("name", directory.name),
-                    description=metadata.get("description", ""),
-                    category=metadata.get("category", ""),
-                    tags=_parse_tags(metadata.get("tags", "")),
-                    path=skill_file,
+            for directory in sorted(root.iterdir()):
+                if not self._safe_skill_directory(root, directory):
+                    continue
+                skill_file = directory / "SKILL.md"
+                if not self._safe_skill_file(directory, skill_file):
+                    self.diagnostics.append(
+                        SkillDiagnostic(
+                            code="SKIPPED_NO_SKILL_MD",
+                            message=f"'{directory.name}' has no readable SKILL.md",
+                            source=source.name,
+                            path=directory,
+                        )
+                    )
+                    continue
+                metadata = _read_frontmatter(skill_file)
+                if not metadata:
+                    self.diagnostics.append(
+                        SkillDiagnostic(
+                            code="SKIPPED_UNPARSEABLE",
+                            message=f"'{directory.name}' SKILL.md has no parseable frontmatter",
+                            source=source.name,
+                            path=skill_file,
+                        )
+                    )
+                    continue
+                entries.append(
+                    SkillIndexEntry(
+                        name=metadata.get("name", directory.name),
+                        description=metadata.get("description", ""),
+                        category=metadata.get("category", ""),
+                        tags=_parse_tags(metadata.get("tags", "")),
+                        path=skill_file,
+                        source=source.name,
+                        license=(
+                            metadata.get("license", "")
+                            or metadata.get("license_name", "")
+                            or source.license
+                        ),
+                        priority=source.priority,
+                    )
                 )
-            )
-        return sorted(entries, key=lambda entry: entry.name)
+        return self._merge(entries)
+
+    def _merge(self, entries: list[SkillIndexEntry]) -> list[SkillIndexEntry]:
+        merged: dict[str, SkillIndexEntry] = {}
+        for entry in sorted(entries, key=lambda item: (-item.priority, item.name)):
+            existing = merged.get(entry.name)
+            if existing is None or entry.priority > existing.priority:
+                merged[entry.name] = entry
+        return sorted(merged.values(), key=lambda entry: entry.name)
 
     def view(self, name: str, path: str | None = None) -> tuple[str, str]:
         """Load the primary SKILL.md or one safe path below its directory."""
@@ -127,10 +213,10 @@ class SkillLoader:
             raise OSError(f"skill reference is not a file: {path}")
         return resolved.read_text(encoding="utf-8"), resolved.relative_to(root).as_posix()
 
-    def _safe_skill_directory(self, directory: Path) -> bool:
+    def _safe_skill_directory(self, root: Path, directory: Path) -> bool:
         if directory.is_symlink() or not directory.is_dir():
             return False
-        skills_root = self.skills_dir.resolve()
+        skills_root = root.resolve()
         resolved = directory.resolve()
         return resolved != skills_root and skills_root in resolved.parents
 
@@ -140,6 +226,55 @@ class SkillLoader:
         root = directory.resolve()
         resolved = skill_file.resolve()
         return resolved != root and root in resolved.parents
+
+
+class Skill(SkillDescriptor):
+    """A skill with its body loaded (progressive disclosure)."""
+
+    content: str
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        description: str,
+        path: Path,
+        content: str,
+        source: str = "native",
+        license: str = "",
+        category: str = "",
+        tags: tuple[str, ...] = (),
+        priority: int = 100,
+    ) -> None:
+        super().__init__(
+            name=name,
+            description=description,
+            path=path,
+            source=source,
+            license=license,
+            tags=tags,
+            priority=priority,
+            category=category,
+        )
+        self.content = content
+
+
+class SkillIndexEntry(SkillDescriptor):
+    """Frontmatter-only view of a skill (name + description + provenance)."""
+
+    def to_skill(self) -> Skill:
+        content = self.path.read_text(encoding="utf-8")
+        return Skill(
+            name=self.name,
+            description=self.description,
+            path=self.path,
+            content=content,
+            source=self.source,
+            license=self.license,
+            category=self.category,
+            tags=self.tags,
+            priority=self.priority,
+        )
 
 
 def _parse_tags(value: str) -> tuple[str, ...]:
