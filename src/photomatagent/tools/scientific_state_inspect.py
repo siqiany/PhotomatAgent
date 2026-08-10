@@ -27,7 +27,12 @@ class ScientificStateInspectTool(Tool):
             text = format_scientific_state(self._state)
         elif section == "evidence":
             text = "\n".join(
-                f"- ({e.type} from {e.source}) {e.content}" for e in self._state.evidence
+                (
+                    f"- ({getattr(e, 'type', getattr(e, 'source_type', 'observation'))} "
+                    f"from {e.source}) "
+                    f"{getattr(e, 'content', getattr(e, 'summary', ''))}"
+                )
+                for e in self._state.evidence
             )
         elif section == "claims":
             text = "\n".join(

@@ -124,10 +124,23 @@ class ToolCatalog:
         self._registry = registry
 
     def entries(self) -> list[ToolCatalogEntry]:
-        return [self._entry(tool) for tool in self._registry.tools_for_exposure(ToolExposure.DEFERRED)]
+        return [
+            self._entry(tool)
+            for tool in self._registry.tools_for_exposure(ToolExposure.DEFERRED)
+            if tool.searchable
+        ]
 
     def get(self, name: str) -> ToolCatalogEntry | None:
-        return next((entry for entry in self.entries() if entry.name == name), None)
+        # tool_describe may still resolve non-searchable (e.g. test-only)
+        # deferred tools by exact name; they are just not discoverable.
+        return next(
+            (
+                self._entry(tool)
+                for tool in self._registry.tools_for_exposure(ToolExposure.DEFERRED)
+                if tool.name == name
+            ),
+            None,
+        )
 
     def search(
         self, query: str, *, limit: int = 5, namespace: str | None = None

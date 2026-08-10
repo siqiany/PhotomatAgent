@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -314,6 +315,157 @@ def scientific_status(
             ", ".join(info.tools) or "—",
         )
     console.print(table)
+
+
+mcp_app = typer.Typer(
+    help="Inspect and operate MCP scientific gateway servers.",
+    no_args_is_help=False,
+)
+app.add_typer(mcp_app, name="mcp")
+
+
+def _mcp_manager(workspace: Path) -> Any:
+    from photomatagent.mcp.manager import MCPServerManager
+
+    return MCPServerManager(workspace=workspace)
+
+
+@mcp_app.command("list")
+def mcp_list(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Show discovered MCP server configurations (no connection attempt)."""
+    manager = _mcp_manager(workspace)
+    configs = manager.discovered()
+    if not configs:
+        console.print(
+            "[yellow]no MCP servers configured[/]\n"
+            "[dim]create .photomatagent/mcp.json (see .photomatagent/mcp.json.example)[/]"
+        )
+        return
+    table = Table("Server", "Transport", "Enabled", "Namespace", "Command/URL", "Trust", "Tools")
+    for cfg in configs:
+        target = cfg.command or cfg.url or "—"
+        table.add_row(
+            cfg.name,
+            cfg.transport,
+            "yes" if cfg.enabled else "no",
+            cfg.effective_namespace,
+            str(target),
+            cfg.trust_level,
+            "—",
+        )
+    console.print(table)
+
+
+@mcp_app.command("status")
+def mcp_status(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Live-probe every configured server (connect + ping)."""
+    manager = _mcp_manager(workspace)
+    if not manager.discovered():
+        console.print("[yellow]no MCP servers configured[/]")
+        return
+    rows = manager.live_status()
+    table = Table("Server", "Transport", "Status", "Namespace", "Tools", "Latency", "Error")
+    for row in rows:
+        style = {
+            "READY": "[green]",
+            "UNCONFIGURED": "[yellow]",
+            "DISABLED": "[dim]",
+            "MISSING_DEPENDENCY": "[yellow]",
+            "START_FAILED": "[red]",
+            "UNHEALTHY": "[red]",
+            "STOPPED": "[dim]",
+        }.get(row.state.value, "")
+        table.add_row(
+            row.name,
+            row.transport,
+            f"{style}{row.state.value}[/]",
+            row.namespace,
+            str(row.tools),
+            f"{row.latency_ms:.0f} ms" if row.latency_ms is not None else "—",
+            (row.error or row.detail or "—")[:80],
+        )
+    console.print(table)
+
+
+@mcp_app.command("doctor")
+def mcp_doctor(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Deep diagnostics: command resolution, env refs, connect, health."""
+    manager = _mcp_manager(workspace)
+    if not manager.discovered():
+        console.print("[yellow]no MCP servers configured[/]")
+        return
+    reports = manager.doctor()
+    for report in reports:
+        from photomatagent.redaction import redact_secrets
+
+        safe = redact_secrets(report)
+        console.print(Panel(json.dumps(safe, indent=2, ensure_ascii=False), title=f"mcp doctor: {safe['server']}"))
+
+
+@mcp_app.command("tools")
+def mcp_tools(
+    server: str = typer.Argument(..., help="Configured server name"),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """List tools advertised by one server (connects if needed)."""
+    manager = _mcp_manager(workspace)
+    handle = manager.handles.get(server)
+    if handle is None:
+        raise typer.BadParameter(
+            f"unknown server {server!r}; configured: {sorted(manager.handles)}"
+        )
+    manager._run_async(handle.start())
+    if handle.state.value != "READY":
+        console.print(f"[red]{handle.state.value}: {handle.detail or handle.last_error}[/]")
+        raise typer.Exit(code=1)
+    table = Table("Name", "Namespace", "Required", "Description")
+    for spec in handle.remote_tools:
+        table.add_row(
+            f"{handle.config.effective_namespace}.{spec.name}",
+            handle.config.effective_namespace,
+            ", ".join(spec.required_parameters) or "—",
+            (spec.description or "")[:120],
+        )
+    console.print(table)
+
+
+@mcp_app.command("test")
+def mcp_test(
+    server: str = typer.Argument(..., help="Configured server name"),
+    tool: str | None = typer.Option(None, "--tool", help="Remote tool to invoke"),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Connect to one server, list tools, ping, and optionally invoke a tool."""
+    manager = _mcp_manager(workspace)
+    handle = manager.handles.get(server)
+    if handle is None:
+        raise typer.BadParameter(
+            f"unknown server {server!r}; configured: {sorted(manager.handles)}"
+        )
+    manager._run_async(handle.restart())
+    manager._run_async(handle.healthcheck())
+    console.print(
+        f"server={server} state={handle.state.value} "
+        f"tools={len(handle.remote_tools)} "
+        f"latency={handle.latency_ms if handle.latency_ms is not None else '—'} ms"
+    )
+    if handle.state.value != "READY":
+        console.print(f"[red]{handle.detail or handle.last_error}[/]")
+        raise typer.Exit(code=1)
+    for spec in handle.remote_tools:
+        console.print(f"  {spec.name}  required={', '.join(spec.required_parameters) or '—'}")
+    if tool:
+        spec = next((s for s in handle.remote_tools if s.name == tool), None)
+        if spec is None:
+            raise typer.BadParameter(f"server {server!r} has no tool {tool!r}")
+        manager._run_async(handle.invoke(tool, {}))
+        console.print(f"invoked {tool}: {handle.last_error or 'ok'}")
 
 
 sessions_app = typer.Typer(help="Inspect JSONL session traces.")

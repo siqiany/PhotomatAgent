@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from photomatagent.models.types import ModelMessage, SystemMessage
 from photomatagent.runtime.state import ConversationState
+from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.state import ScientificState
 from photomatagent.skills.loader import SkillLoader
 
@@ -47,7 +48,7 @@ def format_scientific_state(state: ScientificState) -> str:
     if state.evidence:
         lines.append("Evidence:")
         for ev in state.evidence:
-            if hasattr(ev, "type"):
+            if isinstance(ev, Evidence):
                 lines.append(
                     f"- ({ev.type} from {ev.source}) {ev.content} "
                     f"(confidence={ev.confidence})"

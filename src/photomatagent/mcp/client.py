@@ -5,6 +5,11 @@ they look exactly like local ``Tool`` instances to the Agent Loop. The loop
 never knows whether a tool is local, MCP, or a scientific backend. MCP is
 strictly optional: configuration happens in ``.photomatagent/mcp.json`` and
 any connection failure is reported instead of breaking agent startup.
+
+This module keeps the minimal one-shot JSON-RPC helpers used by tests and
+simple callers. The production gateway in ``mcp.manager`` uses the official
+``mcp`` SDK transports (``stdio_client`` / ``streamable_http_client`` plus
+``ClientSession``) exactly as documented upstream.
 """
 
 from __future__ import annotations
@@ -16,7 +21,6 @@ import subprocess  # noqa: F401  (documented fallback for stdio spawning)
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
-
 from photomatagent.tools.base import Tool, ToolResult
 from photomatagent.tools.exposure import ToolExposure
 
@@ -128,6 +132,7 @@ async def _request(
 async def _request_stdio(
     server: MCPServerSpec, payload: dict[str, Any]
 ) -> dict[str, Any]:
+    assert server.command is not None
     env = dict(os.environ)
     if server.env:
         env.update(server.env)
@@ -172,6 +177,7 @@ async def _request_stdio(
 async def _request_http(
     server: MCPServerSpec, payload: dict[str, Any]
 ) -> dict[str, Any]:
+    assert server.url is not None
     import urllib.request
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")

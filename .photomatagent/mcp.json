@@ -1,0 +1,21 @@
+{
+  "servers": {
+    "materials-project": {
+      "enabled": true,
+      "transport": "stdio",
+      "namespace": "materials_mcp",
+      "command": "mpmcp",
+      "args": [],
+      "env": {
+        "MP_API_KEY": "${MATERIALS_API_KEY}"
+      },
+      "description": "Materials Project official MCP server (mp-api fastmcp entry point mpmcp).",
+      "source": "https://github.com/materialsproject/mp-api",
+      "version": "0.46.4",
+      "trust_level": "local_trusted",
+      "tool_exposure": "deferred",
+      "timeout": 60,
+      "startup_timeout": 30
+    }
+  }
+}

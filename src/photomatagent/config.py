@@ -39,6 +39,10 @@ OPENAI_API_KEY=
 # Anthropic official SDK
 ANTHROPIC_MODEL=
 ANTHROPIC_API_KEY=
+
+# Scientific integrations (optional)
+# MATERIALS_API_KEY: Materials Project API key, enables the materials.* tools
+MATERIALS_API_KEY=
 """
 
 

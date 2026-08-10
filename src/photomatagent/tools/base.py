@@ -40,6 +40,7 @@ class Tool(ABC):
     namespace: str = "core"
     source: str = "builtin"
     tags: tuple[str, ...] = ()
+    searchable: bool = True
 
     @abstractmethod
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
@@ -54,4 +55,5 @@ class Tool(ABC):
             "namespace": self.namespace,
             "source": self.source,
             "tags": list(self.tags),
+            "searchable": self.searchable,
         }

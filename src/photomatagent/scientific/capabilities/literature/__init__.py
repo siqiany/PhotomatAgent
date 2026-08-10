@@ -159,7 +159,7 @@ class LiteratureSearchArxivTool(Tool):
                     provenance={"arxiv_id": paper.get_short_id(), "tool": self.name},
                 )
             )
-        payload = {"count": len(cards), "results": cards}
+        payload: dict[str, Any] = {"count": len(cards), "results": cards}
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data={"results": cards},
@@ -205,7 +205,7 @@ class LiteratureSearchLocalTool(Tool):
                 is_error=True,
                 data={"error": "no_papers_dir"},
             )
-        matches = []
+        matches: list[dict[str, Any]] = []
         for pdf_path in sorted(directory.glob("*.pdf"))[:max_files]:
             try:
                 reader = PdfReader(str(pdf_path))
@@ -232,7 +232,11 @@ class LiteratureSearchLocalTool(Tool):
                     break
             if snippets:
                 matches.append({"file": pdf_path.name, "pages": snippets})
-        payload = {"query": arguments["query"], "count": len(matches), "matches": matches}
+        payload: dict[str, Any] = {
+            "query": arguments["query"],
+            "count": len(matches),
+            "matches": matches,
+        }
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data={"matches": matches},
@@ -261,7 +265,11 @@ class LiteratureListPapersTool(Tool):
                 data={"error": "no_papers_dir"},
             )
         files = [path.name for path in sorted(directory.glob("*.pdf"))]
-        payload = {"count": len(files), "papers": files, "directory": str(directory)}
+        payload: dict[str, Any] = {
+            "count": len(files),
+            "papers": files,
+            "directory": str(directory),
+        }
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data=payload,
@@ -348,4 +356,3 @@ class LiteratureReadPaperTool(Tool):
 
 def literature_pack(config: ScientificConfig, workspace: Workspace) -> CapabilityPack:
     return LiteratureProbe(config, workspace)
-

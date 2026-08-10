@@ -83,6 +83,7 @@ from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.state import ScientificState
 from photomatagent.scientific.tasks import ScientificTask
+from photomatagent.tools.base import ToolResult
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.tools.surface import (

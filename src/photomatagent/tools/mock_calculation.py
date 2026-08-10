@@ -13,12 +13,16 @@ from photomatagent.tools.base import Tool, ToolError, ToolResult
 class MockCalculationTool(Tool):
     name = "mock.run_calculation"
     description = (
-        "Run a mock scientific calculation for a material. "
-        "Returns placeholder results (e.g. band gap) and records evidence "
-        "in the scientific state. Types: band_structure, dos, relaxation."
+        "TEST-ONLY placeholder: run a fake scientific calculation for a "
+        "material. Always returns hardcoded placeholder results (e.g. band "
+        "gap 0.31 eV) and records evidence in the scientific state. Never "
+        "call this for real research; it is excluded from tool_search. "
+        "Types: band_structure, dos, relaxation."
     )
     namespace = "mock"
     tags = ("scientific", "materials", "calculation", "band structure", "dos")
+    # Test fixture only: do not let the agent discover this via tool_search.
+    searchable = False
     input_schema = {
         "type": "object",
         "properties": {

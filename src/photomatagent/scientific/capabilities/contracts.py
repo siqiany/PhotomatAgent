@@ -29,9 +29,27 @@ class ScientificEvidence(BaseModel):
     unit: str = ""
     source: str = ""
     source_type: Literal[
-        "database", "literature", "calculation", "experiment", "derived", "model"
+        "database",
+        "literature",
+        "calculation",
+        "experiment",
+        "derived",
+        "model",
+        "analytical_model",
+        "kp_calculation",
+        "dft_calculation",
+        "user_parameter",
     ] = "calculation"
     method: str = ""
+    fidelity: Literal[
+        "analytical",
+        "empirical",
+        "continuum",
+        "kp",
+        "tight_binding",
+        "dft",
+        "experimental",
+    ] = "analytical"
     summary: str = ""
     limitations: str = ""
     provenance: dict[str, Any] = Field(default_factory=dict)
@@ -55,4 +73,3 @@ class ScientificToolResult(ToolResult):
             self.state_updates = list(self.evidence)
         elif not any(isinstance(item, ScientificEvidence) for item in self.state_updates):
             self.state_updates = [*self.state_updates, *self.evidence]
-

@@ -50,6 +50,28 @@ def test_materials_unconfigured_without_key(tmp_path, monkeypatch):
     assert materials.status.value == "UNCONFIGURED"
 
 
+def test_materials_key_read_from_workspace_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("MATERIALS_API_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "MATERIALS_API_KEY=test-key-123\n", encoding="utf-8"
+    )
+    config = ScientificConfig.from_environment(workspace=tmp_path)
+    assert config.materials_api_key() == "test-key-123"
+
+    infos = probe_all_capabilities(config=config, workspace=Workspace(tmp_path))
+    materials = next(info for info in infos if info.name == "materials")
+    assert materials.status.value == "AVAILABLE"
+
+
+def test_existing_env_wins_over_workspace_dotenv(tmp_path, monkeypatch):
+    monkeypatch.setenv("MATERIALS_API_KEY", "from-process-env")
+    (tmp_path / ".env").write_text(
+        "MATERIALS_API_KEY=from-dotenv\n", encoding="utf-8"
+    )
+    config = ScientificConfig.from_environment(workspace=tmp_path)
+    assert config.materials_api_key() == "from-process-env"
+
+
 def test_optics_available_here(tmp_path):
     infos = probe_all_capabilities(workspace=Workspace(tmp_path))
     optics = next(info for info in infos if info.name == "optics")
@@ -73,4 +95,3 @@ def test_structure_pack_tools_are_deferred(tmp_path):
         "structure.convert",
     }
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in structure_tools)
-

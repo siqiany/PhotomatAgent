@@ -92,6 +92,8 @@ class BashTool(Tool):
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        assert process.stdout is not None
+        assert process.stderr is not None
         stdout_fd = process.stdout.fileno()
         stderr_fd = process.stderr.fileno()
         os.set_blocking(stdout_fd, False)

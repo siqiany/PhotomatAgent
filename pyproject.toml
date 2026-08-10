@@ -13,11 +13,13 @@ dependencies = [
     "openai>=1.100",
     "anthropic>=0.60",
     "pymatgen>=2024.10",
+    "coverage>=7.6,<8",
+    "mcp>=1.24,<2",
 ]
 
 [project.optional-dependencies]
 materials = [
-    "mp-api>=0.44",
+    "mp-api[mcp]>=0.44",
 ]
 electronic = [
     "sumo>=2.4",
@@ -64,6 +66,11 @@ packages = ["src/photomatagent"]
 addopts = "--capture=no"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = false
 
 [tool.hatch.build.targets.sdist]
 include = ["skills/"]

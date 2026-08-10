@@ -39,6 +39,23 @@ def test_retrieval_respects_namespace_filter(catalog):
     assert all(match.entry.namespace == "materials" for match in matches)
 
 
+def test_mock_tool_is_not_discoverable_via_search(catalog):
+    # mock.run_calculation is a test-only placeholder; it must never rank
+    # ahead of real capabilities (e.g. electronic.band_summary) in searches.
+    for query in ("band gap calculation", "mock scientific calculation", "dos"):
+        names = [match.entry.name for match in catalog.search(query, limit=10)]
+        assert "mock.run_calculation" not in names, query
+
+
+def test_mock_tool_still_describable_and_outside_manifest(catalog):
+    # tool_describe by exact name must keep working (offline smoke flow),
+    # but the manifest sent to the model must not advertise the mock.
+    entry = catalog.get("mock.run_calculation")
+    assert entry is not None
+    assert entry.name == "mock.run_calculation"
+    assert "mock.run_calculation" not in [e.name for e in catalog.entries()]
+
+
 def test_all_scientific_tools_are_deferred(catalog):
     scientific_namespaces = {
         "materials",
@@ -59,4 +76,3 @@ def test_all_scientific_tools_are_deferred(catalog):
     assert len(scientific) == len(
         [entry for entry in entries if entry.namespace in scientific_namespaces]
     )
-

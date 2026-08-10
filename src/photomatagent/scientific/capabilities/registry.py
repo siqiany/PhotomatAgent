@@ -23,10 +23,17 @@ def build_scientific_tools(
     from photomatagent.scientific.capabilities.defects import defects_pack
     from photomatagent.scientific.capabilities.device import device_pack
     from photomatagent.scientific.capabilities.electronic import electronic_pack
+    from photomatagent.scientific.capabilities.interface import interface_pack
     from photomatagent.scientific.capabilities.ir import ir_pack
+    from photomatagent.scientific.capabilities.kp import kp_pack
     from photomatagent.scientific.capabilities.literature import literature_pack
     from photomatagent.scientific.capabilities.materials import materials_pack
     from photomatagent.scientific.capabilities.optics import optics_pack
+    from photomatagent.scientific.capabilities.photodetector import photodetector_pack
+    from photomatagent.scientific.capabilities.quantum_dot import (
+        alloy_pack,
+        quantum_dot_pack,
+    )
     from photomatagent.scientific.capabilities.structure import structure_pack
     from photomatagent.scientific.capabilities.transport import transport_pack
 
@@ -44,6 +51,11 @@ def build_scientific_tools(
         device_pack(effective_config, effective_workspace),
         optics_pack(effective_config, effective_workspace),
         ir_pack(),
+        quantum_dot_pack(),
+        alloy_pack(),
+        photodetector_pack(),
+        interface_pack(),
+        kp_pack(effective_workspace),
     ]
     tools: list[Tool] = []
     for pack in packs:
@@ -52,22 +64,25 @@ def build_scientific_tools(
         except Exception:
             # A broken pack must never take down agent startup.
             continue
-    tools.extend(_mcp_materials_tools(effective_config))
+    tools.extend(_mcp_gateway_tools(effective_config, effective_workspace))
     return tools
 
 
-def _mcp_materials_tools(config: ScientificConfig) -> list[Tool]:
-    """Register configured MCP servers under ``materials_mcp`` (optional)."""
-    from photomatagent.mcp.client import connect
+def _mcp_gateway_tools(
+    config: ScientificConfig, workspace: Workspace
+) -> list[Tool]:
+    """Register configured MCP servers as deferred tools through the gateway.
 
-    tools: list[Tool] = []
-    for server in config.mcp_servers:
-        try:
-            tools.extend(connect(server))
-        except Exception:
-            # MCP failure must never prevent agent startup.
-            continue
-    return tools
+    Uses the workspace ``.photomatagent/mcp.json`` configuration. A failing
+    server degrades to a ``<namespace>.status`` stub; it never raises.
+    """
+    from photomatagent.mcp.manager import MCPServerManager
+
+    manager = MCPServerManager(config.mcp_servers, workspace=workspace.root)
+    try:
+        return manager.register_tools()
+    except Exception:
+        return []
 
 
 def scientific_tools_for_namespace(

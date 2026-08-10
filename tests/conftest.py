@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from photomatagent.models.fake import FakeModelProvider
@@ -9,6 +11,11 @@ from photomatagent.runtime.permissions import AllowAllPolicy
 from photomatagent.scientific.state import ScientificState
 from photomatagent.tools.factory import create_default_registry
 from photomatagent.workspace import Workspace
+
+
+# Keep pytest hermetic: registry builds must never spawn real MCP servers
+# (e.g. the workspace .photomatagent/mcp.json Materials Project server).
+os.environ["PHOTOMATAGENT_MCP_AUTO_CONNECT"] = "0"
 
 
 def make_runtime(
