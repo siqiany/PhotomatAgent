@@ -11,6 +11,7 @@ Migrated from the donor ``VaspInputGenerator`` with two changes:
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -22,13 +23,22 @@ from photomatagent.scientific.applications.vasp.profiles import (
 
 
 def _kpoint_grid_density(
-    volume_ang3: float, density: int, lattice_lengths_ang: list[float]
+    volume_ang3: float,
+    density: int,
+    lattice_lengths_ang: list[float],
+    num_sites: int = 1,
 ) -> list[int]:
-    """Monkhorst-Pack grid from a reciprocal density (pymatgen-style)."""
-    n = max(1.0, (density * volume_ang3) ** (1.0 / 3.0))
-    longest = max(lattice_lengths_ang)
+    """Monkhorst-Pack grid from k-points per atom (pymatgen-style)."""
+    del volume_ang3  # kept in the signature for compatibility
+    ngrid = float(density) / max(1, int(num_sites))
+    multiplier = (
+        ngrid
+        * lattice_lengths_ang[0]
+        * lattice_lengths_ang[1]
+        * lattice_lengths_ang[2]
+    ) ** (1.0 / 3.0)
     return [
-        max(1, int(round(n * length / longest)))
+        max(1, math.floor(multiplier / length))
         for length in lattice_lengths_ang
     ]
 
@@ -209,6 +219,7 @@ class VaspInputGenerator:
                 float(structure.volume),
                 density,
                 [float(length) for length in structure.lattice.abc],
+                len(structure),
             )
         incar.update(
             {

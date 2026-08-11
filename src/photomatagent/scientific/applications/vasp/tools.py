@@ -104,7 +104,7 @@ class VaspCapabilitiesTool(Tool):
                     "missing": ["SCNET_HOST", "SCNET_USERNAME"],
                 },
             )
-        payload = application.probe_environment()
+        payload = await application.probe_environment_async()
         payload["profiles"] = [
             {
                 "name": profile.name,

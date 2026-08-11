@@ -99,6 +99,38 @@ class FakeSCNetBackend:
             self.uploaded.append(f"{remote_directory}/{local.name}")
         return names
 
+    async def upload_tree(
+        self, local_directory: Path, remote_directory: str
+    ) -> list[str]:
+        validate_remote_path(remote_directory)
+        local = Path(local_directory).expanduser().resolve()
+        if not local.is_dir():
+            raise FileNotFoundError(f"local upload directory missing: {local}")
+        await self.ensure_remote_directory(remote_directory)
+        names: list[str] = []
+        for path in sorted(local.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(local).as_posix()
+            self.remote_files[remote_directory][relative] = path.read_bytes()
+            names.append(relative)
+            self.uploaded.append(f"{remote_directory}/{relative}")
+        return names
+
+    async def available_partitions(self) -> list[str]:
+        return ["kshcnormal"]
+
+    async def probe_module(
+        self, module_name: str, executable: str
+    ) -> dict[str, str]:
+        return {
+            "configured": "true" if module_name else "false",
+            "available": "true" if module_name else "false",
+            "executable": f"/fake/bin/{executable}" if module_name else "",
+            "error": "" if module_name else "module name is not configured",
+            "module_candidates": "hefei-namd/1.0" if not module_name else "",
+        }
+
     async def submit_script(self, spec: RemoteJobSpec) -> RemoteJobRef:
         violations = self.policy.violations(spec.resource)
         if violations:

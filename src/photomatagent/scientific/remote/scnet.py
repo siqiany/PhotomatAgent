@@ -17,6 +17,8 @@ Security contract (Sprint 3 section 12):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import os
 import re
 import shlex
 from pathlib import Path
@@ -90,12 +92,22 @@ class SCNetBackend:
         max_output_chars: int = _MAX_OUTPUT_CHARS,
         ssh_executable: str = "ssh",
         scp_executable: str = "scp",
+        control_persist_seconds: int = 600,
     ) -> None:
         self.config = config
         self.policy = policy or ResourcePolicy.from_environment()
         self.max_output_chars = max_output_chars
         self.ssh_executable = ssh_executable
         self.scp_executable = scp_executable
+        self.control_persist_seconds = control_persist_seconds
+        identity = (
+            f"{self.config.destination}:{self.config.port}:"
+            f"{self.config.private_key_path}"
+        ).encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()[:20]
+        self.control_path = (
+            f"/tmp/photomatagent-ssh-{os.getuid()}-{digest}.sock"
+        )
 
     # -- low-level SSH ------------------------------------------------------
 
@@ -106,6 +118,12 @@ class SCNetBackend:
             "BatchMode=yes",
             "-o",
             f"ConnectTimeout={int(self.config.connect_timeout_seconds)}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPersist={self.control_persist_seconds}",
+            "-o",
+            f"ControlPath={self.control_path}",
             "-p",
             str(self.config.port),
         ]
@@ -121,6 +139,12 @@ class SCNetBackend:
             str(self.config.port),
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPersist={self.control_persist_seconds}",
+            "-o",
+            f"ControlPath={self.control_path}",
         ]
         if self.config.private_key_path:
             args.extend(["-i", self.config.private_key_path])
@@ -158,7 +182,7 @@ class SCNetBackend:
                     returncode=-1,
                     stdout="",
                     stderr="",
-                    command=command,
+                    command=self._redact(command),
                     error=f"ssh timed out after {timeout:.0f}s",
                 )
             stdout_text = self._redact(stdout.decode("utf-8", errors="replace"))
@@ -168,7 +192,7 @@ class SCNetBackend:
                 returncode=process.returncode or 0,
                 stdout=stdout_text[: self.max_output_chars],
                 stderr=stderr_text[: self.max_output_chars],
-                command=command,
+                command=self._redact(command),
                 error="" if process.returncode == 0 else stderr_text[:2000],
             )
         except (FileNotFoundError, PermissionError) as exc:
@@ -177,7 +201,7 @@ class SCNetBackend:
                 returncode=-1,
                 stdout="",
                 stderr="",
-                command=command,
+                command=self._redact(command),
                 error=self._redact(f"{type(exc).__name__}: {exc}"),
             )
 
@@ -194,13 +218,20 @@ class SCNetBackend:
             timeout_seconds=self.config.connect_timeout_seconds * 2,
         )
         if not result.ok:
-            return {
+            info = {
                 "connected": "false",
                 "error": result.error or "ssh failed",
                 "host": "",
                 "sbatch": "",
                 "squeue": "",
             }
+            if "Permission denied" in (result.error or ""):
+                info["auth_hint"] = (
+                    "SCNet downloaded SSH keys have a selected validity period; "
+                    "download a current key and copy its matching host, port, and "
+                    "username from E-Shell > SSH connection"
+                )
+            return info
         info: dict[str, str] = {"connected": "true"}
         for line in result.stdout.splitlines():
             if "=" in line:
@@ -212,6 +243,60 @@ class SCNetBackend:
             else "false"
         )
         return info
+
+    async def available_partitions(self) -> list[str]:
+        """Return SCNet partitions using its helper, with a Slurm fallback."""
+        result = await self._run_ssh(
+            "if command -v whichpartition >/dev/null 2>&1; then "
+            "whichpartition; else sinfo -h -o %P; fi"
+        )
+        if not result.ok:
+            return []
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if lines and "Available_Partition_Name" in lines[0]:
+            return [
+                line.split()[0].rstrip("*")
+                for line in lines[1:]
+                if line.split()
+            ]
+        partitions: list[str] = []
+        for token in re.findall(r"[A-Za-z0-9_.-]+", result.stdout):
+            value = token.rstrip("*")
+            if value and value.lower() not in {
+                "partition", "available", "queue", "name", "partitions"
+            } and value not in partitions:
+                partitions.append(value)
+        return partitions
+
+    async def probe_module(
+        self, module_name: str, executable: str
+    ) -> dict[str, str]:
+        """Check one configured module and executable without running a job."""
+        if not module_name:
+            candidates = await self._run_ssh(
+                ". /etc/profile >/dev/null 2>&1 || true; "
+                "module avail 2>&1 | grep -i -E 'vasp|namd|hefei' || true"
+            )
+            return {
+                "configured": "false",
+                "available": "false",
+                "executable": "",
+                "error": "module name is not configured",
+                "module_candidates": candidates.stdout.strip()[:4000],
+            }
+        # Module is commonly a shell function initialized by /etc/profile.
+        command = (
+            ". /etc/profile >/dev/null 2>&1 || true; "
+            f"module load {shlex.quote(module_name)} >/dev/null 2>&1 && "
+            f"command -v {shlex.quote(executable)}"
+        )
+        result = await self._run_ssh(command)
+        return {
+            "configured": "true",
+            "available": "true" if result.ok and result.stdout.strip() else "false",
+            "executable": result.stdout.strip()[:500] if result.ok else "",
+            "error": "" if result.ok else (result.error or "module/executable unavailable"),
+        }
 
     async def ensure_remote_directory(self, remote_directory: str) -> bool:
         validate_remote_path(remote_directory)
@@ -239,12 +324,42 @@ class SCNetBackend:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=self.config.connect_timeout_seconds * 10
+            process.communicate(), timeout=self.config.transfer_timeout_seconds
         )
         stderr_text = self._redact(stderr.decode("utf-8", errors="replace"))
         if process.returncode != 0:
             raise RuntimeError(f"scp upload failed: {stderr_text[:2000]}")
         return [path.name for path in resolved]
+
+    async def upload_tree(
+        self, local_directory: Path, remote_directory: str
+    ) -> list[str]:
+        """Recursively upload a directory while preserving relative paths."""
+        validate_remote_path(remote_directory)
+        local = Path(local_directory).expanduser().resolve()
+        if not local.is_dir():
+            raise FileNotFoundError(f"local upload directory missing: {local}")
+        await self.ensure_remote_directory(remote_directory)
+        destination = f"{self.config.destination}:{remote_directory}/"
+        process = await asyncio.create_subprocess_exec(
+            *self._scp_base(),
+            "-r",
+            str(local) + "/.",
+            destination,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=self.config.transfer_timeout_seconds
+        )
+        stderr_text = self._redact(stderr.decode("utf-8", errors="replace"))
+        if process.returncode != 0:
+            raise RuntimeError(f"scp tree upload failed: {stderr_text[:2000]}")
+        return [
+            path.relative_to(local).as_posix()
+            for path in sorted(local.rglob("*"))
+            if path.is_file()
+        ]
 
     async def submit_script(self, spec: RemoteJobSpec) -> RemoteJobRef:
         """Upload a rendered script and submit; refuses without authorization."""
@@ -330,7 +445,7 @@ class SCNetBackend:
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=self.config.connect_timeout_seconds * 10
+            process.communicate(), timeout=self.config.transfer_timeout_seconds
         )
         local_path = local_directory / filename
         if process.returncode != 0 or not local_path.is_file():
@@ -390,4 +505,5 @@ class SCNetBackend:
             home = await self._run_ssh("printf '%s' \"$HOME\"")
             report["slurm_version"] = partition.stdout.strip()[:500]
             report["remote_home"] = home.stdout.strip()[:500]
+            report["available_partitions"] = await self.available_partitions()
         return report

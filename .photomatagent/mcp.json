@@ -16,6 +16,41 @@
       "tool_exposure": "deferred",
       "timeout": 60,
       "startup_timeout": 30
+    },
+    "scnet": {
+      "enabled": true,
+      "transport": "stdio",
+      "namespace": "scnet_science",
+      "command": "photomatagent-mcp-scnet",
+      "args": [],
+      "env": {
+        "SCNET_HOST": "${SCNET_HOST}",
+        "SCNET_USERNAME": "${SCNET_USERNAME}",
+        "SCNET_PORT": "${SCNET_PORT}",
+        "SCNET_PRIVATE_KEY_PATH": "${SCNET_PRIVATE_KEY_PATH}",
+        "SCNET_REMOTE_ROOT": "${SCNET_REMOTE_ROOT}",
+        "SCNET_PARTITION": "${SCNET_PARTITION}",
+        "SCNET_VASP_MODULE": "${SCNET_VASP_MODULE}",
+        "SCNET_VASP_ENV_SCRIPT": "${SCNET_VASP_ENV_SCRIPT}",
+        "SCNET_VASP_PSP_DIR": "${SCNET_VASP_PSP_DIR}",
+        "PMG_VASP_PSP_DIR": "${PMG_VASP_PSP_DIR}",
+        "SCNET_NAMD_MODULE": "${SCNET_NAMD_MODULE}",
+        "SCNET_NAMD_EXECUTABLE": "${SCNET_NAMD_EXECUTABLE}",
+        "SCNET_NAMD_ENV_SCRIPT": "${SCNET_NAMD_ENV_SCRIPT}",
+        "SCNET_CONNECT_TIMEOUT_SECONDS": "${SCNET_CONNECT_TIMEOUT_SECONDS}",
+        "SCNET_TRANSFER_TIMEOUT_SECONDS": "${SCNET_TRANSFER_TIMEOUT_SECONDS}",
+        "PHOTOMATAGENT_ALLOW_HPC_SUBMIT": "${PHOTOMATAGENT_ALLOW_HPC_SUBMIT}",
+        "PHOTOMATAGENT_HPC_MAX_NODES": "${PHOTOMATAGENT_HPC_MAX_NODES}",
+        "PHOTOMATAGENT_HPC_MAX_TASKS_PER_NODE": "${PHOTOMATAGENT_HPC_MAX_TASKS_PER_NODE}",
+        "PHOTOMATAGENT_HPC_MAX_WALLTIME_MINUTES": "${PHOTOMATAGENT_HPC_MAX_WALLTIME_MINUTES}",
+        "PHOTOMATAGENT_HPC_ALLOWED_PARTITIONS": "${PHOTOMATAGENT_HPC_ALLOWED_PARTITIONS}"
+      },
+      "description": "Local SCNet MCP server: vasp.*, namd.*, magus.* application tools over SSH/Slurm (all deferred; server starts even when SCNet is unconfigured).",
+      "source": "https://github.com/siqiany/PhotomatAgent",
+      "trust_level": "local_trusted",
+      "tool_exposure": "deferred",
+      "timeout": 60,
+      "startup_timeout": 30
     }
   }
 }

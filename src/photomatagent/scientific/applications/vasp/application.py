@@ -11,7 +11,11 @@ prepare -> submit -> status -> collect.
 from __future__ import annotations
 
 import json
+import os
+import re
+import shlex
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -50,10 +54,18 @@ class VaspApplication:
         psp_dir: str | None = None,
         jobs_local_dir: str | Path = "output/vasp_inputs",
         policy: ResourcePolicy | None = None,
+        module_name: str = "",
+        env_script: str = "",
+        remote_root: str = "~/photomatagent",
+        remote_psp_dir: str = "",
     ) -> None:
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         self.policy = policy or ResourcePolicy.from_environment()
         self.backend = backend
+        self.module_name = module_name
+        self.env_script = env_script
+        self.remote_root = remote_root.rstrip("/")
+        self.remote_psp_dir = remote_psp_dir.rstrip("/")
         self.generator = VaspInputGenerator(
             psp_dir=psp_dir, jobs_local_dir=jobs_local_dir
         )
@@ -73,26 +85,52 @@ class VaspApplication:
             ),
             "psp_dir_local": (
                 str(self.generator.psp_dir)
-                if self.generator.psp_dir.is_dir()
+                if (self.generator.psp_dir / "potpaw_PBE.64").is_dir()
                 else None
             ),
             "submission_authorized": self.policy.allow_hpc_submit,
+            "module": self.module_name,
+            "env_script_configured": bool(self.env_script),
+            "remote_psp_configured": bool(self.remote_psp_dir),
         }
         if self.backend is not None:
             import asyncio
 
             try:
-                report["connection"] = asyncio.run(self.backend.check_connection())
-            except Exception as exc:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    report["connection"] = asyncio.run(
+                        self.backend.check_connection()
+                    )
+                except Exception as exc:
+                    report["connection"] = {
+                        "connected": "false",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+            else:
                 report["connection"] = {
-                    "connected": "false",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "connected": "unknown",
+                    "error": "use probe_environment_async inside an event loop",
                 }
         else:
             report["connection"] = {
                 "connected": "false",
                 "error": "no backend configured",
             }
+        return report
+
+    async def probe_environment_async(self) -> dict[str, Any]:
+        """Async environment probe for MCP/CLI event loops."""
+        report = self.probe_environment()
+        if self.backend is None:
+            return report
+        report["connection"] = await self.backend.check_connection()
+        if report["connection"].get("connected") == "true":
+            report["available_partitions"] = await self.backend.available_partitions()
+            report["software"] = await self.backend.probe_module(
+                self.module_name, "vasp_std"
+            )
         return report
 
     @staticmethod
@@ -193,14 +231,90 @@ class VaspApplication:
         profile: VaspProfile,
         resource: ResourceRequest | None = None,
         executable: str | None = None,
+        potcar_symbols: list[str] | None = None,
     ) -> str:
         """Render the submission script for one stage."""
+        preamble = ""
+        preamble_parts: list[str] = []
+        if self.env_script:
+            validate_remote_path(self.env_script, allow_tilde=False)
+            # SCNet product env.sh may end with a best-effort accounting
+            # write that returns non-zero for users. Preserve the exported
+            # environment, then explicitly verify the executable.
+            preamble_parts.append(
+                "set +e\n"
+                f"source {shlex.quote(self.env_script)}\n"
+                "set -e\n"
+                f"command -v {shlex.quote(executable or profile.executable)} "
+                ">/dev/null"
+            )
+        if self.remote_psp_dir and potcar_symbols:
+            validate_remote_path(self.remote_psp_dir)
+            if self.remote_psp_dir.startswith("~/"):
+                psp_value = '"${HOME}/' + self.remote_psp_dir[2:] + '/potpaw_PBE.64"'
+            else:
+                psp_value = shlex.quote(self.remote_psp_dir + "/potpaw_PBE.64")
+            lines = [
+                "if [ ! -s POTCAR ]; then",
+                f"  psp_base={psp_value}",
+                "  : > POTCAR",
+            ]
+            for symbol in potcar_symbols:
+                if not symbol.isalpha():
+                    raise ValueError(f"unsafe POTCAR symbol: {symbol!r}")
+                lines.extend(
+                    [
+                        f'  test -s "${{psp_base}}/{symbol}/POTCAR"',
+                        f'  cat "${{psp_base}}/{symbol}/POTCAR" >> POTCAR',
+                    ]
+                )
+            lines.append("fi")
+            preamble_parts.append("\n".join(lines))
+        preamble = "\n".join(preamble_parts)
         return render_slurm_script(
             job_name=job_name,
             resource=resource or profile.default_resource,
-            module_load="",
+            module_load="" if self.env_script else self.module_name,
             executable=executable or profile.executable,
+            preamble=preamble,
         )
+
+    @staticmethod
+    def _potcar_symbols(input_dir: Path) -> list[str]:
+        policy = input_dir / "POTCAR.policy"
+        symbols: list[str] = []
+        if policy.is_file():
+            for line in policy.read_text(encoding="utf-8").splitlines():
+                if line.startswith("  ") and ": " in line:
+                    symbol = line.strip().split(":", 1)[0]
+                    if symbol.isalpha() and symbol not in symbols:
+                        symbols.append(symbol)
+        return symbols
+
+    @staticmethod
+    def _validate_incar_for_resource(
+        incar: Path, resource: ResourceRequest
+    ) -> None:
+        raw = incar.read_bytes()
+        if b"\r\n" in raw:
+            raise ValueError(
+                "INCAR uses CRLF line endings; convert it with dos2unix INCAR"
+            )
+        text = raw.decode("utf-8", errors="replace")
+        total_tasks = resource.nodes * resource.tasks_per_node
+        for key in ("NCORE", "NPAR"):
+            match = re.search(
+                rf"(?im)^\s*{key}\s*=\s*(\d+)\b", text
+            )
+            if not match:
+                continue
+            value = int(match.group(1))
+            if value < 1 or total_tasks % value:
+                raise ValueError(
+                    f"{key}={value} must divide total Slurm tasks "
+                    f"({resource.nodes} x {resource.tasks_per_node} = "
+                    f"{total_tasks})"
+                )
 
     # -- submission ---------------------------------------------------------
 
@@ -210,35 +324,48 @@ class VaspApplication:
         job_name: str,
         input_dir: str | Path,
         profile_name: str,
-        remote_root: str = "~/photomatagent/vasp",
+        remote_root: str | None = None,
         resource: ResourceRequest | None = None,
+        unique_remote_directory: bool = False,
     ) -> RemoteJobRef:
         """Upload one stage directory and submit; detached by default."""
         if self.backend is None:
             raise RuntimeError("VASP backend is not configured")
         profile = get_profile(profile_name)
+        request = resource or profile.default_resource
         input_dir = Path(input_dir).expanduser().resolve()
         missing = [
             name for name in VASP_REQUIRED_INPUTS if not (input_dir / name).is_file()
         ]
         if missing:
             raise ValueError(f"missing VASP inputs: {', '.join(missing)}")
+        self._validate_incar_for_resource(input_dir / "INCAR", request)
         potcar = self.resolve_potcar(input_dir)
-        if potcar is None and not (input_dir / "POTCAR").is_file():
+        symbols = self._potcar_symbols(input_dir)
+        if (
+            potcar is None
+            and not (input_dir / "POTCAR").is_file()
+            and not (self.remote_psp_dir and symbols)
+        ):
             raise ValueError(
                 "POTCAR cannot be resolved: configure PMG_VASP_PSP_DIR "
-                "(local) or a remote pseudopotential location"
+                "(local) or SCNET_VASP_PSP_DIR (remote)"
             )
         files = [input_dir / name for name in VASP_REQUIRED_INPUTS]
         for name in ("POTCAR", "POTCAR.policy"):
             if (input_dir / name).is_file():
                 files.append(input_dir / name)
         safe_name = job_name.replace("/", "-")[:64] or "vasp"
-        remote_directory = f"{remote_root.rstrip('/')}/{safe_name}"
+        root = (remote_root or f"{self.remote_root}/vasp").rstrip("/")
+        suffix = f"-{uuid.uuid4().hex[:8]}" if unique_remote_directory else ""
+        remote_directory = f"{root}/{safe_name}{suffix}"
         validate_remote_path(remote_directory)
         await self.backend.upload_files(files, remote_directory)
         script = self.render_slurm(
-            job_name=safe_name, profile=profile, resource=resource
+            job_name=safe_name,
+            profile=profile,
+            resource=request,
+            potcar_symbols=(symbols if not (input_dir / "POTCAR").is_file() else []),
         )
         script_path = input_dir / "vasp.slurm"
         script_path.write_text(script, encoding="utf-8")
@@ -249,7 +376,7 @@ class VaspApplication:
                 job_name=safe_name,
                 remote_directory=remote_directory,
                 script_name="vasp.slurm",
-                resource=resource or profile.default_resource,
+                resource=request,
                 executable=profile.executable,
                 provenance={
                     "profile": profile.name,
@@ -344,9 +471,22 @@ def default_vasp_application() -> VaspApplication | None:
             or ""
         ),
         remote_root=_env("SCNET_REMOTE_ROOT") or "~/photomatagent",
+        connect_timeout_seconds=float(_env("SCNET_CONNECT_TIMEOUT_SECONDS") or "20"),
+        transfer_timeout_seconds=float(
+            _env("SCNET_TRANSFER_TIMEOUT_SECONDS") or "3600"
+        ),
     )
     backend = SCNetBackend(config)
-    return VaspApplication(backend)
+    return VaspApplication(
+        backend,
+        module_name=(
+            _env("SCNET_VASP_MODULE")
+            or "vasp-6.4.2-intelmpi2017_ioptcell"
+        ),
+        env_script=_env("SCNET_VASP_ENV_SCRIPT"),
+        remote_root=config.remote_root,
+        remote_psp_dir=_env("SCNET_VASP_PSP_DIR"),
+    )
 
 
 def _env(name: str) -> str:

@@ -84,14 +84,6 @@ def check_vasprun(vasprun_path: str | Path) -> VasprunCheck:
     final_step = scsteps[-1]
     has_c = final_step.findall("c")
     has_v = final_step.findall("v")
-    if has_c and has_v:
-        check.electronic_converged = True
-    else:
-        check.electronic_converged = None
-        check.reasons.append(
-            "electronic convergence marker (<c>/<v> in final <scstep>) not "
-            "found; SCF convergence cannot be confirmed"
-        )
     # Ionic convergence: relaxation ends before NSW, or OUTCAR marker.
     outcar = path.parent / "OUTCAR"
     final_text = ET.tostring(final, encoding="unicode")
@@ -99,10 +91,23 @@ def check_vasprun(vasprun_path: str | Path) -> VasprunCheck:
     ionic_steps = len(_IONIC_STEP.findall(final_text))
     nsw: int | None = int(nsw_match.group(1)) if nsw_match else None
     outcar_marker = False
+    electronic_outcar_marker = False
     if outcar.is_file():
         tail = outcar.read_text(encoding="utf-8", errors="replace")[-200000:]
+        electronic_outcar_marker = (
+            "aborting loop because EDIFF is reached" in tail
+            or "EDIFF was reached" in tail
+        )
         outcar_marker = (
             "reached required accuracy" in tail or "EDIFF is reached" in tail
+        )
+    if (has_c and has_v) or electronic_outcar_marker:
+        check.electronic_converged = True
+    else:
+        check.electronic_converged = None
+        check.reasons.append(
+            "electronic convergence marker not found in vasprun.xml or "
+            "OUTCAR; SCF convergence cannot be confirmed"
         )
     if outcar_marker:
         check.ionic_converged = True

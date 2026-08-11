@@ -10,6 +10,10 @@ No carrier-dynamics evidence is produced without actual NAMD output
 
 from __future__ import annotations
 
+import json
+import os
+import shlex
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +37,16 @@ class NamdApplication:
         backend: Any | None = None,
         *,
         module_name: str = "",
+        executable: str = "namd",
+        env_script: str = "",
+        remote_root: str = "~/photomatagent",
         policy: ResourcePolicy | None = None,
     ) -> None:
         self.backend = backend
         self.module_name = module_name
+        self.executable = executable
+        self.env_script = env_script
+        self.remote_root = remote_root.rstrip("/")
         self.policy = policy or ResourcePolicy.from_environment()
 
     # -- environment --------------------------------------------------------
@@ -48,6 +58,8 @@ class NamdApplication:
             "backend": getattr(self.backend, "name", "none"),
             "status": "UNCONFIGURED",
             "module": self.module_name,
+            "executable": self.executable,
+            "env_script_configured": bool(self.env_script),
             "detail": (
                 "Hefei-NAMD module not confirmed; set the SCNet module name "
                 "and verify `module avail` on the login node"
@@ -74,17 +86,67 @@ class NamdApplication:
             import asyncio
 
             try:
-                connection = asyncio.run(self.backend.check_connection())
-                report["connection"] = connection
-                if connection.get("connected") == "true":
-                    probe = asyncio.run(self._probe_module())
-                    report.update(probe)
-            except Exception as exc:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    connection = asyncio.run(self.backend.check_connection())
+                    report["connection"] = connection
+                    if connection.get("connected") == "true":
+                        software = asyncio.run(
+                            self.backend.probe_module(
+                                self.module_name, self.executable
+                            )
+                        )
+                        report["software"] = software
+                        if software.get("available") == "true":
+                            report.update(
+                                status="AVAILABLE",
+                                detail=(
+                                    "configured Hefei-NAMD module and "
+                                    "executable are available"
+                                ),
+                            )
+                except Exception as exc:
+                    report["connection"] = {
+                        "connected": "false",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+            else:
                 report["connection"] = {
-                    "connected": "false",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "connected": "unknown",
+                    "error": "use probe_environment_async inside an event loop",
                 }
         return report
+
+    async def probe_environment_async(self) -> dict[str, Any]:
+        """Async probe for MCP/CLI callers already running an event loop."""
+        report = self._base_probe_report()
+        if self.backend is None:
+            return report
+        report["backend"] = getattr(self.backend, "name", "none")
+        connection = await self.backend.check_connection()
+        report["connection"] = connection
+        if connection.get("connected") == "true":
+            report["available_partitions"] = await self.backend.available_partitions()
+            software = await self.backend.probe_module(
+                self.module_name, self.executable
+            )
+            report["software"] = software
+            if software.get("available") == "true":
+                report.update(
+                    status="AVAILABLE",
+                    detail="configured Hefei-NAMD module and executable are available",
+                )
+        return report
+
+    def _base_probe_report(self) -> dict[str, Any]:
+        """Build the static portion without starting nested event loops."""
+        backend = self.backend
+        self.backend = None
+        try:
+            return self.probe_environment()
+        finally:
+            self.backend = backend
 
     async def _probe_module(self) -> dict[str, Any]:
         """Query `module avail` for the configured Hefei-NAMD module."""
@@ -165,8 +227,12 @@ class NamdApplication:
         trajectory_dir: str | Path,
         output_dir: str | Path,
         snapshot_pattern: str = "{n:04d}",
+        inp_path: str | Path | None = None,
+        inicon_path: str | Path | None = None,
+        parameters: dict[str, Any] | None = None,
+        initial_conditions: list[list[int]] | None = None,
     ) -> dict[str, Any]:
-        """Prepare the Hefei-NAMD remote job tree (never fabricates inp)."""
+        """Prepare a runnable tree from supplied or explicitly parameterized inputs."""
         problems = self.validate_inputs(trajectory_dir)
         if problems:
             raise ValueError("; ".join(problems))
@@ -178,6 +244,36 @@ class NamdApplication:
             for path in root.iterdir()
             if path.is_dir() and path.name.isdigit()
         )
+        run_dir = output / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        for name in NAMD_REQUIRED_TRAJECTORY:
+            shutil.copy2(root / name, output / name)
+        for snapshot in snapshot_dirs:
+            target = run_dir / snapshot.name
+            target.mkdir(parents=True, exist_ok=True)
+            for name in ("POSCAR", "WAVECAR", "OUTCAR"):
+                shutil.copy2(snapshot / name, target / name)
+
+        source_inp = Path(inp_path).expanduser().resolve() if inp_path else root / "inp"
+        source_inicon = (
+            Path(inicon_path).expanduser().resolve()
+            if inicon_path
+            else root / "INICON"
+        )
+        if parameters is not None or initial_conditions is not None:
+            if parameters is None or initial_conditions is None:
+                raise ValueError(
+                    "parameters and initial_conditions must be provided together"
+                )
+            self._write_runtime_inputs(
+                output, parameters=parameters, initial_conditions=initial_conditions
+            )
+        else:
+            if source_inp.is_file():
+                shutil.copy2(source_inp, output / "inp")
+            if source_inicon.is_file():
+                shutil.copy2(source_inicon, output / "INICON")
+        runnable = (output / "inp").is_file() and (output / "INICON").is_file()
         manifest: dict[str, Any] = {
             "application": "hefei-namd",
             "status": "PREPARED",
@@ -188,8 +284,8 @@ class NamdApplication:
             "snapshots": [
                 {
                     "name": snapshot.name,
-                    "poscar": str(snapshot / "POSCAR"),
-                    "wavecar": str(snapshot / "WAVECAR"),
+                    "poscar": str(run_dir / snapshot.name / "POSCAR"),
+                    "wavecar": str(run_dir / snapshot.name / "WAVECAR"),
                     "wavecar_size_bytes": (
                         (snapshot / "WAVECAR").stat().st_size
                         if (snapshot / "WAVECAR").is_file()
@@ -199,14 +295,16 @@ class NamdApplication:
                 for snapshot in snapshot_dirs
             ],
             "runtime_inputs": {
-                "inp": "NOT_GENERATED",
-                "inicon": "NOT_GENERATED",
+                "inp": str(output / "inp") if (output / "inp").is_file() else "NOT_GENERATED",
+                "inicon": str(output / "INICON") if (output / "INICON").is_file() else "NOT_GENERATED",
                 "reason": (
-                    "the Hefei-NAMD `inp`/`INICON` format is version-"
-                    "dependent; they are generated only after the SCNet "
-                    "module has been confirmed (namd.capabilities)"
+                    "provide version-matched inp/INICON files, or explicit "
+                    "parameters + initial_conditions"
+                    if not runnable
+                    else "runtime inputs are present and will be uploaded"
                 ),
             },
+            "runnable": runnable,
             "evidence_scope": (
                 "carrier relaxation / nonadiabatic transition / population "
                 "dynamics / recombination / lifetime are reported ONLY from "
@@ -215,26 +313,101 @@ class NamdApplication:
             ),
         }
         (output / "namd_manifest.json").write_text(
-            __import__("json").dumps(manifest, ensure_ascii=False, indent=2)
+            json.dumps(manifest, ensure_ascii=False, indent=2)
             + "\n",
             encoding="utf-8",
         )
         return manifest
 
+    @staticmethod
+    def _write_runtime_inputs(
+        output: Path,
+        *,
+        parameters: dict[str, Any],
+        initial_conditions: list[list[int]],
+    ) -> None:
+        required = (
+            "BMIN", "BMAX", "NBANDS", "NSW", "POTIM", "TEMP", "NSAMPLE",
+            "NAMDTIME", "NELM", "NTRAJ", "LHOLE",
+        )
+        normalized = {str(key).upper(): value for key, value in parameters.items()}
+        missing = [key for key in required if key not in normalized]
+        if missing:
+            raise ValueError("missing Hefei-NAMD parameters: " + ", ".join(missing))
+        bmin, bmax, nbands = (int(normalized[key]) for key in ("BMIN", "BMAX", "NBANDS"))
+        nsw = int(normalized["NSW"])
+        nsample = int(normalized["NSAMPLE"])
+        namdtime = int(normalized["NAMDTIME"])
+        if not (1 <= bmin <= bmax <= nbands):
+            raise ValueError("require 1 <= BMIN <= BMAX <= NBANDS")
+        if nsample != len(initial_conditions):
+            raise ValueError("NSAMPLE must equal the number of initial_conditions")
+        for condition in initial_conditions:
+            if len(condition) != 2:
+                raise ValueError("each initial condition must be [start_step, band]")
+            start, band = int(condition[0]), int(condition[1])
+            if start < 1 or start + namdtime > nsw:
+                raise ValueError("initial start_step + NAMDTIME must not exceed NSW")
+            if not bmin <= band <= bmax:
+                raise ValueError("initial band must be within [BMIN, BMAX]")
+        lhole = normalized["LHOLE"]
+        lhole_text = ".TRUE." if str(lhole).strip().lower() in {"1", "true", ".true.", "yes"} else ".FALSE."
+        lshp_text = (
+            ".TRUE."
+            if str(normalized.get("LSHP", True)).strip().lower()
+            in {"1", "true", ".true.", "yes"}
+            else ".FALSE."
+        )
+        lcpext_text = (
+            ".TRUE."
+            if str(normalized.get("LCPEXT", False)).strip().lower()
+            in {"1", "true", ".true.", "yes"}
+            else ".FALSE."
+        )
+        inp = (
+            "&NAMDPARA\n"
+            f"  BMIN       = {bmin}\n  BMAX       = {bmax}\n  NBANDS     = {nbands}\n\n"
+            f"  NSW        = {nsw}\n  POTIM      = {float(normalized['POTIM']):g}\n"
+            f"  TEMP       = {float(normalized['TEMP']):g}\n\n"
+            f"  NSAMPLE    = {nsample}\n  NAMDTIME   = {namdtime}\n"
+            f"  NELM       = {int(normalized['NELM'])}\n  NTRAJ      = {int(normalized['NTRAJ'])}\n"
+            f"  LHOLE      = {lhole_text}\n  LSHP       = {lshp_text}\n"
+            f"  LCPEXT     = {lcpext_text}\n\n  RUNDIR     = \"./run/\"\n"
+            "  TBINIT     = \"INICON\"\n/\n"
+        )
+        (output / "inp").write_text(inp, encoding="utf-8")
+        (output / "INICON").write_text(
+            "".join(f"{int(row[0]):6d} {int(row[1]):6d}\n" for row in initial_conditions),
+            encoding="utf-8",
+        )
+
     def render_slurm(self, *, job_name: str, resource: ResourceRequest) -> str:
         """Render the NAMD submission script (module-gated)."""
         from photomatagent.scientific.remote.scheduler import render_slurm_script
 
-        if not self.module_name:
+        if not self.module_name and not self.env_script:
             raise ValueError(
                 "Hefei-NAMD module name is not configured; run "
                 "namd.capabilities first"
             )
+        preamble = ""
+        if self.env_script:
+            from photomatagent.scientific.remote.scnet import validate_remote_path
+
+            validate_remote_path(self.env_script, allow_tilde=False)
+            preamble = (
+                "set +e\n"
+                f"source {shlex.quote(self.env_script)}\n"
+                "set -e\n"
+                f"command -v {shlex.quote(self.executable)} >/dev/null"
+            )
         return render_slurm_script(
             job_name=job_name,
             resource=resource,
-            module_load=self.module_name,
-            executable="namd",
+            module_load="" if self.env_script else self.module_name,
+            executable=self.executable,
+            preamble=preamble,
+            launcher="",
         )
 
     # -- submit / status / collect ------------------------------------------
@@ -260,16 +433,24 @@ class NamdApplication:
                 "Hefei-NAMD module name is not configured; run "
                 "namd.capabilities first"
             )
-        remote_directory = f"~/photomatagent/namd/{job_name.replace('/', '-')[:64]}"
+        if not (root / "inp").is_file() or not (root / "INICON").is_file():
+            raise ValueError(
+                "prepared tree is not runnable: inp and INICON are required; "
+                "rerun namd.prepare with files or explicit parameters"
+            )
+        safe_name = job_name.replace("/", "-")[:64] or "namd"
+        remote_directory = f"{self.remote_root}/namd/{safe_name}"
         validate_remote_path(remote_directory)
-        await self.backend.ensure_remote_directory(remote_directory)
-        files = [path for path in root.rglob("*") if path.is_file()]
-        await self.backend.upload_files(files, remote_directory)
+        await self.backend.upload_tree(root, remote_directory)
+        request = resource or ResourceRequest(
+            partition=os.environ.get("SCNET_PARTITION", "normal"),
+            nodes=1,
+            tasks_per_node=32,
+            walltime_minutes=720,
+        )
         script = self.render_slurm(
             job_name=job_name,
-            resource=resource or ResourceRequest(
-                partition="kshcnormal", nodes=1, tasks_per_node=32, walltime_minutes=1440
-            ),
+            resource=request,
         )
         script_path = root / "namd.slurm"
         script_path.write_text(script, encoding="utf-8")
@@ -280,8 +461,8 @@ class NamdApplication:
                 job_name=job_name,
                 remote_directory=remote_directory,
                 script_name="namd.slurm",
-                resource=resource or ResourceRequest(),
-                executable="namd",
+                resource=request,
+                executable=self.executable,
                 module_load=self.module_name,
                 provenance={"prepared_dir": str(root)},
             )
@@ -302,7 +483,13 @@ class NamdApplication:
             raise RuntimeError("NAMD backend is not configured")
         local = Path(local_dir).expanduser().resolve()
         local.mkdir(parents=True, exist_ok=True)
-        names = ["out.log", "eigenvalues.dat", "inp", "INICON", "populations.dat"]
+        artifacts = await self.backend.list_remote_artifacts(job_ref.remote_directory)
+        names = [
+            item.name.lstrip("./")
+            for item in artifacts
+            if Path(item.name).name in {"inp", "INICON", "NATXT", "EIGTXT", "COUPCAR"}
+            or Path(item.name).name.startswith(("PSICT.", "SHPROP."))
+        ][:500]
         downloaded = await self.backend.download_files(
             job_ref.remote_directory, names, local
         )
@@ -326,3 +513,36 @@ class NamdApplication:
                 "is not fabricated"
             ),
         }
+
+
+def default_namd_application() -> NamdApplication | None:
+    """Build the Hefei-NAMD adapter from the same SCNet environment as VASP."""
+    from photomatagent.scientific.remote.models import RemoteServerConfig
+    from photomatagent.scientific.remote.scnet import SCNetBackend
+
+    host = os.environ.get("SCNET_HOST", "").strip()
+    username = os.environ.get("SCNET_USERNAME", "").strip()
+    if not host or not username:
+        return None
+    config = RemoteServerConfig(
+        host=host,
+        username=username,
+        port=int(os.environ.get("SCNET_PORT", "22") or "22"),
+        private_key_path=os.environ.get("SCNET_PRIVATE_KEY_PATH", "").strip(),
+        remote_root=os.environ.get("SCNET_REMOTE_ROOT", "~/photomatagent").strip()
+        or "~/photomatagent",
+        connect_timeout_seconds=float(
+            os.environ.get("SCNET_CONNECT_TIMEOUT_SECONDS", "20") or "20"
+        ),
+        transfer_timeout_seconds=float(
+            os.environ.get("SCNET_TRANSFER_TIMEOUT_SECONDS", "3600") or "3600"
+        ),
+    )
+    return NamdApplication(
+        SCNetBackend(config),
+        module_name=os.environ.get("SCNET_NAMD_MODULE", "").strip(),
+        executable=os.environ.get("SCNET_NAMD_EXECUTABLE", "namd").strip()
+        or "namd",
+        env_script=os.environ.get("SCNET_NAMD_ENV_SCRIPT", "").strip(),
+        remote_root=config.remote_root,
+    )

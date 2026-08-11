@@ -63,6 +63,74 @@ def test_namd_prepare_writes_manifest_without_fabricating_inp(tmp_path):
     assert "inicon" in manifest["runtime_inputs"]
     assert len(manifest["snapshots"]) == 2
     assert (out / "namd_manifest.json").is_file()
+    assert (out / "run" / "0001" / "WAVECAR").is_file()
+    assert (out / "run" / "0002" / "WAVECAR").is_file()
+
+
+def test_namd_prepare_generates_validated_runtime_inputs(tmp_path):
+    root = make_namd_tree(tmp_path / "traj")
+    out = tmp_path / "prepared"
+    parameters = {
+        "BMIN": 10,
+        "BMAX": 20,
+        "NBANDS": 30,
+        "NSW": 100,
+        "POTIM": 1,
+        "TEMP": 300,
+        "NSAMPLE": 2,
+        "NAMDTIME": 50,
+        "NELM": 1000,
+        "NTRAJ": 20000,
+        "LHOLE": False,
+    }
+    manifest = NamdApplication().prepare(
+        trajectory_dir=root,
+        output_dir=out,
+        parameters=parameters,
+        initial_conditions=[[1, 15], [20, 16]],
+    )
+    assert manifest["runnable"] is True
+    assert 'RUNDIR     = "./run/"' in (out / "inp").read_text()
+    assert (out / "INICON").read_text().splitlines() == [
+        "     1     15",
+        "    20     16",
+    ]
+
+
+def test_namd_submit_uploads_preserved_tree(tmp_path):
+    from photomatagent.scientific.remote.fake import FakeSCNetBackend
+    from photomatagent.scientific.remote.models import ResourceRequest
+
+    root = make_namd_tree(tmp_path / "traj")
+    (root / "inp").write_text("&NAMDPARA\n/\n", encoding="utf-8")
+    (root / "INICON").write_text("1 1\n", encoding="utf-8")
+    out = tmp_path / "prepared"
+    backend = FakeSCNetBackend()
+    app = NamdApplication(
+        backend=backend,
+        module_name="hefei-namd/1.0",
+        remote_root="~/science",
+    )
+    app.prepare(trajectory_dir=root, output_dir=out)
+
+    async def scenario():
+        ref = await app.submit(
+            job_name="demo",
+            prepared_dir=out,
+            resource=ResourceRequest(
+                partition="kshcnormal",
+                nodes=1,
+                tasks_per_node=8,
+                walltime_minutes=60,
+            ),
+        )
+        assert ref.resource_request.partition == "kshcnormal"
+        files = backend.remote_files["~/science/namd/demo"]
+        assert "run/0001/WAVECAR" in files
+        assert "run/0002/WAVECAR" in files
+        assert "inp" in files and "INICON" in files and "namd.slurm" in files
+
+    asyncio.run(scenario())
 
 
 def test_namd_submit_requires_module(tmp_path):
@@ -89,7 +157,24 @@ def test_namd_render_slurm_with_module():
         ).ResourceRequest(),
     )
     assert "module load hefei-namd/1.0" in script
-    assert "srun --mpi=pmi2 namd" in script
+    assert script.rstrip().endswith("namd")
+    assert "srun --mpi=pmi2 namd" not in script
+
+
+def test_namd_render_slurm_with_scnet_env_script():
+    app = NamdApplication(
+        executable="hfnamd",
+        env_script="/public/home/u/apprepo/hefei_namd/v/scripts/env.sh",
+    )
+    script = app.render_slurm(
+        job_name="na-md",
+        resource=__import__(
+            "photomatagent.scientific.remote.models", fromlist=["ResourceRequest"]
+        ).ResourceRequest(),
+    )
+    assert "source /public/home/u/apprepo/hefei_namd/v/scripts/env.sh" in script
+    assert "command -v hfnamd >/dev/null" in script
+    assert script.rstrip().endswith("hfnamd")
 
 
 def test_namd_probe_unconfigured_without_backend():
@@ -222,6 +307,10 @@ def test_live_scnet_mcp_server_roundtrip():
                 assert "vasp_capabilities" in names
                 assert "vasp_prepare" in names
                 assert "namd_capabilities" in names
+                assert "namd_submit" in names
+                assert "namd_status" in names
+                assert "namd_collect" in names
+                assert "scnet_partitions" in names
                 result = await session.call_tool("vasp_capabilities", {})
                 assert not result.isError
 

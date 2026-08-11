@@ -77,7 +77,7 @@ async def vasp_capabilities() -> dict[str, Any]:
         return error
     from photomatagent.scientific.applications.vasp.profiles import profiles
 
-    payload = application.probe_environment()  # type: ignore[union-attr]
+    payload = await application.probe_environment_async()  # type: ignore[union-attr]
     payload["profiles"] = [
         {
             "name": profile.name,
@@ -133,7 +133,7 @@ async def vasp_submit(
     job_name: str,
     input_dir: str,
     profile: str,
-    partition: str = "kshcnormal",
+    partition: str | None = None,
     nodes: int = 1,
     tasks_per_node: int = 32,
     walltime_minutes: int = 240,
@@ -145,16 +145,24 @@ async def vasp_submit(
     if error:
         return error
     try:
+        selected_partition = partition or os.environ.get("SCNET_PARTITION", "").strip()
+        if not selected_partition:
+            return _error(
+                "partition is required: call scnet_partitions (SCNet "
+                "whichpartition) and pass one result, or set SCNET_PARTITION",
+                error_type="missing_partition",
+            )
         ref = await application.submit_stage(  # type: ignore[union-attr]
             job_name=job_name,
             input_dir=input_dir,
             profile_name=profile,
             resource=ResourceRequest(
-                partition=partition,
+                partition=selected_partition,
                 nodes=nodes,
                 tasks_per_node=tasks_per_node,
                 walltime_minutes=walltime_minutes,
             ),
+            unique_remote_directory=True,
         )
     except Exception as exc:
         return _error(
@@ -267,34 +275,176 @@ async def vasp_run_workflow(
 
 def _namd_application() -> Any:
     from photomatagent.scientific.applications.namd.application import (
-        NamdApplication,
+        default_namd_application,
     )
 
-    return NamdApplication()
+    return default_namd_application()
+
+
+def _namd_or_error() -> tuple[Any | None, dict[str, Any] | None]:
+    application = _namd_application()
+    if application is None:
+        return None, _error(
+            "Hefei-NAMD is UNCONFIGURED: set SCNET_HOST / SCNET_USERNAME / "
+            "SCNET_NAMD_MODULE"
+        )
+    return application, None
 
 
 @mcp.tool()
 async def namd_capabilities() -> dict[str, Any]:
     """Probe the SCNet Hefei-NAMD environment: module availability, supported workflow (VASP AIMD trajectory + per-snapshot WAVECARs), required VASP artifacts. Never fabricates carrier-dynamics numbers."""
-    return _namd_application().probe_environment()
+    application, error = _namd_or_error()
+    if error:
+        return error
+    return await application.probe_environment_async()
 
 
 @mcp.tool()
 async def namd_validate_inputs(trajectory_dir: str) -> dict[str, Any]:
     """Validate a VASP AIMD trajectory tree for Hefei-NAMD: reference POSCAR + XDATCAR + OUTCAR, per-snapshot POSCAR/WAVECAR/OUTCAR, identical WAVECAR sizes."""
-    problems = _namd_application().validate_inputs(trajectory_dir)
+    application, error = _namd_or_error()
+    if error:
+        return error
+    problems = application.validate_inputs(trajectory_dir)
     return {"trajectory_dir": trajectory_dir, "problems": problems, "valid": not problems}
 
 
 @mcp.tool()
-async def namd_prepare(trajectory_dir: str, output_dir: str) -> dict[str, Any]:
-    """Prepare the Hefei-NAMD job tree from a validated VASP AIMD trajectory. Runtime inputs (inp/INICON) are NOT fabricated until the SCNet module is confirmed."""
+async def namd_prepare(
+    trajectory_dir: str,
+    output_dir: str,
+    inp_path: str | None = None,
+    inicon_path: str | None = None,
+    parameters: dict[str, Any] | None = None,
+    initial_conditions: list[list[int]] | None = None,
+) -> dict[str, Any]:
+    """Prepare a complete Hefei-NAMD tree. Supply version-matched inp/INICON paths, or explicit NAMDPARA values plus [[start_step, band], ...] initial conditions. Preserves run/NNNN/WAVECAR directories."""
+    application, error = _namd_or_error()
+    if error:
+        return error
     try:
-        return _namd_application().prepare(
-            trajectory_dir=trajectory_dir, output_dir=output_dir
+        return application.prepare(
+            trajectory_dir=trajectory_dir,
+            output_dir=output_dir,
+            inp_path=inp_path,
+            inicon_path=inicon_path,
+            parameters=parameters,
+            initial_conditions=initial_conditions,
         )
     except Exception as exc:
         return _error(f"namd.prepare failed: {type(exc).__name__}: {exc}")
+
+
+@mcp.tool()
+async def namd_submit(
+    job_name: str,
+    prepared_dir: str,
+    partition: str | None = None,
+    nodes: int = 1,
+    tasks_per_node: int = 32,
+    walltime_minutes: int = 720,
+) -> dict[str, Any]:
+    """Submit a runnable Hefei-NAMD tree to SCNet. Requires inp, INICON, preserved run/ snapshots, SCNET_NAMD_MODULE, an explicit/SCNET partition, and PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1."""
+    from photomatagent.scientific.remote.models import ResourceRequest
+
+    application, error = _namd_or_error()
+    if error:
+        return error
+    selected_partition = partition or os.environ.get("SCNET_PARTITION", "").strip()
+    if not selected_partition:
+        return _error(
+            "partition is required: call scnet_partitions and pass one "
+            "result, or set SCNET_PARTITION",
+            error_type="missing_partition",
+        )
+    try:
+        ref = await application.submit(
+            job_name=job_name,
+            prepared_dir=prepared_dir,
+            resource=ResourceRequest(
+                partition=selected_partition,
+                nodes=nodes,
+                tasks_per_node=tasks_per_node,
+                walltime_minutes=walltime_minutes,
+            ),
+        )
+    except Exception as exc:
+        return _error(
+            f"namd.submit refused: {type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
+    payload = ref.model_dump()
+    payload["note"] = "detached job; poll with namd_status"
+    return payload
+
+
+@mcp.tool()
+async def namd_status(job_id: str) -> dict[str, Any]:
+    """Query the Slurm state of a Hefei-NAMD job."""
+    application, error = _namd_or_error()
+    if error:
+        return error
+    try:
+        state = await application.status(job_id)
+    except Exception as exc:
+        return _error(f"namd.status failed: {type(exc).__name__}: {exc}")
+    return {"job_id": job_id, "state": state.value, "terminal": state.terminal}
+
+
+@mcp.tool()
+async def namd_collect(
+    job_id: str, remote_directory: str, local_dir: str | None = None
+) -> dict[str, Any]:
+    """Download real Hefei-NAMD NATXT/EIGTXT/COUPCAR/PSICT.*/SHPROP.* outputs."""
+    from photomatagent.scientific.remote.models import RemoteJobRef
+
+    application, error = _namd_or_error()
+    if error:
+        return error
+    ref = RemoteJobRef(
+        backend="scnet",
+        application="hefei-namd",
+        job_id=job_id,
+        remote_directory=remote_directory,
+    )
+    try:
+        return await application.collect(
+            job_ref=ref, local_dir=local_dir or "output/namd_results"
+        )
+    except Exception as exc:
+        return _error(f"namd.collect failed: {type(exc).__name__}: {exc}")
+
+
+@mcp.tool()
+async def namd_inspect_result(result_dir: str) -> dict[str, Any]:
+    """List bounded local Hefei-NAMD result artifacts without inventing derived values."""
+    from pathlib import Path
+
+    root = Path(result_dir).expanduser().resolve()
+    files = [
+        {"name": path.relative_to(root).as_posix(), "size_bytes": path.stat().st_size}
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    ] if root.is_dir() else []
+    return {"result_dir": str(root), "files": files[:500], "file_count": len(files)}
+
+
+@mcp.tool()
+async def scnet_partitions() -> dict[str, Any]:
+    """Read-only queue discovery using SCNet whichpartition (sinfo fallback)."""
+    application, error = _vasp_or_error()
+    if error:
+        return error
+    try:
+        partitions = await application.backend.available_partitions()
+    except Exception as exc:
+        return _error(f"partition discovery failed: {type(exc).__name__}: {exc}")
+    return {
+        "partitions": partitions,
+        "configured_default": os.environ.get("SCNET_PARTITION", "").strip() or None,
+        "note": "select a partition returned by the connected SCNet center",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -350,13 +500,19 @@ async def build_doctor_report() -> dict[str, Any]:
     application = _application()
     if application is not None:
         try:
-            report["vasp"] = application.probe_environment()
+            report["vasp"] = await application.probe_environment_async()
+            report["scnet"] = await application.backend.doctor()
         except Exception as exc:
             report["vasp"] = {"error": f"{type(exc).__name__}: {exc}"}
     else:
         report["vasp"] = {"connected": "false", "error": "no backend configured"}
     try:
-        report["namd"] = NamdApplication(backend=None).probe_environment()
+        namd = _namd_application()
+        report["namd"] = (
+            await namd.probe_environment_async()
+            if namd is not None
+            else {"status": "UNCONFIGURED", "error": "no backend configured"}
+        )
     except Exception as exc:
         report["namd"] = {"error": f"{type(exc).__name__}: {exc}"}
     try:
@@ -374,6 +530,17 @@ async def scnet_doctor() -> dict[str, Any]:
 
 def main() -> None:
     """Entry point: run the MCP stdio server (or --doctor dump)."""
+    # The MCP gateway expands workspace .env values itself. Direct doctor
+    # mode loads them only when explicitly requested, so an unconfigured
+    # diagnostic never makes an unexpected network connection.
+    if "--load-dotenv" in sys.argv:
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(os.path.join(os.getcwd(), ".env"), override=False)
+        except Exception:
+            pass
+        sys.argv.remove("--load-dotenv")
     if "--doctor" in sys.argv:
         report = asyncio.run(build_doctor_report())
         print(json.dumps(report, ensure_ascii=False, indent=2))

@@ -81,3 +81,83 @@ PHOTOMATAGENT_RUN_LIVE_SCIENCE=1        # 允许 connection probe（无费用）
 `SCNET_PRIVATE_KEY_PATH` 等环境变量（含 workspace `.env` 兜底）配置；
 server 在 SCNet 未配置时也能启动，工具返回 typed
 `missing_prerequisites`。
+
+### SCNet `.env` 最小配置
+
+先在商城开通对应软件，再从商品的“命令行”页面确认登录地址、软件模块名和
+启动命令。队列不能照抄文档示例；用 MCP 的 `scnet_partitions`（远端优先
+执行 `whichpartition`）读取当前中心可用队列。
+
+```dotenv
+SCNET_HOST=登录节点地址
+SCNET_USERNAME=用户名
+SCNET_PORT=22
+SCNET_PRIVATE_KEY_PATH=/绝对路径/id_scnet
+SCNET_REMOTE_ROOT=~/photomatagent
+SCNET_PARTITION=通过 scnet_partitions 确认的队列
+
+# SCNet VASP 6.4.2 商品文档中的模块；若商品终端显示不同名称，以终端为准
+SCNET_VASP_MODULE=vasp-6.4.2-intelmpi2017_ioptcell
+# 若商品自带 case/vasp.slurm 使用 source env.sh，则配置其远端绝对路径
+# SCNET_VASP_ENV_SCRIPT=/public/home/USER/apprepo/vasp/VERSION/scripts/env.sh
+# 二选一：本地赝势库，或 SCNet 上的远端赝势库（都包含 potpaw_PBE.64/）
+PMG_VASP_PSP_DIR=/本地/vasp_psp
+# SCNET_VASP_PSP_DIR=~/path/to/vasp_psp
+
+# Hefei-NAMD 必须填写商品/自编译环境的真实模块名和可执行文件名
+SCNET_NAMD_MODULE=hefei-namd/实际版本
+SCNET_NAMD_EXECUTABLE=namd
+# 若商品案例使用 source env.sh，填写其远端绝对路径
+# SCNET_NAMD_ENV_SCRIPT=/public/home/USER/apprepo/hefei_namd/VERSION/scripts/env.sh
+
+# WAVECAR 树通常很大，传输超时独立于 SSH 连接超时
+SCNET_CONNECT_TIMEOUT_SECONDS=20
+SCNET_TRANSFER_TIMEOUT_SECONDS=3600
+
+# 真实提交必须显式开启，并限制最大资源与允许队列
+PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1
+PHOTOMATAGENT_HPC_MAX_NODES=1
+PHOTOMATAGENT_HPC_MAX_TASKS_PER_NODE=64
+PHOTOMATAGENT_HPC_MAX_WALLTIME_MINUTES=720
+PHOTOMATAGENT_HPC_ALLOWED_PARTITIONS=你的队列
+```
+
+配置后先执行只读诊断，不会提交或计费：
+
+```bash
+uv run photomatagent-mcp-scnet --load-dotenv --doctor
+```
+
+报告中应同时满足：SSH `connected=true`、`slurm_ready=true`、目标队列出现在
+`available_partitions`，且 VASP/NAMD 的 `software.available=true`。SCNet 文档
+明确要求作业脚本与输入文件在同一目录，通过 `sbatch` 提交，并用 `squeue` /
+`sacct` 查询；本实现遵循该流程，且不会在登录节点直接运行计算。
+
+若 SSH 返回 `Permission denied (publickey...)`，按 SCNet 的连接文档回到
+E-Shell 的“SSH连接”重新选择有效期并下载密钥，同时复制该密钥对应的主机、
+端口和用户名；这四项必须来自同一次连接信息。旧密钥、另一中心的用户名或
+过期有效期都会在进入 Slurm 前被拒绝。
+
+### VASP MCP 运行链
+
+1. `vasp_capabilities`：确认 SSH、Slurm、队列、VASP 模块与赝势策略。
+2. `vasp_prepare`：生成 POSCAR/INCAR/KPOINTS 和工作流。
+3. `vasp_submit`：显式传入 `scnet_partitions` 返回的队列；脚本执行
+   `module purge`、`module load`、`srun --mpi=pmi2 vasp_std|vasp_ncl`，并设置
+   `ulimit -s unlimited`。
+4. `vasp_status`，结束后 `vasp_collect`；调度状态 COMPLETED 不替代科学结果校验。
+
+### Hefei-NAMD MCP 运行链
+
+Hefei-NAMD 官方 VASP 工作流需要 `inp`、`INICON` 和保持层级的
+`run/0001.../WAVECAR`。`namd_prepare` 会复制完整快照树，避免同名 WAVECAR
+被覆盖；运行输入可用两种方式提供：
+
+- 传入版本匹配的 `inp_path` 与 `inicon_path`；
+- 传入完整 `parameters`（BMIN/BMAX/NBANDS/NSW/POTIM/TEMP/NSAMPLE/
+  NAMDTIME/NELM/NTRAJ/LHOLE）和 `initial_conditions=[[起始步, 能带], ...]`。
+
+随后调用 `namd_submit`、`namd_status`、`namd_collect`。提交前会校验
+`NSAMPLE`、能带范围以及 `起始步 + NAMDTIME <= NSW`；远端脚本加载配置的
+Hefei-NAMD 模块后直接运行 `namd`。结果收集覆盖官方输出 NATXT、EIGTXT、
+COUPCAR、PSICT.* 与 SHPROP.*。

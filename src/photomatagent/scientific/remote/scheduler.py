@@ -78,6 +78,7 @@ def render_slurm_script(
     env_vars: dict[str, str] | None = None,
     extra_lines: list[str] | None = None,
     preamble: str = "",
+    launcher: str = "srun --mpi=pmi2",
 ) -> str:
     """Render a deterministic, validated Slurm submission script.
 
@@ -90,6 +91,8 @@ def render_slurm_script(
     if module_load:
         _validate_token(module_load, "module name")
     _validate_token(executable, "executable")
+    if launcher not in {"", "srun --mpi=pmi2"}:
+        raise ValueError(f"unsupported launcher: {launcher!r}")
     args = [_validate_token(str(arg), "executable arg") for arg in (executable_args or [])]
     env = {key: value for key, value in (env_vars or {}).items()}
     for key in env:
@@ -116,7 +119,7 @@ def render_slurm_script(
     for extra in extra_lines or []:
         lines.append(extra)
     command = shlex.join([executable, *args])
-    lines.append(f"srun --mpi=pmi2 {command}")
+    lines.append(f"{launcher} {command}".strip())
     lines.append("")
     return "\n".join(lines)
 
@@ -138,27 +141,37 @@ def remote_cancel_command(job_id: str) -> str:
 
 
 def remote_mkdir_command(remote_directory: str) -> str:
-    return f"mkdir -p {shlex.quote(remote_directory)}"
+    return f"mkdir -p {_remote_path_expression(remote_directory)}"
 
 
 def remote_ls_command(remote_directory: str) -> str:
     return (
-        f"cd {shlex.quote(remote_directory)} 2>/dev/null && "
+        f"cd {_remote_path_expression(remote_directory)} 2>/dev/null && "
         "find . -maxdepth 2 -type f -printf '%p %s\\n' 2>/dev/null | sort"
     )
 
 
 def remote_submit_command(remote_directory: str, script_name: str) -> str:
     return (
-        f"cd {shlex.quote(remote_directory)} && "
+        f"cd {_remote_path_expression(remote_directory)} && "
         f"sbatch {shlex.quote(script_name)}"
     )
 
 
 def remote_read_command(remote_directory: str, filename: str, max_bytes: int) -> str:
     return (
-        f"tail -c {int(max_bytes)} {shlex.quote(remote_directory + '/' + filename)}"
+        f"tail -c {int(max_bytes)} "
+        f"{_remote_path_expression(remote_directory + '/' + filename)}"
     )
+
+
+def _remote_path_expression(path: str) -> str:
+    """Quote a validated remote path while preserving home expansion."""
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
 
 
 def remote_artifact_sizes_command(remote_directory: str) -> str:

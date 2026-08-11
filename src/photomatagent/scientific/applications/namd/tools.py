@@ -55,7 +55,7 @@ class NamdCapabilitiesTool(Tool):
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         application = self.application or NamdApplication()
-        payload = application.probe_environment()
+        payload = await application.probe_environment_async()
         payload["cost_class"] = "VERY_EXPENSIVE"
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False, indent=2),

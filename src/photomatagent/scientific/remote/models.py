@@ -141,6 +141,7 @@ class RemoteServerConfig(BaseModel):
     private_key_path: str = ""
     remote_root: str = "~/photomatagent"
     connect_timeout_seconds: float = Field(default=20.0, gt=0)
+    transfer_timeout_seconds: float = Field(default=3600.0, gt=0)
     ssh_batch_mode: bool = True
 
     @property

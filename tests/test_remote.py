@@ -17,11 +17,15 @@ from photomatagent.scientific.remote.models import (
 from photomatagent.scientific.remote.scheduler import (
     parse_sbatch_job_id,
     render_slurm_script,
+    remote_mkdir_command,
+    remote_read_command,
+    remote_submit_command,
     sanitize_job_name,
     slurm_state_to_hpc_state,
     validate_job_id,
 )
 from photomatagent.scientific.remote.scnet import (
+    SCNetBackend,
     RemoteSubmissionBlocked,
     validate_remote_path,
 )
@@ -150,6 +154,21 @@ def test_server_config_never_exposes_private_key():
     assert redacted.private_key_path == ""
 
 
+def test_scnet_backend_reuses_one_controlmaster_socket():
+    config = RemoteServerConfig(
+        host="gateway.example",
+        username="user",
+        port=2222,
+        private_key_path="/keys/id",
+    )
+    first = SCNetBackend(config)
+    second = SCNetBackend(config)
+    assert first.control_path == second.control_path
+    assert "ControlMaster=auto" in first._ssh_base()
+    assert f"ControlPath={first.control_path}" in first._ssh_base()
+    assert f"ControlPath={first.control_path}" in first._scp_base()
+
+
 def test_validate_remote_path():
     assert validate_remote_path("~/jobs/abc") == "~/jobs/abc"
     assert validate_remote_path("/home/user/jobs") == "/home/user/jobs"
@@ -159,6 +178,16 @@ def test_validate_remote_path():
         validate_remote_path("~/jobs/$(rm -rf /)")
     with pytest.raises(ValueError):
         validate_remote_path("~/a//b")
+
+
+def test_remote_commands_expand_tilde_via_home():
+    assert remote_mkdir_command("~/jobs/test") == 'mkdir -p "$HOME"/jobs/test'
+    assert remote_submit_command("~/jobs/test", "run.slurm") == (
+        'cd "$HOME"/jobs/test && sbatch run.slurm'
+    )
+    assert remote_read_command("~/jobs/test", "1.out", 100) == (
+        'tail -c 100 "$HOME"/jobs/test/1.out'
+    )
 
 
 # -- fake backend -------------------------------------------------------------
@@ -235,6 +264,23 @@ def test_fake_backend_upload_download(tmp_path):
         assert missing is None
         artifacts = await backend.list_remote_artifacts("~/jobs/test")
         assert [artifact.name for artifact in artifacts] == ["INCAR"]
+
+    asyncio.run(scenario())
+
+
+def test_fake_backend_upload_tree_preserves_snapshot_paths(tmp_path):
+    backend = FakeSCNetBackend()
+    tree = tmp_path / "prepared"
+    (tree / "run" / "0001").mkdir(parents=True)
+    (tree / "run" / "0002").mkdir(parents=True)
+    (tree / "run" / "0001" / "WAVECAR").write_bytes(b"one")
+    (tree / "run" / "0002" / "WAVECAR").write_bytes(b"two")
+
+    async def scenario():
+        names = await backend.upload_tree(tree, "~/jobs/namd")
+        assert names == ["run/0001/WAVECAR", "run/0002/WAVECAR"]
+        assert backend.remote_files["~/jobs/namd"]["run/0001/WAVECAR"] == b"one"
+        assert backend.remote_files["~/jobs/namd"]["run/0002/WAVECAR"] == b"two"
 
     asyncio.run(scenario())
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from photomatagent.scientific.applications.vasp.application import VaspApplication
+from photomatagent.scientific.applications.vasp.inputs import _kpoint_grid_density
 from photomatagent.scientific.applications.vasp.validation import (
     check_vasprun,
     parse_result,
@@ -141,6 +142,14 @@ As  As  0.25 0.25 0.25
     assert workflow["stages"][1]["required_outputs"] == ["CONTCAR"]
 
 
+def test_kpoint_density_matches_kpoints_per_atom_scaling():
+    grid = _kpoint_grid_density(
+        5.431**3, 1000, [5.431, 5.431, 5.431], num_sites=2
+    )
+    assert grid == [7, 7, 7]
+    assert max(grid) < 20
+
+
 def test_narrow_gap_soc_incar_contains_soc_settings(tmp_path):
     app = make_application()
     structure = tmp_path / "hgTe.cif"
@@ -219,7 +228,8 @@ As  As  0.25 0.25 0.25
     assert "POTCAR In" in content and "POTCAR As" in content
 
 
-def test_submit_refuses_without_potcar(tmp_path):
+def test_submit_refuses_without_potcar(tmp_path, monkeypatch):
+    monkeypatch.delenv("PMG_VASP_PSP_DIR", raising=False)
     app = make_application(psp=None)
     structure = tmp_path / "inAs.cif"
     structure.write_text(
@@ -259,6 +269,43 @@ As  As  0.25 0.25 0.25
     asyncio.run(scenario())
 
 
+def test_submit_rejects_crlf_incar_and_incompatible_ncore(tmp_path):
+    from photomatagent.scientific.remote.models import ResourceRequest
+
+    incar = tmp_path / "INCAR"
+    incar.write_bytes(b"ENCUT = 520\r\n")
+    request = ResourceRequest(
+        partition="p", nodes=1, tasks_per_node=32, walltime_minutes=10
+    )
+    with pytest.raises(ValueError, match="dos2unix"):
+        VaspApplication._validate_incar_for_resource(incar, request)
+    incar.write_text("ENCUT = 520\nNCORE = 5\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must divide"):
+        VaspApplication._validate_incar_for_resource(incar, request)
+    incar.write_text("ENCUT = 520\nNCORE = 8\n", encoding="utf-8")
+    VaspApplication._validate_incar_for_resource(incar, request)
+
+
+def test_render_slurm_can_source_scnet_product_environment():
+    from photomatagent.scientific.applications.vasp.profiles import get_profile
+    from photomatagent.scientific.remote.models import ResourceRequest
+
+    app = VaspApplication(
+        module_name="broken-module",
+        env_script="/public/home/u/apprepo/vasp/v/scripts/env.sh",
+    )
+    script = app.render_slurm(
+        job_name="smoke",
+        profile=get_profile("standard_semiconductor"),
+        resource=ResourceRequest(
+            partition="p", nodes=1, tasks_per_node=2, walltime_minutes=10
+        ),
+    )
+    assert "module load broken-module" not in script
+    assert "source /public/home/u/apprepo/vasp/v/scripts/env.sh" in script
+    assert "command -v vasp_std >/dev/null" in script
+
+
 # -- validation ---------------------------------------------------------------
 
 
@@ -289,6 +336,19 @@ def test_check_vasprun_unconverged_marker(tmp_path):
     check = check_vasprun(path)
     assert check.electronic_converged is None
     assert any("convergence marker" in reason for reason in check.reasons)
+
+
+def test_check_vasprun_accepts_vasp54_outcar_ediff_marker(tmp_path):
+    path = write_vasprun(tmp_path, converged=False)
+    (tmp_path / "OUTCAR").write_text(
+        "aborting loop because EDIFF is reached\n"
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    check = check_vasprun(path)
+    assert check.electronic_converged is True
+    assert check.ionic_converged is True
+    assert not check.reasons
 
 
 def test_validate_output_relax_requires_ionic_convergence(tmp_path):
