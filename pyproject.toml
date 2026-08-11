@@ -28,6 +28,14 @@ electronic = [
 literature = [
     "arxiv>=2.1",
     "pypdf>=4.0",
+    "docling>=2.0",
+    "lancedb>=0.15",
+    "pylance>=0.20",
+    "sentence-transformers>=3.0",
+    # Direct torch pins so the CPU-only index below actually applies (uv
+    # ignores index sources for purely transitive deps).
+    "torch>=2.2",
+    "torchvision>=0.17",
 ]
 defects = [
     "doped>=2.0",
@@ -51,6 +59,17 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+
+# CPU-only torch: the default PyPI CUDA-13 wheels currently ship a broken
+# nvidia-curand wheel, and this project runs retrieval locally on CPU anyway.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
 
 [project.scripts]
 photomatagent = "photomatagent.cli.app:main"

@@ -33,6 +33,13 @@ class ScientificConfig:
     materials_max_results: int = 10
     literature_max_papers: int = 5
     literature_max_chars: int = 4000
+    # Literature RAG V1: configurable dataset/index/embedding locations.
+    literature_root: str = "dataset/paper"
+    literature_index_dir: str = "output/literature_index"
+    embedding_model: str = "intfloat/multilingual-e5-small"
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    literature_search_top_k: int = 5
+    literature_passage_chars: int = 600
     structure_output_dir: str = "output/scientific"
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
 
@@ -62,6 +69,30 @@ class ScientificConfig:
             literature_max_chars=_int_env(
                 "PHOTOMATAGENT_LITERATURE_MAX_CHARS", 4000
             ),
+            literature_root=os.environ.get(
+                "PHOTOMATAGENT_LITERATURE_DIR", "dataset/paper"
+            ).strip()
+            or "dataset/paper",
+            literature_index_dir=os.environ.get(
+                "PHOTOMATAGENT_LITERATURE_INDEX_DIR", "output/literature_index"
+            ).strip()
+            or "output/literature_index",
+            embedding_model=os.environ.get(
+                "PHOTOMATAGENT_EMBEDDING_MODEL",
+                "intfloat/multilingual-e5-small",
+            ).strip()
+            or "intfloat/multilingual-e5-small",
+            reranker_model=os.environ.get(
+                "PHOTOMATAGENT_RERANKER_MODEL",
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            ).strip()
+            or "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            literature_search_top_k=_int_env(
+                "PHOTOMATAGENT_LITERATURE_TOP_K", 5
+            ),
+            literature_passage_chars=_int_env(
+                "PHOTOMATAGENT_LITERATURE_PASSAGE_CHARS", 600
+            ),
             mcp_servers=servers,
         )
 
@@ -78,4 +109,3 @@ def _load_dotenv_if_present(root: Path) -> None:
     env_path = root / ".env"
     if env_path.is_file():
         load_dotenv(env_path, override=False)
-

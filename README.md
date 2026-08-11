@@ -393,6 +393,33 @@ VASP/QE/phonopy/HPC 的具体执行 SOP 交给外部 skills，IR skills 只负�
   evidence_gaps_identified / capability_escalations；
   `photomatagent sessions stats` 直接展示。
 
+### Literature RAG V1（本地检索）
+
+`literature` 能力包在原有 arXiv/本地 PDF 工具之上新增完全本地的
+Literature RAG：docling 解析 PDF → HybridChunker 分块 →
+sentence-transformers（`intfloat/multilingual-e5-small`）嵌入 →
+LanceDB 向量库 → 稠密 + BM25 混合检索（RRF 融合）→
+`cross-encoder/ms-marco-MiniLM-L-6-v2` 重排 → 上下文扩展 → 正则数值证据提取。
+
+配置（环境变量，均有默认值）：
+
+- `PHOTOMATAGENT_LITERATURE_DIR`：PDF 根目录，默认 `dataset/paper`（递归扫描）
+- `PHOTOMATAGENT_LITERATURE_INDEX_DIR`：索引目录，默认 `output/literature_index`
+- `PHOTOMATAGENT_EMBEDDING_MODEL`：默认 `intfloat/multilingual-e5-small`
+- `PHOTOMATAGENT_RERANKER_MODEL`：默认 `cross-encoder/ms-marco-MiniLM-L-6-v2`
+
+安装依赖：`uv sync --extra literature`（torch 固定走 CPU 索引，避免 PyPI
+CUDA 轮子损坏问题）。首次索引会从 Hugging Face 下载 docling 布局模型与嵌入模型。
+
+工具：`literature.index_papers`（建索引）、`literature.search_passages`
+（混合检索，返回带 provenance 的片段）、`literature.read_passage`（按
+passage_id 读全文）、`literature.extract_evidence`（提取 responsivity /
+detectivity / dark current / wavelength / temperature / bandgap / mobility /
+NETD 数值证据，输出 `ScientificEvidence`）。
+
+示例查询：`literature.search_passages` `"HgTe CQD infrared detector
+responsivity"`。测试：`uv run pytest tests/test_literature_rag.py`。
+
 ### Vertical slices（`experiments/vertical/`）
 
 三个 IR 科研回归任务（scripted 确定性 + Slice 1 的真实 LLM 变体）：

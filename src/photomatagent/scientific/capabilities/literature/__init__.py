@@ -36,7 +36,10 @@ def _version(name: str) -> str:
 
 class LiteratureProbe(CapabilityPack):
     name = "literature"
-    description = "Literature search and reading (arXiv + local PDFs)."
+    description = (
+        "Literature search and reading (arXiv + local PDFs) plus the local "
+        "Literature RAG index (docling + LanceDB + hybrid retrieval)."
+    )
 
     def probe(self) -> ProbeResult:
         missing = []
@@ -48,15 +51,34 @@ class LiteratureProbe(CapabilityPack):
             import pypdf  # noqa: F401
         except ImportError:
             missing.append("pypdf")
+        try:
+            import docling  # noqa: F401
+        except ImportError:
+            missing.append("docling")
+        try:
+            import lancedb  # noqa: F401
+        except ImportError:
+            missing.append("lancedb")
+        try:
+            import sentence_transformers  # noqa: F401
+        except ImportError:
+            missing.append("sentence_transformers")
         if missing:
             return ProbeResult(
                 status=CapabilityStatus.MISSING_DEPENDENCY,
-                detail=f"missing: {', '.join(missing)} (extra: photomatagent[literature])",
+                detail=(
+                    f"missing: {', '.join(missing)} "
+                    "(extra: photomatagent[literature])"
+                ),
             )
         return ProbeResult(
             status=CapabilityStatus.AVAILABLE,
-            detail="arxiv + pypdf available",
-            version=f"arxiv={_version('arxiv')}; pypdf={_version('pypdf')}",
+            detail="arxiv + pypdf + docling + lancedb + sentence-transformers available",
+            version=(
+                f"arxiv={_version('arxiv')}; pypdf={_version('pypdf')}; "
+                f"docling={_version('docling')}; lancedb={_version('lancedb')}; "
+                f"sentence-transformers={_version('sentence-transformers')}"
+            ),
         )
 
     def tools(self) -> list[Tool]:
@@ -65,6 +87,10 @@ class LiteratureProbe(CapabilityPack):
             LiteratureSearchLocalTool(self._config, self._workspace),
             LiteratureListPapersTool(self._workspace),
             LiteratureReadPaperTool(self._config, self._workspace),
+            LiteratureIndexPapersTool(self._config, self._workspace),
+            LiteratureSearchPassagesTool(self._config, self._workspace),
+            LiteratureReadPassageTool(self._config, self._workspace),
+            LiteratureExtractEvidenceTool(self._config, self._workspace),
         ]
 
     def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
@@ -351,6 +377,338 @@ class LiteratureReadPaperTool(Tool):
                     provenance={"file": file_name, "tool": self.name},
                 )
             ],
+        )
+
+
+def _resolve_literature_root(config: ScientificConfig, workspace: Workspace) -> Path:
+    """Absolute literature PDF root: configured value or workspace-relative."""
+    root = Path(config.literature_root)
+    if not root.is_absolute():
+        root = workspace.root / root
+    return root
+
+
+def _resolve_index_dir(config: ScientificConfig, workspace: Workspace) -> Path:
+    index_dir = Path(config.literature_index_dir)
+    if not index_dir.is_absolute():
+        index_dir = workspace.root / index_dir
+    return index_dir
+
+
+class LiteratureIndexPapersTool(Tool):
+    name = "literature.index_papers"
+    description = (
+        "Parse PDFs under a directory with docling, embed them, and build or "
+        "incrementally update the local LanceDB index. Idempotent: unchanged "
+        "PDFs are skipped by content hash. Returns indexed/skipped counts and "
+        "the database location."
+    )
+    short_description = "Build/update the local literature RAG index from PDFs."
+    exposure = ToolExposure.DEFERRED
+    namespace = "literature"
+    source = "lancedb"
+    tags = ("literature", "rag", "index", "docling")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "directory": {
+                "type": "string",
+                "description": (
+                    "PDF directory (searched recursively). Defaults to the "
+                    "configured literature root (PHOTOMATAGENT_LITERATURE_DIR)."
+                ),
+            },
+        },
+    }
+
+    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+        self._config = config
+        self._workspace = workspace
+
+    async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        from photomatagent.scientific.capabilities.literature.index import (
+            LiteratureIndex,
+        )
+
+        raw_directory = str(arguments.get("directory") or "")
+        root = (
+            Path(raw_directory)
+            if raw_directory
+            else _resolve_literature_root(self._config, self._workspace)
+        )
+        if not root.is_absolute():
+            root = self._workspace.root / root
+        index_dir = _resolve_index_dir(self._config, self._workspace)
+        index = LiteratureIndex(
+            index_dir, embedding_model=self._config.embedding_model
+        )
+        try:
+            with index.locked():
+                stats = index.index_directory(root)
+        except FileNotFoundError as exc:
+            return ScientificToolResult(
+                output=str(exc),
+                is_error=True,
+                data={"error": "literature_root_not_found", "directory": str(root)},
+            )
+        payload = {
+            "indexed": stats["indexed"],
+            "skipped": stats["skipped"],
+            "failed": stats["failed"],
+            "removed": stats["removed"],
+            "chunks": stats["chunks"],
+            "db_location": stats["db_location"],
+            "errors": stats["errors"][:5],
+        }
+        return ScientificToolResult(
+            output=json.dumps(payload, ensure_ascii=False),
+            data=payload,
+        )
+
+
+class LiteratureSearchPassagesTool(Tool):
+    name = "literature.search_passages"
+    description = (
+        "Hybrid (dense + keyword) search over the local literature index with "
+        "reranking and context expansion. Returns strictly limited passages "
+        "with provenance (paper, title, section, page, score, source file)."
+    )
+    short_description = "Hybrid RAG search for passages in local papers."
+    exposure = ToolExposure.DEFERRED
+    namespace = "literature"
+    source = "lancedb"
+    tags = ("literature", "rag", "search", "hybrid")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Scientific query, e.g. 'HgTe quantum dot infrared detector responsivity'."},
+            "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "required": ["query"],
+    }
+
+    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+        self._config = config
+        self._workspace = workspace
+
+    async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        from photomatagent.scientific.capabilities.literature.index import (
+            LiteratureIndex,
+        )
+        from photomatagent.scientific.capabilities.literature.retrieval import (
+            Retriever,
+        )
+
+        index = LiteratureIndex(
+            _resolve_index_dir(self._config, self._workspace),
+            embedding_model=self._config.embedding_model,
+        )
+        if index.count_passages() == 0:
+            return ScientificToolResult(
+                output=(
+                    "literature index is empty; run literature.index_papers "
+                    "first (or set PHOTOMATAGENT_LITERATURE_DIR)"
+                ),
+                is_error=True,
+                data={"error": "empty_index", "db_location": str(index.index_dir)},
+            )
+        query = str(arguments["query"])
+        top_k = min(
+            int(arguments.get("top_k", self._config.literature_search_top_k)), 10
+        )
+        retriever = Retriever(index, reranker_model=self._config.reranker_model)
+        try:
+            results = retriever.hybrid_search(query, top_k=top_k)
+        except Exception as exc:
+            return ScientificToolResult(
+                output=f"literature search failed: {type(exc).__name__}: {exc}",
+                is_error=True,
+                data={"error": type(exc).__name__},
+            )
+        rows = []
+        for result in results:
+            rows.append(
+                {
+                    "paper_id": result["paper_id"],
+                    "title": result["title"],
+                    "passage": _clean(
+                        result["passage"], self._config.literature_passage_chars
+                    ),
+                    "section": result["section"],
+                    "page": result["page"],
+                    "score": round(float(result["score"]), 4),
+                    "source": result["source"],
+                    "passage_id": result["passage_id"],
+                    "context_before": _clean(result.get("context_before", ""), 300),
+                    "context_after": _clean(result.get("context_after", ""), 300),
+                }
+            )
+        payload = {"query": query, "count": len(rows), "results": rows}
+        return ScientificToolResult(
+            output=json.dumps(payload, ensure_ascii=False),
+            data=payload,
+        )
+
+
+class LiteratureReadPassageTool(Tool):
+    name = "literature.read_passage"
+    description = (
+        "Return one exact passage (full text + metadata) from the local "
+        "literature index by passage_id."
+    )
+    short_description = "Read one indexed passage by passage_id."
+    exposure = ToolExposure.DEFERRED
+    namespace = "literature"
+    source = "lancedb"
+    tags = ("literature", "rag", "read")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "passage_id": {"type": "string", "description": "passage_id from literature.search_passages."},
+        },
+        "required": ["passage_id"],
+    }
+
+    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+        self._config = config
+        self._workspace = workspace
+
+    async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        from photomatagent.scientific.capabilities.literature.index import (
+            LiteratureIndex,
+        )
+
+        passage_id = str(arguments["passage_id"])
+        index = LiteratureIndex(
+            _resolve_index_dir(self._config, self._workspace),
+            embedding_model=self._config.embedding_model,
+        )
+        row = index.get_passage(passage_id)
+        if row is None:
+            return ScientificToolResult(
+                output=f"passage not found: {passage_id}",
+                is_error=True,
+                data={"error": "not_found", "passage_id": passage_id},
+            )
+        payload = {
+            "passage_id": row["passage_id"],
+            "paper_id": row["paper_id"],
+            "title": row["title"],
+            "authors": row.get("authors", []),
+            "year": row.get("year"),
+            "section": row.get("section", ""),
+            "page": row.get("page"),
+            "heading_path": row.get("heading_path", ""),
+            "previous_chunk_id": row.get("previous_chunk_id", ""),
+            "next_chunk_id": row.get("next_chunk_id", ""),
+            "text": row.get("text", ""),
+            "source": row.get("file_name", ""),
+        }
+        return ScientificToolResult(
+            output=json.dumps(payload, ensure_ascii=False),
+            data=payload,
+        )
+
+
+class LiteratureExtractEvidenceTool(Tool):
+    name = "literature.extract_evidence"
+    description = (
+        "Extract numerical scientific evidence (responsivity, detectivity, "
+        "dark current, wavelength, temperature, bandgap, mobility, NETD) from "
+        "passages. Each input item is either {'passage_id': ...} or "
+        "{'text': ..., 'page': ...}. Never guesses: only explicit numbers "
+        "with units are reported, as ScientificEvidence."
+    )
+    short_description = "Extract numbers + units as ScientificEvidence from passages."
+    exposure = ToolExposure.DEFERRED
+    namespace = "literature"
+    source = "builtin"
+    tags = ("literature", "evidence", "extraction")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "passages": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "passage_id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "page": {"type": "integer"},
+                    },
+                },
+            },
+        },
+        "required": ["passages"],
+    }
+
+    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+        self._config = config
+        self._workspace = workspace
+
+    async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        from photomatagent.scientific.capabilities.literature.evidence import (
+            extract_evidence_from_passages,
+        )
+        from photomatagent.scientific.capabilities.literature.index import (
+            LiteratureIndex,
+        )
+
+        passages = list(arguments.get("passages") or [])
+        index = LiteratureIndex(
+            _resolve_index_dir(self._config, self._workspace),
+            embedding_model=self._config.embedding_model,
+        )
+        resolved: list[dict[str, Any]] = []
+        for item in passages:
+            if not isinstance(item, dict):
+                continue
+            passage_id = item.get("passage_id")
+            if passage_id:
+                row = index.get_passage(str(passage_id))
+                if row is None:
+                    resolved.append(
+                        {
+                            "text": "",
+                            "error": f"passage not found: {passage_id}",
+                        }
+                    )
+                    continue
+                resolved.append(
+                    {
+                        "text": row.get("text", ""),
+                        "page": row.get("page"),
+                        "passage_id": passage_id,
+                        "source": row.get("file_name", ""),
+                    }
+                )
+            else:
+                resolved.append(
+                    {
+                        "text": str(item.get("text") or ""),
+                        "page": item.get("page"),
+                        "source": str(item.get("source") or ""),
+                    }
+                )
+        evidence = extract_evidence_from_passages(resolved)
+        rows = [
+            {
+                "subject": item.subject,
+                "property": item.property,
+                "value": item.value,
+                "unit": item.unit,
+                "condition": item.provenance,
+                "source": item.source,
+                "method": item.method,
+                "summary": item.summary,
+            }
+            for item in evidence
+        ]
+        payload = {"count": len(rows), "evidence": rows}
+        return ScientificToolResult(
+            output=json.dumps(payload, ensure_ascii=False),
+            data=payload,
+            evidence=evidence,
         )
 
 
