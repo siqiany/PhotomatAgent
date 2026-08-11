@@ -15,9 +15,11 @@ from photomatagent.models.factory import create_provider
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.loop import AgentRuntime, EventSink
 from photomatagent.runtime.permissions import (
+    ApprovalSettings,
     AllowAllPolicy,
     DenyAllPolicy,
     PermissionPolicy,
+    SwitchablePermissionPolicy,
     default_permission_policy,
 )
 from photomatagent.scientific.state import ScientificState
@@ -59,6 +61,9 @@ def build_runtime(
     if logger is not None:
         sinks.append(logger.log)
 
+    policy = SwitchablePermissionPolicy(
+        policy, settings=ApprovalSettings(workspace.root)
+    )
     runtime = AgentRuntime(
         model=model_provider,
         tools=registry,
@@ -89,8 +94,11 @@ async def run_goal(console: Console, runtime: AgentRuntime, goal: str) -> None:
 async def run_interactive_chat(
     console: Console, runtime: AgentRuntime, session: PromptSession
 ) -> None:
+    from photomatagent.cli.commands import ChatCommandRouter
+
+    commands = ChatCommandRouter(console, runtime, runtime.workspace)
     console.print(
-        "[dim]Type your research goal. [/][bold]/compact[/][dim] compacts old context; "
+        "[dim]Type your research goal or [/][bold]/help[/][dim] for commands; "
         "[/][bold]/exit[/][dim] quits.[/]"
     )
     while True:
@@ -98,14 +106,11 @@ async def run_interactive_chat(
             goal = await session.prompt_async("❯ ")
         except (EOFError, KeyboardInterrupt):
             break
-        if goal.strip().lower() in {"/exit", "/quit", "exit", "quit"}:
+        normalized = goal.strip().lower()
+        if normalized in {"/exit", "/quit", "exit", "quit"}:
             break
-        if goal.strip().lower() == "/compact":
-            events = await runtime.compact_working_context()
-            for event in events:
-                ChatRenderer(console).handle(event)
-            if not events:
-                console.print("[dim]No eligible old turns to compact.[/]")
+        if goal.strip().startswith("/"):
+            await commands.execute(goal.strip())
             continue
         if goal.strip():
             await run_goal(console, runtime, goal)

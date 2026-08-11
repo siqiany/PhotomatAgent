@@ -196,6 +196,35 @@ def test_empty_index_search_is_graceful(tmp_path):
     assert retriever.hybrid_search("anything", top_k=3) == []
 
 
+def test_existing_index_rejects_mismatched_vector_dimension(tmp_path):
+    LiteratureIndex(tmp_path / "index", vector_dim=384).count_passages()
+    mismatched = LiteratureIndex(tmp_path / "index", vector_dim=768)
+    with pytest.raises(ValueError, match="vector_dim=384"):
+        mismatched.count_passages()
+
+
+def test_retriever_cache_invalidates_when_content_changes_at_same_count():
+    class MutableIndex:
+        embedding_model = "unused"
+
+        def __init__(self):
+            self.version = "a"
+            self.text = "old content"
+
+        def revision(self):
+            return 1, (("paper", self.version),)
+
+        def all_passages(self):
+            return [{"passage_id": "p1", "text": self.text}]
+
+    index = MutableIndex()
+    retriever = Retriever(index)  # type: ignore[arg-type]
+    assert retriever._load_corpus()[0]["text"] == "old content"
+    index.version = "b"
+    index.text = "new content"
+    assert retriever._load_corpus()[0]["text"] == "new content"
+
+
 async def test_tools_index_search_and_read_roundtrip(tmp_path):
     from photomatagent.scientific.capabilities.literature import (
         LiteratureIndexPapersTool,

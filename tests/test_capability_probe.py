@@ -72,6 +72,12 @@ def test_existing_env_wins_over_workspace_dotenv(tmp_path, monkeypatch):
     assert config.materials_api_key() == "from-process-env"
 
 
+def test_embedding_vector_dimension_from_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("PHOTOMATAGENT_EMBEDDING_VECTOR_DIM", "768")
+    config = ScientificConfig.from_environment(workspace=tmp_path)
+    assert config.embedding_vector_dim == 768
+
+
 def test_optics_available_here(tmp_path):
     import importlib.util
 

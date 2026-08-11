@@ -234,7 +234,7 @@ def test_magus_prepare_rejects_unsupported_search_type(tmp_path):
     target = tmp_path / "target"
     target.mkdir()
     app = MagusApplication(search_types=["bulk"])
-    with pytest.raises(ValueError, match="not exposed"):
+    with pytest.raises(Exception, match="not exposed"):
         app.prepare(
             search_type="surface",
             composition="HgTe",

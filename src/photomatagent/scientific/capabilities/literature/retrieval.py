@@ -128,13 +128,15 @@ class Retriever:
         self.candidates = candidates
         self._corpus: list[dict[str, Any]] | None = None
         self._bm25: _Bm25 | None = None
+        self._revision: object | None = None
 
     def _load_corpus(self) -> list[dict[str, Any]]:
-        """Passages cached per index state (row count acts as the version)."""
-        count = self.index.count_passages()
-        if self._corpus is None or len(self._corpus) != count:
+        """Passages cached per content-derived index revision."""
+        revision = self.index.revision()
+        if self._corpus is None or self._revision != revision:
             self._corpus = self.index.all_passages()
             self._bm25 = _Bm25(self._corpus)
+            self._revision = revision
         return self._corpus
 
     def _by_id(self) -> dict[str, dict[str, Any]]:

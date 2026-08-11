@@ -343,11 +343,13 @@ async def test_handle_missing_command_is_diagnosed(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_handle_start_failure_is_typed_not_raised(monkeypatch):
     session = _FakeSession(fail_initialize=RuntimeError("boom"))
-    _patch_sdk(monkeypatch, session)
+    transport = _patch_sdk(monkeypatch, session)
     handle = MCPServerHandle(_config())
     state = await handle.start()
     assert state is MCPServerState.START_FAILED
     assert "boom" in handle.last_error
+    assert session.exited
+    assert transport.exited
 
 
 @pytest.mark.asyncio

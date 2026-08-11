@@ -3,7 +3,17 @@ from __future__ import annotations
 import pytest
 
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
-from photomatagent.runtime.permissions import AskPolicy, AutoApproveHandler, DenyAllPolicy, DenyHandler
+from photomatagent.runtime.permissions import (
+    ApprovalScope,
+    ApprovalSettings,
+    AskPolicy,
+    AutoApproveHandler,
+    DenyAllPolicy,
+    DenyHandler,
+    PermissionDecision,
+    SwitchablePermissionPolicy,
+    default_permission_policy,
+)
 from photomatagent.tools.echo import EchoTool
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
@@ -99,3 +109,34 @@ async def test_write_ask_allow_changes_file(tmp_path):
     )
     await collect(runtime, "write")
     assert target.read_text(encoding="utf-8") == "hello"
+
+
+@pytest.mark.asyncio
+async def test_default_policy_asks_for_new_or_scientific_tools():
+    policy = default_permission_policy()
+    assert (await policy.check("read", {})).decision is PermissionDecision.ALLOW
+    assert (await policy.check("vasp.prepare", {})).decision is PermissionDecision.ASK
+    assert (await policy.check("future.plugin.mutate", {})).decision is PermissionDecision.ASK
+
+
+@pytest.mark.asyncio
+async def test_switchable_policy_session_always_and_reset(tmp_path):
+    settings = ApprovalSettings(tmp_path)
+    policy = SwitchablePermissionPolicy(DenyAllPolicy(), settings=settings)
+    assert policy.scope is ApprovalScope.DEFAULT
+    assert (await policy.check("bash", {})).decision is PermissionDecision.DENY
+
+    policy.allow_for_session()
+    assert policy.scope is ApprovalScope.SESSION
+    assert (await policy.check("bash", {})).decision is PermissionDecision.ALLOW
+
+    policy.allow_always()
+    assert policy.scope is ApprovalScope.ALWAYS
+    reloaded = SwitchablePermissionPolicy(
+        DenyAllPolicy(), settings=ApprovalSettings(tmp_path)
+    )
+    assert reloaded.scope is ApprovalScope.ALWAYS
+
+    reloaded.reset()
+    assert reloaded.scope is ApprovalScope.DEFAULT
+    assert (await reloaded.check("bash", {})).decision is PermissionDecision.DENY

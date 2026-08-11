@@ -453,6 +453,16 @@ uv run photomatagent chat --provider fake --goal "investigate material InAs" --a
 
 单轮 goal 默认最多迭代 25 次，达到上限会输出 `loop finished: max_iterations`。可通过 `--max-iterations` 调整，例如 `uv run photomatagent chat --max-iterations 50`。交互模式可输入 `/compact` 手动测试结构化 compaction；无可压缩旧轮次时不会改变默认对话体验。达到上限时若模型最后一条回复还带有未执行的工具调用，下次 working context 会成对隐藏该 abandoned transaction，durable conversation 仍完整保留。
 
+交互聊天同时内置斜杠命令，输入 `/help` 可查看完整清单。常用映射为
+`/doctor`、`/tools`、`/skills`、`/scientific`、`/mcp`、`/sessions`、
+`/experiments`、`/configure` 和 `/compact`；分组命令保留 CLI 的子命令和参数，
+例如 `/sessions stats latest`。
+
+权限可在聊天中显式切换：`/approve -o` 仅在当前聊天任务内完全允许所有工具，
+`/approve -a` 为当前工作区持久启用完全允许，`/approve -b` 清除两种覆盖并恢复
+本次启动所选的初始策略。持久状态保存在被 Git 忽略且权限为 `0600` 的
+`.photomatagent/settings.json`。完全允许会跳过工具确认，因此只应在受信工作区启用。
+
 OpenAI（官方 Python SDK + Responses API）：
 
 ```bash

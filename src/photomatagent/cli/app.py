@@ -331,10 +331,14 @@ def scientific_scnet_doctor(
     """Read-only SCNet diagnostics: SSH, Slurm, VASP/NAMD/MAGUS probes."""
     import json as _json
 
+    from dotenv import load_dotenv
+
     from photomatagent.mcp_servers.scnet.server import build_doctor_report
 
+    load_dotenv(workspace / ".env", override=False)
     report = asyncio.run(build_doctor_report())
-    console.print(_json.dumps(report, ensure_ascii=False, indent=2))
+    # plain print: rich wraps long lines and would break the JSON output
+    print(_json.dumps(report, ensure_ascii=False, indent=2))
 
 
 mcp_app = typer.Typer(

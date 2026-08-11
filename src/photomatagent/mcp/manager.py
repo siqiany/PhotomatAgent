@@ -133,6 +133,7 @@ class MCPServerHandle:
             read, write, transport = await self._open_transport()
             if read is None:
                 return self.state
+            self._transport_cm = transport
             try:
                 from mcp import ClientSession
 
@@ -151,6 +152,7 @@ class MCPServerHandle:
                     ).__aenter__(),
                     timeout=self.config.startup_timeout_seconds,
                 )
+                self._session = session
                 await asyncio.wait_for(
                     session.initialize(),
                     timeout=self.config.startup_timeout_seconds,
@@ -170,8 +172,6 @@ class MCPServerHandle:
                 self.last_error = str(exc)[:500]
                 await self._close_locked()
                 return self.state
-            self._session = session
-            self._transport_cm = transport
             self.remote_tools = [
                 RemoteToolSpec(
                     name=str(tool.name),

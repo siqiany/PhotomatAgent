@@ -46,6 +46,10 @@ class FakeSCNetBackend:
             key: dict(value) for key, value in (remote_files or {}).items()
         }
         self.fail_submit_with = fail_submit_with
+        # Scripted ``_run_ssh`` replies (substring -> (stdout, ok)) for the
+        # read-only probe commands used by application adapters (MAGUS
+        # environment probe, pseudopotential checks).
+        self.ssh_script: dict[str, tuple[str, bool]] = {}
         self._job_counter = 1000
         self._state_index: dict[str, int] = {}
         self.uploaded: list[str] = []
@@ -67,6 +71,41 @@ class FakeSCNetBackend:
         return state
 
     # -- capability surface ------------------------------------------------
+
+    async def _run_ssh(
+        self, remote_command: str, *, timeout_seconds: float | None = None
+    ) -> RemoteExecutionResult:
+        """Scripted stand-in for SCNetBackend._run_ssh (offline tests)."""
+        # Longest needles first so ``test -d ~/magus/bin`` wins over the
+        # prefix ``test -d ~/magus``.
+        for needle, (stdout, ok) in sorted(
+            self.ssh_script.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if needle in remote_command:
+                return RemoteExecutionResult(
+                    ok=ok,
+                    returncode=0 if ok else 1,
+                    stdout=stdout if ok else "",
+                    stderr="" if ok else "scripted failure",
+                    command=remote_command,
+                )
+        # Conservative default: unmatched ``test`` checks fail (a missing
+        # remote file/dir must never be reported as present).
+        if remote_command.lstrip().startswith("test "):
+            return RemoteExecutionResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="scripted test failure",
+                command=remote_command,
+            )
+        return RemoteExecutionResult(
+            ok=True, returncode=0, stdout="", command=remote_command
+        )
+
+    def add_ssh_script(self, needle: str, stdout: str = "", ok: bool = True) -> None:
+        """Script one substring-triggered ``_run_ssh`` reply."""
+        self.ssh_script[needle] = (stdout, ok)
 
     async def check_connection(self) -> dict[str, str]:
         return {
@@ -189,7 +228,9 @@ class FakeSCNetBackend:
             return None
         local = Path(local_directory).expanduser().resolve()
         local.mkdir(parents=True, exist_ok=True)
-        target = local / filename
+        # Mirror real scp semantics: the remote basename lands inside the
+        # target directory (relative structure is arranged by the caller).
+        target = local / Path(filename).name
         target.write_bytes(files[filename])
         return target
 

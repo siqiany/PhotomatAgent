@@ -218,7 +218,7 @@ class SCNetBackend:
             timeout_seconds=self.config.connect_timeout_seconds * 2,
         )
         if not result.ok:
-            info = {
+            failure_info = {
                 "connected": "false",
                 "error": result.error or "ssh failed",
                 "host": "",
@@ -226,12 +226,12 @@ class SCNetBackend:
                 "squeue": "",
             }
             if "Permission denied" in (result.error or ""):
-                info["auth_hint"] = (
+                failure_info["auth_hint"] = (
                     "SCNet downloaded SSH keys have a selected validity period; "
                     "download a current key and copy its matching host, port, and "
                     "username from E-Shell > SSH connection"
                 )
-            return info
+            return failure_info
         info: dict[str, str] = {"connected": "true"}
         for line in result.stdout.splitlines():
             if "=" in line:

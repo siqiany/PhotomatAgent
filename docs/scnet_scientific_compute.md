@@ -161,3 +161,88 @@ Hefei-NAMD 官方 VASP 工作流需要 `inp`、`INICON` 和保持层级的
 `NSAMPLE`、能带范围以及 `起始步 + NAMDTIME <= NSW`；远端脚本加载配置的
 Hefei-NAMD 模块后直接运行 `namd`。结果收集覆盖官方输出 NATXT、EIGTXT、
 COUPCAR、PSICT.* 与 SHPROP.*。
+
+### MAGUS MCP 运行链（Sprint 4）
+
+MAGUS 是安装在 SCNet 的进化结构搜索程序（当前实测版本 **2.1.0**，conda
+环境，可执行文件 `<SCNET_MAGUS_ROOT>/bin/magus`）。PhotoMatAgent 把它当作
+SCNet Scientific MCP 下的 application capability，绝不在本地 fallback。
+
+```text
+LLM → tool_search("structure search") → magus.capabilities (真实远程 probe)
+    → magus.prepare_generate | magus.prepare_search (本地确定性 renderer)
+    → magus.submit (policy + POTCAR 前置检查 + SSH 上传 + sbatch)
+    → magus.status → magus.collect (有界 artifacts) → magus.inspect_results
+    → CandidateRecord / 有界 ScientificEvidence → Agent
+```
+
+#### MAGUS `.env` 配置
+
+```dotenv
+# MAGUS 安装根目录（conda 环境，含 bin/magus）
+SCNET_MAGUS_ROOT=~/magus
+# 可选：显式可执行文件绝对路径（否则按 <root>/bin/magus -> <root>/magus
+# -> root 内 maxdepth 4 bounded find 探测）
+# SCNET_MAGUS_EXECUTABLE=/public/home/USER/magus/bin/magus
+# 可选：激活 MAGUS python 环境的脚本（默认自动设置 PATH=<root>/bin）
+# SCNET_MAGUS_ENV_SCRIPT=/path/to/magus_env.sh
+# 可选：MAGUS+VASP 时激活 VASP 工具链的 env.sh（不设置则复用
+# SCNET_VASP_ENV_SCRIPT；两者都无则 launcher 报 MISSING）
+# SCNET_MAGUS_VASP_SCRIPT=/public/home/USER/apprepo/vasp/VERSION/scripts/env.sh
+
+# ASE VASP_PP_PATH 语义：指向“包含 potpaw_PBE/ 的父目录”，ASE 自行拼
+# potpaw_PBE/<setup>/POTCAR。与 SCNET_VASP_PSP_DIR（精确库目录，
+# $SCNET_VASP_PSP_DIR/<setup>/POTCAR）语义不同，不要混淆。
+SCNET_MAGUS_VASP_PP_PATH=/public/home/USER
+```
+
+#### 已验证的 MAGUS 2.1.0 事实（Sprint 4 远程探测）
+
+* `magus -v` → `2.1.0`；子命令含 `search/summary/clean/prepare/calculate/
+  generate/checkpack/test/update/tool/mutate`（无 `parmhelp`）。
+* `magus generate -i input.yaml -o gen.traj -n N`、`magus search -i input.yaml`
+  为实际 CLI 语义（`magus generate -h` / `magus search -h` 实测）。
+* `checkpack calculators` 实测可用：`emt espresso gulp KIM lj lammps mtp*
+  vasp vaspc abacus castep confine dftb siesta`；torch 系（deepmd/mace/
+  m3gnet/nep/quip/tblite/xtb/hotpp）因缺 torch/matgl 报 plugin 失败，不影响
+  VASP calculator。
+* `JOB_SYSTEM=SLURM` 时 MAGUS 会嵌套 sbatch（`#SBATCH --partition=...`），
+  因此在 PhotoMatAgent 的 Slurm 分配内只支持 `execution_mode=serial`
+  （`MainCalculator.mode: serial`，进程内跑 calculator，无嵌套提交）。
+* input.yaml 键名以安装包官方 example 为准（generate: `01--1-B12`；VASP
+  search: `03--2-Al-fix-VASP`；cluster: `05--1-LJ26`；surface: `06--1-*`）：
+  `formulaType / structureType / symbols / formula / min_n_atoms /
+  max_n_atoms / spacegroup / d_ratio / volume_ratio / pressure / initSize /
+  popSize / numGen / saveGood / rand_ratio / add_sym / MainCalculator`.
+
+#### MAGUS 工具与错误契约
+
+```text
+magus.capabilities        只读远程 probe（root/executable/version/commands/
+                          calculators/structure types/JOB_SYSTEM/VASP readiness）
+magus.prepare_generate    生成 input.yaml + magus.slurm + manifest（不提交）
+magus.prepare_search      生成 input.yaml + inputFold/VASP/INCAR + Slurm + manifest
+magus.submit              上传 + sbatch（需 ALLOW_HPC_SUBMIT=1 + resource policy；
+                          VASP search 先做远程 POTCAR 前置检查）
+magus.status / collect / inspect_results
+```
+
+错误契约：`UNCONFIGURED`（SCNet 未配）、`MISSING_DEPENDENCY`（root/
+executable 不存在）、`MISSING_PREREQUISITE`（缺 slab 配置、缺 VASP launcher）、
+`MISSING_PSEUDOPOTENTIALS`（缺 POTCAR setup）、`SUBMISSION_BLOCKED`（策略
+拒绝）、`EXECUTION_FAILED`。**从不**用 LLM 猜测替代结果。
+
+#### 赝势布局（Sprint 4 修复）
+
+旧实现硬编码 `potpaw_PBE.64`；现改为三布局确定性探测（`vasp/psp.py`）：
+
+```text
+direct:       <configured>/<setup>/POTCAR           （SCNET_VASP_PSP_DIR 精确库目录）
+potpaw_PBE:   <configured>/potpaw_PBE/<setup>/POTCAR （ASE VASP_PP_PATH 父目录）
+potpaw_PBE.64:<configured>/potpaw_PBE.64/<setup>/POTCAR（legacy）
+```
+
+VASP Slurm 脚本在作业内按上述顺序自动定位库目录并组装 POTCAR；MAGUS
+VASP search 提交前用 `test -f` 检查每个所需 setup，缺则返回
+`MISSING_PSEUDOPOTENTIALS`（绝不先提交再失败）。POTCAR 内容永不读写到
+模型上下文、日志或 git。

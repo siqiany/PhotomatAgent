@@ -297,6 +297,7 @@ async def namd_capabilities() -> dict[str, Any]:
     application, error = _namd_or_error()
     if error:
         return error
+    assert application is not None
     return await application.probe_environment_async()
 
 
@@ -306,6 +307,7 @@ async def namd_validate_inputs(trajectory_dir: str) -> dict[str, Any]:
     application, error = _namd_or_error()
     if error:
         return error
+    assert application is not None
     problems = application.validate_inputs(trajectory_dir)
     return {"trajectory_dir": trajectory_dir, "problems": problems, "valid": not problems}
 
@@ -323,6 +325,7 @@ async def namd_prepare(
     application, error = _namd_or_error()
     if error:
         return error
+    assert application is not None
     try:
         return application.prepare(
             trajectory_dir=trajectory_dir,
@@ -351,6 +354,7 @@ async def namd_submit(
     application, error = _namd_or_error()
     if error:
         return error
+    assert application is not None
     selected_partition = partition or os.environ.get("SCNET_PARTITION", "").strip()
     if not selected_partition:
         return _error(
@@ -385,6 +389,7 @@ async def namd_status(job_id: str) -> dict[str, Any]:
     application, error = _namd_or_error()
     if error:
         return error
+    assert application is not None
     try:
         state = await application.status(job_id)
     except Exception as exc:
@@ -402,6 +407,7 @@ async def namd_collect(
     application, error = _namd_or_error()
     if error:
         return error
+    assert application is not None
     ref = RemoteJobRef(
         backend="scnet",
         application="hefei-namd",
@@ -436,6 +442,7 @@ async def scnet_partitions() -> dict[str, Any]:
     application, error = _vasp_or_error()
     if error:
         return error
+    assert application is not None and application.backend is not None
     try:
         partitions = await application.backend.available_partitions()
     except Exception as exc:
@@ -454,32 +461,230 @@ async def scnet_partitions() -> dict[str, Any]:
 
 def _magus_application() -> Any:
     from photomatagent.scientific.applications.magus.application import (
-        MagusApplication,
+        default_magus_application,
     )
 
-    return MagusApplication()
+    return default_magus_application()
 
 
 @mcp.tool()
 async def magus_capabilities() -> dict[str, Any]:
-    """Probe MAGUS availability (local binary or SCNet module) and list supported search types. UNCONFIGURED when absent; agent keeps working."""
-    return _magus_application().probe_environment()
+    """Probe the remote SCNet MAGUS installation (root, executable, version, commands, calculators, structure types, JOB_SYSTEM, VASP/pseudopotential readiness). Read-only; never submits."""
+    application = _magus_application()
+    if application is None:
+        return _error(
+            "MAGUS is UNCONFIGURED: set SCNET_HOST / SCNET_USERNAME / "
+            "SCNET_PRIVATE_KEY_PATH (and SCNET_MAGUS_ROOT)",
+            error_type="UNCONFIGURED",
+        )
+    return await application.probe_environment_async()
+
+
+@mcp.tool()
+async def magus_prepare_generate(
+    composition: str,
+    job_dir: str,
+    structure_type: str = "bulk",
+    number: int = 5,
+    min_atoms: int | None = None,
+    max_atoms: int | None = None,
+) -> dict[str, Any]:
+    """Prepare a MAGUS structure-generation job (input.yaml + magus.slurm + photomat_manifest.json); NEVER submits."""
+    application = _magus_application()
+    if application is None:
+        return _error("MAGUS is UNCONFIGURED", error_type="UNCONFIGURED")
+    from photomatagent.scientific.applications.magus.models import (
+        MagusGenerateRequest,
+    )
+
+    try:
+        request = MagusGenerateRequest.from_composition(
+            composition,
+            structure_type=structure_type,  # type: ignore[arg-type]
+            number=number,
+            min_atoms=min_atoms,
+            max_atoms=max_atoms,
+        )
+        return application.prepare_generate(request, job_dir)
+    except Exception as exc:
+        return _error(
+            f"magus.prepare_generate failed: {type(exc).__name__}: {exc}",
+            error_type="INVALID_REQUEST",
+        )
+
+
+@mcp.tool()
+async def magus_prepare_search(
+    composition: str,
+    job_dir: str,
+    structure_type: str = "bulk",
+    calculator: str = "vasp",
+    init_size: int = 4,
+    population_size: int = 4,
+    generations: int = 1,
+    save_good: int = 2,
+    pressure_gpa: float = 0.0,
+    min_atoms: int | None = None,
+    max_atoms: int | None = None,
+    slab: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prepare a constrained MAGUS structure-search job (input.yaml + inputFold/VASP/INCAR + magus.slurm + manifest); NEVER submits."""
+    application = _magus_application()
+    if application is None:
+        return _error("MAGUS is UNCONFIGURED", error_type="UNCONFIGURED")
+    from photomatagent.scientific.applications.magus.models import (
+        MagusSearchRequest,
+    )
+
+    try:
+        request = MagusSearchRequest.from_composition(
+            composition,
+            structure_type=structure_type,  # type: ignore[arg-type]
+            calculator=calculator,  # type: ignore[arg-type]
+            init_size=init_size,
+            population_size=population_size,
+            generations=generations,
+            save_good=save_good,
+            pressure_gpa=pressure_gpa,
+            min_atoms=min_atoms,
+            max_atoms=max_atoms,
+        )
+        if slab is not None:
+            from photomatagent.scientific.applications.magus.models import (
+                MagusSlabConfig,
+            )
+
+            request.slab = MagusSlabConfig(**slab)
+        return application.prepare_search(request, job_dir)
+    except Exception as exc:
+        return _error(
+            f"magus.prepare_search failed: {type(exc).__name__}: {exc}",
+            error_type="INVALID_REQUEST",
+        )
+
+
+@mcp.tool()
+async def magus_submit(
+    job_name: str,
+    prepared_dir: str,
+    partition: str | None = None,
+    nodes: int = 1,
+    tasks_per_node: int = 8,
+    walltime_minutes: int = 120,
+) -> dict[str, Any]:
+    """Submit a prepared MAGUS job tree to SCNet via Slurm (requires PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1 + resource policy)."""
+    from photomatagent.scientific.remote.models import ResourceRequest
+
+    application = _magus_application()
+    if application is None:
+        return _error("MAGUS is UNCONFIGURED", error_type="UNCONFIGURED")
+    try:
+        selected_partition = partition or os.environ.get("SCNET_PARTITION", "").strip()
+        if not selected_partition:
+            return _error(
+                "partition is required: call scnet_partitions and pass one "
+                "result, or set SCNET_PARTITION",
+                error_type="missing_partition",
+            )
+        ref = await application.submit(
+            job_name=job_name,
+            prepared_dir=prepared_dir,
+            resource=ResourceRequest(
+                partition=selected_partition,
+                nodes=nodes,
+                tasks_per_node=tasks_per_node,
+                walltime_minutes=walltime_minutes,
+            ),
+        )
+    except Exception as exc:
+        return _error(
+            f"magus.submit refused: {type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
+    payload = ref.model_dump()
+    payload["note"] = "detached job; poll with magus_status"
+    return payload
+
+
+@mcp.tool()
+async def magus_status(job_id: str) -> dict[str, Any]:
+    """Query the Slurm state of a MAGUS job id (scheduler state only)."""
+    application = _magus_application()
+    if application is None:
+        return _error("MAGUS is UNCONFIGURED", error_type="UNCONFIGURED")
+    try:
+        state = await application.status(job_id)
+    except Exception as exc:
+        return _error(f"magus.status failed: {type(exc).__name__}: {exc}")
+    return {"job_id": job_id, "state": state.value, "terminal": state.terminal}
+
+
+@mcp.tool()
+async def magus_collect(
+    job_id: str, remote_directory: str, local_dir: str | None = None
+) -> dict[str, Any]:
+    """Download a finished MAGUS job's bounded artifacts and summarize candidates."""
+    from photomatagent.scientific.remote.models import RemoteJobRef
+
+    application = _magus_application()
+    if application is None:
+        return _error("MAGUS is UNCONFIGURED", error_type="UNCONFIGURED")
+    job_ref = RemoteJobRef(
+        backend="scnet",
+        application="magus",
+        job_id=job_id,
+        remote_directory=remote_directory,
+    )
+    try:
+        return await application.collect(
+            job_ref=job_ref, local_dir=local_dir or "output/magus_results"
+        )
+    except Exception as exc:
+        return _error(f"magus.collect failed: {type(exc).__name__}: {exc}")
+
+
+@mcp.tool()
+async def magus_inspect_results(
+    result_dir: str, operation: str = "generate"
+) -> dict[str, Any]:
+    """Parse a collected MAGUS result directory (bounded summary + candidates)."""
+    application = _magus_application()
+    if application is None:
+        application = _bare_magus_application()
+    try:
+        return application.inspect_results(result_dir, operation=operation)
+    except Exception as exc:
+        return _error(f"magus.inspect_results failed: {type(exc).__name__}: {exc}")
 
 
 @mcp.tool()
 async def magus_search_bulk(
     composition: str, target_dir: str, output_dir: str
 ) -> dict[str, Any]:
-    """Prepare a MAGUS bulk structure search manifest for a composition (no execution). Candidates are UNVALIDATED_GENERATED_STRUCTURE."""
+    """DEPRECATED prepare-only alias of magus_prepare_search (bulk, VASP calculator, serial)."""
+    application = _magus_application()
+    if application is None:
+        return _error("MAGUS is UNCONFIGURED", error_type="UNCONFIGURED")
     try:
-        return _magus_application().prepare(
+        return application.prepare(
             search_type="bulk",
             composition=composition,
             target_dir=target_dir,
             output_dir=output_dir,
         )
     except Exception as exc:
-        return _error(f"magus.search_bulk failed: {type(exc).__name__}: {exc}")
+        return _error(
+            f"magus.search_bulk failed: {type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
+
+
+def _bare_magus_application() -> Any:
+    from photomatagent.scientific.applications.magus.application import (
+        MagusApplication,
+    )
+
+    return MagusApplication()
 
 
 # ---------------------------------------------------------------------------
@@ -489,9 +694,6 @@ async def magus_search_bulk(
 
 async def build_doctor_report() -> dict[str, Any]:
     """Read-only SCNet diagnostics (no MCP needed; used by --doctor)."""
-    from photomatagent.scientific.applications.magus.application import (
-        MagusApplication,
-    )
     from photomatagent.scientific.applications.namd.application import (
         NamdApplication,
     )
@@ -500,6 +702,7 @@ async def build_doctor_report() -> dict[str, Any]:
     application = _application()
     if application is not None:
         try:
+            assert application.backend is not None
             report["vasp"] = await application.probe_environment_async()
             report["scnet"] = await application.backend.doctor()
         except Exception as exc:
@@ -516,7 +719,14 @@ async def build_doctor_report() -> dict[str, Any]:
     except Exception as exc:
         report["namd"] = {"error": f"{type(exc).__name__}: {exc}"}
     try:
-        report["magus"] = MagusApplication().probe_environment()
+        magus = _magus_application()
+        if magus is None:
+            report["magus"] = {
+                "status": "UNCONFIGURED",
+                "error_type": "UNCONFIGURED",
+            }
+        else:
+            report["magus"] = await magus.probe_environment_async()
     except Exception as exc:
         report["magus"] = {"error": f"{type(exc).__name__}: {exc}"}
     return report

@@ -37,6 +37,7 @@ class ScientificConfig:
     literature_root: str = "dataset/paper"
     literature_index_dir: str = "output/literature_index"
     embedding_model: str = "intfloat/multilingual-e5-small"
+    embedding_vector_dim: int = 384
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     literature_search_top_k: int = 5
     literature_passage_chars: int = 600
@@ -82,6 +83,9 @@ class ScientificConfig:
                 "intfloat/multilingual-e5-small",
             ).strip()
             or "intfloat/multilingual-e5-small",
+            embedding_vector_dim=_int_env(
+                "PHOTOMATAGENT_EMBEDDING_VECTOR_DIM", 384
+            ),
             reranker_model=os.environ.get(
                 "PHOTOMATAGENT_RERANKER_MODEL",
                 "cross-encoder/ms-marco-MiniLM-L-6-v2",

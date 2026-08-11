@@ -74,6 +74,11 @@ class VaspApplication:
 
     def probe_environment(self) -> dict[str, Any]:
         """Read-only probe: backend, Slurm, pseudopotential resolution."""
+        from photomatagent.scientific.applications.vasp.psp import (
+            resolve_local_psp_library,
+        )
+
+        local_psp = resolve_local_psp_library(self.generator.psp_dir)
         report: dict[str, Any] = {
             "application": "vasp",
             "backend": getattr(self.backend, "name", "none"),
@@ -84,10 +89,9 @@ class VaspApplication:
                 "at submit time; never committed or logged"
             ),
             "psp_dir_local": (
-                str(self.generator.psp_dir)
-                if (self.generator.psp_dir / "potpaw_PBE.64").is_dir()
-                else None
+                str(local_psp[0]) if local_psp is not None else None
             ),
+            "psp_layout_local": local_psp[1] if local_psp is not None else None,
             "submission_authorized": self.policy.allow_hpc_submit,
             "module": self.module_name,
             "env_script_configured": bool(self.env_script),
@@ -200,10 +204,15 @@ class VaspApplication:
 
     def resolve_potcar(self, input_dir: str | Path) -> Path | None:
         """Assemble POTCAR from the local psp dir; None when unresolvable."""
+        from photomatagent.scientific.applications.vasp.psp import (
+            resolve_local_psp_library,
+        )
+
         input_dir = Path(input_dir)
-        psp = self.generator.psp_dir / "potpaw_PBE.64"
-        if not psp.is_dir():
+        resolved = resolve_local_psp_library(self.generator.psp_dir)
+        if resolved is None:
             return None
+        psp, _ = resolved
         policy = input_dir / "POTCAR.policy"
         symbols: list[str] = []
         if policy.is_file():
@@ -251,23 +260,38 @@ class VaspApplication:
         if self.remote_psp_dir and potcar_symbols:
             validate_remote_path(self.remote_psp_dir)
             if self.remote_psp_dir.startswith("~/"):
-                psp_value = '"${HOME}/' + self.remote_psp_dir[2:] + '/potpaw_PBE.64"'
+                psp_value = '"${HOME}/' + self.remote_psp_dir[2:] + '"'
             else:
-                psp_value = shlex.quote(self.remote_psp_dir + "/potpaw_PBE.64")
+                psp_value = shlex.quote(self.remote_psp_dir)
             lines = [
                 "if [ ! -s POTCAR ]; then",
                 f"  psp_base={psp_value}",
                 "  : > POTCAR",
+                (
+                    "  # layout detection: direct <root>/<setup>/POTCAR, "
+                    "then potpaw_PBE, then legacy potpaw_PBE.64"
+                ),
+                '  for cand in "$psp_base" "$psp_base/potpaw_PBE" '
+                '"$psp_base/potpaw_PBE.64"; do',
             ]
             for symbol in potcar_symbols:
                 if not symbol.isalpha():
                     raise ValueError(f"unsafe POTCAR symbol: {symbol!r}")
                 lines.extend(
                     [
-                        f'  test -s "${{psp_base}}/{symbol}/POTCAR"',
-                        f'  cat "${{psp_base}}/{symbol}/POTCAR" >> POTCAR',
+                        f'    if [ -z "$psp_lib" ] && [ -s "$cand/{symbol}/POTCAR" ]; then',
+                        f'      psp_lib="$cand"',
                     ]
                 )
+            lines.extend(
+                [
+                    "  done",
+                    '  test -n "$psp_lib"',
+                    '  for sym in ' + " ".join(potcar_symbols) + "; do",
+                    '    cat "$psp_lib/$sym/POTCAR" >> POTCAR',
+                    "  done",
+                ]
+            )
             lines.append("fi")
             preamble_parts.append("\n".join(lines))
         preamble = "\n".join(preamble_parts)

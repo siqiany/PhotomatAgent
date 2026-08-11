@@ -77,8 +77,21 @@ async def run_vasp_workflow(
             if scheduler_state.terminal:
                 break
             if time.monotonic() - started >= timeout_seconds:
-                scheduler_state = HPCJobState.TIMEOUT
-                break
+                backend = getattr(application, "backend", None)
+                cancellation_note = "no backend was available to cancel it"
+                if backend is not None:
+                    try:
+                        await backend.cancel_job(job_ref.job_id)
+                        cancellation_note = "the remote job was cancelled"
+                    except Exception as exc:
+                        cancellation_note = (
+                            "remote cancellation failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                raise TimeoutError(
+                    f"local workflow polling timed out after {timeout_seconds}s; "
+                    f"job {job_ref.job_id}: {cancellation_note}"
+                )
             await asyncio.sleep(poll_interval_seconds)
         result_dir = workflow_dir / "results" / stage["stage"]
         report = await application.collect(

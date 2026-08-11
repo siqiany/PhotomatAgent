@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import multiprocessing
+import queue
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,38 @@ _SAFE_BUILTINS = {
     "tuple": tuple,
     "zip": zip,
 }
+
+
+def _device_worker(script: str, source: str, results: Any) -> None:
+    """Execute one restricted script in a process that can be terminated."""
+    captured: list[str] = []
+    try:
+        import devsim
+
+        def restricted_import(
+            name: str,
+            globals: object = None,
+            locals: object = None,
+            fromlist: tuple[str, ...] = (),
+            level: int = 0,
+        ) -> Any:
+            if name != "devsim" or level:
+                raise ImportError(f"only 'devsim' may be imported, got {name!r}")
+            return devsim
+
+        builtins = dict(_SAFE_BUILTINS)
+        builtins["__import__"] = restricted_import
+        namespace: dict[str, Any] = {
+            "__builtins__": builtins,
+            "devsim": devsim,
+            "print": lambda *args: captured.append(" ".join(str(a) for a in args)),
+        }
+        exec(compile(source, script, "exec"), namespace)
+        results.put({"ok": True, "stdout": captured})
+    except BaseException as exc:
+        results.put(
+            {"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:1000]}
+        )
 
 
 class DeviceProbe(CapabilityPack):
@@ -180,42 +214,57 @@ class DeviceRunScriptTool(Tool):
             )
         import asyncio
 
-        captured: list[str] = []
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(self._execute_script, script, source, captured),
-                timeout=float(arguments.get("timeout_seconds", 60)),
-            )
-        except asyncio.TimeoutError:
+        timeout = float(arguments.get("timeout_seconds", 60))
+        result = await asyncio.to_thread(self._execute_script, script, source, timeout)
+        if result.get("timeout"):
             return ScientificToolResult(
-                output=f"device script timed out after {arguments.get('timeout_seconds', 60)}s",
+                output=f"device script timed out after {timeout:g}s and was terminated",
                 is_error=True,
                 data={"error": "timeout"},
             )
-        except Exception as exc:
+        if not result.get("ok"):
             return ScientificToolResult(
-                output=f"device script failed: {type(exc).__name__}: {exc}",
+                output=(
+                    f"device script failed: {result.get('error_type', 'Error')}: "
+                    f"{result.get('error', '')}"
+                ),
                 is_error=True,
-                data={"error": type(exc).__name__},
+                data={"error": result.get("error_type", "Error")},
             )
         payload = {
             "script": str(script),
-            "stdout": "\n".join(captured)[-8000:],
+            "stdout": "\n".join(result.get("stdout", []))[-8000:],
         }
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data=payload,
         )
 
-    def _execute_script(self, script: Path, source: str, captured: list[str]) -> None:
-        import devsim
-
-        namespace: dict[str, Any] = {
-            "__builtins__": _SAFE_BUILTINS,
-            "devsim": devsim,
-            "print": lambda *args: captured.append(" ".join(str(a) for a in args)),
-        }
-        exec(compile(source, str(script), "exec"), namespace)
+    def _execute_script(self, script: Path, source: str, timeout: float) -> dict[str, Any]:
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue(maxsize=1)
+        process = context.Process(
+            target=_device_worker,
+            args=(str(script), source, results),
+            daemon=True,
+        )
+        process.start()
+        process.join(timeout)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            return {"ok": False, "timeout": True}
+        try:
+            return dict(results.get(timeout=1))
+        except queue.Empty:
+            return {
+                "ok": False,
+                "error_type": "WorkerExit",
+                "error": f"worker exited with code {process.exitcode}",
+            }
 
 
 class DeviceInspectResultTool(Tool):
@@ -290,4 +339,3 @@ class DeviceInspectResultTool(Tool):
 
 def device_pack(config: ScientificConfig, workspace: Workspace) -> CapabilityPack:
     return DeviceProbe(config, workspace)
-

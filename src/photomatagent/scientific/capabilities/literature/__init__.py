@@ -382,17 +382,11 @@ class LiteratureReadPaperTool(Tool):
 
 def _resolve_literature_root(config: ScientificConfig, workspace: Workspace) -> Path:
     """Absolute literature PDF root: configured value or workspace-relative."""
-    root = Path(config.literature_root)
-    if not root.is_absolute():
-        root = workspace.root / root
-    return root
+    return workspace.resolve(config.literature_root)
 
 
 def _resolve_index_dir(config: ScientificConfig, workspace: Workspace) -> Path:
-    index_dir = Path(config.literature_index_dir)
-    if not index_dir.is_absolute():
-        index_dir = workspace.root / index_dir
-    return index_dir
+    return workspace.resolve(config.literature_index_dir, must_exist=False)
 
 
 class LiteratureIndexPapersTool(Tool):
@@ -431,16 +425,23 @@ class LiteratureIndexPapersTool(Tool):
         )
 
         raw_directory = str(arguments.get("directory") or "")
-        root = (
-            Path(raw_directory)
-            if raw_directory
-            else _resolve_literature_root(self._config, self._workspace)
-        )
-        if not root.is_absolute():
-            root = self._workspace.root / root
-        index_dir = _resolve_index_dir(self._config, self._workspace)
+        try:
+            root = (
+                self._workspace.resolve(raw_directory)
+                if raw_directory
+                else _resolve_literature_root(self._config, self._workspace)
+            )
+            index_dir = _resolve_index_dir(self._config, self._workspace)
+        except Exception as exc:
+            return ScientificToolResult(
+                output=f"literature path is not authorized: {exc}",
+                is_error=True,
+                data={"error": "outside_workspace"},
+            )
         index = LiteratureIndex(
-            index_dir, embedding_model=self._config.embedding_model
+            index_dir,
+            embedding_model=self._config.embedding_model,
+            vector_dim=self._config.embedding_vector_dim,
         )
         try:
             with index.locked():
@@ -502,6 +503,7 @@ class LiteratureSearchPassagesTool(Tool):
         index = LiteratureIndex(
             _resolve_index_dir(self._config, self._workspace),
             embedding_model=self._config.embedding_model,
+            vector_dim=self._config.embedding_vector_dim,
         )
         if index.count_passages() == 0:
             return ScientificToolResult(
@@ -582,6 +584,7 @@ class LiteratureReadPassageTool(Tool):
         index = LiteratureIndex(
             _resolve_index_dir(self._config, self._workspace),
             embedding_model=self._config.embedding_model,
+            vector_dim=self._config.embedding_vector_dim,
         )
         row = index.get_passage(passage_id)
         if row is None:
@@ -658,6 +661,7 @@ class LiteratureExtractEvidenceTool(Tool):
         index = LiteratureIndex(
             _resolve_index_dir(self._config, self._workspace),
             embedding_model=self._config.embedding_model,
+            vector_dim=self._config.embedding_vector_dim,
         )
         resolved: list[dict[str, Any]] = []
         for item in passages:

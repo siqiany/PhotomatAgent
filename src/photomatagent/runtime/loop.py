@@ -169,6 +169,15 @@ class AgentRuntime:
     def context_engine(self) -> ContextEngine:
         return self._context_engine
 
+    @property
+    def permission_policy(self) -> PermissionPolicy:
+        """Current policy, exposed for explicit interactive-session controls."""
+        return self._permission
+
+    @property
+    def workspace(self) -> Workspace:
+        return self._workspace
+
     async def run(self, goal: str) -> AsyncIterator[RuntimeEvent]:
         """Run one user turn while preserving conversation and scientific state."""
         self._close_pending_tool_calls()

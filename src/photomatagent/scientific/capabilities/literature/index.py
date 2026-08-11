@@ -38,8 +38,11 @@ PASSAGES_TABLE = "passages"
 DOCUMENTS_TABLE = "documents"
 DEFAULT_VECTOR_DIM = 384  # intfloat/multilingual-e5-small
 
-_PASSAGE_SCHEMA = pa.schema(
-    [
+def _passage_schema(vector_dim: int) -> pa.Schema:
+    if vector_dim < 1:
+        raise ValueError("vector_dim must be positive")
+    return pa.schema(
+        [
         pa.field("passage_id", pa.string()),
         pa.field("paper_id", pa.string()),
         pa.field("file_name", pa.string()),
@@ -53,9 +56,9 @@ _PASSAGE_SCHEMA = pa.schema(
         pa.field("heading_path", pa.string()),
         pa.field("previous_chunk_id", pa.string()),
         pa.field("next_chunk_id", pa.string()),
-        pa.field("vector", pa.list_(pa.float32(), DEFAULT_VECTOR_DIM)),
-    ]
-)
+            pa.field("vector", pa.list_(pa.float32(), vector_dim)),
+        ]
+    )
 
 _DOCUMENT_SCHEMA = pa.schema(
     [
@@ -117,11 +120,24 @@ class LiteratureIndex:
         return self._db
 
     def _ensure_tables(self) -> None:
-        existing = set(self._db.list_tables().tables)
+        db = self._db
+        assert db is not None
+        existing = set(db.list_tables().tables)
         if PASSAGES_TABLE not in existing:
-            self._db.create_table(PASSAGES_TABLE, schema=_PASSAGE_SCHEMA)
+            db.create_table(
+                PASSAGES_TABLE, schema=_passage_schema(self.vector_dim)
+            )
+        else:
+            vector_type = db.open_table(PASSAGES_TABLE).schema.field("vector").type
+            existing_dim = getattr(vector_type, "list_size", None)
+            if existing_dim != self.vector_dim:
+                raise ValueError(
+                    f"existing literature index uses vector_dim={existing_dim}; "
+                    f"configured vector_dim={self.vector_dim}. Rebuild the index "
+                    "or restore PHOTOMATAGENT_EMBEDDING_VECTOR_DIM."
+                )
         if DOCUMENTS_TABLE not in existing:
-            self._db.create_table(DOCUMENTS_TABLE, schema=_DOCUMENT_SCHEMA)
+            db.create_table(DOCUMENTS_TABLE, schema=_DOCUMENT_SCHEMA)
 
     def passage_table(self) -> Any:
         return self.db.open_table(PASSAGES_TABLE)
@@ -132,8 +148,24 @@ class LiteratureIndex:
     def count_passages(self) -> int:
         try:
             return self.passage_table().count_rows()
+        except ValueError:
+            raise
         except Exception:
             return 0
+
+    def revision(self) -> tuple[int, tuple[tuple[str, str], ...]]:
+        """Content-derived cache key that changes when indexed PDFs change."""
+        try:
+            documents = self.existing_documents()
+        except Exception:
+            documents = {}
+        fingerprints = tuple(
+            sorted(
+                (paper_id, str(row.get("sha256") or ""))
+                for paper_id, row in documents.items()
+            )
+        )
+        return self.count_passages(), fingerprints
 
     def existing_documents(self) -> dict[str, dict[str, Any]]:
         """Map paper_id -> row for all currently indexed documents."""
@@ -182,7 +214,7 @@ class LiteratureIndex:
             raise FileNotFoundError(f"literature root does not exist: {root}")
         pdfs = sorted(path for path in root.rglob("*.pdf") if path.is_file())
         known = self.existing_documents()
-        stats = {
+        stats: dict[str, Any] = {
             "indexed": 0,
             "skipped": 0,
             "failed": 0,
@@ -218,6 +250,12 @@ class LiteratureIndex:
                 stats["errors"].append(f"{pdf_path.name}: no text chunks extracted")
                 continue
             vectors = _embed_texts([p.text for p in passages], self.embedding_model)
+            if vectors and any(len(vector) != self.vector_dim for vector in vectors):
+                actual = len(vectors[0])
+                raise ValueError(
+                    f"embedding model returned {actual} dimensions; index expects "
+                    f"{self.vector_dim}. Recreate the index with a matching vector_dim."
+                )
             rows = []
             for passage, vector in zip(passages, vectors):
                 row = passage.to_retrieval_row()

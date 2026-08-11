@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -530,6 +531,55 @@ As  As  0.25 0.25 0.25
         ]
 
     asyncio.run(scenario())
+
+
+def test_workflow_local_timeout_cancels_without_collecting(tmp_path):
+    from photomatagent.scientific.applications.vasp.workflow import run_vasp_workflow
+    from photomatagent.scientific.remote.models import HPCJobState
+
+    workflow = tmp_path / "workflow"
+    stage_dir = workflow / "relax"
+    stage_dir.mkdir(parents=True)
+    (workflow / "workflow.json").write_text(
+        json.dumps({"stages": [{"stage": "relax", "directory": str(stage_dir)}]}),
+        encoding="utf-8",
+    )
+
+    class Backend:
+        def __init__(self):
+            self.cancelled: list[str] = []
+
+        async def cancel_job(self, job_id: str):
+            self.cancelled.append(job_id)
+
+    class Application:
+        def __init__(self):
+            self.backend = Backend()
+            self.collected = False
+
+        async def submit_stage(self, **kwargs):
+            return SimpleNamespace(job_id="42")
+
+        async def status(self, job_id: str):
+            return HPCJobState.RUNNING
+
+        async def collect(self, **kwargs):
+            self.collected = True
+            raise AssertionError("timed-out jobs must not be collected")
+
+    application = Application()
+    with pytest.raises(TimeoutError, match="job 42"):
+        asyncio.run(
+            run_vasp_workflow(
+                application=application,
+                workflow_dir=workflow,
+                profile_name="test",
+                poll_interval_seconds=0,
+                timeout_seconds=0,
+            )
+        )
+    assert application.backend.cancelled == ["42"]
+    assert application.collected is False
 
 
 def test_tool_search_finds_vasp_tools():

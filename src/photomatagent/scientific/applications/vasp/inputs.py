@@ -155,23 +155,35 @@ class VaspInputGenerator:
 
     def potcar_policy_text(self, site_symbols: list[str], profile: VaspProfile) -> str:
         """Document how POTCAR resolves; never contains POTCAR content."""
-        family = "potpaw_PBE.64"
         lines = [
             "# POTCAR policy (POTCAR files are never committed or generated",
             "# by PhotoMatAgent).",
             f"profile: {profile.name}",
             f"executable: {profile.executable}",
             "resolution_order:",
-            "  1. PMG_VASP_PSP_DIR (local) with potpaw_PBE.64/<Element>/POTCAR",
+            "  1. PMG_VASP_PSP_DIR (local) with <setup>/POTCAR layouts:",
+            "     direct <root>/<setup>/POTCAR, potpaw_PBE/, potpaw_PBE.64/",
             "  2. remote pseudopotential location configured on SCNet",
             "  3. explicit potcar_overrides",
         ]
         if self.psp_dir.is_dir():
+            from photomatagent.scientific.applications.vasp.psp import (
+                resolve_local_psp_library,
+            )
+
+            resolved = resolve_local_psp_library(self.psp_dir)
             for symbol in dict.fromkeys(site_symbols):
-                candidate = self.psp_dir / family / symbol / "POTCAR"
+                candidate = None
+                if resolved is not None:
+                    candidate = resolved[0] / symbol / "POTCAR"
                 lines.append(
-                    f"  {symbol}: {'resolved' if candidate.is_file() else 'MISSING'} "
-                    f"({candidate})"
+                    f"  {symbol}: "
+                    + (
+                        "resolved"
+                        if candidate is not None and candidate.is_file()
+                        else "MISSING"
+                    )
+                    + (f" ({candidate})" if candidate is not None else "")
                 )
         else:
             lines.append(
