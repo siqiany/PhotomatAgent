@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +21,30 @@ _YEAR_RE = re.compile(r"(?:^|[_\s])(\d{4})(?:[_\s]|$)")
 _CLEAN_TITLE_RE = re.compile(r"[_-]+")
 
 
+@lru_cache(maxsize=1)
+def _converter():
+    """Shared docling converter: layout models load once per process."""
+    from docling.document_converter import DocumentConverter
+
+    return DocumentConverter()
+
+
+@lru_cache(maxsize=1)
+def _chunker():
+    """Shared HybridChunker: tokenizer loads once per process."""
+    from docling.chunking import HybridChunker
+
+    return HybridChunker()
+
+
 def paper_id_for(pdf_path: Path) -> str:
-    """Stable, content-agnostic paper id derived from the file path."""
-    return hashlib.sha1(str(pdf_path).encode("utf-8")).hexdigest()[:12]
+    """Stable, content-agnostic paper id derived from the resolved path.
+
+    ``resolve()`` normalises relative vs absolute paths and follows
+    symlinks, so the same PDF gets the same id no matter how the indexer
+    was invoked (and a symlinked paper aliases its real file).
+    """
+    return hashlib.sha1(str(pdf_path.resolve()).encode("utf-8")).hexdigest()[:12]
 
 
 def _sha256(pdf_path: Path) -> str:
@@ -73,11 +95,7 @@ def parse_pdf(pdf_path: Path) -> tuple[PaperRecord, list[PassageRecord]]:
     (section, page, heading path, neighbours). Raises on unreadable PDFs so
     the indexer can record per-file failures.
     """
-    from docling.chunking import HybridChunker
-    from docling.document_converter import DocumentConverter
-
-    converter = DocumentConverter()
-    result = converter.convert(pdf_path)
+    result = _converter().convert(pdf_path)
     doc = result.document
 
     title = (getattr(doc, "name", "") or pdf_path.stem).strip()
@@ -85,8 +103,7 @@ def parse_pdf(pdf_path: Path) -> tuple[PaperRecord, list[PassageRecord]]:
     year = _year_from_name(pdf_path, title)
     paper_id = paper_id_for(pdf_path)
 
-    chunker = HybridChunker()
-    chunks = list(chunker.chunk(doc))
+    chunks = list(_chunker().chunk(doc))
 
     passages: list[PassageRecord] = []
     for index, chunk in enumerate(chunks):

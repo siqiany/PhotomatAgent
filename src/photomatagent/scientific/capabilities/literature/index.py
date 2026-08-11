@@ -166,8 +166,17 @@ class LiteratureIndex:
             ]
         )
 
-    def index_directory(self, root: Path) -> dict[str, Any]:
-        """Index (or update) every PDF under ``root`` recursively."""
+    def index_directory(
+        self,
+        root: Path,
+        *,
+        on_progress: Any = None,
+    ) -> dict[str, Any]:
+        """Index (or update) every PDF under ``root`` recursively.
+
+        ``on_progress`` (optional) is called after every PDF with the
+        running stats dict, so long runs can report/resume in batches.
+        """
         root = Path(root)
         if not root.is_dir():
             raise FileNotFoundError(f"literature root does not exist: {root}")
@@ -221,6 +230,8 @@ class LiteratureIndex:
             stats["indexed"] += 1
             stats["chunks"] += len(rows)
             logger.info("indexed %s (%d chunks)", pdf_path.name, len(rows))
+            if on_progress is not None:
+                on_progress(dict(stats))
         # Drop papers whose files disappeared from the literature root.
         for paper_id, row in known.items():
             if paper_id not in seen:
