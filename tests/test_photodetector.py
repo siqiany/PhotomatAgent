@@ -138,3 +138,120 @@ def test_check_targets_evidence_attached():
     assert len(result.evidence) == 1
     assert result.evidence[0].property == "required_eqe_for_responsivity"
     assert result.evidence[0].source_type == "analytical_model"
+
+
+def test_check_targets_peak_in_band_2_5um_eqe20():
+    # Regression (Sprint 3): 2-5 um, EQE 20%, gain 1, R target 0.8 A/W.
+    # At 5 um: R = 0.2 * 5 / 1.23984 = 0.8067 A/W >= 0.8 -> peak check passes.
+    tool = CheckTargetsTool()
+    result = _run(
+        tool,
+        spectral_min_um=2.0,
+        spectral_max_um=5.0,
+        target_responsivity_a_w=0.8,
+        eqe_percent=20.0,
+        mode="peak_in_band",
+    )
+    assert not result.is_error
+    payload = json.loads(result.output)
+    assert payload["mode"] == "peak_in_band"
+    assert payload["checked_wavelength_um"] == 5.0
+    assert payload["mutually_consistent"] is True
+    assert payload["achieved_responsivity_at_checked_a_w"] == pytest.approx(
+        0.8067, abs=1e-3
+    )
+    # The ideal unity-gain responsivity at 5 um is 5/1.23984 = 4.033 A/W,
+    # so 0.8 A/W at 5 um corresponds to EQE = 0.8/4.033 = 19.8% ~ 20%:
+    # physically consistent at unity gain.
+    assert payload["required_eqe_at_checked_fraction"] == pytest.approx(
+        0.198, abs=1e-3
+    )
+
+
+def test_check_targets_peak_in_band_not_whole_band():
+    # The same 20% EQE target must NOT be interpreted as holding across the
+    # whole band: at 2 um R = 0.2 * 2 / 1.23984 = 0.3226 A/W < 0.8.
+    tool = CheckTargetsTool()
+    result = _run(
+        tool,
+        spectral_min_um=2.0,
+        spectral_max_um=5.0,
+        target_responsivity_a_w=0.8,
+        eqe_percent=20.0,
+        mode="minimum_across_band",
+    )
+    payload = json.loads(result.output)
+    assert payload["mode"] == "minimum_across_band"
+    assert payload["checked_wavelength_um"] == 2.0
+    assert payload["mutually_consistent"] is False
+    assert "NOT a whole-band check" not in payload["semantics"]
+
+
+def test_check_targets_at_wavelength():
+    tool = CheckTargetsTool()
+    inside = json.loads(
+        _run(
+            tool,
+            spectral_min_um=2.0,
+            spectral_max_um=5.0,
+            target_responsivity_a_w=0.8,
+            eqe_percent=20.0,
+            mode="at_wavelength",
+            wavelength_um=5.0,
+        ).output
+    )
+    assert inside["mode"] == "at_wavelength"
+    assert inside["mutually_consistent"] is True
+    edge = json.loads(
+        _run(
+            tool,
+            spectral_min_um=2.0,
+            spectral_max_um=5.0,
+            target_responsivity_a_w=0.8,
+            eqe_percent=20.0,
+            mode="at_wavelength",
+            wavelength_um=4.95,
+        ).output
+    )
+    assert edge["mutually_consistent"] is False
+
+
+def test_check_targets_at_wavelength_requires_wavelength():
+    tool = CheckTargetsTool()
+    result = _run(
+        tool,
+        spectral_min_um=2.0,
+        spectral_max_um=5.0,
+        target_responsivity_a_w=0.8,
+        eqe_percent=20.0,
+        mode="at_wavelength",
+    )
+    assert result.is_error
+
+
+def test_check_targets_out_of_band_wavelength_rejected():
+    tool = CheckTargetsTool()
+    result = _run(
+        tool,
+        spectral_min_um=2.0,
+        spectral_max_um=5.0,
+        target_responsivity_a_w=0.8,
+        eqe_percent=20.0,
+        mode="at_wavelength",
+        wavelength_um=6.0,
+    )
+    assert result.is_error
+
+
+def test_check_targets_invalid_mode_rejected():
+    tool = CheckTargetsTool()
+    result = _run(
+        tool,
+        spectral_min_um=2.0,
+        spectral_max_um=5.0,
+        target_responsivity_a_w=0.8,
+        eqe_percent=20.0,
+        mode="somewhere_in_band",
+    )
+    assert result.is_error
+    assert "mode" in result.output

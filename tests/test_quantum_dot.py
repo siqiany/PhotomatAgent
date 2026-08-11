@@ -16,6 +16,7 @@ from photomatagent.scientific.capabilities.quantum_dot.brus import (
     transition_energy,
 )
 from photomatagent.scientific.errors import MissingScientificPrerequisite
+from photomatagent.scientific.errors import UnsupportedScientificRegime
 
 
 GAAS = dict(
@@ -156,10 +157,10 @@ def test_inverse_by_wavelength():
 
 def test_inverse_below_gap_returns_no_solution():
     inverse = solve_size_for_transition(
-        target_energy_eV=1.0,  # below GaAs bulk gap 1.424
+        target_energy_eV=1.0,  # below the Coulomb minimum ~1.4225 eV
         **GAAS,
     )
-    assert inverse["outcome"] == "NO_PHYSICAL_SOLUTION"
+    assert inverse["outcome"] == "NO_MATHEMATICAL_SOLUTION"
 
 
 def test_inverse_exactly_at_gap_without_coulomb_returns_no_solution():
@@ -168,7 +169,140 @@ def test_inverse_exactly_at_gap_without_coulomb_returns_no_solution():
         include_coulomb_term=False,
         **GAAS,
     )
-    assert inverse["outcome"] == "NO_PHYSICAL_SOLUTION"
+    assert inverse["outcome"] == "NO_MATHEMATICAL_SOLUTION"
+
+
+def test_inverse_between_coulomb_min_and_gap_has_two_mathematical_roots():
+    # E(R) = Eg + A/R^2 - B/R dips to E_min = Eg - B^2/(4A) below the bulk
+    # gap, so a target inside (E_min, Eg) has TWO mathematical roots. The
+    # solver must report them rather than claiming no solution exists.
+    inverse = solve_size_for_transition(
+        target_energy_eV=GAAS["bulk_band_gap_eV"] - 5e-4,
+        **GAAS,
+    )
+    roots = inverse["mathematical_roots"]
+    assert len(roots) == 2
+    assert inverse["outcome"] in {
+        "AMBIGUOUS_BRANCH",
+        "OUTSIDE_MODEL_VALIDITY",
+        "SOLVED",
+    }
+    radii = [root["radius_nm"] for root in roots]
+    assert radii[0] < radii[1]  # strong branch then weak branch
+    for root in roots:
+        # every reported root satisfies E(root) == target within tolerance
+        assert abs(root["energy_eV"] - (GAAS["bulk_band_gap_eV"] - 5e-4)) < 1e-5
+
+
+def test_inverse_branch_reports_validity_reasons():
+    # Deep below the bulk gap but above the Coulomb minimum: the weak branch
+    # is far outside the strong-confinement EMA; validity reasons must be
+    # attached to each root.
+    inverse = solve_size_for_transition(
+        target_energy_eV=GAAS["bulk_band_gap_eV"] - 1e-3,
+        **GAAS,
+    )
+    roots = inverse["mathematical_roots"]
+    assert all("reasons" in root for root in roots)
+    assert any(root["valid"] for root in roots) or inverse[
+        "outcome"
+    ] == "OUTSIDE_MODEL_VALIDITY"
+
+
+def test_inverse_solved_keeps_roundtrip_contract():
+    forward = transition_energy(radius_nm=2.0, **GAAS)
+    inverse = solve_size_for_transition(
+        target_energy_eV=forward["transition_energy_eV"],
+        relative_dielectric_kind="static",
+        **GAAS,
+    )
+    assert inverse["outcome"] == "SOLVED"
+    assert inverse["input_parameters"]["relative_dielectric_kind"] == "static"
+
+
+def test_dielectric_kind_optical_rejected_by_transition_energy():
+    with pytest.raises(UnsupportedScientificRegime) as excinfo:
+        transition_energy(
+            radius_nm=3.0,
+            **GAAS,
+            relative_dielectric_kind="optical",
+        )
+    assert "INCOMPATIBLE_SCIENTIFIC_PARAMETER" in str(excinfo.value)
+
+
+def test_dielectric_kind_high_frequency_rejected_by_excitonic_regime():
+    with pytest.raises(UnsupportedScientificRegime):
+        excitonic_regime(
+            radius_nm=3.0,
+            electron_effective_mass_m0=0.067,
+            hole_effective_mass_m0=0.45,
+            relative_dielectric_constant=12.9,
+            relative_dielectric_kind="high_frequency",
+        )
+
+
+def test_dielectric_kind_unknown_is_flagged_not_silent():
+    result = transition_energy(radius_nm=3.0, **GAAS)
+    assert result["input_parameters"]["relative_dielectric_kind"] == "unknown"
+    assert "unknown" in result["dielectric_kind_note"]
+
+
+def test_dielectric_kind_static_accepted():
+    result = transition_energy(
+        radius_nm=3.0,
+        **GAAS,
+        relative_dielectric_kind="static",
+    )
+    assert result["input_parameters"]["relative_dielectric_kind"] == "static"
+
+
+def test_brus_tool_rejects_optical_dielectric_kind():
+    import asyncio
+
+    from photomatagent.scientific.capabilities.quantum_dot import (
+        BrusTransitionEnergyTool,
+    )
+
+    tool = BrusTransitionEnergyTool()
+    result = asyncio.run(
+        tool.execute(
+            {
+                "radius_nm": 3.0,
+                "bulk_band_gap_eV": 1.424,
+                "electron_effective_mass_m0": 0.067,
+                "hole_effective_mass_m0": 0.45,
+                "relative_dielectric_constant": 10.9,
+                "relative_dielectric_kind": "optical",
+            }
+        )
+    )
+    assert result.is_error
+    assert result.data["error_type"] == "INCOMPATIBLE_SCIENTIFIC_PARAMETER"
+    assert "INCOMPATIBLE_SCIENTIFIC_PARAMETER" in result.output
+
+
+def test_brus_tool_accepts_static_dielectric_kind():
+    import asyncio
+
+    from photomatagent.scientific.capabilities.quantum_dot import (
+        BrusTransitionEnergyTool,
+    )
+
+    tool = BrusTransitionEnergyTool()
+    result = asyncio.run(
+        tool.execute(
+            {
+                "radius_nm": 3.0,
+                "bulk_band_gap_eV": 1.424,
+                "electron_effective_mass_m0": 0.067,
+                "hole_effective_mass_m0": 0.45,
+                "relative_dielectric_constant": 12.9,
+                "relative_dielectric_kind": "static",
+            }
+        )
+    )
+    assert not result.is_error
+    assert result.data["input_parameters"]["relative_dielectric_kind"] == "static"
 
 
 def test_inverse_requires_target():

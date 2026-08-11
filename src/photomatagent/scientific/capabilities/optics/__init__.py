@@ -1,8 +1,9 @@
 """Optics capability pack (namespace ``optics``).
 
-PyTASER integration is dependency-optional: with pytaser installed the
-transient-absorption tool is registered; otherwise only metadata exists and
-the probe reports MISSING_DEPENDENCY.
+PyTASER (transient absorption) and Meep (1D thin-film R/T/A) integrations
+are dependency-optional: tools are always registered and return typed
+missing-dependency failures when the package is unavailable; probes report
+MISSING_DEPENDENCY accordingly.
 """
 
 from __future__ import annotations
@@ -19,6 +20,9 @@ from photomatagent.scientific.capabilities.base import (
 from photomatagent.scientific.capabilities.contracts import ScientificToolResult
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
+from photomatagent.scientific.capabilities.optics.meep_thinfilm import (
+    MeepThinFilmTool,
+)
 
 
 class OpticsProbe(CapabilityPack):
@@ -26,27 +30,37 @@ class OpticsProbe(CapabilityPack):
     description = "Transient absorption / optical response analysis via PyTASER."
 
     def probe(self) -> ProbeResult:
+        missing: list[str] = []
         try:
             import pytaser  # noqa: F401
         except Exception as exc:
+            missing.append(f"pytaser ({type(exc).__name__})")
+        try:
+            import meep  # noqa: F401
+        except Exception as exc:
+            missing.append(f"meep ({type(exc).__name__})")
+        if missing:
             return ProbeResult(
                 status=CapabilityStatus.MISSING_DEPENDENCY,
                 detail=(
-                    f"pytaser not importable: {type(exc).__name__}: {exc} "
-                    "(extra: photomatagent[optics])"
+                    "optional optics backends not importable: "
+                    + ", ".join(missing)
+                    + " (extra: photomatagent[optics])"
                 ),
             )
         return ProbeResult(
             status=CapabilityStatus.AVAILABLE,
-            version=importlib.metadata.version("pytaser"),
+            version="pytaser+meep",
         )
 
     def tools(self) -> list[Tool]:
+        tools: list[Tool] = [MeepThinFilmTool()]
         try:
             import pytaser  # noqa: F401
         except Exception:
-            return []
-        return [TransientAbsorptionTool()]
+            return tools
+        tools.append(TransientAbsorptionTool())
+        return tools
 
 
 class TransientAbsorptionTool(Tool):
@@ -140,4 +154,3 @@ class TransientAbsorptionTool(Tool):
 
 def optics_pack(config: Any, workspace: Any) -> CapabilityPack:
     return OpticsProbe()
-

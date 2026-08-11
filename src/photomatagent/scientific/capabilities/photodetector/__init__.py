@@ -233,13 +233,23 @@ class CheckTargetsTool(Tool):
     name = "photodetector.check_targets"
     description = (
         "Check whether a target responsivity and target EQE are mutually "
-        "consistent across a spectral band using R = EQE * gain * lambda / "
-        "1.23984. Reports required EQE at each band edge for the R target, "
-        "required R for the EQE target, the required gain when inconsistent, "
-        "and the wavelength dependence. This checks physical consistency "
-        "only -- it never claims a device is realizable."
+        "consistent using R = EQE * gain * lambda / 1.23984, under an "
+        "explicit semantic mode. Modes: 'peak_in_band' (default; the target "
+        "only needs to be met somewhere in the band, checked at the "
+        "longest wavelength where R is largest), 'minimum_across_band' (the "
+        "target must hold across the whole band, checked at the shortest "
+        "wavelength), and 'at_wavelength' (checked at the given "
+        "wavelength_um, which must lie inside the band). Reports required "
+        "EQE for the R target at the checked wavelength, required R for the "
+        "EQE target, the required gain when inconsistent, and the semantics "
+        "used. A peak-in-band requirement is never silently interpreted as "
+        "a whole-band requirement. This checks physical consistency only -- "
+        "it never claims a device is realizable."
     )
-    short_description = "Responsivity/EQE target consistency check across a band."
+    short_description = (
+        "Responsivity/EQE target check with explicit peak/whole-band/"
+        "wavelength mode."
+    )
     exposure = ToolExposure.DEFERRED
     namespace = "photodetector"
     source = "native device-physics model"
@@ -253,6 +263,25 @@ class CheckTargetsTool(Tool):
             "eqe_fraction": {"type": "number", "minimum": 0, "maximum": 1},
             "eqe_percent": {"type": "number", "minimum": 0, "maximum": 100},
             "photoconductive_gain": {"type": "number", "minimum": 0},
+            "mode": {
+                "type": "string",
+                "enum": [
+                    "peak_in_band",
+                    "minimum_across_band",
+                    "at_wavelength",
+                ],
+                "description": (
+                    "peak_in_band: exists lambda in band meeting the target "
+                    "(checked at band max); minimum_across_band: whole band "
+                    "meets the target (checked at band min); at_wavelength: "
+                    "checked at wavelength_um"
+                ),
+            },
+            "wavelength_um": {
+                "type": "number",
+                "minimum": 0,
+                "description": "required when mode == at_wavelength",
+            },
         },
         "required": [
             "spectral_min_um",
@@ -276,6 +305,41 @@ class CheckTargetsTool(Tool):
         gain = 1.0 if gain is None else float(gain)
         if gain <= 0:
             return _invalid("photoconductive_gain must be positive")
+        mode = str(arguments.get("mode", "peak_in_band")).strip().lower()
+        valid_modes = {"peak_in_band", "minimum_across_band", "at_wavelength"}
+        if mode not in valid_modes:
+            return _invalid(
+                "mode must be one of peak_in_band | minimum_across_band | "
+                f"at_wavelength, got {mode!r}"
+            )
+        if mode == "at_wavelength":
+            wavelength = _positive_float(arguments, "wavelength_um")
+            if wavelength is None:
+                return _invalid("mode 'at_wavelength' requires wavelength_um")
+            if not band_min - 1e-9 <= wavelength <= band_max + 1e-9:
+                return _invalid(
+                    f"wavelength_um {wavelength} lies outside the spectral "
+                    f"band [{band_min}, {band_max}] um"
+                )
+            checked_wavelength = wavelength
+            semantics = (
+                "target checked at the user-specified wavelength "
+                f"{wavelength:.4f} um only"
+            )
+        elif mode == "peak_in_band":
+            checked_wavelength = band_max
+            semantics = (
+                "target only needs to be met somewhere in the band; because "
+                "R = EQE * gain * lambda / 1.23984 grows with lambda at fixed "
+                "EQE, the best case is the band maximum "
+                f"{band_max:.4f} um (peak check, NOT a whole-band check)"
+            )
+        else:
+            checked_wavelength = band_min
+            semantics = (
+                "target must hold across the whole band; the worst case is "
+                f"the band minimum {band_min:.4f} um"
+            )
 
         edges = [band_min, band_max]
         required_eqe_for_r = {
@@ -290,34 +354,44 @@ class CheckTargetsTool(Tool):
             )
             for lam in edges
         }
-        max_required_eqe = max(required_eqe_for_r.values())
-        max_required_r = max(required_r_for_eqe.values())
-        consistent_at_gain = max_required_eqe <= 1.0 and max_required_r >= target_r
+        required_eqe_at_checked = target_r * HC_EV_UM / (gain * checked_wavelength)
+        achieved_r_at_checked = _responsivity_from_eqe(checked_wavelength, eqe[0], gain)
+        consistent_at_gain = (
+            required_eqe_at_checked <= 1.0 and achieved_r_at_checked >= target_r
+        )
         if not consistent_at_gain:
-            needed_gain = max(
-                target_r * HC_EV_UM / (eqe[0] * band_min),
-                target_r * HC_EV_UM / (eqe[0] * band_max),
-            )
+            needed_gain = target_r * HC_EV_UM / (eqe[0] * checked_wavelength)
         else:
             needed_gain = gain
         payload = {
             "spectral_band_um": [band_min, band_max],
+            "mode": mode,
+            "semantics": semantics,
+            "checked_wavelength_um": round(checked_wavelength, 6),
             "target_responsivity_a_w": target_r,
             "target_eqe_fraction": round(eqe[0], 6),
             "target_eqe_percent": round(eqe[0] * 100.0, 4),
             "photoconductive_gain": gain,
+            "achieved_responsivity_at_checked_a_w": round(
+                achieved_r_at_checked, 5
+            ),
+            "required_eqe_at_checked_fraction": round(
+                required_eqe_at_checked, 5
+            ),
             "required_eqe_for_r_target": required_eqe_for_r,
             "required_responsivity_for_eqe_target": required_r_for_eqe,
             "mutually_consistent": consistent_at_gain,
             "required_gain_if_not_consistent": round(needed_gain, 4),
             "wavelength_dependence": {
                 "responsivity_scales_as": "R ~ lambda (linear) at fixed EQE",
+                "best_case_wavelength_um": band_max,
                 "worst_case_wavelength_um": (
                     band_max if required_eqe_for_r[band_max] > required_eqe_for_r[band_min] else band_min
                 ),
             },
             "statement": (
-                "physical consistency check only: achievable device "
+                f"{semantics}. Physical consistency check only: achievable "
+                "device "
                 "performance additionally requires absorption, collection, "
                 "dark current, and noise evidence"
             ),
@@ -326,18 +400,23 @@ class CheckTargetsTool(Tool):
             ScientificEvidence(
                 subject="photodetector_targets",
                 property="required_eqe_for_responsivity",
-                value=max_required_eqe,
+                value=required_eqe_at_checked,
                 unit="fraction",
                 source="photomatagent native device-physics model",
                 source_type="analytical_model",
                 method="R = EQE * gain * lambda / 1.23984",
                 fidelity="analytical",
                 summary=(
-                    f"required EQE {max_required_eqe * 100:.1f}% for "
-                    f"R={target_r:.3f} A/W across {band_min}-{band_max} um"
+                    f"mode={mode}: required EQE "
+                    f"{required_eqe_at_checked * 100:.1f}% for "
+                    f"R={target_r:.3f} A/W at {checked_wavelength:.4f} um"
                 ),
                 limitations="consistency only; not a realizability claim",
-                provenance={"tool": self.name},
+                provenance={
+                    "tool": self.name,
+                    "mode": mode,
+                    "checked_wavelength_um": checked_wavelength,
+                },
             )
         ]
         return ScientificToolResult(

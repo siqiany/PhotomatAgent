@@ -31,6 +31,12 @@ def probe_all_capabilities(
     )
     from photomatagent.scientific.capabilities.structure import structure_pack
     from photomatagent.scientific.capabilities.transport import transport_pack
+    from photomatagent.scientific.applications.vasp.tools import vasp_pack
+    from photomatagent.scientific.applications.namd.tools import namd_pack
+    from photomatagent.scientific.applications.magus.tools import magus_pack
+    from photomatagent.scientific.capabilities.generation.tools import (
+        generation_pack,
+    )
 
     effective_config = config or ScientificConfig.from_environment(
         workspace=workspace.root if workspace else None
@@ -51,6 +57,10 @@ def probe_all_capabilities(
         photodetector_pack(),
         interface_pack(),
         kp_pack(effective_workspace),
+        vasp_pack(effective_workspace),
+        namd_pack(effective_workspace),
+        magus_pack(effective_workspace),
+        generation_pack(effective_config),
     ]
     infos: list[CapabilityInfo] = []
     for pack in packs:

@@ -41,6 +41,7 @@ class Tool(ABC):
     source: str = "builtin"
     tags: tuple[str, ...] = ()
     searchable: bool = True
+    cost_class: str = "CHEAP"  # CHEAP | MODERATE | EXPENSIVE | VERY_EXPENSIVE
 
     @abstractmethod
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
@@ -56,4 +57,5 @@ class Tool(ABC):
             "source": self.source,
             "tags": list(self.tags),
             "searchable": self.searchable,
+            "cost_class": self.cost_class,
         }

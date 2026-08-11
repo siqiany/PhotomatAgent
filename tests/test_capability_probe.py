@@ -73,9 +73,18 @@ def test_existing_env_wins_over_workspace_dotenv(tmp_path, monkeypatch):
 
 
 def test_optics_available_here(tmp_path):
+    import importlib.util
+
     infos = probe_all_capabilities(workspace=Workspace(tmp_path))
     optics = next(info for info in infos if info.name == "optics")
-    assert optics.status.value == "AVAILABLE"
+    meep_installed = importlib.util.find_spec("meep") is not None
+    pytaser_installed = importlib.util.find_spec("pytaser") is not None
+    if meep_installed and pytaser_installed:
+        assert optics.status.value == "AVAILABLE"
+    else:
+        # Probe reports MISSING_DEPENDENCY listing the missing backend(s).
+        assert optics.status.value == "MISSING_DEPENDENCY"
+        assert "meep" in optics.detail or "pytaser" in optics.detail
 
 
 def test_structure_pack_tools_are_deferred(tmp_path):

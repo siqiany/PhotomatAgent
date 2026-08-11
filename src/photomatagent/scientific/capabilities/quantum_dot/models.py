@@ -5,13 +5,30 @@ database tools, verified local reference tables, or external solver output.
 The registry below deliberately holds only a handful of clearly sourced
 example/test entries -- never a large unverified database. Entries flagged
 ``example`` must not be used as design-grade values without verification.
+
+Sprint 3 typing: ``ScientificParameter.kind`` carries the physical nature of
+a parameter. For dielectric constants the kind is one of ``static``,
+``optical``, ``high_frequency``, or ``unknown``. Solvers that require a
+specific screening regime must declare it and refuse to compute silently
+when the supplied kind is incompatible (typed
+``INCOMPATIBLE_SCIENTIFIC_PARAMETER`` diagnostic).
 """
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+class DielectricKind(str, Enum):
+    """Physical regime of a relative dielectric constant."""
+
+    STATIC = "static"
+    OPTICAL = "optical"
+    HIGH_FREQUENCY = "high_frequency"
+    UNKNOWN = "unknown"
 
 
 class ScientificParameter(BaseModel):
@@ -24,6 +41,9 @@ class ScientificParameter(BaseModel):
     method: str = ""
     temperature_k: float | None = None
     uncertainty: float | None = None
+    kind: str = ""
+    frequency_regime: str = ""
+    reference: str = ""
     notes: str = ""
     validity: str = ""
     confidence: str = "example"  # example | established
@@ -37,10 +57,25 @@ class ScientificParameter(BaseModel):
             "method": self.method,
             "temperature_k": self.temperature_k,
             "uncertainty": self.uncertainty,
+            "kind": self.kind,
+            "frequency_regime": self.frequency_regime,
+            "reference": self.reference,
             "notes": self.notes,
             "validity": self.validity,
             "confidence": self.confidence,
         }
+
+    @property
+    def dielectric_kind(self) -> DielectricKind:
+        """Normalized dielectric kind; ``UNKNOWN`` for non-dielectric uses."""
+        normalized = self.kind.strip().lower().replace("-", "_")
+        if normalized == "static":
+            return DielectricKind.STATIC
+        if normalized in {"optical", "optic"}:
+            return DielectricKind.OPTICAL
+        if normalized in {"high_frequency", "high_frequency_optical", "infrared"}:
+            return DielectricKind.HIGH_FREQUENCY
+        return DielectricKind.UNKNOWN
 
 
 class MaterialParameterRegistry:

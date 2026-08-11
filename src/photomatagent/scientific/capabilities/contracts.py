@@ -38,6 +38,11 @@ class ScientificEvidence(BaseModel):
         "analytical_model",
         "kp_calculation",
         "dft_calculation",
+        "generative_model",
+        "ml_interatomic_potential",
+        "nonadiabatic_dynamics",
+        "electromagnetic_simulation",
+        "experimental",
         "user_parameter",
     ] = "calculation"
     method: str = ""
@@ -48,6 +53,10 @@ class ScientificEvidence(BaseModel):
         "kp",
         "tight_binding",
         "dft",
+        "ml_generated",
+        "ml_potential",
+        "namd",
+        "electromagnetic",
         "experimental",
     ] = "analytical"
     summary: str = ""

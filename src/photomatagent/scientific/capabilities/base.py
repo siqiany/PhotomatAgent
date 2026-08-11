@@ -49,6 +49,8 @@ class CapabilityPack:
 
     name: str
     description: str = ""
+    execution_mode: str = "local"  # local | subprocess | mcp/scnet | mcp | ...
+    backend_name: str = ""  # SCNet | local | isolated env | ...
 
     def probe(self) -> ProbeResult:
         raise NotImplementedError
@@ -64,5 +66,8 @@ class CapabilityPack:
             detail=result.detail,
             version=result.version,
             tools=sorted(tool.name for tool in self.tools()),
+            metadata={
+                "execution_mode": self.execution_mode,
+                "backend": self.backend_name,
+            },
         )
-

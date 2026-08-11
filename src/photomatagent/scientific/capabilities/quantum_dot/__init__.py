@@ -29,6 +29,7 @@ from photomatagent.scientific.capabilities.quantum_dot.brus import (
     transition_energy,
 )
 from photomatagent.scientific.capabilities.quantum_dot.models import (
+    DielectricKind,
     MaterialParameterRegistry,
     ScientificParameter,
     default_registry,
@@ -127,6 +128,40 @@ def _params_or_failure(
     return None
 
 
+def _dielectric_kind_or_error(
+    arguments: dict[str, Any],
+) -> tuple[str | None, ScientificToolResult | None]:
+    """Read relative_dielectric_kind; return (kind, error-result-or-None)."""
+    raw = arguments.get("relative_dielectric_kind")
+    if raw is None:
+        return None, None
+    kind = str(raw).strip().lower().replace("-", "_")
+    if kind in {"static", "unknown"}:
+        return kind, None
+    if kind in {"optical", "high_frequency"}:
+        return kind, ScientificToolResult(
+            output=(
+                "INCOMPATIBLE_SCIENTIFIC_PARAMETER: "
+                f"relative_dielectric_kind={kind!r} is not accepted by the "
+                "Brus/exciton Coulomb term, which requires static screening "
+                "of the electron-hole attraction (lattice polarization "
+                "included). Accepted kinds: static (recommended) or unknown."
+            ),
+            is_error=True,
+            data={
+                "error_type": "INCOMPATIBLE_SCIENTIFIC_PARAMETER",
+                "message": (
+                    f"relative_dielectric_kind={kind!r} is incompatible with "
+                    "the static-screening assumption of the Brus/exciton "
+                    "Coulomb term"
+                ),
+                "accepted_kinds": ["static", "unknown"],
+                "provided_kind": kind,
+            },
+        )
+    return "unknown", None
+
+
 class BrusTransitionEnergyTool(Tool):
     name = "qd.brus_transition_energy"
     description = (
@@ -134,7 +169,12 @@ class BrusTransitionEnergyTool(Tool):
         "nanocrystal: E = Eg + h^2/(8 m0 R^2)(1/me + 1/mh) - 1.786 e^2/(4 pi eps0 "
         "epsr R) (Brus 1984 / Kayanuma 1988). Inputs: radius_nm, "
         "bulk_band_gap_eV, electron_effective_mass_m0, hole_effective_mass_m0, "
-        "optional relative_dielectric_constant and include_coulomb_term. Low "
+        "optional relative_dielectric_constant (with "
+        "relative_dielectric_kind) and include_coulomb_term. The Coulomb "
+        "term assumes STATIC (low-frequency) screening of the electron-hole "
+        "attraction: accepted relative_dielectric_kind values are 'static' "
+        "(recommended) or 'unknown'; 'optical' / 'high_frequency' are "
+        "rejected with INCOMPATIBLE_SCIENTIFIC_PARAMETER. Low "
         "fidelity (L1): spherical/EMA/infinite-barrier assumptions; do NOT use "
         "for design values on narrow-gap or inverted-band materials (HgTe etc.) "
         "without higher-fidelity electronic structure."
@@ -152,6 +192,14 @@ class BrusTransitionEnergyTool(Tool):
             "electron_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "hole_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "relative_dielectric_constant": {"type": "number", "minimum": 1.0},
+            "relative_dielectric_kind": {
+                "type": "string",
+                "enum": ["static", "optical", "high_frequency", "unknown"],
+                "description": (
+                    "screening regime of relative_dielectric_constant; "
+                    "Brus accepts static (recommended) or unknown only"
+                ),
+            },
             "include_coulomb_term": {"type": "boolean"},
         },
         "required": [
@@ -163,6 +211,9 @@ class BrusTransitionEnergyTool(Tool):
     }
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        kind, kind_error = _dielectric_kind_or_error(arguments)
+        if kind_error is not None:
+            return kind_error
         failure = _params_or_failure(
             arguments,
             tool=self.name,
@@ -192,9 +243,19 @@ class BrusTransitionEnergyTool(Tool):
                     if arguments.get("relative_dielectric_constant") is not None
                     else None
                 ),
+                relative_dielectric_kind=kind,
                 include_coulomb_term=bool(
                     arguments.get("include_coulomb_term", True)
                 ),
+            )
+        except UnsupportedScientificRegime as exc:
+            return ScientificToolResult(
+                output=str(exc),
+                is_error=True,
+                data={
+                    "error_type": "INCOMPATIBLE_SCIENTIFIC_PARAMETER",
+                    "message": str(exc),
+                },
             )
         except (MissingScientificPrerequisite, ValueError) as exc:
             return ScientificToolResult(
@@ -237,7 +298,11 @@ class ExcitonicRegimeTool(Tool):
         "and report R/a_B* with a strong/intermediate/weak confinement "
         "diagnostic. Requires electron/hole effective masses and relative "
         "dielectric constant. Use to judge whether the strong-confinement "
-        "assumption of qd.brus_transition_energy holds."
+        "assumption of qd.brus_transition_energy holds. The exciton "
+        "screening term assumes STATIC (low-frequency) screening: accepted "
+        "relative_dielectric_kind values are 'static' (recommended) or "
+        "'unknown'; 'optical' / 'high_frequency' are rejected with "
+        "INCOMPATIBLE_SCIENTIFIC_PARAMETER."
     )
     short_description = "Exciton Bohr radius and confinement regime diagnostic."
     exposure = ToolExposure.DEFERRED
@@ -251,6 +316,10 @@ class ExcitonicRegimeTool(Tool):
             "electron_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "hole_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "relative_dielectric_constant": {"type": "number", "minimum": 1.0},
+            "relative_dielectric_kind": {
+                "type": "string",
+                "enum": ["static", "optical", "high_frequency", "unknown"],
+            },
         },
         "required": [
             "radius_nm",
@@ -261,6 +330,9 @@ class ExcitonicRegimeTool(Tool):
     }
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        kind, kind_error = _dielectric_kind_or_error(arguments)
+        if kind_error is not None:
+            return kind_error
         try:
             result = excitonic_regime(
                 radius_nm=float(arguments["radius_nm"]),
@@ -271,6 +343,16 @@ class ExcitonicRegimeTool(Tool):
                 relative_dielectric_constant=float(
                     arguments["relative_dielectric_constant"]
                 ),
+                relative_dielectric_kind=kind,
+            )
+        except UnsupportedScientificRegime as exc:
+            return ScientificToolResult(
+                output=str(exc),
+                is_error=True,
+                data={
+                    "error_type": "INCOMPATIBLE_SCIENTIFIC_PARAMETER",
+                    "message": str(exc),
+                },
             )
         except (MissingScientificPrerequisite, ValueError) as exc:
             return ScientificToolResult(
@@ -287,10 +369,16 @@ class SolveSizeForTransitionTool(Tool):
     description = (
         "Invert the Brus model: find the nanocrystal radius whose L1 transition "
         "energy equals target_energy_eV OR target_wavelength_um (exactly one). "
-        "Uses numerical bisection on the monotonic strong-confinement branch; "
-        "returns NO_PHYSICAL_SOLUTION for targets at/below the bulk gap. "
-        "Requires bulk_band_gap_eV, electron/hole effective masses, and (if "
-        "include_coulomb_term) relative_dielectric_constant."
+        "Performs full branch analysis of E(R) = Eg + A/R^2 - B/R and "
+        "distinguishes mathematical from scientifically valid solutions: "
+        "outcomes are SOLVED, NO_MATHEMATICAL_SOLUTION, "
+        "OUTSIDE_MODEL_VALIDITY, or AMBIGUOUS_BRANCH. With the Coulomb term "
+        "a target between the Coulomb minimum and the bulk gap has two "
+        "mathematical roots; both are reported, and the outcome reflects "
+        "whether the strong/weak confinement branches are supported by the "
+        "EMA. Requires bulk_band_gap_eV, electron/hole effective masses, "
+        "and (if include_coulomb_term) relative_dielectric_constant with "
+        "relative_dielectric_kind 'static' or 'unknown'."
     )
     short_description = "Solve QD size for a target transition energy/wavelength."
     exposure = ToolExposure.DEFERRED
@@ -306,6 +394,10 @@ class SolveSizeForTransitionTool(Tool):
             "electron_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "hole_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "relative_dielectric_constant": {"type": "number", "minimum": 1.0},
+            "relative_dielectric_kind": {
+                "type": "string",
+                "enum": ["static", "optical", "high_frequency", "unknown"],
+            },
             "include_coulomb_term": {"type": "boolean"},
         },
         "required": [
@@ -316,6 +408,9 @@ class SolveSizeForTransitionTool(Tool):
     }
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        kind, kind_error = _dielectric_kind_or_error(arguments)
+        if kind_error is not None:
+            return kind_error
         try:
             result = solve_size_for_transition(
                 target_energy_eV=(
@@ -338,9 +433,19 @@ class SolveSizeForTransitionTool(Tool):
                     if arguments.get("relative_dielectric_constant") is not None
                     else None
                 ),
+                relative_dielectric_kind=kind,
                 include_coulomb_term=bool(
                     arguments.get("include_coulomb_term", True)
                 ),
+            )
+        except UnsupportedScientificRegime as exc:
+            return ScientificToolResult(
+                output=str(exc),
+                is_error=True,
+                data={
+                    "error_type": "INCOMPATIBLE_SCIENTIFIC_PARAMETER",
+                    "message": str(exc),
+                },
             )
         except (MissingScientificPrerequisite, ValueError) as exc:
             return ScientificToolResult(
@@ -396,6 +501,10 @@ class SizeSweepTool(Tool):
             "electron_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "hole_effective_mass_m0": {"type": "number", "minimum": 0.001},
             "relative_dielectric_constant": {"type": "number", "minimum": 1.0},
+            "relative_dielectric_kind": {
+                "type": "string",
+                "enum": ["static", "optical", "high_frequency", "unknown"],
+            },
             "include_coulomb_term": {"type": "boolean"},
         },
         "required": [
@@ -409,6 +518,9 @@ class SizeSweepTool(Tool):
     }
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        kind, kind_error = _dielectric_kind_or_error(arguments)
+        if kind_error is not None:
+            return kind_error
         try:
             result = size_sweep(
                 min_size_nm=float(arguments["min_size_nm"]),
@@ -424,9 +536,19 @@ class SizeSweepTool(Tool):
                     if arguments.get("relative_dielectric_constant") is not None
                     else None
                 ),
+                relative_dielectric_kind=kind,
                 include_coulomb_term=bool(
                     arguments.get("include_coulomb_term", True)
                 ),
+            )
+        except UnsupportedScientificRegime as exc:
+            return ScientificToolResult(
+                output=str(exc),
+                is_error=True,
+                data={
+                    "error_type": "INCOMPATIBLE_SCIENTIFIC_PARAMETER",
+                    "message": str(exc),
+                },
             )
         except (MissingScientificPrerequisite, ValueError) as exc:
             return ScientificToolResult(

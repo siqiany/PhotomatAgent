@@ -299,7 +299,13 @@ def scientific_status(
 ) -> None:
     """Show dependency-probe status of every scientific capability pack."""
     infos = probe_all_capabilities(workspace=Workspace(workspace))
-    table = Table("capability", "status", "version", "detail", "tools")
+    table = Table(
+        "Capability",
+        "Execution Mode",
+        "Status",
+        "Backend",
+        "Environment / Reason",
+    )
     for info in sorted(infos, key=lambda item: item.name):
         status_style = {
             "AVAILABLE": "[green]",
@@ -307,14 +313,28 @@ def scientific_status(
             "UNCONFIGURED": "[yellow]",
             "ERROR": "[red]",
         }.get(info.status.value, "")
+        metadata = info.metadata or {}
         table.add_row(
             info.name,
+            metadata.get("execution_mode", "local"),
             f"{status_style}{info.status.value}[/]",
-            info.version or "—",
-            info.detail,
-            ", ".join(info.tools) or "—",
+            metadata.get("backend", "—"),
+            info.detail or "—",
         )
     console.print(table)
+
+
+@scientific_app.command("scnet-doctor")
+def scientific_scnet_doctor(
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Read-only SCNet diagnostics: SSH, Slurm, VASP/NAMD/MAGUS probes."""
+    import json as _json
+
+    from photomatagent.mcp_servers.scnet.server import build_doctor_report
+
+    report = asyncio.run(build_doctor_report())
+    console.print(_json.dumps(report, ensure_ascii=False, indent=2))
 
 
 mcp_app = typer.Typer(

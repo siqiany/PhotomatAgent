@@ -54,6 +54,7 @@ dev = [
 
 [project.scripts]
 photomatagent = "photomatagent.cli.app:main"
+photomatagent-mcp-scnet = "photomatagent.mcp_servers.scnet.server:main"
 
 [build-system]
 requires = ["hatchling"]
