@@ -40,6 +40,10 @@ UNSUPPORTED_DEVICE_PROPERTIES = {
     "noise_equivalent_power",
 }
 
+PACKAGED_VAE_ASSET_ROOT = (
+    Path(__file__).resolve().parent / "assets" / "photoelectric_vae"
+)
+
 
 class GenerationCapabilitiesTool(Tool):
     name = "generation.capabilities"
@@ -78,7 +82,8 @@ class GenerationCapabilitiesTool(Tool):
         elif vae_checkpoint is None:
             vae_status = "UNCONFIGURED"
             vae_detail = (
-                "set PHOTOMATAGENT_VAE_ASSET_ROOT or VAE_CHECKPOINT_PATH"
+                "packaged VAE assets are missing; reinstall the generation "
+                "extra or set an explicit VAE_CHECKPOINT_PATH override"
             )
         elif vae_metadata is None:
             vae_status = "PARTIAL"
@@ -140,9 +145,9 @@ class VAEFormulaTool(Tool):
         "property-conditioned VAE. forbidden_elements is an OPTIONAL user "
         "constraint (default: none). Scope: composition prior / formula "
         "proposal only -- never predicts responsivity/EQE/detectivity/dark "
-        "current. Loads the deployed JARVIS conditional-VAE checkpoint via "
-        "PHOTOMATAGENT_VAE_ASSET_ROOT/VAE_CHECKPOINT_PATH and reports typed "
-        "missing prerequisites when model assets are unavailable."
+        "current. Loads the JARVIS conditional-VAE checkpoint packaged with "
+        "PhotomatAgent; VAE_CHECKPOINT_PATH is an optional override. Reports "
+        "typed missing prerequisites when model assets are unavailable."
     )
     short_description = "VAE composition proposal for a target gap/wavelength."
     exposure = ToolExposure.DEFERRED
@@ -285,9 +290,10 @@ class VAERetrieveTool(Tool):
     name = "generation.vae_retrieve"
     description = (
         "Retrieve known structures matching a formula or element system "
-        "from a local formula index CSV (jid, formula, properties). "
+        "from the packaged JARVIS candidate metadata or an optional local "
+        "formula-index CSV override. "
         "Composition prior / candidate retrieval only; no device-property "
-        "prediction. Index path via VAE_INDEX_PATH."
+        "prediction. Optional override path via VAE_INDEX_PATH."
     )
     short_description = "Retrieve known structures for a formula/system."
     exposure = ToolExposure.DEFERRED
@@ -308,19 +314,17 @@ class VAERetrieveTool(Tool):
         import csv
 
         index_path = _env("VAE_INDEX_PATH")
-        if not index_path:
+        _, packaged_metadata = _resolve_vae_assets()
+        path = Path(index_path).expanduser() if index_path else packaged_metadata
+        if path is None:
             return ScientificToolResult(
-                output=(
-                    "missing prerequisite: VAE_INDEX_PATH is not configured; "
-                    "no formula index to retrieve from"
-                ),
+                output="packaged VAE candidate metadata is missing",
                 is_error=True,
                 data={
                     "error_type": "missing_prerequisites",
-                    "missing": ["VAE_INDEX_PATH"],
+                    "missing": ["packaged VAE candidate metadata"],
                 },
             )
-        path = Path(index_path)
         if not path.is_file():
             return ScientificToolResult(
                 output=f"formula index not found: {path}",
@@ -338,16 +342,29 @@ class VAERetrieveTool(Tool):
         max_results = int(arguments.get("max_results", 10))
         matches: list[dict[str, Any]] = []
         try:
-            with path.open("r", encoding="utf-8", newline="") as handle:
-                for row in csv.DictReader(handle):
+            if path.suffix.lower() == ".json":
+                raw_rows = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw_rows, list):
+                    raise ValueError("candidate metadata must be a JSON list")
+                rows = (
+                    row for row in raw_rows if isinstance(row, dict)
+                )
+            else:
+                handle = path.open("r", encoding="utf-8", newline="")
+                rows = csv.DictReader(handle)
+            try:
+                for row_index, row in enumerate(rows):
                     row_formula = str(row.get("formula", "")).strip()
-                    row_system = str(row.get("chemical_system", "")).strip()
+                    row_system = _row_chemical_system(row)
                     if formula and row_formula == formula:
-                        matches.append(row)
-                    elif system and row_system == system:
-                        matches.append(row)
+                        matches.append({**row, "model_row_index": row_index})
+                    elif system and row_system == _canonical_system(system):
+                        matches.append({**row, "model_row_index": row_index})
                     if len(matches) >= max_results:
                         break
+            finally:
+                if path.suffix.lower() != ".json":
+                    handle.close()
         except Exception as exc:
             return ScientificToolResult(
                 output=f"index read failed: {type(exc).__name__}: {exc}",
@@ -358,8 +375,11 @@ class VAERetrieveTool(Tool):
                 {
                     "matches": matches,
                     "count": len(matches),
-                    "source": str(path),
-                    "note": "database retrieval only; no device-property claims",
+                "source": str(path),
+                "note": (
+                    "packaged JARVIS database retrieval only; no "
+                    "device-property claims"
+                ),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -489,12 +509,7 @@ def _resolve_vae_assets(
     checkpoint_path: Any = None,
     metadata_path: Any = None,
 ) -> tuple[Path | None, Path | None]:
-    """Resolve configured, bundled, or sibling-agent VAE assets.
-
-    The sibling lookup connects the already deployed GlassCrewAgent model on
-    this workstation without copying multi-megabyte scientific data into this
-    repository. Explicit environment/input paths always take precedence.
-    """
+    """Resolve packaged VAE assets with optional explicit overrides."""
 
     explicit_checkpoint = str(
         checkpoint_path or _env("VAE_CHECKPOINT_PATH")
@@ -516,7 +531,7 @@ def _resolve_vae_assets(
     if checkpoint is not None:
         return checkpoint, metadata
 
-    roots: list[Path] = []
+    configured_roots: list[Path] = []
     for name in (
         "PHOTOMATAGENT_VAE_ASSET_ROOT",
         "PHOTOELECTRIC_VAE_ASSET_ROOT",
@@ -524,23 +539,9 @@ def _resolve_vae_assets(
     ):
         value = _env(name)
         if value:
-            roots.append(Path(value).expanduser())
+            configured_roots.append(Path(value).expanduser())
 
-    repository = Path(__file__).resolve().parents[5]
-    roots.extend(
-        [
-            repository / "data" / "photoelectric_vae",
-            Path.cwd() / "data" / "photoelectric_vae",
-            repository.parent
-            / "GlassCrewAgent"
-            / "data"
-            / "photoelectric_vae",
-            Path.cwd().parent
-            / "GlassCrewAgent"
-            / "data"
-            / "photoelectric_vae",
-        ]
-    )
+    roots = configured_roots or [PACKAGED_VAE_ASSET_ROOT]
     seen: set[Path] = set()
     for root in roots:
         resolved = root.resolve()
@@ -566,6 +567,20 @@ def _existing_file(value: str | Path | None) -> Path | None:
         return None
     path = Path(value).expanduser()
     return path.resolve() if path.is_file() else None
+
+
+def _canonical_system(value: str) -> str:
+    normalized = value.replace(";", "-").replace(",", "-")
+    return "-".join(
+        sorted(item.strip() for item in normalized.split("-") if item.strip())
+    )
+
+
+def _row_chemical_system(row: dict[str, Any]) -> str:
+    value = str(
+        row.get("chemical_system") or row.get("elements") or ""
+    ).strip()
+    return _canonical_system(value)
 
 
 def generation_pack(config: Any = None) -> GenerationCapabilityPack:

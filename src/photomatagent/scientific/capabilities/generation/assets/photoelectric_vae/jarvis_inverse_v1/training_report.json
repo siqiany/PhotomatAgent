@@ -1,0 +1,27 @@
+{
+  "record_count": 11240,
+  "element_count": 89,
+  "ridge_alpha": 10.0,
+  "validation": {
+    "composition_mae": 0.01725710708228113,
+    "top_element_accuracy": 0.36743772241992884,
+    "note": "Random 20% validation split; metrics evaluate composition prior only."
+  },
+  "property_fields": [
+    "gap_selected_eV",
+    "cutoff_wavelength_um_from_gap",
+    "formation_energy_eV_per_atom",
+    "energy_above_hull_eV_per_atom",
+    "density_g_cm3",
+    "dielectric_mean",
+    "avg_electron_mass_m0",
+    "avg_hole_mass_m0",
+    "bulk_modulus_GPa",
+    "shear_modulus_GPa",
+    "exfoliation_energy_meV_per_atom",
+    "max_IR_mode_cm-1",
+    "min_IR_mode_cm-1",
+    "spillage"
+  ],
+  "model_scope": "DFT property-conditioned composition prior plus nonparametric structure retrieval"
+}

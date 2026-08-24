@@ -57,6 +57,24 @@ if torch is not None and nn is not None:
                 dim=-1, keepdim=True
             ).clamp_min(1e-8)
 
+        def encode(self, composition, condition):
+            hidden = self.encoder(
+                torch.cat([composition, condition], dim=-1)
+            )
+            return self.mu(hidden), self.logvar(hidden)
+
+        @staticmethod
+        def reparameterize(mu, logvar):
+            std = torch.exp(0.5 * logvar)
+            return mu + torch.randn_like(std) * std
+
+        def forward(self, composition, condition):
+            mu, logvar = self.encode(composition, condition)
+            reconstruction = self.decode(
+                self.reparameterize(mu, logvar), condition
+            )
+            return reconstruction, mu, logvar
+
         def sample(self, condition, count: int = 8):
             expanded = condition.expand(count, -1)
             latent = torch.randn(
@@ -65,6 +83,16 @@ if torch is not None and nn is not None:
                 device=expanded.device,
             )
             return self.decode(latent, expanded)
+
+        @staticmethod
+        def loss(reconstruction, target, mu, logvar, beta: float = 0.05):
+            reconstruction_loss = -(
+                target * reconstruction.clamp_min(1e-8).log()
+            ).sum(-1).mean()
+            kl = -0.5 * torch.mean(
+                1 + logvar - mu.pow(2) - logvar.exp()
+            )
+            return reconstruction_loss + beta * kl
 
 else:
 

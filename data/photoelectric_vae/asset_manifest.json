@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "source": "NIST JARVIS-DFT CC BY 4.0",
+  "generated_model": "conditional_composition_vae",
+  "reproduction_validation": {
+    "date": "2026-08-24",
+    "candidate_csv_byte_identical": true,
+    "inverse_index_arrays_exact": true,
+    "metadata_structures_reports_byte_identical": true,
+    "cvae_epochs": 10,
+    "cvae_metric_absolute_difference": {
+      "train_loss": 1.357543499835856e-08,
+      "validation_loss": 0.0,
+      "validation_composition_mae": 9.313225746154785e-10
+    },
+    "cvae_state_dict_max_absolute_difference": 1.3355165719985962e-06,
+    "note": "CVAE rerun used seed 42 and four CPU threads; small floating-point differences are expected from parallel CPU reduction order."
+  },
+  "files": [
+    {
+      "path": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_cvae_v1/checkpoint.pt",
+      "size": 582133,
+      "sha256": "7f1eec46433232fd7718da868e6e6b0ceefd914b99deb6a07418e8b6e893587b"
+    },
+    {
+      "path": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_cvae_v1/training_report.json",
+      "size": 569,
+      "sha256": "02afdb5ebba97a8d108a79158a2ed3a20695a191289f19ee57c29cff81a9cf07"
+    },
+    {
+      "path": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_inverse_v1/candidate_metadata.json",
+      "size": 4570101,
+      "sha256": "592e93422bb1e0d378bfefde46b7d6abe9c2bcdcfd8efc38b3a54e9d3a0ed51c"
+    },
+    {
+      "path": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_inverse_v1/inverse_index.npz",
+      "size": 509235,
+      "sha256": "6babb6efbf15d7d17b931df363565d42d697209a88948ba36a74474453b10208"
+    },
+    {
+      "path": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_inverse_v1/structures.jsonl",
+      "size": 13314904,
+      "sha256": "6bd42e1533f536b31123c3b61215c0526900892dad0d613190e9197e22b3a74e"
+    },
+    {
+      "path": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_inverse_v1/training_report.json",
+      "size": 783,
+      "sha256": "d02a1017dc0d92e468354769be1ff248243d30d5dfcdc29a977b8bf3d6f4c17a"
+    },
+    {
+      "path": "data/photoelectric_vae/training/jarvis_all_ir_candidates.csv",
+      "size": 5981148,
+      "sha256": "48076ca38eedd546fd51e042d983a050e080a4e3527c79076e34f99605c5f7eb"
+    },
+    {
+      "path": "data/photoelectric_vae/training/raw/jarvis_dft2d_2022.zip",
+      "size": 8394653,
+      "sha256": "eb38d5d16c15e8b9afeef964a47dd6434d2770fc601c21eab35b354ac2b06914"
+    },
+    {
+      "path": "data/photoelectric_vae/training/raw/jarvis_dft3d_2025.zip",
+      "size": 48447610,
+      "sha256": "f9e0a3309f0000d5de1ec9e49c93963109ea45e63f451103f8f6595d2eabf7f5"
+    }
+  ]
+}

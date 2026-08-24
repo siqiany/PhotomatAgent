@@ -19,6 +19,7 @@ PhotoMatAgent 不复制外部科学软件代码；通过 `native package`、隔�
 | Hefei-NAMD | Qijing Zheng, USTC (official repo: QijingZheng/Hefei-NAMD) | SCNet module (probed) | free for academic use per project page | remote Slurm job via SCNet MCP (`namd.*`); adapter only prepares/validates the VASP trajectory + WAVECAR bridge | Zheng et al., Comput. Phys. Commun. 288, 108745 (2023) |
 | MAGUS | Xia et al. (magus-software) | SCNet module or local binary (probed) | open source (project page) | remote/local execution (`magus.*`); probe-gated, UNCONFIGURED when absent | Xia et al., Comput. Phys. Commun. 295, 109021 (2024) |
 | MatterGen | Microsoft Research AI4Science | `dft_band_gap` / `chemical_system` checkpoints | MIT (code), model weights per HF hub terms | **isolated subprocess** (`generation.mattergen`); never loaded into the main venv | Zeni et al., Nature 626, 345 (2024) |
+| NIST JARVIS-DFT data | NIST | 3D v11 / 2D v8 snapshots | CC BY 4.0 | committed training snapshots and derived VAE/index assets (`generation.vae_formula`, `generation.vae_retrieve`) | Choudhary et al., npj Comput. Mater. 6, 173 (2020); Figshare DOIs `10.6084/m9.figshare.6815699.v11`, `10.6084/m9.figshare.6815705.v8` |
 | CHGNet | Materials Virtual Lab (UC Berkeley) | 0.3.0 | BSD-3-Clause | optional isolated backend (cheap screening; never a DFT substitute) | Deng et al., Nat. Mach. Intell. 5, 1031 (2023) |
 | Meep | MIT (Joannopoulos group) | 1.x | GPL-2.0 | **isolated environment** (`optics.meep_thinfilm`); 1D thin-film only | Oskooi et al., Comput. Phys. Commun. 181, 687 (2010) |
 
@@ -33,5 +34,7 @@ PhotoMatAgent 不复制外部科学软件代码；通过 `native package`、隔�
   PhotoMatAgent 只做输入生成、提交、状态轮询、下载与结果验证，**不复制
   任何商业/受限软件代码**（POTCAR 内容绝不入库、绝不记录）。
 * MatterGen / Meep 采用隔离环境（conda/venv），与主环境完全隔离。
+* JARVIS 原始归档、派生候选表、索引和 VAE 权重随仓库分发，遵循
+  CC BY 4.0；再分发和发表结果时必须保留 NIST/JARVIS 归属与上述 DOI。
 * 未来接入 GPAW / nextnano 时同样遵循：不复制代码、以子进程或 MCP 调用、
   记录许可证与引用。

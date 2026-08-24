@@ -47,8 +47,9 @@ and property validation as separate scientific stages.
 
 - If `generation.vae_formula` reports missing prerequisites, show the missing
   asset or dependency exactly. Do not replace the VAE result with invented
-  formulas. The normal configuration is `PHOTOMATAGENT_VAE_ASSET_ROOT`, or the
-  explicit `VAE_CHECKPOINT_PATH` plus `VAE_METADATA_PATH` overrides.
+  formulas. The model and novelty metadata normally ship inside PhotomatAgent;
+  `PHOTOMATAGENT_VAE_ASSET_ROOT`, `VAE_CHECKPOINT_PATH`, and
+  `VAE_METADATA_PATH` are optional retrained-model overrides only.
 - If novelty metadata is unavailable, only set `require_novel=false` after
   telling the user that novelty can no longer be established against the
   training set.
@@ -57,6 +58,13 @@ and property validation as separate scientific stages.
 - Do not send responsivity, EQE, detectivity, dark current, response time, or
   other device properties to the VAE. Route those to the corresponding
   scientific capabilities after a composition/structure exists.
+
+## Reproducibility requests
+
+When the user asks to audit or retrain the VAE, use the project-contained
+`data/photoelectric_vae/README.md` rebuild sequence and verify all committed
+inputs/assets with `scripts/vae/verify_assets.py`. Do not look for model files
+in sibling repositories.
 
 ## Output contract
 

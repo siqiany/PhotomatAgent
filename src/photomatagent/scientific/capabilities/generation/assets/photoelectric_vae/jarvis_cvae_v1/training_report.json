@@ -1,0 +1,17 @@
+{
+  "checkpoint": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_cvae_v1/checkpoint.pt",
+  "record_count": 11240,
+  "epochs": 10,
+  "batch_size": 256,
+  "learning_rate": 0.001,
+  "beta": 0.02,
+  "condition_dropout": 0.45,
+  "seed": 42,
+  "final_metrics": {
+    "epoch": 10,
+    "train_loss": 2.177849400510143,
+    "validation_loss": 2.095813274383545,
+    "validation_composition_mae": 0.009848540648818016
+  },
+  "data_source": "src/photomatagent/scientific/capabilities/generation/assets/photoelectric_vae/jarvis_inverse_v1"
+}

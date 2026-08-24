@@ -16,3 +16,4 @@ build/
 output/
 tmp/
 vasp_sio2/
+data/photoelectric_vae/training/raw/
