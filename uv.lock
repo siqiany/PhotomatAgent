@@ -3230,6 +3230,10 @@ electronic = [
     { name = "effmass" },
     { name = "sumo" },
 ]
+generation = [
+    { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version < '3.15' and platform_machine != 'x86_64' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(python_full_version >= '3.15' and platform_machine != 'x86_64') or platform_machine == 'x86_64' or sys_platform != 'darwin'" },
+]
 literature = [
     { name = "arxiv" },
     { name = "docling" },
@@ -3292,7 +3296,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.24,<2" },
     { name = "mp-api", extras = ["mcp"], marker = "extra == 'materials'", specifier = ">=0.44" },
     { name = "openai", specifier = ">=1.100" },
-    { name = "photomatagent", extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics"], marker = "extra == 'science'" },
+    { name = "photomatagent", extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "generation"], marker = "extra == 'science'" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pylance", marker = "extra == 'literature'", specifier = ">=0.20" },
@@ -3303,11 +3307,12 @@ requires-dist = [
     { name = "rich", specifier = ">=13.7" },
     { name = "sentence-transformers", marker = "extra == 'literature'", specifier = ">=3.0" },
     { name = "sumo", marker = "extra == 'electronic'", specifier = ">=2.4" },
+    { name = "torch", marker = "extra == 'generation'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "extra == 'literature'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "extra == 'literature'", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cpu" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "science"]
+provides-extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "generation", "science"]
 
 [package.metadata.requires-dev]
 dev = [

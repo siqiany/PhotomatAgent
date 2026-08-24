@@ -447,7 +447,10 @@ class SCNetBackend:
         _, stderr = await asyncio.wait_for(
             process.communicate(), timeout=self.config.transfer_timeout_seconds
         )
-        local_path = local_directory / filename
+        # scp semantics: the remote basename lands inside the target
+        # directory; nested relative structure is arranged by the caller
+        # (the fake backend already mirrors this).
+        local_path = local_directory / Path(filename).name
         if process.returncode != 0 or not local_path.is_file():
             return None
         return local_path

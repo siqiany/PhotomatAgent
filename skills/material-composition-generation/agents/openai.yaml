@@ -1,0 +1,4 @@
+interface:
+  display_name: "材料成分生成"
+  short_description: "Generate VAE material formulas from band-gap targets"
+  default_prompt: "Use $material-composition-generation to generate material composition candidates for a target band gap or wavelength."

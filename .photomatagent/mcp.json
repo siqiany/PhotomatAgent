@@ -48,7 +48,8 @@
         "SCNET_MAGUS_EXECUTABLE": "${SCNET_MAGUS_EXECUTABLE}",
         "SCNET_MAGUS_ENV_SCRIPT": "${SCNET_MAGUS_ENV_SCRIPT}",
         "SCNET_MAGUS_VASP_SCRIPT": "${SCNET_MAGUS_VASP_SCRIPT}",
-        "SCNET_MAGUS_VASP_PP_PATH": "${SCNET_MAGUS_VASP_PP_PATH}"
+        "SCNET_MAGUS_VASP_PP_PATH": "${SCNET_MAGUS_VASP_PP_PATH}",
+        "SCNET_MAGUS_ASE_VASP_COMMAND": "${SCNET_MAGUS_ASE_VASP_COMMAND}"
       },
       "description": "Local SCNet MCP server: vasp.*, namd.*, magus.* application tools over SSH/Slurm (all deferred; server starts even when SCNet is unconfigured).",
       "source": "https://github.com/siqiany/PhotomatAgent",

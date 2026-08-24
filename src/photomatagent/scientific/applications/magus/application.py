@@ -105,6 +105,15 @@ def _env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+def _psp_status(readiness: dict[str, Any]) -> str:
+    """Map a ``_probe_psp_readiness`` dict to a single status word."""
+    if not readiness.get("configured"):
+        return "UNCONFIGURED"
+    if readiness.get("resolved_library") is None:
+        return "MISSING"
+    return "READY"
+
+
 def default_magus_application() -> "MagusApplication | None":
     """Build the MAGUS adapter from the SCNet environment; None when SCNet
     itself is unconfigured (mirrors default_vasp_application)."""
@@ -139,6 +148,7 @@ def default_magus_application() -> "MagusApplication | None":
         # MAGUS VASP script is configured (both source into the job).
         vasp_script=_env("SCNET_MAGUS_VASP_SCRIPT") or _env("SCNET_VASP_ENV_SCRIPT"),
         vasp_pp_path=_env("SCNET_MAGUS_VASP_PP_PATH"),
+        ase_vasp_command=_env("SCNET_MAGUS_ASE_VASP_COMMAND"),
         remote_root=config.remote_root,
     )
 
@@ -157,6 +167,7 @@ class MagusApplication:
         env_script: str = "",
         vasp_script: str = "",
         vasp_pp_path: str = "",
+        ase_vasp_command: str = "",
         remote_root: str = "~/photomatagent",
         policy: ResourcePolicy | None = None,
         search_types: list[str] | None = None,
@@ -168,6 +179,7 @@ class MagusApplication:
         self.env_script = env_script.strip()
         self.vasp_script = vasp_script.strip()
         self.vasp_pp_path = vasp_pp_path.strip()
+        self.ase_vasp_command = ase_vasp_command.strip()
         self.remote_root = remote_root.rstrip("/")
         self.policy = policy or ResourcePolicy.from_environment()
         self.search_types = list(search_types or SUPPORTED_STRUCTURE_TYPES)
@@ -317,10 +329,10 @@ class MagusApplication:
                 ]
         else:
             report["search_types"] = self.search_types
-        report["vasp_readiness"] = await self._probe_vasp_readiness(
-            executable, report["calculators"]
-        )
         report["pseudopotential_readiness"] = await self._probe_psp_readiness()
+        report["vasp_readiness"] = await self._probe_vasp_readiness(
+            report["calculators"], report["pseudopotential_readiness"]
+        )
         return report
 
     async def _discover_executable(self) -> str:
@@ -396,35 +408,132 @@ class MagusApplication:
         return parse_example_structure_types(result.stdout)
 
     async def _probe_vasp_readiness(
-        self, executable: str, calculators: list[str]
+        self, calculators: list[str], psp_readiness: dict[str, Any]
     ) -> dict[str, Any]:
+        """Layered MAGUS+VASP readiness (Sprint 5 P0-4).
+
+        ``Slurm COMPLETED != scientific validity`` and ``VASP env loaded !=
+        ASE knows how to run VASP``: this probe separates the VASP
+        calculator plugin, the VASP environment scripts, the configured
+        ``SCNET_MAGUS_ASE_VASP_COMMAND``, its resolved components
+        (``command -v``, read-only) and the pseudopotential path. The probe
+        never runs a VASP calculation, never creates POSCAR and never
+        consumes an allocation.
+        """
         backend = self.backend
         if backend is None:
-            return {"calculator": "MISSING", "detail": "no backend"}
-        if "vasp" not in calculators and "vaspc" not in calculators:
             return {
                 "calculator": "MISSING",
-                "detail": "vasp calculator not reported by `magus checkpack calculators`",
+                "environment": "MISSING",
+                "ase_command_configured": False,
+                "ase_command_verified": False,
+                "pseudopotential_path": "MISSING",
+                "overall": "MISSING",
+                "detail": "no backend",
             }
-        vasp_command = await backend._run_ssh(
-            "command -v vasp_std 2>/dev/null | head -n 1"
-        )
+        calculator_ready = "vasp" in calculators or "vaspc" in calculators
+        environment_ready = bool(self.vasp_script or self.env_script)
+        ase_components: dict[str, str] = {}
+        command_tokens: list[str] = []
+        if self.ase_vasp_command:
+            try:
+                from photomatagent.scientific.applications.magus.render import (
+                    validate_configured_vasp_command,
+                )
+
+                command_tokens = validate_configured_vasp_command(
+                    self.ase_vasp_command
+                ).split()
+            except ValueError as exc:
+                return {
+                    "calculator": "READY" if calculator_ready else "MISSING",
+                    "environment": "READY" if environment_ready else "MISSING",
+                    "ase_command_configured": True,
+                    "ase_vasp_command": self.ase_vasp_command,
+                    "ase_command_invalid": str(exc),
+                    "ase_command_verified": False,
+                    "pseudopotential_path": _psp_status(psp_readiness),
+                    "overall": "PARTIAL",
+                    "detail": (
+                        "SCNET_MAGUS_ASE_VASP_COMMAND is configured but "
+                        "rejected by validation; fix .env before any "
+                        "MAGUS+VASP acceptance"
+                    ),
+                }
+        probe_tokens = [
+            token for token in command_tokens if not token.startswith("-")
+        ]
+        if probe_tokens:
+            prefix = ""
+            if self.vasp_script:
+                prefix = (
+                    f"source {shlex.quote(self.vasp_script)} "
+                    ">/dev/null 2>&1 || true; "
+                )
+            probe_command = prefix + "; ".join(
+                f'p=$(command -v "{token}" 2>/dev/null) && '
+                f'echo "FOUND-{token}=$p" || echo "MISSING-{token}"'
+                for token in probe_tokens
+            )
+            result = await backend._run_ssh(probe_command)
+            missing: list[str] = []
+            for line in (result.stdout or "").splitlines():
+                line = line.strip()
+                if line.startswith("MISSING-"):
+                    missing.append(line[len("MISSING-") :])
+                elif line.startswith("FOUND-"):
+                    token, _, path = line[len("FOUND-") :].partition("=")
+                    ase_components[token] = path
+            for token in probe_tokens:
+                if token not in ase_components and token not in missing:
+                    missing.append(token)
+            ase_components.update({token: "missing" for token in missing})
+        else:
+            missing = [] if not command_tokens else list(command_tokens)
+        ase_verified = bool(self.ase_vasp_command) and not missing
+        psp_status = _psp_status(psp_readiness)
+        if not calculator_ready:
+            overall = "MISSING"
+            detail = "vasp calculator not reported by `magus checkpack calculators`"
+        else:
+            missing_items: list[str] = []
+            if not environment_ready:
+                missing_items.append(
+                    "VASP environment script (SCNET_MAGUS_VASP_SCRIPT / "
+                    "SCNET_VASP_ENV_SCRIPT)"
+                )
+            if not self.ase_vasp_command:
+                missing_items.append(
+                    "SCNET_MAGUS_ASE_VASP_COMMAND (ASE execution command)"
+                )
+            elif not ase_verified:
+                missing_items.append(
+                    f"ASE VASP command components not resolvable: "
+                    f"{', '.join(missing)}"
+                )
+            if psp_status != "READY":
+                missing_items.append(
+                    "pseudopotential path (SCNET_MAGUS_VASP_PP_PATH)"
+                )
+            overall = "READY" if not missing_items else "PARTIAL"
+            detail = (
+                "MAGUS_VASP_READY: calculator + environment + ASE command "
+                "+ pseudopotentials verified"
+                if not missing_items
+                else "MAGUS_VASP_PARTIAL; missing: " + "; ".join(missing_items)
+            )
         return {
-            "calculator": "READY",
-            "vasp_std_on_path": (
-                vasp_command.stdout.strip()[:300] if vasp_command.ok else ""
-            ),
-            "launcher": (
-                "READY"
-                if (self.vasp_script or self.env_script)
-                else "MISSING"
-            ),
-            "detail": (
-                "MAGUS VASP calculator present; launcher requires "
-                "SCNET_MAGUS_VASP_SCRIPT or SCNET_MAGUS_ENV_SCRIPT"
-                if not (self.vasp_script or self.env_script)
-                else "VASP env script configured; sourced inside MAGUS jobs"
-            ),
+            "calculator": "READY" if calculator_ready else "MISSING",
+            "environment": "READY" if environment_ready else "MISSING",
+            "env_script": self.env_script,
+            "vasp_script": self.vasp_script,
+            "ase_command_configured": bool(self.ase_vasp_command),
+            "ase_vasp_command": self.ase_vasp_command or "",
+            "ase_command_components": ase_components,
+            "ase_command_verified": ase_verified,
+            "pseudopotential_path": psp_status,
+            "overall": overall,
+            "detail": detail,
         }
 
     async def _probe_psp_readiness(self) -> dict[str, Any]:
@@ -706,6 +815,9 @@ class MagusApplication:
     ) -> str:
         """Deterministic Slurm script (launcher empty; JOB_SYSTEM=SLURM)."""
         operation = "generate" if isinstance(request, MagusGenerateRequest) else "search"
+        needs_vasp = isinstance(request, MagusSearchRequest) and (
+            request.calculator == "vasp"
+        )
         args = magus_arguments(operation, request)
         return render_magus_slurm(
             job_name=job_name,
@@ -716,6 +828,8 @@ class MagusApplication:
             env_script=self.env_script,
             vasp_script=self.vasp_script,
             vasp_pp_path=self.vasp_pp_path,
+            ase_vasp_command=self.ase_vasp_command,
+            needs_vasp=needs_vasp,
         )
 
     # ------------------------------------------------------------------
@@ -866,6 +980,7 @@ class MagusApplication:
             ],
             "candidates": inspected["candidates"],
             "candidate_count": inspected["candidate_count"],
+            "artifact_candidate_counts": inspected["artifact_candidate_counts"],
             "summary": inspected["summary"],
             "note": (
                 "execution acceptance only; candidates remain "
@@ -880,8 +995,15 @@ class MagusApplication:
         if base in _TEXT_ARTIFACTS:
             return True
         return base.endswith(
-            (".traj", ".vasp", ".out", ".err", ".yaml", ".json")
-        ) or base in {"INCAR", "POSCAR", "CONTCAR", "OUTCAR", "EIGENVAL"}
+            (".traj", ".vasp", ".out", ".err", ".yaml", ".json", ".xml")
+        ) or base in {
+            "INCAR",
+            "POSCAR",
+            "CONTCAR",
+            "OUTCAR",
+            "OSZICAR",
+            "EIGENVAL",
+        }
 
     def inspect_results(
         self,
@@ -890,17 +1012,26 @@ class MagusApplication:
         operation: str = "generate",
         expected_number: int | None = None,
     ) -> dict[str, Any]:
-        """Parse bounded candidate info from collected artifacts. Never
-        fabricates: anything unverifiable is reported as unknown."""
+        """Parse bounded candidate info from collected artifacts.
+
+        ``candidate_count`` is the VERIFIED structure count, never the
+        number of artifact records: ``gen.traj`` with 3 frames is 3
+        candidates, not 1. Priority for search is summary rows ->
+        best.traj frames -> good.traj frames (never summed, since the same
+        structure can appear in several artifacts). Anything unverifiable
+        is reported as ``None`` -- never guessed.
+        """
         root = Path(result_dir).expanduser().resolve()
         candidates: list[dict[str, Any]] = []
+        summary_rows: list[dict[str, Any]] = []
         summary_text = ""
         summary_file = root / "summary"
         if summary_file.is_file():
             summary_text = (
                 summary_file.read_text(encoding="utf-8", errors="replace")[:6000]
             )
-            candidates = self._parse_summary_rows(summary_text)
+            summary_rows = self._parse_summary_rows(summary_text)
+            candidates = list(summary_rows)
         traj_files = []
         if operation == "generate":
             traj_files.append(root / "gen.traj")
@@ -914,25 +1045,49 @@ class MagusApplication:
             count = self._count_traj_frames(traj)
             if count is not None:
                 traj_counts[traj.relative_to(root).as_posix()] = count
-        if traj_counts:
-            for name, count in sorted(traj_counts.items()):
-                candidates.append({"artifact": name, "frames": count})
-        if operation == "generate" and not traj_counts and expected_number is not None:
+        for name, count in sorted(traj_counts.items()):
+            candidates.append({"artifact": name, "frames": count})
+        if (
+            operation == "generate"
+            and "gen.traj" not in traj_counts
+            and not summary_rows
+            and expected_number is not None
+        ):
             candidates = [
                 {"requested": expected_number, "verified_from_artifact": False}
             ]
+        if operation == "generate":
+            if traj_counts.get("gen.traj") is not None:
+                candidate_count = traj_counts["gen.traj"]
+            elif summary_rows:
+                candidate_count = len(summary_rows)
+            else:
+                candidate_count = None
+        else:
+            if summary_rows:
+                candidate_count = len(summary_rows)
+            elif "results/best.traj" in traj_counts:
+                candidate_count = traj_counts["results/best.traj"]
+            elif "best.traj" in traj_counts:
+                candidate_count = traj_counts["best.traj"]
+            elif "results/good.traj" in traj_counts:
+                candidate_count = traj_counts["results/good.traj"]
+            elif "good.traj" in traj_counts:
+                candidate_count = traj_counts["good.traj"]
+            else:
+                candidate_count = None
         return {
             "operation": operation,
             "candidates": candidates[:200],
-            "candidate_count": (
-                len(candidates)
-                if candidates
-                else None
-            ),
+            "candidate_count": candidate_count,
+            "artifact_candidate_counts": traj_counts,
             "summary": summary_text,
             "note": (
-                "candidate count derived from downloaded artifacts only; "
-                "no energies are reported without an internal calculator"
+                "candidate_count is the verified structure count (generate: "
+                "gen.traj frames; search: summary rows, then best.traj, then "
+                "good.traj -- never summed); candidates lists artifact "
+                "records separately; no energies without an internal "
+                "calculator"
             ),
         }
 

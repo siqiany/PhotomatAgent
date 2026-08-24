@@ -49,8 +49,11 @@ device = [
 optics = [
     "pytaser>=1.0",
 ]
+generation = [
+    "torch>=2.2",
+]
 science = [
-    "photomatagent[materials,electronic,literature,defects,transport,device,optics]",
+    "photomatagent[materials,electronic,literature,defects,transport,device,optics,generation]",
 ]
 
 [dependency-groups]

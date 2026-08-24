@@ -53,3 +53,17 @@ def test_loader_ignores_symlinked_skill_directory(tmp_path):
 
     assert loader.load_index() == []
     assert loader.load_all() == []
+
+
+def test_native_composition_generation_skill_routes_to_vae_tool():
+    loader = SkillLoader()
+    entry = next(
+        item
+        for item in loader.load_index()
+        if item.name == "material-composition-generation"
+    )
+    assert "成分生成" in entry.description
+    body, resolved = loader.view(entry.name)
+    assert resolved == "SKILL.md"
+    assert "generation.vae_formula" in body
+    assert "generation.mattergen" in body

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shlex
 from dataclasses import dataclass
 
@@ -12,6 +13,33 @@ from photomatagent.cli.render import ChatRenderer
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import ApprovalScope, SwitchablePermissionPolicy
 from photomatagent.workspace import Workspace
+
+
+# Matches ANSI/control escape sequences Rich may embed in CLI output when the
+# command was captured while its console believed it was writing to a TTY:
+#   CSI sequences like "\x1b[1;2;36m" (colors, styles, cursor moves)
+#   OSC sequences like "\x1b]8;;url\x1b\\" (hyperlink wrappers)
+# plus any leftover bare ESC byte. Keeping them would make the interactive
+# console print literal "[1;2;36m…[0m" garbage, because Rich drops the ESC
+# character and re-renders the remainder as plain text.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_ANSI_OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
+
+
+def strip_ansi_codes(text: str) -> str:
+    """Remove ANSI/control escape sequences so only readable text remains."""
+    text = _ANSI_CSI_RE.sub("", text)
+    text = _ANSI_OSC_RE.sub("", text)
+    return text.replace("\x1b", "")
+
+
+def _print_cli_capture(console: Console, captured: str) -> None:
+    """Render captured CLI stdout without re-mangling embedded ANSI escapes."""
+    console.print(
+        strip_ansi_codes(captured).rstrip("\n"),
+        markup=False,
+        highlight=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -147,6 +175,11 @@ class ChatCommandRouter:
             args.extend(["--workspace", str(self.workspace.root)])
         result = await asyncio.to_thread(CliRunner().invoke, app, args)
         if result.stdout:
-            self.console.print(result.stdout.rstrip(), markup=False)
+            # The CLI module console may render ANSI styles into the captured
+            # buffer (it fixes its color system at import time, when stdout is
+            # still the interactive TTY). Re-printing raw escapes through
+            # another Rich console corrupts them into literal "[1;2;36m…[0m"
+            # text, so hand the interactive console only clean plain text.
+            _print_cli_capture(self.console, result.stdout)
         if result.exception is not None and result.exit_code != 0:
             self.console.print(f"[red]命令失败（exit={result.exit_code}）：{result.exception}[/]")

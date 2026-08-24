@@ -149,16 +149,91 @@ def test_vae_tool_rejects_device_properties():
     assert result.data["error_type"] == "unsupported_device_property"
 
 
-def test_vae_tool_missing_prerequisite_when_no_checkpoint():
+def test_vae_tool_missing_prerequisite_when_checkpoint_is_invalid():
     from photomatagent.scientific.capabilities.generation.tools import (
         VAEFormulaTool,
     )
 
     result = asyncio.run(
-        VAEFormulaTool().execute({"target_band_gap_eV": 0.5})
+        VAEFormulaTool().execute(
+            {
+                "target_band_gap_eV": 0.5,
+                "checkpoint_path": "/nonexistent/checkpoint.pt",
+            }
+        )
     )
     assert result.is_error
+    assert result.data["error_type"] == "missing_prerequisites"
     assert "checkpoint" in result.output
+
+
+def test_vae_checkpoint_decoder_is_loadable_and_deterministic(tmp_path):
+    torch = pytest.importorskip("torch")
+    from photomatagent.scientific.capabilities.generation.conditional_vae import (
+        ConditionalVAE,
+        VAEConfig,
+    )
+
+    config = VAEConfig(
+        composition_dim=len(VOCABULARY),
+        condition_dim=2,
+        hidden_dim=12,
+        latent_dim=4,
+    )
+    model = ConditionalVAE(config)
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "config": {
+                "composition_dim": config.composition_dim,
+                "condition_dim": config.condition_dim,
+                "hidden_dim": config.hidden_dim,
+                "latent_dim": config.latent_dim,
+            },
+            "model_state_dict": model.state_dict(),
+            "condition_center": torch.tensor([0.5, 2.5]),
+            "condition_scale": torch.tensor([0.25, 1.0]),
+            "property_fields": [
+                "gap_selected_eV",
+                "cutoff_wavelength_um_from_gap",
+            ],
+            "vocabulary": VOCABULARY,
+        },
+        checkpoint,
+    )
+    generator = VAEFormulaGenerator(
+        checkpoint_path=checkpoint,
+        require_novel=False,
+        sample_count=8,
+        random_seed=17,
+    )
+    generator._load_torch_decoder()
+    condition = generator.condition(
+        target_band_gap_eV=0.5,
+        target_wavelength_um=2.5,
+    )
+    first = generator.decode_samples(condition, 8)
+    second = generator.decode_samples(condition, 8)
+    assert first.shape == (8, len(VOCABULARY))
+    assert np.allclose(first.sum(axis=1), 1.0)
+    assert np.allclose(first, second)
+
+
+def test_vae_asset_root_resolves_deployed_layout(tmp_path, monkeypatch):
+    from photomatagent.scientific.capabilities.generation.tools import (
+        _resolve_vae_assets,
+    )
+
+    checkpoint = tmp_path / "jarvis_cvae_v1" / "checkpoint.pt"
+    metadata = tmp_path / "jarvis_inverse_v1" / "candidate_metadata.json"
+    checkpoint.parent.mkdir()
+    metadata.parent.mkdir()
+    checkpoint.write_bytes(b"checkpoint")
+    metadata.write_text("[]", encoding="utf-8")
+    monkeypatch.setenv("PHOTOMATAGENT_VAE_ASSET_ROOT", str(tmp_path))
+    resolved_checkpoint, resolved_metadata = _resolve_vae_assets()
+    assert resolved_checkpoint == checkpoint.resolve()
+    assert resolved_metadata == metadata.resolve()
 
 
 # -- MatterGen ----------------------------------------------------------------

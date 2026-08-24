@@ -187,13 +187,20 @@ SCNET_MAGUS_ROOT=~/magus
 # 可选：激活 MAGUS python 环境的脚本（默认自动设置 PATH=<root>/bin）
 # SCNET_MAGUS_ENV_SCRIPT=/path/to/magus_env.sh
 # 可选：MAGUS+VASP 时激活 VASP 工具链的 env.sh（不设置则复用
-# SCNET_VASP_ENV_SCRIPT；两者都无则 launcher 报 MISSING）
+# SCNET_VASP_ENV_SCRIPT；两者都无则 environment 报 MISSING）。这只是
+# “VASP 环境初始化脚本”，不是 ASE 的执行命令（见
+# SCNET_MAGUS_ASE_VASP_COMMAND）。
 # SCNET_MAGUS_VASP_SCRIPT=/public/home/USER/apprepo/vasp/VERSION/scripts/env.sh
 
 # ASE VASP_PP_PATH 语义：指向“包含 potpaw_PBE/ 的父目录”，ASE 自行拼
 # potpaw_PBE/<setup>/POTCAR。与 SCNET_VASP_PSP_DIR（精确库目录，
 # $SCNET_VASP_PSP_DIR/<setup>/POTCAR）语义不同，不要混淆。
 SCNET_MAGUS_VASP_PP_PATH=/public/home/USER
+
+# ASE 在 MAGUS 内实际执行 VASP 的命令（如 "srun --mpi=pmi2 vasp_std"）。
+# 必须先在真实 SCNet 环境验证，否则 MAGUS+VASP readiness 报 PARTIAL；
+# 未配置时绝不自动提交 VASP。
+# SCNET_MAGUS_ASE_VASP_COMMAND=srun --mpi=pmi2 vasp_std
 ```
 
 #### 已验证的 MAGUS 2.1.0 事实（Sprint 4 远程探测）

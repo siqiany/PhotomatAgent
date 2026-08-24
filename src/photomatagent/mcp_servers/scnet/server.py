@@ -169,7 +169,7 @@ async def vasp_submit(
             f"vasp.submit refused: {type(exc).__name__}: {exc}",
             error_type=type(exc).__name__,
         )
-    payload = ref.model_dump()
+    payload = ref.model_dump(mode="json")
     payload["note"] = (
         "detached job: poll with vasp_status; Slurm COMPLETED is not "
         "scientific validity -- collect with vasp_collect"
@@ -378,7 +378,7 @@ async def namd_submit(
             f"namd.submit refused: {type(exc).__name__}: {exc}",
             error_type=type(exc).__name__,
         )
-    payload = ref.model_dump()
+    payload = ref.model_dump(mode="json")
     payload["note"] = "detached job; poll with namd_status"
     return payload
 
@@ -601,7 +601,7 @@ async def magus_submit(
             f"magus.submit refused: {type(exc).__name__}: {exc}",
             error_type=type(exc).__name__,
         )
-    payload = ref.model_dump()
+    payload = ref.model_dump(mode="json")
     payload["note"] = "detached job; poll with magus_status"
     return payload
 

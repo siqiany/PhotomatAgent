@@ -47,6 +47,11 @@ def test_tool_search_finds_inverse_composition(catalog):
     assert "generation.vae_formula" in names
 
 
+def test_tool_search_finds_vae_for_chinese_composition_generation(catalog):
+    names = _top_names(catalog, "成分生成")
+    assert "generation.vae_formula" in names
+
+
 def test_tool_search_finds_thin_film_absorption(catalog):
     names = _top_names(catalog, "thin film absorption")
     assert "optics.meep_thinfilm" in names

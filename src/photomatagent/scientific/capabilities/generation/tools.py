@@ -23,6 +23,7 @@ from photomatagent.scientific.capabilities.generation.mattergen import (
     LocalIsolatedMatterGenProvider,
     MatterGenGenerator,
 )
+from photomatagent.scientific.errors import MissingScientificPrerequisite
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 
@@ -53,7 +54,15 @@ class GenerationCapabilitiesTool(Tool):
     exposure = ToolExposure.DEFERRED
     namespace = "generation"
     source = "capability metadata"
-    tags = ("generation", "vae", "mattergen", "candidates")
+    tags = (
+        "generation",
+        "vae",
+        "mattergen",
+        "candidates",
+        "成分生成",
+        "组分生成",
+        "化学式生成",
+    )
     cost_class = "CHEAP"
     input_schema: dict[str, Any] = {"type": "object", "properties": {}}
 
@@ -62,17 +71,31 @@ class GenerationCapabilitiesTool(Tool):
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         torch_available = importlib.util.find_spec("torch") is not None
+        vae_checkpoint, vae_metadata = _resolve_vae_assets()
+        if not torch_available:
+            vae_status = "MISSING_DEPENDENCY"
+            vae_detail = "install the generation extra to provide PyTorch"
+        elif vae_checkpoint is None:
+            vae_status = "UNCONFIGURED"
+            vae_detail = (
+                "set PHOTOMATAGENT_VAE_ASSET_ROOT or VAE_CHECKPOINT_PATH"
+            )
+        elif vae_metadata is None:
+            vae_status = "PARTIAL"
+            vae_detail = (
+                f"checkpoint: {vae_checkpoint}; set VAE_METADATA_PATH for "
+                "training-set novelty filtering"
+            )
+        else:
+            vae_status = "AVAILABLE"
+            vae_detail = (
+                f"checkpoint: {vae_checkpoint}; novelty metadata: {vae_metadata}"
+            )
         mattergen_script = _env("MATTERGEN_SKILL_SCRIPT")
         payload = {
             "vae_formula": {
-                "status": "AVAILABLE" if torch_available else "MISSING_DEPENDENCY",
-                "detail": (
-                    "torch checkpoint decoding"
-                    if torch_available
-                    else "torch not installed; formula filtering (integer "
-                    "stoichiometry / neutrality / novelty) is testable, but "
-                    "decoding requires an isolated torch environment"
-                ),
+                "status": vae_status,
+                "detail": vae_detail,
                 "scope": (
                     "composition prior / formula proposal / candidate "
                     "retrieval only; VAE does NOT predict responsivity, EQE, "
@@ -117,14 +140,23 @@ class VAEFormulaTool(Tool):
         "property-conditioned VAE. forbidden_elements is an OPTIONAL user "
         "constraint (default: none). Scope: composition prior / formula "
         "proposal only -- never predicts responsivity/EQE/detectivity/dark "
-        "current. Requires a torch checkpoint configured via "
-        "VAE_CHECKPOINT_PATH, or fails with missing_prerequisites."
+        "current. Loads the deployed JARVIS conditional-VAE checkpoint via "
+        "PHOTOMATAGENT_VAE_ASSET_ROOT/VAE_CHECKPOINT_PATH and reports typed "
+        "missing prerequisites when model assets are unavailable."
     )
     short_description = "VAE composition proposal for a target gap/wavelength."
     exposure = ToolExposure.DEFERRED
     namespace = "generation"
     source = "photomatagent VAE formula generator (donor migration)"
-    tags = ("generation", "vae", "formula", "composition")
+    tags = (
+        "generation",
+        "vae",
+        "formula",
+        "composition",
+        "成分生成",
+        "组分生成",
+        "化学式生成",
+    )
     cost_class = "CHEAP"
     input_schema = {
         "type": "object",
@@ -139,6 +171,13 @@ class VAEFormulaTool(Tool):
             "require_charge_neutral": {"type": "boolean"},
             "require_novel": {"type": "boolean"},
             "checkpoint_path": {"type": "string"},
+            "metadata_path": {"type": "string"},
+            "sample_count": {
+                "type": "integer",
+                "minimum": 8,
+                "maximum": 4096,
+            },
+            "random_seed": {"type": "integer", "minimum": 0},
         },
     }
 
@@ -166,16 +205,19 @@ class VAEFormulaTool(Tool):
                     "unsupported": unsupported,
                 },
             )
-        checkpoint = arguments.get("checkpoint_path") or _env(
-            "VAE_CHECKPOINT_PATH"
+        checkpoint, metadata = _resolve_vae_assets(
+            checkpoint_path=arguments.get("checkpoint_path"),
+            metadata_path=arguments.get("metadata_path"),
         )
         generator = VAEFormulaGenerator(
-            checkpoint_path=checkpoint or None,
+            checkpoint_path=checkpoint,
+            metadata_path=metadata,
+            sample_count=int(arguments.get("sample_count", 512)),
+            random_seed=int(arguments.get("random_seed", 42)),
             require_charge_neutral=bool(
                 arguments.get("require_charge_neutral", True)
             ),
             require_novel=bool(arguments.get("require_novel", True)),
-            vocabulary=_env_list("VAE_VOCABULARY"),
         )
         try:
             proposals, metadata = generator.generate(
@@ -193,11 +235,16 @@ class VAEFormulaTool(Tool):
                 forbidden_elements=arguments.get("forbidden_elements", []),
             )
         except Exception as exc:
+            is_prerequisite = isinstance(exc, MissingScientificPrerequisite)
             return ScientificToolResult(
                 output=f"generation.vae_formula failed: {exc}",
                 is_error=True,
                 data={
-                    "error_type": getattr(exc, "__class__", type(exc)).__name__,
+                    "error_type": (
+                        "missing_prerequisites"
+                        if is_prerequisite
+                        else type(exc).__name__
+                    ),
                     "message": str(exc),
                     "missing": getattr(exc, "missing", []),
                 },
@@ -401,19 +448,23 @@ class GenerationCapabilityPack(CapabilityPack):
 
     def probe(self) -> ProbeResult:
         torch_available = importlib.util.find_spec("torch") is not None
+        checkpoint, metadata = _resolve_vae_assets()
         script = _env("MATTERGEN_SKILL_SCRIPT")
-        if torch_available or script:
+        vae_available = torch_available and checkpoint is not None
+        if vae_available or script:
             return ProbeResult(
                 status=CapabilityStatus.AVAILABLE,
                 detail=(
                     f"torch={'yes' if torch_available else 'no'}; "
+                    f"vae checkpoint={'set' if checkpoint else 'unset'}; "
+                    f"vae metadata={'set' if metadata else 'unset'}; "
                     f"mattergen script={'set' if script else 'unset'}"
                 ),
             )
         return ProbeResult(
             status=CapabilityStatus.MISSING_DEPENDENCY,
             detail=(
-                "torch not installed and MATTERGEN_SKILL_SCRIPT unset; "
+                "VAE runtime/assets and MATTERGEN_SKILL_SCRIPT are unavailable; "
                 "generation tools return typed missing_prerequisites"
             ),
         )
@@ -433,8 +484,88 @@ def _env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
-def _env_list(name: str) -> list[str]:
-    return [item.strip() for item in _env(name).split(",") if item.strip()]
+def _resolve_vae_assets(
+    *,
+    checkpoint_path: Any = None,
+    metadata_path: Any = None,
+) -> tuple[Path | None, Path | None]:
+    """Resolve configured, bundled, or sibling-agent VAE assets.
+
+    The sibling lookup connects the already deployed GlassCrewAgent model on
+    this workstation without copying multi-megabyte scientific data into this
+    repository. Explicit environment/input paths always take precedence.
+    """
+
+    explicit_checkpoint = str(
+        checkpoint_path or _env("VAE_CHECKPOINT_PATH")
+    ).strip()
+    explicit_metadata = str(
+        metadata_path or _env("VAE_METADATA_PATH")
+    ).strip()
+
+    checkpoint = _existing_file(explicit_checkpoint)
+    metadata = _existing_file(explicit_metadata)
+    if explicit_checkpoint and checkpoint is None:
+        return None, metadata
+    if checkpoint is not None and not explicit_metadata:
+        metadata = _existing_file(
+            checkpoint.parent.parent
+            / "jarvis_inverse_v1"
+            / "candidate_metadata.json"
+        )
+    if checkpoint is not None:
+        return checkpoint, metadata
+
+    roots: list[Path] = []
+    for name in (
+        "PHOTOMATAGENT_VAE_ASSET_ROOT",
+        "PHOTOELECTRIC_VAE_ASSET_ROOT",
+        "VAE_ASSET_ROOT",
+    ):
+        value = _env(name)
+        if value:
+            roots.append(Path(value).expanduser())
+
+    repository = Path(__file__).resolve().parents[5]
+    roots.extend(
+        [
+            repository / "data" / "photoelectric_vae",
+            Path.cwd() / "data" / "photoelectric_vae",
+            repository.parent
+            / "GlassCrewAgent"
+            / "data"
+            / "photoelectric_vae",
+            Path.cwd().parent
+            / "GlassCrewAgent"
+            / "data"
+            / "photoelectric_vae",
+        ]
+    )
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidate_checkpoint = _existing_file(
+            resolved / "jarvis_cvae_v1" / "checkpoint.pt"
+        )
+        if candidate_checkpoint is None:
+            continue
+        candidate_metadata = metadata
+        if not explicit_metadata:
+            candidate_metadata = _existing_file(
+                resolved / "jarvis_inverse_v1" / "candidate_metadata.json"
+            )
+        return candidate_checkpoint, candidate_metadata
+    return None, metadata
+
+
+def _existing_file(value: str | Path | None) -> Path | None:
+    if value is None or not str(value).strip():
+        return None
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_file() else None
 
 
 def generation_pack(config: Any = None) -> GenerationCapabilityPack:

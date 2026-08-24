@@ -1,0 +1,11 @@
+# POTCAR policy (POTCAR files are never committed or generated
+# by PhotoMatAgent).
+profile: standard_semiconductor
+executable: vasp_std
+resolution_order:
+  1. PMG_VASP_PSP_DIR (local) with <setup>/POTCAR layouts:
+     direct <root>/<setup>/POTCAR, potpaw_PBE/, potpaw_PBE.64/
+  2. remote pseudopotential location configured on SCNet
+  3. explicit potcar_overrides
+  Si: resolved (/home/shiqiany/Vasp/potpaw_PBE.64/Si/POTCAR)
+  O: resolved (/home/shiqiany/Vasp/potpaw_PBE.64/O/POTCAR)

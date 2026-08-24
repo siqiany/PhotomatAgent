@@ -225,11 +225,13 @@ def test_slurm_rendering_launcher_empty_and_job_system():
     )
     assert "srun --mpi=pmi2" not in script
     assert script.rstrip().endswith(
-        "'~/magus/bin/magus' generate -i input.yaml -o gen.traj -n 5"
+        "magus generate -i input.yaml -o gen.traj -n 5"
     )
     assert "export JOB_SYSTEM=SLURM" in script
-    assert "export PATH='~/magus/bin:$PATH'" in script
-    assert "export VASP_PP_PATH='~/psp'" in script
+    # PATH is a deterministic double-quoted preamble (single quotes would
+    # prevent $PATH expansion); generate never loads the VASP environment.
+    assert 'export PATH="$HOME/magus/bin:$PATH"' in script
+    assert "export VASP_PP_PATH" not in script
 
 
 def test_slurm_rendering_sources_env_scripts():
@@ -239,8 +241,127 @@ def test_slurm_rendering_sources_env_scripts():
         args=["search", "-i", "input.yaml"],
         resource=ResourceRequest(),
         vasp_script="/public/home/u/apprepo/vasp/env.sh",
+        needs_vasp=True,
+        ase_vasp_command="srun --mpi=pmi2 vasp_std",
     )
     assert "source /public/home/u/apprepo/vasp/env.sh" in script
+    assert 'export ASE_VASP_COMMAND="srun --mpi=pmi2 vasp_std"' in script
+
+
+def test_slurm_generate_never_loads_vasp_environment():
+    """magus generate must not carry VASP env / PP path / ASE command."""
+    script = render_magus_slurm(
+        job_name="magus-gen-y",
+        executable="/opt/magus/bin/magus",
+        args=["generate", "-i", "input.yaml", "-o", "gen.traj", "-n", "5"],
+        resource=ResourceRequest(),
+        magus_root="/opt/magus",
+        vasp_script="/public/home/u/apprepo/vasp/env.sh",
+        vasp_pp_path="/public/home/u",
+        ase_vasp_command="srun --mpi=pmi2 vasp_std",
+    )
+    assert "export JOB_SYSTEM=SLURM" in script
+    assert 'export PATH="/opt/magus/bin:$PATH"' in script
+    assert "VASP_PP_PATH" not in script
+    assert "ASE_VASP_COMMAND" not in script
+    assert "source /public/home/u/apprepo/vasp/env.sh" not in script
+
+
+def test_slurm_non_vasp_search_never_loads_vasp_environment():
+    """LJ/EMT searches load MAGUS only, exactly like generate."""
+    script = render_magus_slurm(
+        job_name="magus-lj-search",
+        executable="/opt/magus/bin/magus",
+        args=["search", "-i", "input.yaml"],
+        resource=ResourceRequest(),
+        magus_root="/opt/magus",
+        vasp_script="/public/home/u/apprepo/vasp/env.sh",
+        vasp_pp_path="/public/home/u",
+        ase_vasp_command="srun --mpi=pmi2 vasp_std",
+    )
+    assert "VASP_PP_PATH" not in script
+    assert "ASE_VASP_COMMAND" not in script
+    assert "source /public/home/u/apprepo/vasp/env.sh" not in script
+    assert 'export PATH="/opt/magus/bin:$PATH"' in script
+
+
+def test_slurm_vasp_search_loads_full_vasp_environment():
+    script = render_magus_slurm(
+        job_name="magus-vasp-search",
+        executable="/opt/magus/bin/magus",
+        args=["search", "-i", "input.yaml"],
+        resource=ResourceRequest(),
+        magus_root="/opt/magus",
+        vasp_script="/public/home/u/apprepo/vasp/env.sh",
+        vasp_pp_path="/public/home/u",
+        ase_vasp_command="srun --mpi=pmi2 vasp_std",
+        needs_vasp=True,
+    )
+    assert "export VASP_PP_PATH=/public/home/u" in script
+    assert 'export ASE_VASP_COMMAND="srun --mpi=pmi2 vasp_std"' in script
+    assert "source /public/home/u/apprepo/vasp/env.sh" in script
+
+
+def test_slurm_path_expansion_never_single_quoted():
+    script = render_magus_slurm(
+        job_name="magus-path",
+        executable="~/magus/bin/magus",
+        args=["generate", "-i", "input.yaml", "-o", "gen.traj", "-n", "3"],
+        resource=ResourceRequest(),
+        magus_root="~/magus",
+    )
+    assert 'export PATH="$HOME/magus/bin:$PATH"' in script
+    assert "export PATH='~/magus/bin:$PATH'" not in script
+    # $PATH must remain expandable (double quotes), never a literal.
+    assert "':$PATH'" not in script
+
+
+def test_slurm_tilde_executable_invoked_via_path():
+    """A ~/ executable cannot be quoted (tilde does not expand inside
+    quotes): it must be invoked by basename through the $HOME-based PATH
+    preamble instead."""
+    script = render_magus_slurm(
+        job_name="magus-tilde-exe",
+        executable="~/magus/bin/magus",
+        args=["generate", "-i", "input.yaml", "-o", "gen.traj", "-n", "3"],
+        resource=ResourceRequest(),
+        magus_root="~/magus",
+    )
+    assert script.rstrip().endswith(
+        "magus generate -i input.yaml -o gen.traj -n 3"
+    )
+    assert "'~/magus/bin/magus' generate" not in script
+    assert 'export PATH="$HOME/magus/bin:$PATH"' in script
+
+
+def test_validate_configured_vasp_command():
+    from photomatagent.scientific.applications.magus.render import (
+        validate_configured_vasp_command,
+    )
+
+    assert (
+        validate_configured_vasp_command("srun --mpi=pmi2 vasp_std")
+        == "srun --mpi=pmi2 vasp_std"
+    )
+    assert validate_configured_vasp_command("  vasp_std  ") == "vasp_std"
+    for bad in (
+        "srun\nvasp_std",
+        "srun\rvasp_std",
+        "vasp_std; rm -rf /",
+        "vasp_std && echo hi",
+        "vasp_std || true",
+        "vasp_std > /tmp/x",
+        "vasp_std < /dev/null",
+        "vasp_std | grep x",
+        "`vasp_std`",
+        "$(vasp_std)",
+        "echo $HOME",
+        'echo "hi"',
+        "",
+        "   ",
+    ):
+        with pytest.raises(ValueError):
+            validate_configured_vasp_command(bad)
 
 
 # -- default application -------------------------------------------------------
@@ -256,11 +377,13 @@ def test_default_magus_application_from_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("SCNET_REMOTE_ROOT", "~/myjob")
     monkeypatch.setenv("SCNET_MAGUS_ROOT", "/opt/magus")
     monkeypatch.setenv("SCNET_MAGUS_VASP_PP_PATH", "/opt/psp")
+    monkeypatch.setenv("SCNET_MAGUS_ASE_VASP_COMMAND", "srun --mpi=pmi2 vasp_std")
     monkeypatch.setenv("SCNET_VASP_ENV_SCRIPT", "/opt/vasp/env.sh")
     app = default_magus_application()
     assert app is not None
     assert app.magus_root == "/opt/magus"
     assert app.vasp_pp_path == "/opt/psp"
+    assert app.ase_vasp_command == "srun --mpi=pmi2 vasp_std"
     assert app.vasp_script == "/opt/vasp/env.sh"
     assert app.backend is not None
     assert app.backend.config.host == "cancon.example"
@@ -305,6 +428,56 @@ def test_probe_explicit_executable_override():
     app = MagusApplication(backend, executable="/opt/magus/bin/magus")
     report = asyncio.run(app.probe_environment_async())
     assert report["executable"] == "/opt/magus/bin/magus"
+
+
+def test_probe_vasp_readiness_layered_ready():
+    backend = FakeSCNetBackend()
+    backend.add_ssh_script("test -f ~/psp/In/POTCAR", "OK")
+    backend.add_ssh_script(
+        'p=$(command -v "srun" 2>/dev/null) && '
+        'echo "FOUND-srun=$p" || echo "MISSING-srun"; '
+        'p=$(command -v "vasp_std" 2>/dev/null) && '
+        'echo "FOUND-vasp_std=$p" || echo "MISSING-vasp_std"',
+        "FOUND-srun=/usr/bin/srun\nFOUND-vasp_std=/opt/vasp/vasp_std",
+    )
+    app = MagusApplication(
+        backend,
+        vasp_pp_path="~/psp",
+        vasp_script="/opt/vasp/env.sh",
+        ase_vasp_command="srun --mpi=pmi2 vasp_std",
+    )
+    psp = asyncio.run(app._probe_psp_readiness())
+    report = asyncio.run(app._probe_vasp_readiness(["vasp"], psp))
+    assert report["calculator"] == "READY"
+    assert report["environment"] == "READY"
+    assert report["ase_command_configured"] is True
+    assert report["ase_command_verified"] is True
+    assert report["pseudopotential_path"] == "READY"
+    assert report["overall"] == "READY"
+
+
+def test_probe_vasp_readiness_partial_without_ase_command():
+    backend = FakeSCNetBackend()
+    backend.add_ssh_script("test -f ~/psp/In/POTCAR", "OK")
+    app = MagusApplication(
+        backend, vasp_pp_path="~/psp", vasp_script="/opt/vasp/env.sh"
+    )
+    psp = asyncio.run(app._probe_psp_readiness())
+    report = asyncio.run(app._probe_vasp_readiness(["vasp"], psp))
+    assert report["calculator"] == "READY"
+    assert report["environment"] == "READY"
+    assert report["ase_command_configured"] is False
+    assert report["ase_command_verified"] is False
+    assert report["overall"] == "PARTIAL"
+
+
+def test_probe_vasp_readiness_missing_calculator():
+    backend = FakeSCNetBackend()
+    app = MagusApplication(backend)
+    psp = asyncio.run(app._probe_psp_readiness())
+    report = asyncio.run(app._probe_vasp_readiness(["emt"], psp))
+    assert report["calculator"] == "MISSING"
+    assert report["overall"] == "MISSING"
 
 
 def test_probe_bounded_find_fallback():
@@ -636,7 +809,11 @@ def test_collect_downloads_bounded_artifacts(tmp_path):
         assert "input.yaml" in names
         assert "summary" in names
         assert "huge.bin" not in names
-        assert report["candidate_count"] is not None
+        # Nested artifacts must keep their relative structure (scp
+        # basename-in-target semantics), not double-nest.
+        assert (tmp_path / "out" / "results" / "best.traj").is_file()
+        assert report["candidate_count"] == 1
+        assert report["artifact_candidate_counts"] == {"results/best.traj": 1}
 
     asyncio.run(scenario())
 
@@ -669,7 +846,8 @@ def test_inspect_results_reports_unverified_generate(tmp_path):
     out.mkdir()
     report = app.inspect_results(out, operation="generate", expected_number=5)
     assert report["candidates"] == [{"requested": 5, "verified_from_artifact": False}]
-    assert report["candidate_count"] == 1
+    # requested != verified: no artifact means no verified count.
+    assert report["candidate_count"] is None
 
 
 def test_inspect_results_no_fabrication_when_nothing_downloaded(tmp_path):
@@ -680,6 +858,80 @@ def test_inspect_results_no_fabrication_when_nothing_downloaded(tmp_path):
     assert report["candidates"] == []
     assert report["candidate_count"] is None
     assert report["summary"] == ""
+
+
+def test_generate_candidate_count_uses_traj_frames(tmp_path):
+    import io
+
+    from ase import Atoms
+    from ase.io import write
+
+    app = MagusApplication()
+    out = tmp_path / "res"
+    out.mkdir()
+    buffer = io.BytesIO()
+    write(
+        buffer,
+        [Atoms("B", positions=[[0, 0, 0]], cell=[4, 4, 4]) for _ in range(3)],
+        format="traj",
+    )
+    (out / "gen.traj").write_bytes(buffer.getvalue())
+    report = app.inspect_results(out, operation="generate", expected_number=3)
+    assert report["candidate_count"] == 3
+    assert report["artifact_candidate_counts"] == {"gen.traj": 3}
+    assert len(report["candidates"]) == 1
+    assert report["candidates"][0] == {"artifact": "gen.traj", "frames": 3}
+
+
+def test_search_candidate_count_summary_priority(tmp_path):
+    import io
+
+    from ase import Atoms
+    from ase.io import write
+
+    app = MagusApplication()
+    out = tmp_path / "res"
+    results = out / "results"
+    results.mkdir(parents=True)
+    (out / "summary").write_text(
+        "symmetry enthalpy formula priFormula\n"
+        "  I4_1md (109)     None     B12         B6\n"
+        "  Pbam (55)     None     B12        B12\n",
+        encoding="utf-8",
+    )
+    buffer = io.BytesIO()
+    write(
+        buffer,
+        [Atoms("B", positions=[[0, 0, 0]], cell=[4, 4, 4]) for _ in range(3)],
+        format="traj",
+    )
+    (results / "best.traj").write_bytes(buffer.getvalue())
+    report = app.inspect_results(out, operation="search")
+    # summary rows (2) win over best.traj frames (3); never summed.
+    assert report["candidate_count"] == 2
+    assert report["artifact_candidate_counts"] == {"results/best.traj": 3}
+
+
+def test_search_candidate_count_best_traj_fallback(tmp_path):
+    import io
+
+    from ase import Atoms
+    from ase.io import write
+
+    app = MagusApplication()
+    out = tmp_path / "res"
+    results = out / "results"
+    results.mkdir(parents=True)
+    buffer = io.BytesIO()
+    write(
+        buffer,
+        [Atoms("Al", positions=[[0, 0, 0]], cell=[4, 4, 4]) for _ in range(3)],
+        format="traj",
+    )
+    (results / "best.traj").write_bytes(buffer.getvalue())
+    (results / "good.traj").write_bytes(buffer.getvalue())
+    report = app.inspect_results(out, operation="search")
+    assert report["candidate_count"] == 3
 
 
 def test_manifest_provenance(tmp_path):
@@ -816,7 +1068,10 @@ def test_live_magus_generate_acceptance(tmp_path):
         app.collect(job_ref=ref, local_dir=tmp_path / "results")
     )
     assert report["candidate_count"] == 3
-    assert "gen.traj" in {artifact["name"] for artifact in report["artifacts"]}
+    assert report["artifact_candidate_counts"] == {"gen.traj": 3}
+    assert "gen.traj" in {
+        Path(artifact["name"]).name for artifact in report["artifacts"]
+    }
     print(
         "MAGUS generate acceptance: job",
         ref.job_id,
@@ -824,4 +1079,103 @@ def test_live_magus_generate_acceptance(tmp_path):
         state.value,
         "candidates",
         report["candidate_count"],
+    )
+
+
+def test_live_magus_vasp_tiny_acceptance(tmp_path):
+    """Real tiny MAGUS+VASP acceptance (Al, serial, VASP through ASE).
+
+    Triple-gated on PHOTOMATAGENT_RUN_LIVE_SCIENCE=1,
+    PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1 and
+    PHOTOMATAGENT_RUN_LIVE_MAGUS_VASP=1; skipped by default. Requires the
+    verified SCNet configuration (SCNET_MAGUS_ASE_VASP_COMMAND and
+    SCNET_MAGUS_VASP_PP_PATH). Execution acceptance only -- not a
+    scientific result; Al structure stability is NOT evaluated.
+
+    Run::
+
+        PHOTOMATAGENT_RUN_LIVE_SCIENCE=1 PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1 \\
+            PHOTOMATAGENT_RUN_LIVE_MAGUS_VASP=1 \\
+            uv run pytest tests/test_magus_sprint.py -k live_magus_vasp -q -s
+    """
+    import os
+    import time
+
+    if (
+        os.environ.get("PHOTOMATAGENT_RUN_LIVE_SCIENCE") != "1"
+        or os.environ.get("PHOTOMATAGENT_ALLOW_HPC_SUBMIT") != "1"
+        or os.environ.get("PHOTOMATAGENT_RUN_LIVE_MAGUS_VASP") != "1"
+    ):
+        pytest.skip(
+            "set PHOTOMATAGENT_RUN_LIVE_SCIENCE=1, "
+            "PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1 and "
+            "PHOTOMATAGENT_RUN_LIVE_MAGUS_VASP=1 for the MAGUS+VASP "
+            "acceptance"
+        )
+    app = default_magus_application()
+    assert app is not None
+    request = MagusSearchRequest.from_composition(
+        "Al",
+        structure_type="bulk",
+        calculator="vasp",
+        execution_mode="serial",
+        init_size=2,
+        population_size=2,
+        generations=1,
+        save_good=1,
+        min_atoms=4,
+        max_atoms=4,
+    )
+    job = tmp_path / "magus-vasp-acceptance"
+    app.prepare_search(request, job)
+    partition = os.environ.get("SCNET_PARTITION", "kshcnormal")
+    ref = asyncio.run(
+        app.submit(
+            job_name="acceptance-vasp",
+            prepared_dir=job,
+            resource=ResourceRequest(
+                partition=partition,
+                nodes=1,
+                tasks_per_node=2,
+                walltime_minutes=10,
+            ),
+        )
+    )
+
+    async def wait_terminal() -> HPCJobState:
+        state = HPCJobState.SUBMITTED
+        deadline = time.monotonic() + 25 * 60
+        while not state.terminal and time.monotonic() < deadline:
+            await asyncio.sleep(20)
+            state = await app.status(ref.job_id)
+        return state
+
+    state = asyncio.run(wait_terminal())
+    assert state == HPCJobState.COMPLETED, f"job {ref.job_id} ended {state.value}"
+    results_dir = tmp_path / "results"
+    report = asyncio.run(app.collect(job_ref=ref, local_dir=results_dir))
+    artifact_names = {Path(a["name"]).name for a in report["artifacts"]}
+    # VASP must actually have run: OUTCAR / vasprun.xml / OSZICAR exist in
+    # the downloaded tree (Slurm COMPLETED alone is not evidence).
+    local_vasp_evidence = {
+        path.name
+        for path in results_dir.rglob("*")
+        if path.is_file() and path.name in {"OUTCAR", "vasprun.xml", "OSZICAR"}
+    }
+    assert (
+        artifact_names & {"OUTCAR", "vasprun.xml", "OSZICAR"}
+        or local_vasp_evidence
+    ), "no VASP execution evidence (OUTCAR/vasprun.xml/OSZICAR)"
+    assert (
+        report["candidate_count"] is not None and report["candidate_count"] >= 1
+    ), "MAGUS reported no candidate structure"
+    print(
+        "MAGUS+VASP acceptance: job",
+        ref.job_id,
+        "state",
+        state.value,
+        "candidates",
+        report["candidate_count"],
+        "vasp_evidence",
+        sorted(local_vasp_evidence or (artifact_names & {"OUTCAR", "vasprun.xml", "OSZICAR"})),
     )

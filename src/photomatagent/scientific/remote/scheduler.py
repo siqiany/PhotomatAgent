@@ -147,7 +147,10 @@ def remote_mkdir_command(remote_directory: str) -> str:
 def remote_ls_command(remote_directory: str) -> str:
     return (
         f"cd {_remote_path_expression(remote_directory)} 2>/dev/null && "
-        "find . -maxdepth 2 -type f -printf '%p %s\\n' 2>/dev/null | sort"
+        # Depth 3 so VASP evidence inside MAGUS calculator work dirs
+        # (calcFold/VASP/OUTCAR etc.) is reachable; still bounded by the
+        # collect-side file/size caps.
+        "find . -maxdepth 3 -type f -printf '%p %s\\n' 2>/dev/null | sort"
     )
 
 

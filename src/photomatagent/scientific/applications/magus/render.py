@@ -49,6 +49,58 @@ KSPACING = 0.314
 NCORE = 1
 """
 
+# Characters that can never appear in a trusted VASP execution command.
+# This is a config-level validator (admin/user input, not LLM input): it
+# must accept multi-word commands such as ``srun --mpi=pmi2 vasp_std`` but
+# reject any obvious shell-injection construct. Unlike
+# ``scheduler._validate_token`` (single tokens), this handles a full
+# command line.
+_FORBIDDEN_COMMAND_CHARS = frozenset("\r\n`$;|&><\\()\"'")
+
+
+def validate_configured_vasp_command(command: str) -> str:
+    """Validate a configured ``SCNET_MAGUS_ASE_VASP_COMMAND`` value.
+
+    Returns the normalized (whitespace-joined) command, or raises
+    ``ValueError`` when the value contains shell metacharacters, control
+    characters or unbalanced constructs. The result is safe to embed
+    inside double quotes in the rendered Slurm script.
+    """
+    raw = command or ""
+    if not raw.strip():
+        raise ValueError("ASE VASP command must not be empty")
+    # Check the RAW value first: normalization would otherwise hide
+    # embedded newlines/CR from the character scan.
+    if any(character in _FORBIDDEN_COMMAND_CHARS for character in raw):
+        raise ValueError(
+            "unsafe characters in configured ASE VASP command " f"{raw!r}"
+        )
+    normalized = " ".join(raw.split())
+    if not normalized:
+        raise ValueError("ASE VASP command must not be empty")
+    return normalized
+
+
+def _magus_command_executable(
+    executable: str, preamble_parts: list[str]
+) -> str:
+    """Return the command token for ``executable`` inside the Slurm script.
+
+    A ``~/``-prefixed executable cannot survive ``shlex`` quoting (tilde
+    expansion does not happen inside single quotes), so it is translated
+    into a PATH-based invocation: the ``$HOME``-relative parent directory
+    is exported on PATH in the deterministic preamble and the bare
+    basename becomes the command. Absolute executables are used verbatim.
+    """
+    if not executable.startswith("~/"):
+        return executable
+    tail = executable[2:]
+    base = tail.rsplit("/", 1)[-1]
+    parent = tail.rsplit("/", 1)[0] if "/" in tail else ""
+    if parent:
+        preamble_parts.append(f'export PATH="$HOME/{parent}:$PATH"')
+    return base
+
 
 def _yaml_quote(value: Any) -> str:
     if isinstance(value, str):
@@ -196,33 +248,60 @@ def render_magus_slurm(
     env_script: str = "",
     vasp_script: str = "",
     vasp_pp_path: str = "",
+    ase_vasp_command: str = "",
+    needs_vasp: bool = False,
     job_system: str = "SLURM",
 ) -> str:
     """Render the MAGUS Slurm script (launcher empty: MAGUS is the workflow
-    controller running inside the allocation; never ``srun magus``)."""
+    controller running inside the allocation; never ``srun magus``).
+
+    Environment isolation (Sprint 5 P0-5): ``needs_vasp`` is derived by the
+    application from the request (search + calculator == vasp). VASP-only
+    pieces (VASP env script, VASP_PP_PATH, ASE_VASP_COMMAND) are emitted
+    exclusively when ``needs_vasp`` is true; ``magus generate`` and
+    non-VASP searches (EMT/LJ/...) never load them.
+
+    ``PATH`` needs shell expansion (``$PATH``), so it is emitted as a
+    deterministic double-quoted preamble line -- never through the generic
+    single-quoted ``env_vars`` path. ``~/`` roots are rewritten to
+    ``$HOME`` because tilde expansion does not happen inside quotes.
+    """
     if not executable:
         raise ValueError("MAGUS executable is required")
     env_vars: dict[str, str] = {}
     if job_system:
         env_vars["JOB_SYSTEM"] = job_system
-    if magus_root:
-        validate_remote_path(magus_root, allow_tilde=True)
-        env_vars["PATH"] = f"{magus_root}/bin:$PATH"
-    if vasp_pp_path:
+    if needs_vasp and vasp_pp_path:
         validate_remote_path(vasp_pp_path, allow_tilde=True)
         env_vars["VASP_PP_PATH"] = vasp_pp_path
     preamble_parts: list[str] = []
-    scripts = [script for script in (vasp_script, env_script) if script]
-    for script in scripts:
-        validate_remote_path(script, allow_tilde=False)
+    if magus_root:
+        validate_remote_path(magus_root, allow_tilde=True)
+        if magus_root.startswith("~/"):
+            # Tilde does not expand inside double quotes; rewrite to $HOME.
+            path_value = f'"$HOME/{magus_root[2:]}/bin:$PATH"'
+        else:
+            path_value = f'"{magus_root}/bin:$PATH"'
+        preamble_parts.append(f"export PATH={path_value}")
+    command_executable = _magus_command_executable(executable, preamble_parts)
+    if needs_vasp and ase_vasp_command:
+        validated = validate_configured_vasp_command(ase_vasp_command)
+        preamble_parts.append(f'export ASE_VASP_COMMAND="{validated}"')
+    if needs_vasp and vasp_script:
+        validate_remote_path(vasp_script, allow_tilde=False)
         preamble_parts.append(
-            "set +e\n" + f"source {shlex.quote(script)}\n" + "set -e"
+            "set +e\n" + f"source {shlex.quote(vasp_script)}\n" + "set -e"
+        )
+    if env_script:
+        validate_remote_path(env_script, allow_tilde=False)
+        preamble_parts.append(
+            "set +e\n" + f"source {shlex.quote(env_script)}\n" + "set -e"
         )
     preamble = "\n".join(preamble_parts)
     return render_slurm_script(
         job_name=job_name,
         resource=resource,
-        executable=executable,
+        executable=command_executable,
         executable_args=args,
         env_vars=env_vars,
         preamble=preamble,
