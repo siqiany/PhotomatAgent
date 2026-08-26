@@ -37,6 +37,10 @@ from photomatagent.scientific.applications.vasp.molecular.models import (
     StageSpec,
     WorkflowSpec,
 )
+from photomatagent.scientific.applications.vasp.molecular.calibration import (
+    CalibrationRecord,
+    calibration_applicable,
+)
 from photomatagent.scientific.applications.vasp.molecular.psp_metadata import (
     resolve_potcar_metadata,
 )
@@ -50,9 +54,113 @@ from photomatagent.scientific.applications.vasp.molecular.templates import (
     make_stage,
     orbital_single_incar,
     relax_incar,
+    static_incar,
     static_hse_incar,
     static_preconverge_incar,
 )
+
+
+def _assemble_workflow(
+    *,
+    molecule: MoleculeSpec,
+    stages: list[StageSpec],
+    scientific_method: str,
+    profile: ResourceProfile,
+    encut: float,
+    monopole: MonopoleMethod,
+    dipole: bool,
+    tasks_per_node: int,
+    walltime_minutes: int,
+    ispin: int,
+    nupdown: int | None,
+    magmom: list[float] | None,
+    calibration: CalibrationRecord | None,
+    atom_count: int,
+    screen_decision: ScreenDecision | None = None,
+    provenance_extra: dict[str, Any] | None = None,
+) -> WorkflowSpec:
+    """Shared WorkflowSpec assembly (normal DAG and screen-only workflows)."""
+    from photomatagent.scientific.applications.vasp.molecular.calibration import (
+        finalize_calibration,
+    )
+    from photomatagent.scientific.applications.vasp.molecular.models import (
+        CorrectionPolicy,
+        PreflightConfig,
+        ResourceCeiling,
+        ResourcePlan,
+        SmokeBaseline,
+    )
+
+    finalized_calibration: CalibrationRecord | None = None
+    if calibration is not None:
+        finalized_calibration = finalize_calibration(calibration)
+        applicable, reasons = calibration_applicable(
+            finalized_calibration,
+            atom_count=atom_count,
+            box_ang=molecule.box_ang,
+            encut_ev=encut,
+        )
+        if not applicable:
+            raise ValueError(
+                "calibration record does not apply to this molecule: "
+                + "; ".join(reasons)
+            )
+
+    return WorkflowSpec(
+        molecule=molecule,
+        stages=stages,
+        scientific_method=scientific_method,
+        correction_policy=CorrectionPolicy(
+            monopole_method=monopole, dipole=dipole
+        ),
+        resource_ceiling=ResourceCeiling(
+            nodes=1,
+            tasks_per_node=tasks_per_node,
+            walltime_minutes=walltime_minutes,
+        ),
+        resource_plan=ResourcePlan(
+            profile=profile,
+            tasks_per_node=tasks_per_node,
+            walltime_minutes=walltime_minutes,
+            calibration=finalized_calibration,
+            calibration_note=(
+                f"calibration {finalized_calibration.calibration_id} from "
+                f"job {finalized_calibration.source_job_id}"
+                if finalized_calibration is not None
+                else ""
+            ),
+        ),
+        smoke_baseline=SmokeBaseline(),
+        screen_decision=screen_decision,
+        preflight_config=PreflightConfig(
+            encut_floor_ev=400.0
+            if profile is ResourceProfile.SMOKE
+            else 520.0,
+            encut_max_enmax_ratio=(
+                # The verified smoke run ran ENCUT = max ENMAX (400 eV).
+                1.0 if profile is ResourceProfile.SMOKE else 1.3
+            ),
+            # The verified smoke run used a 20 A box: 10 A of vacuum per
+            # side is only reachable in production-size cells (>=30 A).
+            min_vacuum_per_side_ang=(
+                5.0 if profile is ResourceProfile.SMOKE else 10.0
+            ),
+        ),
+        provenance={
+            "builder": "build_molecule_workflow",
+            "builder_version": 1,
+            "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "spin": {
+                "spin_multiplicity": molecule.spin_multiplicity,
+                "ispin": ispin,
+                "spin_polarized": molecule.spin_polarized,
+                "nupdown": nupdown,
+                "magmom_declared": magmom is not None,
+                "assumptions": molecule.spin_assumptions(),
+            },
+            **(provenance_extra or {}),
+        },
+    )
 
 
 def build_molecule_workflow(
@@ -60,7 +168,9 @@ def build_molecule_workflow(
     *,
     psp_dir: str | Path | None = None,
     encut_ev: float | None = None,
-    spin: int = 1,
+    spin: int | None = None,
+    nupdown: int | None = None,
+    magmom: list[float] | None = None,
     lmono: bool | None = None,
     dipole: bool = True,
     include_orbital_homo: bool = True,
@@ -68,10 +178,12 @@ def build_molecule_workflow(
     include_esp: bool = True,
     include_hse06: bool = False,
     screen_decision: ScreenDecision | None = None,
+    screen_only: bool = False,
     resource_profile: ResourceProfile = ResourceProfile.SMOKE,
     tasks_per_node: int = 8,
     walltime_minutes: int = 20,
     ncore: int = 2,
+    calibration: CalibrationRecord | None = None,
     scientific_method: str = "isolated-molecule PBE-D3(BJ) Gamma-only DAG",
 ) -> WorkflowSpec:
     """Build the canonical typed DAG from a molecule spec.
@@ -83,6 +195,32 @@ def build_molecule_workflow(
     """
     profile = ResourceProfile(resource_profile)
     encut = encut_ev if encut_ev is not None else (520.0 if profile is ResourceProfile.PRODUCTION else 400.0)
+    # ISPIN is NEVER the spin multiplicity: a triplet must not render
+    # ISPIN = 3. Explicit ``spin`` wins; otherwise the molecule's typed
+    # derivation applies (odd electrons / multiplicity > 1 -> ISPIN 2).
+    ispin = molecule.effective_ispin() if spin is None else int(spin)
+    if ispin not in {1, 2}:
+        raise ValueError(
+            "ISPIN must be 1 or 2; got "
+            f"{ispin} (spin_multiplicity={molecule.spin_multiplicity} is "
+            "not an ISPIN value)"
+        )
+    nupdown = molecule.nupdown if nupdown is None else nupdown
+    magmom = molecule.magmom if magmom is None else magmom
+    if calibration is not None:
+        # Measured calibration drives the per-node task count and a
+        # walltime derived from the measured per-stage elapsed time
+        # (still capped by the caller's explicit parameters).
+        tasks_per_node = calibration.tasks or tasks_per_node
+        if calibration.elapsed_seconds > 0:
+            from_calibration = max(
+                20, int(calibration.elapsed_seconds / 60.0 * 1.5) + 5
+            )
+            walltime_minutes = (
+                min(walltime_minutes, from_calibration)
+                if walltime_minutes
+                else from_calibration
+            )
     needs_monopole = molecule.total_charge != 0
     if lmono is None:
         lmono = needs_monopole  # charged systems default to LMONO
@@ -108,16 +246,60 @@ def build_molecule_workflow(
     monopole = MonopoleMethod.LMONO if lmono and needs_monopole else MonopoleMethod.NONE
     stages: list[StageSpec] = []
 
+    if screen_only:
+        # Cheap conformer screen: ONE static single point on the candidate
+        # geometry. It ranks candidates by E0 only; it is never a production
+        # value and never feeds downstream stages.
+        stages.append(
+            make_stage(
+                StageName.STATIC,
+                incar=static_incar(
+                    spin=ispin,
+                    encut=encut,
+                    nelect=nelect,
+                    lmono=monopole is MonopoleMethod.LMONO,
+                    dipole=dipole,
+                    ncore=ncore,
+                ),
+                produced_outputs=["OSZICAR", "EIGENVAL", "vasprun.xml"],
+                resource_class=ResourceClass.SMOKE,
+                description=(
+                    "conformer static screen (cheap E0 ranking; never a "
+                    "production value)"
+                ),
+            )
+        )
+        return _assemble_workflow(
+            molecule=molecule,
+            stages=stages,
+            profile=profile,
+            encut=encut,
+            monopole=monopole,
+            dipole=dipole,
+            tasks_per_node=tasks_per_node,
+            walltime_minutes=walltime_minutes,
+            ispin=ispin,
+            nupdown=nupdown,
+            magmom=magmom,
+            calibration=calibration,
+            atom_count=len(structure.symbols),
+            scientific_method=(
+                "conformer static screen; E0 ranking only, not production"
+            ),
+        )
+
     stages.append(
         make_stage(
             StageName.RELAX,
             incar=relax_incar(
-                spin=spin,
+                spin=ispin,
                 encut=encut,
                 nelect=nelect,
                 lmono=monopole is MonopoleMethod.LMONO,
                 dipole=dipole,
                 ncore=ncore,
+                nupdown=nupdown,
+                magmom=magmom,
             ),
             produced_outputs=["CONTCAR", "CHGCAR", "OSZICAR", "vasprun.xml"],
             resource_class=ResourceClass.STANDARD,
@@ -129,7 +311,7 @@ def build_molecule_workflow(
             StageName.STATIC_PRECONVERGE,
             depends_on=StageName.RELAX,
             incar=static_preconverge_incar(
-                spin=spin,
+                spin=ispin,
                 encut=encut,
                 nelect=nelect,
                 lmono=monopole is MonopoleMethod.LMONO,
@@ -150,7 +332,7 @@ def build_molecule_workflow(
             StageName.CORRECTED_STATIC,
             depends_on=StageName.STATIC_PRECONVERGE,
             incar=corrected_static_incar(
-                spin=spin,
+                spin=ispin,
                 encut=encut,
                 nelect=nelect,
                 lmono=monopole is MonopoleMethod.LMONO,
@@ -174,7 +356,7 @@ def build_molecule_workflow(
                 StageName.ORBITAL_HOMO,
                 depends_on=StageName.CORRECTED_STATIC,
                 incar=orbital_single_incar(
-                    spin=spin,
+                    spin=ispin,
                     encut=encut,
                     nelect=nelect,
                     lmono=monopole is MonopoleMethod.LMONO,
@@ -197,7 +379,7 @@ def build_molecule_workflow(
                 StageName.ORBITAL_LUMO,
                 depends_on=StageName.CORRECTED_STATIC,
                 incar=orbital_single_incar(
-                    spin=spin,
+                    spin=ispin,
                     encut=encut,
                     nelect=nelect,
                     lmono=monopole is MonopoleMethod.LMONO,
@@ -220,7 +402,7 @@ def build_molecule_workflow(
                 StageName.ESP,
                 depends_on=StageName.CORRECTED_STATIC,
                 incar=esp_incar(
-                    spin=spin,
+                    spin=ispin,
                     encut=encut,
                     nelect=nelect,
                     lmono=monopole is MonopoleMethod.LMONO,
@@ -239,7 +421,7 @@ def build_molecule_workflow(
                 StageName.STATIC_HSE,
                 depends_on=StageName.CORRECTED_STATIC,
                 incar=static_hse_incar(
-                    spin=spin,
+                    spin=ispin,
                     encut=encut,
                     nelect=nelect,
                     lmono=monopole is MonopoleMethod.LMONO,
@@ -252,53 +434,22 @@ def build_molecule_workflow(
                 description="HSE06 single point (gated by screen_decision)",
             )
         )
-    from photomatagent.scientific.applications.vasp.molecular.models import (
-        CorrectionPolicy,
-        ResourceCeiling,
-        ResourcePlan,
-        SmokeBaseline,
-    )
-
-    from photomatagent.scientific.applications.vasp.molecular.models import (
-        PreflightConfig,
-    )
-
-    return WorkflowSpec(
+    return _assemble_workflow(
         molecule=molecule,
         stages=stages,
         scientific_method=scientific_method,
-        correction_policy=CorrectionPolicy(
-            monopole_method=monopole, dipole=dipole
-        ),
-        resource_ceiling=ResourceCeiling(
-            nodes=1, tasks_per_node=tasks_per_node, walltime_minutes=walltime_minutes
-        ),
-        resource_plan=ResourcePlan(
-            profile=profile,
-            tasks_per_node=tasks_per_node,
-            walltime_minutes=walltime_minutes,
-        ),
-        smoke_baseline=SmokeBaseline(),
+        profile=profile,
+        encut=encut,
+        monopole=monopole,
+        dipole=dipole,
+        tasks_per_node=tasks_per_node,
+        walltime_minutes=walltime_minutes,
+        ispin=ispin,
+        nupdown=nupdown,
+        magmom=magmom,
+        calibration=calibration,
+        atom_count=len(structure.symbols),
         screen_decision=screen_decision,
-        preflight_config=PreflightConfig(
-            encut_floor_ev=400.0
-            if profile is ResourceProfile.SMOKE
-            else 520.0,
-            encut_max_enmax_ratio=(
-                # The verified smoke run ran ENCUT = max ENMAX (400 eV).
-                1.0 if profile is ResourceProfile.SMOKE else 1.3
-            ),
-            # The verified smoke run used a 20 A box: 10 A of vacuum per
-            # side is only reachable in production-size cells (>=30 A).
-            min_vacuum_per_side_ang=(
-                5.0 if profile is ResourceProfile.SMOKE else 10.0
-            ),
-        ),
-        provenance={
-            "builder": "build_molecule_workflow",
-            "builder_version": 1,
-            "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        },
     )
 
 
@@ -317,6 +468,9 @@ class StageTask(BaseModel):
     results_dir: str = ""
     validated: bool = False
     error: str = ""
+    attempt_id: str = ""
+    retry_count: int = 0
+    recovery_attempts: list[dict] = Field(default_factory=list)
     updated_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
@@ -386,9 +540,11 @@ TASK_STATE_KEYS = ("task_state.json", "workflow.json")
 
 
 MOLECULAR_RESULT_FILES: dict[str, list[str]] = {
-    "relax": ["CONTCAR", "OSZICAR", "EIGENVAL", "vasprun.xml"],
+    # OUTCAR is a REQUIRED collection artifact for relax (ionic force
+    # criterion) and corrected_static (E0 + runtime-error scan).
+    "relax": ["CONTCAR", "OUTCAR", "OSZICAR", "EIGENVAL", "vasprun.xml"],
     "static_preconverge": ["OSZICAR", "EIGENVAL", "vasprun.xml"],
-    "corrected_static": ["OSZICAR", "EIGENVAL", "vasprun.xml"],
+    "corrected_static": ["OUTCAR", "OSZICAR", "EIGENVAL", "vasprun.xml"],
     "orbital_homo": [
         "LOCPOT", "EIGENVAL", "OSZICAR", "PARCHG", "PARCHG.ALL",
     ],
@@ -628,6 +784,239 @@ async def _download_parchg_artifacts(
     return await backend.download_files(remote_directory, names, result_dir)
 
 
+async def _recover_collected_relax(
+    *,
+    backend: Any,
+    session: Any,
+    workflow: WorkflowSpec,
+    entry: StageTask,
+    stage_dir: Path,
+    root: Path,
+    task_state: TaskState,
+    psp_dir: str | Path | None,
+    module_name: str,
+    env_script: str,
+    remote_psp_dir: str,
+    recovery_policy: Any,
+    analysis: dict[str, Any],
+    wait_timeout_seconds: float,
+    provenance: dict[str, Any] | None,
+) -> tuple[bool, StageTask, dict[str, Any], int]:
+    """One deterministic relax recovery attempt (rule-based, typed policy).
+
+    Only a COLLECTED-but-not-converged relax enters here. The decision table
+    decides restart artifact (CONTCAR / XDATCAR best), typed INCAR changes
+    and whether to submit at all; every attempt gets a NEW attempt_id and a
+    NEW remote directory (submit-once + unique remote dirs are preserved).
+    """
+    from photomatagent.scientific.applications.vasp.molecular.preflight import (
+        preflight_gate,
+        run_molecular_preflight,
+    )
+    from photomatagent.scientific.applications.vasp.molecular.recovery import (
+        classify_relax_failure,
+        decide_recovery,
+        materialize_recovery_stage_dir,
+        outcar_force_history,
+    )
+    from photomatagent.scientific.applications.vasp.molecular.slurm import (
+        cleanup_materialized_potcar,
+        materialize_stage_potcar,
+        potcar_mode_of_stage,
+        potcar_symbols_from_stage,
+        render_stage_slurm,
+    )
+    from photomatagent.scientific.remote.registry import JobLifecycleState
+
+    convergence = analysis.get("convergence") or {}
+    force_history: list[float] = []
+    result_dir = Path(entry.results_dir) if entry.results_dir else Path(entry.stage_dir)
+    outcar = result_dir / "OUTCAR"
+    if outcar.is_file():
+        try:
+            force_history = outcar_force_history(outcar)
+        except Exception:
+            force_history = []
+    failure = classify_relax_failure(
+        convergence=convergence,
+        lifecycle_state=entry.state,
+        force_history=force_history,
+    )
+    contcar = result_dir / "CONTCAR"
+    decision = decide_recovery(
+        recovery_policy,
+        failure=failure,
+        attempts_used=entry.retry_count,
+        has_contcar=contcar.is_file(),
+        max_force=convergence.get("max_force_ev_ang"),
+        ediffg=convergence.get("ediffg_ev_ang"),
+    )
+    if decision.action != "RESUBMIT":
+        updated = entry.model_copy(
+            update={
+                "error": (
+                    (entry.error + "; " if entry.error else "")
+                    + f"recovery {decision.action}: {decision.reason}"
+                )
+            }
+        )
+        task_state = persist_stage_task(
+            root, task_state,
+            {"stage": "relax", "error": updated.error},
+        )
+        return False, updated, analysis, 0
+
+    restart_source = contcar if decision.restart_from == "CONTCAR" else (
+        result_dir / "XDATCAR_BEST"
+    )
+    restart_dir = materialize_recovery_stage_dir(
+        previous_stage_dir=stage_dir,
+        restart_structure=str(restart_source),
+        incar_changes=decision.incar_changes,
+        attempt_id=decision.new_attempt_id,
+        workflow_dir=str(root),
+        reason=decision.reason,
+        practical_convergence=decision.practical_convergence,
+        practical_convergence_note=decision.practical_convergence_note,
+    )
+    # Re-run the deterministic gate over the FULL workflow, pointing only the
+    # relax stage at the restart directory (typed changes are re-checked).
+    inputs_root = root / "inputs"
+    stage_dirs = {
+        stage.name: inputs_root / f"{index + 1:02d}_{stage.name.value}"
+        for index, stage in enumerate(workflow.stages)
+    }
+    stage_dirs[StageName.RELAX] = restart_dir
+    report = run_molecular_preflight(
+        workflow, psp_dir=psp_dir, stage_dirs=stage_dirs
+    )
+    gate = preflight_gate(report, report_path=str(root / "preflight.json"))
+    stage_spec = workflow.stages[0]
+    potcar_mode = potcar_mode_of_stage(
+        restart_dir, remote_psp_dir=remote_psp_dir, psp_dir=psp_dir
+    )
+    if potcar_mode == "none":
+        return False, entry, analysis, 0
+    potcar_materialized = False
+    if potcar_mode == "local" and not (restart_dir / "POTCAR").is_file():
+        try:
+            potcar_materialized = materialize_stage_potcar(
+                restart_dir, psp_dir, potcar_symbols_from_stage(restart_dir)
+            )
+        except Exception as exc:
+            return False, entry, analysis, 0
+    try:
+        submit = await session.submit_once(
+            application="vasp_molecular",
+            workflow_stage="relax",
+            job_name=(
+                f"{workflow.molecule.name}-relax-"
+                f"{decision.new_attempt_id}"
+            ),
+            local_input_dir=restart_dir,
+            gate=gate,
+            resource=sanitize_resource(workflow, stage_spec),
+            executable="vasp_std",
+            script_name="run.slurm",
+            provenance={
+                "workflow_dir": str(root),
+                "molecule": workflow.molecule.name,
+                "recovery": decision.provenance,
+                "recovery_reason": decision.reason,
+                "recovery_attempt_id": decision.new_attempt_id,
+                "recovery_restart_from": decision.restart_from,
+                **dict(provenance or {}),
+            },
+            remote_copies=[],
+            script_renderer=lambda job_name, resource: render_stage_slurm(
+                job_name=job_name,
+                resource=resource,
+                stage_dir=restart_dir,
+                module_name=module_name,
+                env_script=env_script,
+                remote_psp_dir=remote_psp_dir,
+            ),
+            potcar_mode=potcar_mode,
+            potcar_symbols=potcar_symbols_from_stage(restart_dir),
+            remote_psp_dir=remote_psp_dir,
+        )
+    finally:
+        cleanup_materialized_potcar(
+            restart_dir, materialized=potcar_materialized
+        )
+    if submit.blocked or submit.needs_reconciliation or not submit.submitted:
+        return False, entry, analysis, 0
+    terminal = await wait_for_terminal_state(
+        session, submit.request_id, timeout_seconds=wait_timeout_seconds
+    )
+    if terminal != JobLifecycleState.COMPLETED.value:
+        return False, entry, analysis, 0
+    synthetic = StageTask(
+        stage="relax",
+        state=JobLifecycleState.COMPLETED.value,
+        request_id=submit.request_id,
+        job_id=submit.record.get("job_id") or "",
+        remote_directory=submit.record.get("remote_directory") or "",
+        stage_dir=str(restart_dir),
+        results_dir="",
+    )
+    updated2, analysis2, evidence_count = await _collect_and_validate_stage(
+        backend=backend,
+        session=session,
+        workflow=workflow,
+        stage=stage_spec,
+        entry=synthetic,
+        stage_dir=restart_dir,
+        results_root=root / "results",
+    )
+    if decision.practical_convergence:
+        convergence2 = dict(analysis2.get("convergence") or {})
+        convergence2["practical_convergence"] = True
+        convergence2["practical_convergence_note"] = (
+            decision.practical_convergence_note
+        )
+        analysis2["convergence"] = convergence2
+        analysis2["warnings"] = [
+            *analysis2.get("warnings", []),
+            "PRACTICAL_CONVERGENCE: " + decision.practical_convergence_note,
+        ]
+        (Path(updated2.results_dir) / "results.json").write_text(
+            json.dumps(analysis2, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    attempt_record = {
+        "attempt_id": decision.new_attempt_id,
+        "failure": decision.failure,
+        "restart_from": decision.restart_from,
+        "parameter_changes": decision.parameter_changes,
+        "reason": decision.reason,
+        "request_id": submit.request_id,
+        "job_id": submit.record.get("job_id") or "",
+        "remote_directory": submit.record.get("remote_directory") or "",
+        "validated": updated2.validated,
+        "practical_convergence": decision.practical_convergence,
+        "practical_convergence_note": decision.practical_convergence_note,
+    }
+    task_state = persist_stage_task(
+        root, task_state,
+        {
+            "stage": "relax",
+            "state": updated2.state,
+            "results_dir": updated2.results_dir,
+            "remote_directory": updated2.remote_directory,
+            "validated": updated2.validated,
+            "error": updated2.error,
+            "attempt_id": decision.new_attempt_id,
+            "retry_count": entry.retry_count + 1,
+            "recovery_attempts": [
+                *entry.recovery_attempts,
+                attempt_record,
+            ],
+        },
+    )
+    return True, updated2, analysis2, evidence_count
+
+
 async def run_molecule_workflow(
     workflow: WorkflowSpec,
     workflow_dir: str | Path,
@@ -644,6 +1033,7 @@ async def run_molecule_workflow(
     only: list[str] | None = None,
     wait_timeout_seconds: float = 3600.0,
     provenance: dict[str, Any] | None = None,
+    recovery_policy: Any | None = None,
 ) -> dict[str, Any]:
     """Execute the DAG stage by stage; resumes from task_state.json.
 
@@ -771,6 +1161,45 @@ async def run_molecule_workflow(
                 }
             )
             if updated.state != JobLifecycleState.VALIDATED.value:
+                if (
+                    recovery_policy is not None
+                    and stage.name is StageName.RELAX
+                ):
+                    recovered, updated, analysis, evidence_count = (
+                        await _recover_collected_relax(
+                            backend=backend,
+                            session=session,
+                            workflow=workflow,
+                            entry=task_state.stage_map().get(name) or entry,
+                            stage_dir=stage_dir,
+                            root=root,
+                            task_state=task_state,
+                            psp_dir=psp_dir,
+                            module_name=module_name,
+                            env_script=env_script,
+                            remote_psp_dir=remote_psp_dir,
+                            recovery_policy=recovery_policy,
+                            analysis=analysis,
+                            wait_timeout_seconds=wait_timeout_seconds,
+                            provenance=provenance,
+                        )
+                    )
+                    if recovered:
+                        report["evidence_count"] += evidence_count
+                        report["stages"].append(
+                            {
+                                "stage": "relax",
+                                "state": updated.state,
+                                "recovered": True,
+                                "validated": updated.validated,
+                                "evidence": evidence_count,
+                                "recovery_attempts": (
+                                    task_state.stage_map().get("relax") or updated
+                                ).recovery_attempts,
+                                "errors": analysis.get("errors", []),
+                            }
+                        )
+                        continue
                 report["blocked"] = [
                     s.name.value
                     for s in workflow.stages
@@ -1048,6 +1477,45 @@ async def run_molecule_workflow(
             # Validation failed: the stage is collected but not valid; every
             # dependent stage is blocked (no scientific dependency is ever
             # satisfied by a merely-collected result).
+            if (
+                recovery_policy is not None
+                and stage.name is StageName.RELAX
+            ):
+                recovered, updated, analysis, evidence_count = (
+                    await _recover_collected_relax(
+                        backend=backend,
+                        session=session,
+                        workflow=workflow,
+                        entry=task_state.stage_map().get(name) or synthetic,
+                        stage_dir=stage_dir,
+                        root=root,
+                        task_state=task_state,
+                        psp_dir=psp_dir,
+                        module_name=module_name,
+                        env_script=env_script,
+                        remote_psp_dir=remote_psp_dir,
+                        recovery_policy=recovery_policy,
+                        analysis=analysis,
+                        wait_timeout_seconds=wait_timeout_seconds,
+                        provenance=provenance,
+                    )
+                )
+                if recovered:
+                    report["evidence_count"] += evidence_count
+                    report["stages"].append(
+                        {
+                            "stage": "relax",
+                            "state": updated.state,
+                            "recovered": True,
+                            "validated": updated.validated,
+                            "evidence": evidence_count,
+                            "recovery_attempts": (
+                                task_state.stage_map().get("relax") or updated
+                            ).recovery_attempts,
+                            "errors": analysis.get("errors", []),
+                        }
+                    )
+                    continue
             if stop_on_failure:
                 report["blocked"] = [
                     s.name.value

@@ -34,6 +34,33 @@ WALLTIME_MINUTES = 20
 DISK_GB_PER_WORKFLOW = 8.0
 
 
+def _profile_budget(request: VaspStudyRequest) -> tuple[int, int, float, float]:
+    """(tasks, walltime_minutes, disk_gb) from profile/calibration, never
+    from hard-coded production guesses: smoke keeps the verified 8-core /
+    20-min / 8 GB baseline; production requires a CalibrationRecord and
+    derives tasks/walltime/disk from its measured values (capped by the
+    hard ceiling enforced at execution time)."""
+    method = request.method
+    profile = method.profile()
+    calibration = method.calibration_record()
+    if profile.value == "production" and calibration is None:
+        # Plan honestly: mark the imprecise default so the executor refuses
+        # to submit without a record; the numbers stay capped by budget.
+        return TASKS_PER_NODE, WALLTIME_MINUTES, DISK_GB_PER_WORKFLOW, 0.0
+    if calibration is not None:
+        tasks = calibration.tasks or TASKS_PER_NODE
+        disk_gb = max(DISK_GB_PER_WORKFLOW, calibration.max_rss_bytes / 1e9 * 3.0)
+        if calibration.elapsed_seconds > 0:
+            walltime = max(
+                WALLTIME_MINUTES,
+                int(calibration.elapsed_seconds / 60.0 * 1.5) + 5,
+            )
+        else:
+            walltime = WALLTIME_MINUTES
+        return tasks, walltime, round(disk_gb, 1), float(calibration.elapsed_seconds)
+    return TASKS_PER_NODE, WALLTIME_MINUTES, DISK_GB_PER_WORKFLOW, 0.0
+
+
 def _system_properties(
     system: StudySystem, request: VaspStudyRequest
 ) -> list[PropertyRequest]:
@@ -43,15 +70,19 @@ def _system_properties(
 
 
 def _estimate_core_hours(assists: list[Any]) -> float:
+    return _estimate_core_hours_for(assists, TASKS_PER_NODE, WALLTIME_MINUTES)
+
+
+def _estimate_core_hours_for(
+    assists: list[Any], tasks: int, walltime_minutes: int
+) -> float:
     stages = BASE_STAGES
-    values = {
-        str(getattr(item, "value", item)) for item in assists
-    }
+    values = {str(getattr(item, "value", item)) for item in assists}
     if PropertyRequest.HOMO_LUMO.value in values:
         stages += 2  # orbital_homo, orbital_lumo
     if PropertyRequest.ESP.value in values:
         stages += 1  # esp
-    return stages * TASKS_PER_NODE * WALLTIME_MINUTES / 60.0
+    return stages * tasks * walltime_minutes / 60.0
 
 
 def build_calculation_matrix(
@@ -59,6 +90,7 @@ def build_calculation_matrix(
     resolved: dict[str, list[GeneratedStructure]],
 ) -> CalculationMatrix:
     """Build the deduplicated matrix from resolved structures."""
+    tasks_per_node, walltime_minutes, disk_gb, _ = _profile_budget(request)
     tasks: dict[str, CalculationTask] = {}
     binding_groups: list[BindingGroup] = []
     notes: list[str] = []
@@ -133,7 +165,9 @@ def build_calculation_matrix(
             if property_request not in task.assists
             and property_request is not PropertyRequest.BINDING_ENERGY
         )
-        task.estimated_core_hours = _estimate_core_hours(task.assists)
+        task.estimated_core_hours = _estimate_core_hours_for(
+            task.assists, tasks_per_node, walltime_minutes
+        )
 
     # -- binding groups: expand complexes into fragment references --------
     for system in request.systems:
@@ -225,7 +259,9 @@ def build_calculation_matrix(
 
     for task in tasks.values():
         if not task.estimated_core_hours:
-            task.estimated_core_hours = _estimate_core_hours(task.assists)
+            task.estimated_core_hours = _estimate_core_hours_for(
+                task.assists, tasks_per_node, walltime_minutes
+            )
     ordered = list(tasks.values())
     # Depth-first topological order: fragments before complexes.
     ordered.sort(
@@ -253,7 +289,7 @@ def build_calculation_matrix(
         ),
         estimated_disk_gb=round(
             sum(
-                DISK_GB_PER_WORKFLOW
+                disk_gb
                 for task in ordered
                 if task.structure_path
             ),

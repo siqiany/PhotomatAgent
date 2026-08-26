@@ -207,6 +207,12 @@ def render_report(
         add("- **电子结合能**：不含振动、热力学或溶剂自由能。")
         add("- 裸离子参考 (Li+) 存在真空参考误差；ΔΔE / 替代参考可降低该误差。")
         for row in binding_rows:
+            if row.get("uses_declared_reference_assumption"):
+                add(
+                    f"> 高风险提示 ({row['complex']})：结合能使用了显式参考假设"
+                    "（E=0 约定，非 VASP 计算结果）；ΔΔE / 配体交换能优先，"
+                    "绝对结合能仅供参考。"
+                )
             if row.get("state") == "VALIDATED" and row.get("complex_reliability") in {
                 "C", "D",
             }:

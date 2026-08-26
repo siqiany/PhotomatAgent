@@ -59,6 +59,24 @@ class MethodSpec(BaseModel):
     box_ang: float = 20.0  # smoke baseline; production 30 A needs calibration
     potcar_set: str = "PAW-PBE"
     spin: int | None = None  # None -> 1 unless implied by electron parity
+    resource_profile: str = "smoke"  # ResourceProfile value (smoke|production)
+    calibration: dict[str, Any] | None = None  # CalibrationRecord (audited)
+
+    def profile(self) -> Any:
+        from photomatagent.scientific.applications.vasp.molecular.models import (
+            ResourceProfile,
+        )
+
+        return ResourceProfile(self.resource_profile)
+
+    def calibration_record(self) -> Any | None:
+        if not self.calibration:
+            return None
+        from photomatagent.scientific.applications.vasp.molecular.calibration import (
+            CalibrationRecord,
+        )
+
+        return CalibrationRecord.model_validate(self.calibration)
 
 
 class StructurePolicy(BaseModel):
@@ -77,6 +95,8 @@ class ExecutionPolicy(BaseModel):
     stop_on_failure: bool = False  # studies isolate failures per system
     max_conformer_retries: int = 2
     wait_timeout_seconds: float = 3600.0
+    screen_conformers: bool = True  # B3 funnel: cheap E0 screens rank candidates
+    max_screen_candidates: int = 6
 
 
 class ResourceBudget(BaseModel):
@@ -150,6 +170,8 @@ class BindingGroup(BaseModel):
     delta_e_ev: float | None = None
     delta_delta_e_ev: float | None = None
     error: str = ""
+    uses_declared_reference_assumption: bool = False
+    high_risk_absolute_binding_energy: bool = False
 
 
 class CalculationMatrix(BaseModel):

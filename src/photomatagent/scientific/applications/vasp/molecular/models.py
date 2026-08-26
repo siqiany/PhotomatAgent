@@ -19,6 +19,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from photomatagent.scientific.applications.vasp.molecular.calibration import (
+    CalibrationRecord,
+)
+
 
 class StructureKind(str, Enum):
     """Input structure formats accepted by the molecular readers."""
@@ -108,6 +112,16 @@ class MoleculeSpec(BaseModel):
     # Required on purpose: the charge is NEVER guessed from the molecule name.
     total_charge: int
     spin_multiplicity: int = 1
+    # Spin semantics are separated on purpose (A5):
+    # * spin_polarized  - explicit polarization intent (None = derive);
+    # * ispin           - the VASP tag, ONLY 1 or 2 (never multiplicity!);
+    # * nupdown         - optional fixed spin projection (mapping assumption
+    #                     nupdown = multiplicity - 1 is recorded in provenance);
+    # * magmom          - optional initial moments (one per atom).
+    spin_polarized: bool | None = None
+    ispin: Literal[1, 2] | None = None
+    nupdown: int | None = None
+    magmom: list[float] | None = None
     box_ang: float = 30.0
     functional: str = "PBE-D3(BJ)"
     potcar_set: str = "PAW-PBE"
@@ -131,6 +145,78 @@ class MoleculeSpec(BaseModel):
         if value <= 5.0:
             raise ValueError("box_ang must be greater than 5 Angstrom")
         return value
+
+    @field_validator("ispin")
+    @classmethod
+    def _ispin_only_1_or_2(cls, value: int | None) -> int | None:
+        if value is not None and value not in {1, 2}:
+            raise ValueError(
+                "ISPIN must be 1 or 2; spin_multiplicity is NOT ISPIN "
+                f"(got {value})"
+            )
+        return value
+
+    @field_validator("nupdown")
+    @classmethod
+    def _nupdown_positive(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("NUPDOWN must be >= 1 when declared")
+        return value
+
+    def effective_ispin(self) -> Literal[1, 2]:
+        """Deterministic ISPIN derivation (never the multiplicity itself).
+
+        * explicit ``ispin`` wins;
+        * spin_polarized=False -> ISPIN=1;
+        * spin_polarized=True  -> ISPIN=2;
+        * multiplicity > 1 (doublet, triplet, ...) -> ISPIN=2;
+        * otherwise (singlet / even-electron default) -> ISPIN=1.
+        """
+        if self.ispin is not None:
+            return self.ispin
+        if self.spin_polarized is False:
+            return 1
+        if self.spin_polarized is True:
+            return 2
+        if self.spin_multiplicity > 1:
+            return 2
+        return 1
+
+    def spin_assumptions(self) -> list[str]:
+        """Recorded mapping assumptions for NUPDOWN / polarization."""
+        notes: list[str] = []
+        if self.nupdown is not None:
+            if self.spin_multiplicity > 1:
+                expected = self.spin_multiplicity - 1
+                if self.nupdown == expected:
+                    notes.append(
+                        "NUPDOWN assumption: nupdown = multiplicity - 1 = "
+                        f"{expected} assumes a maximal projection / "
+                        "valence-localized spin configuration"
+                    )
+                else:
+                    notes.append(
+                        f"NUPDOWN={self.nupdown} does NOT match the naive "
+                        f"nupdown = multiplicity - 1 = {expected} mapping; "
+                        "the imposed projection may not correspond to the "
+                        "declared spin state"
+                    )
+            else:
+                notes.append(
+                    f"NUPDOWN={self.nupdown} declared for multiplicity 1; "
+                    "a polarized solution is being imposed on a singlet spec"
+                )
+        if self.magmom is not None:
+            n_atoms = (
+                len(self.magmom)
+                if self.magmom is not None
+                else 0
+            )
+            notes.append(
+                f"initial MAGMOM declared for {n_atoms} atoms; converged "
+                "magnetization is verified from OUTCAR, never assumed"
+            )
+        return notes
 
     @field_validator("structure_kind", mode="before")
     @classmethod
@@ -220,6 +306,7 @@ class ResourcePlan(BaseModel):
     max_total_core_hours: float = Field(default=32.0, gt=0)
     resource_calibrated: bool = False
     calibration_note: str = ""
+    calibration: CalibrationRecord | None = None
 
     def core_hours(self, stages: int) -> float:
         return stages * self.tasks_per_node * self.walltime_minutes / 60.0
@@ -232,11 +319,12 @@ class ResourcePlan(BaseModel):
                 f"workflow needs {hours:.2f} core-hours but the plan caps at "
                 f"{self.max_total_core_hours:g}"
             )
-        if self.profile is ResourceProfile.PRODUCTION and not self.resource_calibrated:
+        calibrated = bool(self.resource_calibrated or self.calibration is not None)
+        if self.profile is ResourceProfile.PRODUCTION and not calibrated:
             problems.append(
-                "production resource plan requires resource_calibrated=True "
-                "(memory/ENMAX calibration from a live smoke run) before "
-                "any submission"
+                "production resource plan requires a CalibrationRecord "
+                "(measured memory/timings from a real representative run) "
+                "before any submission; a bare note is not enough"
             )
         return problems
 

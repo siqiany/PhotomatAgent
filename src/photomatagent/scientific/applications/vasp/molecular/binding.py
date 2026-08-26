@@ -54,6 +54,11 @@ def _identity_of(directory: Path) -> dict[str, Any]:
         "functional": method.get("functional"),
         "encut_ev": method.get("encut_ev"),
         "corrections": corrections,
+        "explicit_reference_assumption": bool(
+            results.get("explicit_reference_assumption")
+        ),
+        "reference_kind": results.get("reference_kind", ""),
+        "not_a_vasp_result": bool(results.get("not_a_vasp_result")),
         "results_dir": str(directory),
     }
 
@@ -131,12 +136,15 @@ def compute_binding_energy(
 
     resolved_primary: list[tuple[BindingReference, dict[str, Any]]] = []
     resolved_alt: list[tuple[BindingReference, dict[str, Any]]] = []
+    reference_assumptions: list[str] = []
     primary_sum = 0.0
     for binding in inputs.references:
         identity = check_reference(binding)
         if not identity:
             continue
         primary_sum += identity["e0_ev"]
+        if identity.get("explicit_reference_assumption"):
+            reference_assumptions.append(f"{binding.name}")
         resolved_primary.append((binding, identity))
     declared_ref_charge = sum(ref.charge for ref in inputs.references)
     if inputs.alternative_references:
@@ -152,6 +160,8 @@ def compute_binding_energy(
         if not identity:
             continue
         alt_sum += identity["e0_ev"]
+        if identity.get("explicit_reference_assumption"):
+            reference_assumptions.append(binding.name)
         resolved_alt.append((binding, identity))
     if declared_ref_charge != inputs.charge:
         errors.append(
@@ -176,6 +186,10 @@ def compute_binding_energy(
                 "charge": binding.charge,
                 "formula": identity.get("formula", "?"),
                 "e0_ev": identity.get("e0_ev"),
+                "explicit_reference_assumption": bool(
+                    identity.get("explicit_reference_assumption")
+                ),
+                "not_a_vasp_result": bool(identity.get("not_a_vasp_result")),
             }
         )
     alternative_components = []
@@ -187,7 +201,19 @@ def compute_binding_energy(
                 "charge": binding.charge,
                 "formula": identity.get("formula", "?"),
                 "e0_ev": identity.get("e0_ev"),
+                "explicit_reference_assumption": bool(
+                    identity.get("explicit_reference_assumption")
+                ),
             }
+        )
+
+    mentions_reference_assumption = bool(reference_assumptions)
+    if mentions_reference_assumption:
+        warnings.append(
+            "declared reference model(s) present (E=0 convention): "
+            + ", ".join(sorted(set(reference_assumptions)))
+            + "; ΔΔE / ligand-exchange schemes are preferred over absolute "
+            "binding energies, which carry high bare-ion reference risk"
         )
 
     return {
@@ -215,6 +241,8 @@ def compute_binding_energy(
             "definition": "ΔE = E0(complex) - Σ E0(references)",
             "definition_dde": "ΔΔE = ΔE(primary scheme) - ΔE(alternative scheme)",
             "electronic_only": True,
+            "uses_declared_reference_assumption": mentions_reference_assumption,
+            "high_risk_absolute_binding_energy": mentions_reference_assumption,
         },
         "limitations": [
             "electronic binding only; zero-point, thermal and entropy terms "
@@ -223,4 +251,5 @@ def compute_binding_energy(
             "fragment geometries are the ones actually computed; deformation "
             "energies are reported only if the fragments were relaxed",
         ],
+        "reference_assumptions": sorted(set(reference_assumptions)),
     }

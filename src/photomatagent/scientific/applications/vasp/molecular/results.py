@@ -10,6 +10,7 @@ true.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -196,36 +197,52 @@ class VasprunData:
 
 
 def parse_vasprun(path: str | Path, *, max_steps_read: int = 200) -> VasprunData:
-    """Parse energies/scf/ionic structure of vasprun.xml (small molecule runs)."""
+    """Parse energies/scf/ionic structure of vasprun.xml.
+
+    * relax runs: the LAST ``<calculation>`` provides the final energy and
+      structure (intermediate steps are statistical noise);
+    * ALL ionic steps across the file are counted
+      (``n_calculations - 1``, one structure per step);
+    * ``iterparse`` with subtree clearing keeps memory bounded for large
+      multi-step XML files (no whole-tree ElementTree model).
+    """
     source = str(path)
-    tree = ET.parse(path)
-    root = tree.getroot()
-    calc = root.find("calculation")
-    if calc is None:
+    calc_count = 0
+    final_energy_elem: ET.Element | None = None
+    final_scsteps = 0
+    final_eigenvalues: ET.Element | None = None
+    n_atoms: int | None = None
+    for event, elem in ET.iterparse(path, events=("end",)):
+        if elem.tag == "structure":
+            if n_atoms is None:
+                positions = elem.find('varray[@name="positions"]')
+                if positions is not None:
+                    n_atoms = len(positions.findall("v"))
+            elem.clear()
+            continue
+        if elem.tag != "calculation":
+            continue
+        calc_count += 1
+        final_energy_elem = elem.find("energy")
+        final_scsteps = len(elem.findall("scstep"))
+        final_eigenvalues = elem.find("eigenvalues")
+        # Keep only the LAST calculation's data; release the rest.
+        elem.clear()
+    if calc_count == 0:
         raise ValueError(f"vasprun.xml has no <calculation>: {source}")
-    final_energy = calc.find("energy")
     final_f: float | None = None
     final_e0: float | None = None
     entropy: float | None = None
-    if final_energy is not None:
-        names = {v.get("name"): v.text for v in final_energy}
+    if final_energy_elem is not None:
+        names = {v.get("name"): v.text for v in final_energy_elem}
         final_f = _safe_float(names.get("e_fr_energy"))
         final_e0 = _safe_float(names.get("e_0_energy"))
         entropy = _safe_float(names.get("eentropy"))
-    steps = calc.findall("scstep")
-    ionic_steps = len(calc.findall("structure"))
-    n_atoms: int | None = None
-    for structure in root.iter("structure"):
-        if structure.get("name") in {None, "finalpos", "initialpos"}:
-            positions = structure.find('varray[@name="positions"]')
-            if positions is not None:
-                n_atoms = len(positions.findall("v"))
-                break
+    ionic_steps = max(0, calc_count - 1)
     eigenvalues: EigenvalData | None = None
-    eig_node = calc.find("eigenvalues")
-    if eig_node is not None:
+    if final_eigenvalues is not None:
         try:
-            eigenvalues = _parse_vasprun_eigenvalues(eig_node)
+            eigenvalues = _parse_vasprun_eigenvalues(final_eigenvalues)
         except Exception:
             eigenvalues = None
     return VasprunData(
@@ -233,7 +250,7 @@ def parse_vasprun(path: str | Path, *, max_steps_read: int = 200) -> VasprunData
         final_e0_ev=final_e0,
         entropy_ts_ev=entropy,
         ionic_steps=ionic_steps,
-        scf_steps=len(steps),
+        scf_steps=final_scsteps,
         eigenvalues=eigenvalues,
         n_atoms=n_atoms,
         source=source,
@@ -360,49 +377,340 @@ class LocpotGrid:
         )
 
 
-def read_locpot(path: str | Path, box_ang: float | None = None) -> LocpotGrid:
-    """Read a LOCPOT 3D potential grid (VASP5 header; x-fastest ordering).
+# In-memory (legacy) LOCPOT read is capped: a real 448^3 ~1.6 GB LOCPOT must
+# go through the streaming API below instead of materializing the full grid.
+# Raising this number would NOT fix large files; it would only move the OOM.
+MAX_IN_MEMORY_GRID_POINTS = 40_000_000
 
-    The file is read as numpy data only after the header/coordinate block;
-    no grid content is ever logged or returned to the model.
+SUPPORTED_VACUUM_THICKNESSES_ANG = (0.5, 1.0, 1.5, 2.0)
+VACUUM_STABILITY_THRESHOLD_EV = 0.1
+
+
+@dataclass
+class LocpotHeader:
+    """LOCPOT header only: lattice, grid, atom count and data byte offset.
+
+    Parsed by streaming the first ``8 + n_atoms + 1`` lines; the potential
+    grid itself is never loaded, read or logged by header parsing (so
+    ``esp_metadata`` never touches the 1.6 GB body).
+    """
+
+    lattice_lengths_ang: list[float]
+    lattice: list[list[float]]  # 3x3 Cartesian rows (already scaled)
+    grid: tuple[int, int, int]
+    n_atoms: int
+    data_offset_bytes: int
+    source: str
+
+    @property
+    def spacing_ang(self) -> tuple[float, float, float]:
+        return tuple(
+            self.lattice_lengths_ang[axis] / self.grid[axis]
+            for axis in range(3)
+        )  # type: ignore[return-value]
+
+    @property
+    def n_points(self) -> int:
+        return int(np.prod(self.grid))
+
+
+def _decode_line(line: bytes) -> str:
+    return line.decode("ascii", errors="replace")
+
+
+def read_locpot_header(path: str | Path) -> LocpotHeader:
+    """Stream the LOCPOT header region only (memory bounded by n_atoms)."""
+    source = str(path)
+    lattice_lines: list[bytes] = []
+    offset = 0
+    with open(path, "rb") as handle:
+        for _ in range(8):
+            line = handle.readline()
+            if not line:
+                raise ValueError(f"LOCPOT header too short: {source}")
+            lattice_lines.append(line)
+            offset += len(line)
+        try:
+            counts_line = lattice_lines[6]
+            n_atoms = sum(int(token) for token in _decode_line(counts_line).split())
+        except ValueError:
+            # VASP4-style header: a single total atom count on line 7.
+            counts_line = lattice_lines[7]
+            n_atoms = sum(int(token) for token in _decode_line(counts_line).split())
+        for _ in range(n_atoms):
+            line = handle.readline()
+            if not line:
+                raise ValueError(f"LOCPOT header too short: {source}")
+            lattice_lines.append(line)
+            offset += len(line)
+        grid_line = handle.readline()
+        if not grid_line:
+            raise ValueError(f"LOCPOT grid line missing: {source}")
+        offset += len(grid_line)
+    grid_tokens = _decode_line(grid_line).split()
+    if len(grid_tokens) < 3:
+        raise ValueError(
+            f"LOCPOT grid line unreadable: {_decode_line(grid_line)!r}"
+        )
+    grid = (int(grid_tokens[0]), int(grid_tokens[1]), int(grid_tokens[2]))
+    scale = float(_decode_line(lattice_lines[1]).split()[0])
+    raw_rows: list[list[float]] = []
+    lengths: list[float] = []
+    for raw in lattice_lines[2:5]:
+        tokens = [float(token) for token in _decode_line(raw).split()]
+        if len(tokens) != 3:
+            raise ValueError(f"LOCPOT lattice row unreadable: {_decode_line(raw)!r}")
+        raw_rows.append(tokens)
+        lengths.append(float(np.linalg.norm(tokens)) * abs(scale))
+    return LocpotHeader(
+        lattice_lengths_ang=lengths,
+        lattice=[[value * scale for value in row] for row in raw_rows],
+        grid=grid,
+        n_atoms=n_atoms,
+        data_offset_bytes=offset,
+        source=source,
+    )
+
+
+def read_locpot(path: str | Path, box_ang: float | None = None) -> LocpotGrid:
+    """Legacy in-memory LOCPOT read for SMALL test/analysis files.
+
+    Real production grids (448^3 ~1.6 GB) MUST use :func:`read_locpot_header`
+    + :func:`stream_locpot_planar` / :func:`vacuum_summary_all_thicknesses`
+    instead: this path keeps its hard in-memory cap at
+    ``MAX_IN_MEMORY_GRID_POINTS`` (40,000,000 points) and refuses to raise it.
     """
     source = str(path)
-    text_head = Path(path).read_text(encoding="utf-8", errors="replace")[:20000]
-    lines = text_head.splitlines()
-    if len(lines) < 9:
-        raise ValueError(f"LOCPOT header too short: {source}")
+    header = read_locpot_header(path)
     if box_ang is None:
-        try:
-            box_ang = float(lines[1].split()[0])
-        except (IndexError, ValueError):
-            raise ValueError(f"LOCPOT scale line unreadable: {source}")
+        box_ang = header.lattice_lengths_ang[0]
     box_ang = abs(box_ang)
-    counts_line = lines[6].split()
-    try:
-        n_atoms = sum(int(token) for token in counts_line)
-    except ValueError:
-        # VASP4-style header: single count on line 7
-        counts_line = lines[7].split()
-        n_atoms = sum(int(token) for token in counts_line)
-    grid_line_index = 8 + n_atoms
-    grid_tokens = lines[grid_line_index].split()
-    if len(grid_tokens) < 3:
-        raise ValueError(f"LOCPOT grid line unreadable at line {grid_line_index + 1}")
-    grid = (int(grid_tokens[0]), int(grid_tokens[1]), int(grid_tokens[2]))
+    grid = header.grid
     expected = int(np.prod(grid))
-    if expected > 40_000_000:
-        raise ValueError(f"LOCPOT grid too large for offline analysis: {grid}")
-    body = Path(path).read_text(
-        encoding="utf-8", errors="replace"
-    ).splitlines()[grid_line_index + 1:]
-    tokens = " ".join(body).split()
+    if expected > MAX_IN_MEMORY_GRID_POINTS:
+        raise ValueError(
+            "LOCPOT grid too large for the in-memory reader: "
+            f"{grid} ({expected:,} points). Use read_locpot_header + "
+            "stream_locpot_planar / vacuum_summary_all_thicknesses instead; "
+            "the 40,000,000-point cap is intentional and will not be raised."
+        )
+    with open(path, "rb") as handle:
+        handle.seek(header.data_offset_bytes)
+        body = handle.read().decode("ascii", errors="replace")
+    tokens = body.split()
     if len(tokens) < expected:
         raise ValueError(f"LOCPOT grid data too short: {len(tokens)} < {expected}")
     flat = np.asarray(tokens[:expected], dtype=np.float64)
-    # VASP grid data is x-fastest; a C-order reshape of (nx, ny, nz) maps
-    # flat[ix + nx*(iy + ny*iz)] -> data[ix, iy, iz].
-    data = flat.reshape(grid)
+    # VASP grid data is x-fastest: token k carries the potential at
+    # (ix = k % nx, iy = (k // nx) % ny, iz = k // (nx*ny)), i.e.
+    # data[ix, iy, iz] = flat[ix + nx*iy + nx*ny*iz]. That is exactly a
+    # FORTRAN-order reshape of the (nx, ny, nz) dimensions; a C-order
+    # reshape would interpret the file as z-fastest and scramble planes.
+    data = flat.reshape(grid, order="F")
     return LocpotGrid(box_ang=box_ang, grid=grid, data=data, source=source)
+
+
+@dataclass
+class LocpotPlanarStats:
+    """Per-plane sums for one axis, accumulated WITHOUT the full 3D grid."""
+
+    axis: int  # 0=x, 1=y, 2=z
+    plane_means: np.ndarray  # length grid[axis]
+    n_points: int
+
+
+def stream_locpot_planar(
+    path: str | Path,
+    header: LocpotHeader | None = None,
+    *,
+    chunk_bytes: int = 1 << 20,
+) -> list[LocpotPlanarStats]:
+    """Stream a LOCPOT body in fixed-size chunks, accumulating planar sums.
+
+    The full 3D grid never materializes: only three ~n_axis float arrays are
+    kept. The flat index mapping honours VASP's x-fastest ordering
+    (``k = ix + nx*(iy + ny*iz)``) exactly, so the planar averages are
+    identical to an in-memory C-order reshape.
+    """
+    if header is None:
+        header = read_locpot_header(path)
+    n_points = header.n_points
+    nx, ny, nz = header.grid
+    sums_x = np.zeros(nx, dtype=np.float64)
+    sums_y = np.zeros(ny, dtype=np.float64)
+    sums_z = np.zeros(nz, dtype=np.float64)
+    counts_x = np.zeros(nx, dtype=np.int64)
+    counts_y = np.zeros(ny, dtype=np.int64)
+    counts_z = np.zeros(nz, dtype=np.int64)
+    count = 0
+    carry = ""
+    with open(path, "rb") as handle:
+        handle.seek(header.data_offset_bytes)
+        while count < n_points:
+            chunk = handle.read(chunk_bytes)
+            if not chunk:
+                break
+            text = carry + chunk.decode("ascii", errors="replace")
+            if chunk[-1:] and not chunk.endswith((b" ", b"\n", b"\r", b"\t")):
+                parts = text.split()
+                if parts:
+                    carry = parts[-1]
+                    parts = parts[:-1]
+                else:
+                    carry = ""
+            else:
+                parts = text.split()
+                carry = ""
+            for token in parts:
+                value = float(token)
+                ix = count % nx
+                iy = (count // nx) % ny
+                iz = count // (nx * ny)
+                sums_x[ix] += value
+                sums_y[iy] += value
+                sums_z[iz] += value
+                counts_x[ix] += 1
+                counts_y[iy] += 1
+                counts_z[iz] += 1
+                count += 1
+                if count >= n_points:
+                    break
+    if count < n_points:
+        raise ValueError(
+            f"LOCPOT grid data too short: {count} < {n_points} points"
+        )
+    return [
+        LocpotPlanarStats(
+            axis=axis,
+            plane_means=means / counts.astype(np.float64),
+            n_points=count,
+        )
+        for axis, (means, counts) in (
+            (0, (sums_x, counts_x)),
+            (1, (sums_y, counts_y)),
+            (2, (sums_z, counts_z)),
+        )
+    ]
+
+
+@dataclass
+class VacuumFace:
+    """One boundary-layer face of the fixed vacuum box."""
+
+    axis: str  # "x" | "y" | "z"
+    side: str  # "low" | "high"
+    thickness_ang: float
+    mean_ev: float
+    std_ev: float
+    n_planes: int
+
+
+@dataclass
+class VacuumSummary:
+    """Six-face vacuum characterization for one boundary thickness."""
+
+    thickness_ang: float
+    lattice_lengths_ang: list[float]
+    grid: tuple[int, int, int]
+    faces: list[VacuumFace]
+    mean_ev: float  # mean of the six face means
+    std_ev: float
+    range_ev: float
+    stability: str  # "stable" | "unstable"
+
+
+def vacuum_summary_from_planar(
+    planar: list[LocpotPlanarStats],
+    *,
+    thickness_ang: float,
+    lattice_lengths_ang: list[float],
+    grid: tuple[int, int, int],
+) -> VacuumSummary:
+    """Six boundary-layer face means at ``thickness_ang`` from planar stats."""
+    if thickness_ang <= 0:
+        raise ValueError(f"vacuum boundary thickness must be positive: {thickness_ang}")
+    faces: list[VacuumFace] = []
+    axis_names = ("x", "y", "z")
+    for stats in planar:
+        axis = stats.axis
+        spacing = lattice_lengths_ang[axis] / grid[axis]
+        n_planes = max(1, int(round(thickness_ang / spacing)))
+        values = stats.plane_means
+        for side, selection in (
+            ("low", values[:n_planes]),
+            ("high", values[-n_planes:] if n_planes else values[-1:]),
+        ):
+            faces.append(
+                VacuumFace(
+                    axis=axis_names[axis],
+                    side=side,
+                    thickness_ang=thickness_ang,
+                    mean_ev=float(selection.mean()),
+                    std_ev=float(selection.std()) if selection.size > 1 else 0.0,
+                    n_planes=int(selection.size),
+                )
+            )
+    face_means = np.asarray([face.mean_ev for face in faces], dtype=float)
+    stability = (
+        "stable"
+        if float(face_means.std()) <= VACUUM_STABILITY_THRESHOLD_EV
+        else "unstable"
+    )
+    return VacuumSummary(
+        thickness_ang=thickness_ang,
+        lattice_lengths_ang=list(lattice_lengths_ang),
+        grid=grid,
+        faces=faces,
+        mean_ev=float(face_means.mean()),
+        std_ev=float(face_means.std()),
+        range_ev=float(face_means.max() - face_means.min()),
+        stability=stability,
+    )
+
+
+def stream_vacuum_summary(
+    path: str | Path,
+    *,
+    thickness_ang: float = 1.0,
+    chunk_bytes: int = 1 << 20,
+) -> VacuumSummary:
+    """Streaming vacuum summary for ONE boundary thickness (any grid size)."""
+    header = read_locpot_header(path)
+    planar = stream_locpot_planar(path, header, chunk_bytes=chunk_bytes)
+    return vacuum_summary_from_planar(
+        planar,
+        thickness_ang=thickness_ang,
+        lattice_lengths_ang=header.lattice_lengths_ang,
+        grid=header.grid,
+    )
+
+
+def vacuum_summary_all_thicknesses(
+    path: str | Path,
+    *,
+    thicknesses: tuple[float, ...] = SUPPORTED_VACUUM_THICKNESSES_ANG,
+    chunk_bytes: int = 1 << 20,
+) -> dict[float, VacuumSummary]:
+    """Six-face summaries for every supported thickness with ONE grid pass."""
+    header = read_locpot_header(path)
+    planar = stream_locpot_planar(path, header, chunk_bytes=chunk_bytes)
+    return {
+        thickness: vacuum_summary_from_planar(
+            planar,
+            thickness_ang=thickness,
+            lattice_lengths_ang=header.lattice_lengths_ang,
+            grid=header.grid,
+        )
+        for thickness in thicknesses
+    }
+
+
+def vacuum_summary_dict(summary: VacuumSummary) -> dict[str, Any]:
+    """Serializable form of a VacuumSummary (faces included)."""
+    return {
+        **dataclasses.asdict(summary),
+        "faces": [dataclasses.asdict(face) for face in summary.faces],
+    }
 
 
 def vacuum_level(locpot: LocpotGrid, *, outer_band_fraction: float = 0.12) -> tuple[float, float, int]:
@@ -438,18 +746,57 @@ def vacuum_aligned(
 
 
 def read_outcar_corrections(path: str | Path) -> dict[str, Any]:
-    """Best-effort monopole/dipole+quadrupole corrections from OUTCAR."""
+    """Best-effort monopole/dipole+quadrupole corrections from OUTCAR.
+
+    Accepts real VASP 5.4/6.x wording, plain decimals AND scientific
+    notation, e.g. ``dipol+quadrupol energy correction           -0.000154 eV``
+    (6.x) and ``dipol+quadrupol moment           -0.000161 eAng`` (5.4-style).
+    Only energy lines are reported in eV; moment lines (eAng) are reported
+    separately and never mixed into the eV fields.
+    """
     text = Path(path).read_text(encoding="utf-8", errors="replace")
-    results: dict[str, Any] = {"monopole_ev": None, "dipole_quadrupole_ev": None}
-    for pattern, key in (
-        (r"[Dd]ipol\+quadrupol moment[^\n]*?(-?\d+\.\d+[Ee][+-]?\d+)", "dipole_quadrupole_ev"),
-        (r"[Mm]onopole[^\n]*?(-?\d+\.\d+[Ee][+-]?\d+)", "monopole_ev"),
-    ):
-        match = re.search(pattern, text)
-        if match:
-            results[key] = float(match.group(1))
+    results: dict[str, Any] = {
+        "monopole_ev": None,
+        "dipole_quadrupole_ev": None,
+        "dipole_quadrupole_moment_eang": None,
+        "monopole_moment_eang": None,
+    }
+    number = r"[-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?"
+    quadrupole = r"(?:dipol\+quadrupol|dipole\+quadrupol|dipol\+quadrupole|dipole\+quadrupole)"
+    _apply_correction_pattern(
+        results,
+        "dipole_quadrupole_ev",
+        rf"{quadrupole}[^\r\n]*?energy correction\s+({number})\s*e[Vv]\b",
+        text,
+    )
+    _apply_correction_pattern(
+        results,
+        "dipole_quadrupole_moment_eang",
+        rf"{quadrupole}[^\r\n]*?moment\s+({number})\s*e?[Aa][Nn][Gg]\b",
+        text,
+    )
+    _apply_correction_pattern(
+        results,
+        "monopole_ev",
+        rf"monopole[^\r\n]*?energy correction\s+({number})\s*e[Vv]\b",
+        text,
+    )
+    _apply_correction_pattern(
+        results,
+        "monopole_moment_eang",
+        rf"monopole[^\r\n]*?moment\s+({number})\s*e?[Aa][Nn][Gg]\b",
+        text,
+    )
     results["source"] = "OUTCAR best-effort parse; verify against VASP output"
     return results
+
+
+def _apply_correction_pattern(
+    results: dict[str, Any], key: str, pattern: str, text: str
+) -> None:
+    match = re.search(pattern, text)
+    if match:
+        results[key] = float(match.group(1))
 
 
 def magnetization_from_outcar(path: str | Path) -> float | None:
@@ -529,18 +876,240 @@ def geometry_summary(poscar: str | Path, box_ang: float | None = None) -> dict[s
     }
 
 
+# --------------------------------------------------------------------------
+# relax convergence (OUTCAR-grounded; never Slurm state)
+# --------------------------------------------------------------------------
+
+RELAX_ACCURACY_MARKER = (
+    "reached required accuracy - stopping structural energy minimisation"
+)
+
+# Deterministic VASP failure tokens (lowercase). Detection of any of these
+# makes a COLLECTED job NOT converged and forbids blind resubmission.
+VASP_FAILURE_TOKENS: tuple[str, ...] = (
+    "out of memory",
+    "cannot allocate",
+    "allocation would exceed",
+    "brmix: serious error",
+    "zhegv",
+    "segmentation",
+    "mpi_abort",
+    "forrtl: severe",
+    "fatal error",
+)
+
+
+@dataclass
+class ConvergenceReport:
+    """Deterministic ionic/electronic convergence verdict for one stage.
+
+    ``ionic_converged`` is TRUE only when VASP's own formal marker appears
+    AND the last TOTAL-FORCE block's maximum atomic force satisfies
+    ``max|F| <= |EDIFFG|``. Adjacent ionic-step total-energy differences are
+    deliberately NOT a convergence criterion (dE can vanish while forces stay
+    large). Slurm COMPLETED never enters this report.
+    """
+
+    applicable: bool  # False for NSW=0 static single points
+    electronic_converged: bool
+    ionic_converged: bool
+    reached_required_accuracy: bool
+    ionic_steps: int | None
+    nsw_limit: int | None
+    exhausted_nsw: bool
+    last_force_ev_ang: float | None
+    max_force_ev_ang: float | None
+    ediff_ev: float | None
+    ediffg_ev_ang: float | None
+    detected_errors: list[str]
+    recommended_recovery_reason: str
+    practical_convergence: bool = False
+    practical_convergence_note: str = ""
+    source: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+def _parse_total_force_blocks(text: str) -> tuple[list[list[float]], int]:
+    """Last TOTAL-FORCE block rows (max force per row) + block count."""
+    blocks: list[list[float]] = []
+    current: list[float] = []
+    in_block = False
+    block_count = 0
+    for line in text.splitlines():
+        # Real VASP OUTCAR: the header line reads
+        # "POSITION ... TOTAL-FORCE (eV/Angst)" followed by a dashes row.
+        if "TOTAL-FORCE" in line:
+            in_block = True
+            current = []
+            block_count += 1
+            continue
+        if in_block:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("-"):
+                if current:
+                    # Trailing separator: the block is complete.
+                    blocks.append(current)
+                    in_block = False
+                # Leading separator (before the first row) is ignored.
+                continue
+            tokens = stripped.split()
+            if len(tokens) >= 6:
+                try:
+                    fx, fy, fz = (float(tokens[3]), float(tokens[4]), float(tokens[5]))
+                    current.append(float(np.linalg.norm([fx, fy, fz])))
+                except ValueError:
+                    continue
+    if in_block and current:
+        blocks.append(current)
+    return blocks, block_count
+
+
+def analyze_outcar_convergence(
+    path: str | Path,
+    *,
+    incar_dict: dict[str, Any] | None = None,
+    ediff_ev: float = 1e-6,
+    nsw: int = 0,
+    oszi: Any = None,
+) -> ConvergenceReport:
+    """Parse one OUTCAR into a ConvergenceReport (streaming-friendly read).
+
+    ``incar_dict`` carries EDIFF/EDIFFG/NSW as submitted (mirrored by the
+    collector into the results directory). ``oszi`` is an optional OsziData
+    used for the SCF verdict and ionic-step count.
+    """
+    source = str(path)
+    incar = dict(incar_dict or {})
+    ediff_value = _plain(incar.get("EDIFF")) if incar.get("EDIFF") is not None else ediff_ev
+    ediffg_raw = incar.get("EDIFFG")
+    ediffg = abs(_plain(ediffg_raw)) if ediffg_raw is not None else None
+    nsw_limit = nsw
+    if nsw_limit == 0:
+        raw_nsw = _plain(incar.get("NSW")) if incar.get("NSW") is not None else None
+        if raw_nsw is not None:
+            nsw_limit = int(raw_nsw)
+
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    reached = RELAX_ACCURACY_MARKER in text
+    force_blocks, block_count = _parse_total_force_blocks(text)
+    last_block = force_blocks[-1] if force_blocks else []
+    max_force = float(max(last_block)) if last_block else None
+    last_force = float(last_block[-1]) if last_block else None
+    lower = text.lower()
+    detected_errors = [
+        token for token in VASP_FAILURE_TOKENS if token in lower
+    ]
+    ionic_steps: int | None = None
+    if oszi is not None and getattr(oszi, "ionic_steps", None):
+        ionic_steps = len(oszi.ionic_steps)
+    elif block_count:
+        ionic_steps = max(0, block_count - 1)
+    electronic_converged = bool(
+        oszi is not None
+        and getattr(oszi, "last_scf_de_ev", None) is not None
+        and oszi.last_scf_de_ev <= (ediff_value or 1e-6)
+    )
+    if ediffg is None:
+        # EDIFFG missing is itself a validation problem: relax acceptance
+        # cannot be proven without the force threshold that was submitted.
+        detected_errors.append("EDIFFG missing from INCAR; force criterion unknown")
+    force_ok = (
+        max_force is not None
+        and ediffg is not None
+        and max_force <= ediffg + 1e-12
+    )
+    ionic_converged = bool(reached and force_ok)
+    exhausted = bool(
+        nsw_limit is not None
+        and nsw_limit > 0
+        and ionic_steps is not None
+        and ionic_steps >= nsw_limit
+        and not ionic_converged
+    )
+    recommendation = "not applicable (static single point)"
+    if detected_errors:
+        if any(token in detected_errors for token in ("out of memory", "cannot allocate", "allocation would exceed")):
+            recommendation = (
+                "OOM: do NOT repeat identical resources; increase tasks/memory "
+                "or switch LREAL/.FALSE. before any retry, then restart from CONTCAR"
+            )
+        elif any(
+            token in detected_errors
+            for token in ("mpi_abort", "forrtl: severe", "segmentation", "fatal error", "brmix: serious error", "zhegv")
+        ):
+            recommendation = (
+                "VASP runtime error detected in OUTCAR; inspect stdout/stderr; do not "
+                "blindly resubmit identical inputs"
+            )
+        elif "EDIFFG missing" in detected_errors:
+            recommendation = "EDIFFG missing from INCAR; declare EDIFFG before resubmitting"
+    elif exhausted:
+        recommendation = (
+            "NSW_EXHAUSTED: NSW steps were consumed without reaching |EDIFFG|; "
+            "restart from CONTCAR with a NEW attempt (never from the initial POSCAR)"
+        )
+    elif reached and not force_ok:
+        recommendation = (
+            "CONVERGENCE_FLAG_MISMATCH: VASP reported 'reached required accuracy' but "
+            f"max force {max_force:.6f} eV/A exceeds |EDIFFG| {ediffg:.6f}; re-verify "
+            "EDIFFG and restart from CONTCAR"
+        )
+    elif not ionic_converged and ionic_steps is not None and nsw_limit:
+        if ionic_steps < nsw_limit:
+            recommendation = (
+                f"relax stopped early ({ionic_steps} < NSW {nsw_limit}) without the "
+                "formal convergence marker; check walltime/OUTCAR tail and continue "
+                "from CONTCAR"
+            )
+        else:
+            recommendation = "relax did not converge; restart from CONTCAR with a new attempt"
+    return ConvergenceReport(
+        applicable=True,
+        electronic_converged=electronic_converged,
+        ionic_converged=ionic_converged,
+        reached_required_accuracy=reached,
+        ionic_steps=ionic_steps,
+        nsw_limit=nsw_limit,
+        exhausted_nsw=exhausted,
+        last_force_ev_ang=last_force,
+        max_force_ev_ang=max_force,
+        ediff_ev=ediff_value,
+        ediffg_ev_ang=ediffg,
+        detected_errors=detected_errors,
+        recommended_recovery_reason=recommendation,
+        source=source,
+    )
+
+
 def esp_metadata(result_dir: str | Path) -> dict[str, Any]:
-    """LOCPOT presence + grid metadata (never the potential itself)."""
+    """LOCPOT presence + header metadata (never the potential itself).
+
+    Only the header region is parsed: the grid body (potentially ~1.6 GB for
+    a 448^3 LOCPOT) is never read, loaded or hashed here.
+    """
     locpot = Path(result_dir) / "LOCPOT"
     if not locpot.is_file():
-        return {"has_locpot": False, "grid": None, "spacing_ang": None, "size_bytes": None}
+        return {
+            "has_locpot": False,
+            "grid": None,
+            "spacing_ang": None,
+            "size_bytes": None,
+            "lattice_lengths_ang": None,
+            "data_offset_bytes": None,
+        }
     try:
-        grid = read_locpot(locpot)
+        header = read_locpot_header(locpot)
         return {
             "has_locpot": True,
-            "grid": list(grid.grid),
-            "spacing_ang": [round(v, 4) for v in grid.spacing_ang],
+            "grid": list(header.grid),
+            "spacing_ang": [round(v, 4) for v in header.spacing_ang],
             "size_bytes": locpot.stat().st_size,
+            "lattice_lengths_ang": [round(v, 6) for v in header.lattice_lengths_ang],
+            "data_offset_bytes": header.data_offset_bytes,
         }
     except Exception as exc:
         return {
@@ -548,6 +1117,8 @@ def esp_metadata(result_dir: str | Path) -> dict[str, Any]:
             "grid": None,
             "spacing_ang": None,
             "size_bytes": locpot.stat().st_size,
+            "lattice_lengths_ang": None,
+            "data_offset_bytes": None,
             "parse_error": str(exc),
         }
 
@@ -685,18 +1256,76 @@ def analyze_result_dir(
 
     nsw_value = _plain(incar_dict.get("NSW", ""))
     nsw = int(nsw_value) if nsw_value is not None else 0
+    convergence: dict[str, Any] | None = None
     ionic = {
         "steps": vasprun_data.ionic_steps if vasprun_data is not None else None,
         "static_single_point": nsw == 0,
         "converged": nsw == 0,
         "note": "NSW=0 static single point; ionic convergence not applicable" if nsw == 0 else "",
     }
-    if nsw != 0 and oszi_data is not None and len(oszi_data.ionic_steps) >= 2:
-        last = oszi_data.ionic_steps[-1]
-        prev = oszi_data.ionic_steps[-2]
-        ionic["converged"] = abs(last["F"] - prev["F"]) < 1e-5
-        ionic["note"] = f"dE between ionic steps = {last['F'] - prev['F']:.3e} eV"
-
+    if nsw != 0:
+        # Ionic convergence comes ONLY from the OUTCAR force criterion
+        # (max|F| <= |EDIFFG| + formal marker). Adjacent-step total-energy
+        # differences are never a substitute for the force criterion.
+        outcar = files.get("OUTCAR")
+        if outcar is None:
+            errors.append(
+                "RELAX_OUTCAR_MISSING: OUTCAR is required to verify ionic "
+                "convergence (max force vs EDIFFG) for a relax stage"
+            )
+            convergence = {
+                "applicable": True,
+                "error": "OUTCAR missing; ionic convergence unverifiable",
+                "ionic_converged": False,
+            }
+        else:
+            try:
+                report = analyze_outcar_convergence(
+                    outcar,
+                    incar_dict=incar_dict,
+                    ediff_ev=ediff,
+                    nsw=nsw,
+                    oszi=oszi_data,
+                )
+                convergence = report.to_dict()
+                ionic["steps"] = report.ionic_steps if report.ionic_steps is not None else ionic["steps"]
+                ionic["converged"] = report.ionic_converged
+                ionic["note"] = (
+                    f"max force {report.max_force_ev_ang:.6f} eV/A vs |EDIFFG| "
+                    f"{report.ediffg_ev_ang:.6f}; formal marker "
+                    f"{'present' if report.reached_required_accuracy else 'absent'}"
+                )
+                if report.detected_errors:
+                    errors.append(
+                        "DETECTED_VASP_ERROR: "
+                        + "; ".join(report.detected_errors[:5])
+                    )
+                if report.practical_convergence:
+                    warnings.append(
+                        "PRACTICAL_CONVERGENCE: " + report.practical_convergence_note
+                    )
+                if not report.ionic_converged:
+                    errors.append(
+                        "IONIC_NOT_CONVERGED: max force "
+                        f"{report.max_force_ev_ang if report.max_force_ev_ang is not None else 'n/a'} "
+                        "eV/A vs |EDIFFG| "
+                        f"{report.ediffg_ev_ang if report.ediffg_ev_ang is not None else 'n/a'} eV/A; "
+                        f"steps={report.ionic_steps} NSW={report.nsw_limit} "
+                        f"exhausted={report.exhausted_nsw}"
+                    )
+            except Exception as exc:
+                errors.append(f"RELAX_CONVERGENCE_UNREADABLE: {exc}")
+                convergence = {
+                    "applicable": True,
+                    "error": str(exc),
+                    "ionic_converged": False,
+                }
+    else:
+        convergence = {
+            "applicable": False,
+            "ionic_converged": True,
+            "note": "NSW=0 static single point; ionic convergence not applicable",
+        }
     # -- orbitals -------------------------------------------------------------
     orbitals: dict[str, Any] = {
         "homo_band": None, "lumo_band": None,
@@ -745,20 +1374,37 @@ def analyze_result_dir(
     vacuum: dict[str, Any] = {
         "level_ev": None, "std_ev": None, "samples": None,
         "method": None, "aligned_homo_ev": None, "aligned_lumo_ev": None,
+        "grid": None, "lattice_lengths_ang": None,
+        "faces": None, "thicknesses": None, "stability": None,
     }
     locpot_path = directory / "LOCPOT"
     if locpot_path.is_file():
         try:
-            locpot = read_locpot(locpot_path, box_ang=box_ang)
-            level, std, count = vacuum_level(locpot)
+            # Streaming LOCPOT processing: never materializes the 3D grid,
+            # so a real 448^3 (~1.6 GB) LVHAR LOCPOT is analyzed fine.
+            header = read_locpot_header(locpot_path)
+            by_thickness = vacuum_summary_all_thicknesses(locpot_path)
+            summary = by_thickness[1.0]
             vacuum.update(
                 {
-                    "level_ev": level,
-                    "std_ev": std,
-                    "samples": count,
+                    "level_ev": summary.mean_ev,
+                    "std_ev": summary.std_ev,
+                    "samples": sum(face.n_planes for face in summary.faces),
+                    "grid": list(header.grid),
+                    "lattice_lengths_ang": [
+                        round(v, 6) for v in header.lattice_lengths_ang
+                    ],
+                    "faces": [
+                        dataclasses.asdict(face) for face in summary.faces
+                    ],
+                    "thicknesses": {
+                        str(thickness): vacuum_summary_dict(item)
+                        for thickness, item in by_thickness.items()
+                    },
+                    "stability": summary.stability,
                     "method": (
-                        "LOCPOT planar average; mean of the outermost "
-                        "planes along all three axes of the fixed box"
+                        "LOCPOT streaming planar average; mean of six "
+                        "vacuum-face boundary layers (0.5/1.0/1.5/2.0 A)"
                     ),
                 }
             )
@@ -767,13 +1413,13 @@ def analyze_result_dir(
                 if eigen_data is not None
                 else OrbitalBands(None, None, None, None, None, None, None)
             )
-            aligned = vacuum_aligned(ref_bands, level)
+            aligned = vacuum_aligned(ref_bands, summary.mean_ev)
             vacuum["aligned_homo_ev"] = aligned["aligned_homo_ev"]
             vacuum["aligned_lumo_ev"] = aligned["aligned_lumo_ev"]
-            if std > 0.1:
+            if summary.std_ev > VACUUM_STABILITY_THRESHOLD_EV:
                 warnings.append(
-                    f"VACUUM_PLATEAU_UNSTABLE: std {std:.3f} eV in the "
-                    "outer planes; aligned energies are unreliable"
+                    f"VACUUM_PLATEAU_UNSTABLE: six-face std "
+                    f"{summary.std_ev:.3f} eV; aligned energies are unreliable"
                 )
         except Exception as exc:
             warnings.append(f"LOCPOT parse failed: {exc}")
@@ -884,6 +1530,7 @@ def analyze_result_dir(
         "energy": energy,
         "scf": scf,
         "ionic": ionic,
+        "convergence": convergence,
         "orbitals": orbitals,
         "vacuum": vacuum,
         "corrections": corrections,

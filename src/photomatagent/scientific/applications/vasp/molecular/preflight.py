@@ -26,6 +26,7 @@ from photomatagent.scientific.applications.vasp.molecular.models import (
     PreflightIssue,
     PreflightReport,
     PreflightSummary,
+    ResourceProfile,
     StageName,
     WorkflowSpec,
 )
@@ -74,6 +75,7 @@ CHECK_ORDER = [
     "DIPOL_FORMAT",
     "PARITY_AND_ISPIN",
     "RESOURCE_COMPATIBILITY",
+    "RESOURCE_CALIBRATION",
     "POTCAR_CONTENT_POLICY",
 ]
 
@@ -543,13 +545,35 @@ def run_molecular_preflight(
             )
 
         collector.note("PARITY_AND_ISPIN")
-        if nelect is not None and resolution is not None:
-            ispin_raw = parsed.get("ISPIN")
-            ispin = (
-                parse_int(ispin_raw)
-                if ispin_raw is not None
-                else config.default_ispin
+        ispin_raw = parsed.get("ISPIN")
+        ispin = (
+            parse_int(ispin_raw)
+            if ispin_raw is not None
+            else config.default_ispin
+        )
+        # ISPIN is a VASP tag, never the spin multiplicity: only {1, 2}
+        # exist, and this is checked even when electron metadata is missing.
+        if ispin is not None and ispin not in {1, 2}:
+            collector.error(
+                "ISPIN_INVALID",
+                f"ISPIN = {ispin} is not a valid VASP value; ISPIN must "
+                "be 1 or 2 (spin_multiplicity is NOT ISPIN)",
+                f"{prefix}.incar.ISPIN",
             )
+        elif (
+            ispin is not None
+            and ispin == 1
+            and workflow.molecule.spin_multiplicity > 1
+        ):
+            collector.error(
+                "SPIN_POLARIZATION_REQUIRED",
+                f"spin_multiplicity = "
+                f"{workflow.molecule.spin_multiplicity} (> 1) with "
+                f"ISPIN = 1 in this stage; declare ISPIN = 2 (or "
+                "spin_polarized=True)",
+                f"{prefix}.incar.ISPIN",
+            )
+        if nelect is not None and resolution is not None:
             if ispin is not None and nelect % 2 == 1 and ispin == 1:
                 collector.error(
                     "ELECTRON_PARITY_MISMATCH",
@@ -568,6 +592,42 @@ def run_molecular_preflight(
                         f"{neutral_electrons:g} - q {molecule.total_charge})",
                         f"{prefix}.incar.NELECT",
                     )
+            nupdown_raw = parsed.get("NUPDOWN")
+            if nupdown_raw is not None:
+                nupdown = parse_int(nupdown_raw)
+                if nupdown is None or nupdown < 1:
+                    collector.error(
+                        "NUPDOWN_INVALID",
+                        f"NUPDOWN = {nupdown_raw} must be a positive integer",
+                        f"{prefix}.incar.NUPDOWN",
+                    )
+                elif nupdown is not None and nelect is not None:
+                    if nupdown > nelect:
+                        collector.error(
+                            "NUPDOWN_PARITY_INCONSISTENT",
+                            f"NUPDOWN = {nupdown} exceeds NELECT = {nelect:g}",
+                            f"{prefix}.incar.NUPDOWN",
+                        )
+                    elif (int(nelect) - nupdown) % 2:
+                        collector.error(
+                            "NUPDOWN_PARITY_INCONSISTENT",
+                            f"NELECT - NUPDOWN = {int(nelect)} - {nupdown} is "
+                            "odd; no integer magnetization fits",
+                            f"{prefix}.incar.NUPDOWN",
+                        )
+                    expected = workflow.molecule.spin_multiplicity - 1
+                    if (
+                        workflow.molecule.spin_multiplicity > 1
+                        and nupdown != expected
+                    ):
+                        collector.warn(
+                            "NUPDOWN_MAPPING_MISMATCH",
+                            f"NUPDOWN = {nupdown} does not match the recorded "
+                            f"nupdown = multiplicity - 1 = {expected} mapping "
+                            "assumption for "
+                            f"multiplicity {workflow.molecule.spin_multiplicity}",
+                            f"{prefix}.incar.NUPDOWN",
+                        )
 
         collector.note("RESOURCE_COMPATIBILITY")
         resource_violations = workflow.resource_plan.violations(len(workflow.stages))
@@ -654,6 +714,38 @@ def run_molecular_preflight(
                 f"inconsistent with NELECT = {nelect:g} (parity "
                 f"{multiplicity_parity} vs {electron_parity})",
                 "molecule.spin_multiplicity",
+            )
+
+    # -- resource calibration scope --------------------------------------------
+    collector.note("RESOURCE_CALIBRATION")
+    calibration_record = workflow.resource_plan.calibration
+    if (
+        workflow.resource_plan.profile is ResourceProfile.PRODUCTION
+        and calibration_record is not None
+    ):
+        from photomatagent.scientific.applications.vasp.molecular.calibration import (
+            calibration_applicable,
+        )
+
+        plan_box = molecule.box_ang
+        plan_encut: float | None = None
+        if workflow.stages:
+            first_incar = workflow.stages[0].incar.get("ENCUT")
+            parsed_encut = parse_float(str(first_incar)) if first_incar is not None else None
+            plan_encut = parsed_encut
+        ok, reasons = calibration_applicable(
+            calibration_record,
+            formula=summary.formula if summary is not None else None,
+            atom_count=len(structure.symbols) if structure is not None else None,
+            box_ang=plan_box,
+            encut_ev=plan_encut,
+        )
+        if not ok:
+            collector.error(
+                "RESOURCE_CALIBRATION_MISMATCH",
+                "CalibrationRecord does not apply to the planned run: "
+                + "; ".join(reasons),
+                "workflow.resource_plan.calibration",
             )
 
     # -- POTCAR content policy ---------------------------------------------------

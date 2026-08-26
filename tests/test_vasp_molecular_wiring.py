@@ -196,7 +196,11 @@ def seed_results(
             encoding="utf-8",
         )
         _write_minimal_vasprun(bulk / "vasprun.xml", e0=-122.277)
-        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml"):
+        # Relax validation is OUTCAR-grounded (max force vs EDIFFG); seed a
+        # force-converged OUTCAR so the synthetic results satisfy the same
+        # scientific contract as real VASP outputs.
+        write_outcar(bulk / "OUTCAR", reached=converged)
+        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml", "OUTCAR"):
             backend.add_remote_file(
                 remote_directory, name, (bulk / name).read_bytes()
             )
@@ -225,6 +229,32 @@ def seed_results(
         return names
 
     backend.upload_files = upload_with_results
+
+
+def write_outcar(
+    path: Path, *, n_atoms: int = 17, reached: bool = True
+) -> None:
+    """Synthetic force-converged OUTCAR (relax validation fixture)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        " vasp.5.4.4.18Apr17 (build Mar 03 2024 15:47:24) complex parallel",
+        "   NSW      =      200     number of steps for ionic motion",
+        "   IBRION   =      2     ionic relax: 1=quasi-Newton, 2=damped",
+        "   EDIFFG   = -0.02E+00  force-criterion for ionic relax",
+    ]
+    if reached:
+        lines.append(
+            "  reached required accuracy - stopping structural energy minimisation"
+        )
+    lines.append("POSITION                                       TOTAL-FORCE (eV/Angst)")
+    lines.append("-" * 90)
+    for index in range(n_atoms):
+        lines.append(
+            f"{index + 1:6d} {0.0:17.10f} {0.0:17.10f} {0.0:17.10f}"
+            f"{0.00014:14.8f} {0.00014:14.8f} {0.00014:14.8f}"
+        )
+    lines.append("-" * 90)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------

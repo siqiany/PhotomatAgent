@@ -205,6 +205,38 @@ def write_locpot(path: Path) -> None:
     )
 
 
+def write_outcar(
+    path: Path,
+    *,
+    n_atoms: int = 21,
+    max_force: float = 0.001,
+    reached: bool = True,
+) -> None:
+    """Synthetic force-converged OUTCAR (relax validation fixture)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        " vasp.5.4.4.18Apr17 (build Mar 03 2024 15:47:24) complex parallel",
+        "   NSW      =     200     number of steps for ionic motion",
+        "   IBRION   =      2     ionic relax: 1=quasi-Newton, 2=damped",
+        "   EDIFFG   = -0.02E+00  force-criterion for ionic relax",
+    ]
+    if reached:
+        lines.append(
+            "  reached required accuracy - stopping structural energy minimisation"
+        )
+        lines.append("")
+    lines.append("POSITION                                       TOTAL-FORCE (eV/Angst)")
+    lines.append("-" * 90)
+    component = max_force / max(1.0, (3 * n_atoms) ** 0.5)
+    for index in range(n_atoms):
+        lines.append(
+            f"{index + 1:6d} {0.0:17.10f} {0.0:17.10f} {0.0:17.10f}"
+            f"{component:14.8f} {component:14.8f} {component:14.8f}"
+        )
+    lines.append("-" * 90)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_tiny_parchg(path: Path, *, box: float = 24.0) -> None:
     """A valid tiny VASP text PARCHG grid (8^3) with a Gaussian blob."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,7 +294,8 @@ def seed_results(backend: FakeSCNetBackend, tmp_path: Path) -> None:
         write_eigenval(bulk / "EIGENVAL", nelect=nelect)
         write_oszicar(bulk / "OSZICAR")
         write_vasprun(bulk / "vasprun.xml")
-        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml"):
+        write_outcar(bulk / "OUTCAR")
+        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml", "OUTCAR"):
             backend.add_remote_file(
                 remote_directory, name, (bulk / name).read_bytes()
             )

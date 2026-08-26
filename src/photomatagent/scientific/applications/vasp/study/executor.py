@@ -232,6 +232,14 @@ class StudyExecutor:
     def _build_workflow(self, task: Any) -> Any:
         request = self.spec.request
         method = request.method
+        profile = method.profile()
+        calibration = method.calibration_record()
+        tasks = (calibration.tasks if calibration is not None else None) or 8
+        walltime = 20
+        if calibration is not None and calibration.elapsed_seconds > 0:
+            walltime = max(
+                20, int(calibration.elapsed_seconds / 60.0 * 1.5) + 5
+            )
         assert task.structure_path is not None
         molecule = MoleculeSpec(
             name=task.display_name,
@@ -248,13 +256,17 @@ class StudyExecutor:
             molecule,
             psp_dir=self.runtime.psp_dir,
             encut_ev=method.encut_ev,
-            spin=method.spin or task.spin_multiplicity,
+            # ISPIN is derived from the typed MoleculeSpec (multiplicity > 1
+            # or odd electrons -> ISPIN=2). Passing ``spin`` here means
+            # "explicit ISPIN override" -- it is NEVER the multiplicity.
+            spin=method.spin,
             include_orbital_homo=PropertyRequest.HOMO_LUMO in assists,
             include_orbital_lumo=PropertyRequest.HOMO_LUMO in assists,
             include_esp=PropertyRequest.ESP in assists,
-            resource_profile=ResourceProfile.SMOKE,
-            tasks_per_node=8,
-            walltime_minutes=20,
+            resource_profile=profile,
+            tasks_per_node=tasks,
+            walltime_minutes=walltime,
+            calibration=calibration,
         )
 
     # -- execution ------------------------------------------------------------
@@ -341,7 +353,37 @@ class StudyExecutor:
         return report
 
     async def _run_task(self, task: Any) -> dict[str, Any]:
-        """Run one unique calculation with conformer fallback."""
+        """Run one unique calculation.
+
+        With the screening funnel enabled (B3), every candidate gets a cheap
+        static E0 screen first and ONLY the selected lowest-energy candidate
+        enters the expensive production stages; there is no expensive
+        fallback loop over candidates after screening. Without screening the
+        legacy conformer fallback remains.
+        """
+        policy = self.spec.request.execution_policy
+        candidates = list(task.structure_candidates)
+        if policy.screen_conformers and len(candidates) > 1:
+            from photomatagent.scientific.applications.vasp.study.screening import (
+                load_screen_reports,
+            )
+
+            # Resume safety: never re-screen a task that already has a
+            # completed, persisted screen report (no duplicate screen jobs).
+            existing = load_screen_reports(self.spec.study_dir).get(task.task_id)
+            if (
+                existing is not None
+                and existing.screen_complete
+                and existing.selected_structure_path
+            ):
+                task.structure_path = Path(existing.selected_structure_path)
+                task.conformer_index = existing.selected_candidate_index or 0
+                return await self._run_task_with_conformer(task)
+            screened = await self._screen_task(task, candidates)
+            if screened["selected"] is not None:
+                task.structure_path = Path(screened["selected"])
+                task.conformer_index = screened["index"]
+            return await self._run_task_with_conformer(task)
         max_attempts = max(1, len(task.structure_candidates))
         for attempt in range(max_attempts):
             if attempt > 0:
@@ -356,6 +398,35 @@ class StudyExecutor:
                 continue
             return outcome
         return {"state": task.state, "error": task.error}
+
+    async def _screen_task(
+        self, task: Any, candidates: list[str]
+    ) -> dict[str, Any]:
+        """Run the deterministic conformer screen funnel (cheap statics)."""
+        from photomatagent.scientific.applications.vasp.study.screening import (
+            ConformerScreener,
+            persist_screen_report,
+        )
+
+        policy = self.spec.request.execution_policy
+        candidates = candidates[: policy.max_screen_candidates]
+        box = self._group_box_ang(task)
+        screener = ConformerScreener(
+            runtime=self.runtime,
+            screens_root=self.spec.study_dir / "screening",
+            method=self.spec.request.method,
+        )
+        report = await screener.screen(
+            task=task, candidates=candidates, box_ang=box
+        )
+        persist_screen_report(report, self.spec.study_dir)
+        return {
+            "selected": (
+                report.selected_structure_path if report.screen_complete else None
+            ),
+            "index": report.selected_candidate_index,
+            "report": report,
+        }
 
     async def _run_task_with_conformer(self, task: Any) -> dict[str, Any]:
         """Prepare + submit + collect one conformer through vasp_molecule.*."""
@@ -461,6 +532,8 @@ class StudyExecutor:
             "validated": True,
             "errors": [],
             "warnings": [],
+            "explicit_reference_assumption": True,
+            "reference_kind": "zero_electron_bare_ion",
             "reference_model": {
                 "kind": "zero_electron_bare_ion",
                 "convention": "E = 0 eV by definition (VASP cannot run "
@@ -468,6 +541,7 @@ class StudyExecutor:
                 "note": "use relative binding energies (ΔΔE) or an "
                 "alternative reference to reduce bare-ion error",
             },
+            "not_a_vasp_result": True,
             "identity": {
                 "formula": task.formula or "Li",
                 "charge": task.total_charge,
@@ -686,6 +760,16 @@ class StudyExecutor:
             group.delta_e_ev = (result.get("results") or {}).get("delta_e_ev")
             group.delta_delta_e_ev = (result.get("results") or {}).get(
                 "delta_delta_e_ev"
+            )
+            group.uses_declared_reference_assumption = bool(
+                (result.get("results") or {}).get(
+                    "uses_declared_reference_assumption"
+                )
+            )
+            group.high_risk_absolute_binding_energy = bool(
+                (result.get("results") or {}).get(
+                    "high_risk_absolute_binding_energy"
+                )
             )
             group.error = ""
 

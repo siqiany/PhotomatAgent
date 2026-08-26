@@ -30,6 +30,8 @@ def _base_incar(
     dipol: str,
     ncore: int,
     functional: str = "PBE-D3(BJ)",
+    nupdown: int | None = None,
+    magmom: list[float] | None = None,
 ) -> dict[str, Any]:
     gga = "PE" if functional.startswith("PBE") else functional.upper()
     settings: dict[str, Any] = {
@@ -55,6 +57,10 @@ def _base_incar(
         settings["LMONO"] = True
     if nelect is not None:
         settings["NELECT"] = nelect
+    if nupdown is not None:
+        settings["NUPDOWN"] = nupdown
+    if magmom is not None:
+        settings["MAGMOM"] = magmom
     return settings
 
 
@@ -68,6 +74,8 @@ def relax_incar(
     dipol: str = "0.5 0.5 0.5",
     ncore: int = 2,
     nsw: int = 200,
+    nupdown: int | None = None,
+    magmom: list[float] | None = None,
 ) -> dict[str, Any]:
     settings = _base_incar(
         spin=spin,
@@ -77,6 +85,8 @@ def relax_incar(
         dipole=dipole,
         dipol=dipol,
         ncore=ncore,
+        nupdown=nupdown,
+        magmom=magmom,
     )
     settings.update(
         {

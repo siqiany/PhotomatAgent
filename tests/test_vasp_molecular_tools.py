@@ -272,6 +272,39 @@ def write_locpot(
     return path
 
 
+def write_outcar(
+    path: Path,
+    *,
+    n_atoms: int = 17,
+    max_force: float = 0.001,
+    reached: bool = True,
+) -> Path:
+    """Synthetic force-converged OUTCAR (relax validation fixture)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        " vasp.5.4.4.18Apr17 (build Mar 03 2024 15:47:24) complex parallel",
+        "   NSW      =     200     number of steps for ionic motion",
+        "   IBRION   =      2     ionic relax: 1=quasi-Newton, 2=damped",
+        "   EDIFFG   = -0.02E+00  force-criterion for ionic relax",
+    ]
+    if reached:
+        lines.append(
+            "  reached required accuracy - stopping structural energy minimisation"
+        )
+        lines.append("")
+    lines.append("POSITION                                       TOTAL-FORCE (eV/Angst)")
+    lines.append("-" * 90)
+    component = max_force / max(1.0, (3 * n_atoms) ** 0.5)
+    for index in range(n_atoms):
+        lines.append(
+            f"{index + 1:6d} {0.0:17.10f} {0.0:17.10f} {0.0:17.10f}"
+            f"{component:14.8f} {component:14.8f} {component:14.8f}"
+        )
+    lines.append("-" * 90)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def stage_results_bundle(
     stage_dir: Path,
     *,
@@ -284,6 +317,7 @@ def stage_results_bundle(
 ) -> None:
     write_eigenval(stage_dir / "EIGENVAL", nelect=nelect)
     write_oszicar(stage_dir / "OSZICAR", e0=e0)
+    write_outcar(stage_dir / "OUTCAR")
     if include_vasprun:
         write_minimal_vasprun(stage_dir / "vasprun.xml", e_fr=e0, e_0=e0)
     if include_locpot:
@@ -305,7 +339,7 @@ def result_seeding_backend(psp: Path, tmp_path: Path) -> FakeSCNetBackend:
         if "orbital" in remote_directory or remote_directory.endswith("/esp") or "-esp-" in remote_directory:
             write_locpot(bulk / "LOCPOT", box=20.0)
             backend.add_remote_file(remote_directory, "LOCPOT", (bulk / "LOCPOT").read_bytes())
-        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml"):
+        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml", "OUTCAR"):
             backend.add_remote_file(remote_directory, name, (bulk / name).read_bytes())
         if "-relax-" in remote_directory:
             contcar = next(

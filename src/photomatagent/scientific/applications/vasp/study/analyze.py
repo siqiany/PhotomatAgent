@@ -137,6 +137,12 @@ def analyze_study(
                 "delta_delta_e_ev": group.delta_delta_e_ev,
                 "state": group.state,
                 "error": group.error,
+                "uses_declared_reference_assumption": (
+                    group.uses_declared_reference_assumption
+                ),
+                "high_risk_absolute_binding_energy": (
+                    group.high_risk_absolute_binding_energy
+                ),
                 "zero_electron_references": [
                     fragment.display_name
                     for fragment, fragment_id in (
@@ -171,6 +177,14 @@ def analyze_study(
                         "confidence": provenance.get("confidence"),
                     }
                 )
+    screening: list[dict[str, Any]] = []
+    from photomatagent.scientific.applications.vasp.study.screening import (
+        load_screen_reports,
+    )
+
+    for report in load_screen_reports(Path(spec.study_dir)).values():
+        screening.append(report.summary())
+
     return {
         "study_id": spec.study_id,
         "summary": {
@@ -211,6 +225,7 @@ def analyze_study(
         },
         "systems": rows,
         "binding_energies": binding_rows,
+        "conformer_screening": screening,
         "structure_assumptions": assumptions,
         "method": {
             "functional": spec.request.method.functional,

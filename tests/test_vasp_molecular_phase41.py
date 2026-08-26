@@ -269,6 +269,41 @@ def write_locpot(path: Path, *, box: float = 20.0) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_outcar(
+    path: Path,
+    *,
+    n_atoms: int = 17,
+    max_force: float = 0.001,
+    reached: bool = True,
+    nsw: int = 200,
+    steps: int = 8,
+) -> None:
+    """Synthetic OUTCAR with a plausible TOTAL-FORCE block (fixture only)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        " vasp.5.4.4.18Apr17 (build Mar 03 2024 15:47:24) complex parallel",
+        "   POTIM   =      0.50     time-step for ionic-motion",
+        "   NSW      =     200     number of steps for ionic motion",
+        "   IBRION   =      2     ionic relax: 1=quasi-Newton, 2=damped",
+        "   EDIFFG   = -0.02E+00  force-criterion for ionic relax",
+    ]
+    if reached:
+        lines.append(
+            "  reached required accuracy - stopping structural energy minimisation"
+        )
+        lines.append("")
+    lines.append("POSITION                                       TOTAL-FORCE (eV/Angst)")
+    lines.append("-" * 90)
+    for index in range(n_atoms):
+        fx = max_force / max(1.0, n_atoms**0.5)
+        lines.append(
+            f"{index + 1:6d} {0.0:17.10f} {0.0:17.10f} {0.0:17.10f}"
+            f"{fx:14.8f} {-fx:14.8f} {fx:14.8f}"
+        )
+    lines.append("-" * 90)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def seed_results(
     backend: FakeSCNetBackend,
     tmp_path: Path,
@@ -286,7 +321,11 @@ def seed_results(
         write_eigenval(bulk / "EIGENVAL", nelect=38)
         write_oszicar(bulk / "OSZICAR", converged=converged)
         write_minimal_vasprun(bulk / "vasprun.xml")
-        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml"):
+        # Relax validation is OUTCAR-grounded (max force vs EDIFFG); every
+        # seeded job gets a force-converged OUTCAR so the synthetic results
+        # satisfy the same scientific contract as real VASP outputs.
+        write_outcar(bulk / "OUTCAR", n_atoms=17, reached=converged)
+        for name in ("EIGENVAL", "OSZICAR", "vasprun.xml", "OUTCAR"):
             backend.add_remote_file(
                 remote_directory, name, (bulk / name).read_bytes()
             )
@@ -679,9 +718,12 @@ async def test_resume_revalidates_collected_without_resubmit(tmp_path):
     assert len(backend.submitted_scripts) == jobs  # no resubmission
 
     # The results on disk were transiently bad; once they are fixed, the same
-    # resume re-validates to VALIDATED with no new submission.
+    # resume re-validates to VALIDATED with no new submission. The scientific
+    # contract requires BOTH the SCF row and the OUTCAR force criterion to
+    # pass, so the OUTCAR is fixed here too.
     result_dir = root / "results" / "relax"
     write_oszicar(result_dir / "OSZICAR", converged=True)
+    write_outcar(result_dir / "OUTCAR", n_atoms=17, reached=True)
     third = await run_molecule_workflow(
         workflow, root, session=session, backend=backend, psp_dir=psp,
         remote_psp_dir="",
