@@ -1,35 +1,46 @@
 ---
 name: material-composition-generation
-description: Generate inorganic material composition and chemical-formula candidates with the deployed conditional VAE for a target band gap or wavelength, optionally retrieve known formula matches and hand selected compositions to MatterGen for crystal generation. Use for 成分生成、组分生成、化学式生成、VAE 逆向设计、候选材料生成、target-band-gap composition proposals, and wavelength-conditioned semiconductor discovery; do not use it to claim device performance or validated structures.
+description: Generate new inorganic compositions and chemical formulas from one or more target material properties with the deployed multi-property conditional VAE, then optionally hand selected formulas to MatterGen for structure generation. Use for 成分生成、组分生成、化学式生成、VAE 多性质逆向生成、候选材料生成 and property-conditioned materials discovery; do not substitute database retrieval for generation or claim device performance.
 ---
 
 # Material Composition Generation
 
-Generate formula candidates with the real `generation.vae_formula` model tool,
-preserve model provenance, and keep composition proposal, structure generation,
-and property validation as separate scientific stages.
+Generate new formula candidates with the real multi-property
+`generation.vae_formula` model tool. This is inverse generation, not nearest
+neighbour or database retrieval. Preserve model provenance and keep composition
+proposal, structure generation, and property validation as separate stages.
 
 ## Workflow
 
-1. Convert the request into exactly one conditioning input:
-   `target_band_gap_eV` or `target_wavelength_um`. If the user supplies a
-   wavelength band, use the longest-wavelength cutoff for a gap upper bound and
-   state that choice.
+1. Map every requested, trained material property into `target_properties`.
+   Supported canonical fields are `gap_selected_eV`,
+   `cutoff_wavelength_um_from_gap`, `formation_energy_eV_per_atom`,
+   `energy_above_hull_eV_per_atom`, `density_g_cm3`, `dielectric_mean`,
+   `avg_electron_mass_m0`, `avg_hole_mass_m0`, `bulk_modulus_GPa`,
+   `shear_modulus_GPa`, `exfoliation_energy_meV_per_atom`,
+   `max_IR_mode_cm-1`, `min_IR_mode_cm-1`, and `spillage`. Omit unspecified
+   fields; do not fill them with guessed values. The legacy
+   `target_band_gap_eV` and `target_wavelength_um` parameters remain valid for
+   single-condition requests. If the user supplies a wavelength band, use the
+   longest-wavelength cutoff and state that choice.
 2. Discover the deferred generation tools with `tool_search` when they are not
    already visible. Inspect `generation.capabilities` if model availability is
    unknown.
-3. Call `generation.vae_formula` with the conditioning input. Keep
+3. Call `generation.vae_formula` with all supplied material conditions in one
+   request. Keep
    `require_charge_neutral=true` and `require_novel=true` unless the user asks
    for an exploratory relaxation. Pass `forbidden_elements` only when the user
    explicitly supplies that constraint; never exclude Hg, Cd, Pb, Bi, Te, or
    Sb by default.
-4. Report each proposed formula with its chemical system, integer atom counts,
+4. Report the normalized `target_properties`, unspecified conditions, any
+   clipped out-of-distribution conditions, and each proposed formula with its
+   chemical system, integer atom counts,
    composition discretization error, charge-neutrality result, novelty flag,
    target conditions, checkpoint provenance, novelty reference count and
    definition, model scope, and rejection counts.
-5. If the user wants known database analogues rather than new formulas, call
-   `generation.vae_retrieve` separately. Label its rows as retrieval results,
-   not VAE-generated formulas.
+5. Do not call `generation.vae_retrieve` for inverse-generation requests. It
+   searches existing records and cannot replace VAE sampling. Use it only when
+   the user separately and explicitly asks for known database analogues.
 6. If the user requests crystal structures, pass a selected proposal's
    `formula` as `proposed_formula` and its `chemical_system` to
    `generation.mattergen`. Preserve `vae_proposed_formula`,
@@ -56,8 +67,13 @@ and property validation as separate scientific stages.
 - If no proposals survive, report the rejection counts. Relax at most one
   explicit constraint at a time and label the rerun exploratory.
 - Do not send responsivity, EQE, detectivity, dark current, response time, or
-  other device properties to the VAE. Route those to the corresponding
-  scientific capabilities after a composition/structure exists.
+  other device-level properties to the VAE: its training pairs contain the 14
+  material-level fields above, not device labels. Route device validation to
+  the corresponding scientific capabilities after a composition/structure
+  exists.
+- If band gap and cutoff wavelength are both supplied, they must agree with
+  `wavelength_um = 1.239841984 / gap_eV`; otherwise ask the user to resolve the
+  conflicting targets.
 
 ## Reproducibility requests
 

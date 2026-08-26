@@ -1,0 +1,18 @@
+{
+  "tool": "generation.vae_formula",
+  "arguments": {
+    "target_properties": {
+      "gap_selected_eV": 0.35,
+      "formation_energy_eV_per_atom": -1.2,
+      "energy_above_hull_eV_per_atom": 0.05,
+      "density_g_cm3": 6.0,
+      "dielectric_mean": 15.0,
+      "avg_electron_mass_m0": 0.2
+    },
+    "limit": 8,
+    "sample_count": 4096,
+    "require_novel": true,
+    "require_charge_neutral": true,
+    "random_seed": 23
+  }
+}

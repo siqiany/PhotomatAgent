@@ -524,6 +524,15 @@ class VaspCapabilityPack(CapabilityPack):
         self, application: VaspApplication | None = None, workspace: Any = None
     ) -> None:
         self.application = application or default_vasp_application()
+        from photomatagent.workspace import Workspace
+
+        self.workspace = Path(
+            workspace.root if isinstance(workspace, Workspace) else (
+                workspace or Path.cwd()
+            )
+        ).expanduser().resolve()
+        self._molecular_pack: Any = None
+        self._study_pack: Any = None
 
     def probe(self) -> ProbeResult:
         if self.application is None:
@@ -553,7 +562,39 @@ class VaspCapabilityPack(CapabilityPack):
             VaspCollectTool(self.application),
             VaspInspectResultTool(self.application),
             VaspRunWorkflowTool(self.application),
+            *self._molecular_tools(),
+            *self._study_tools(),
         ]
+
+    def _molecular_tools(self) -> list[Tool]:
+        from photomatagent.scientific.applications.vasp.molecular.runtime import (
+            default_molecular_runtime,
+        )
+        from photomatagent.scientific.applications.vasp.molecular.tool_pack import (
+            MolecularVaspCapabilityPack,
+        )
+
+        if self._molecular_pack is None:
+            runtime = default_molecular_runtime(
+                self.workspace, application=self.application
+            )
+            self._molecular_pack = MolecularVaspCapabilityPack(runtime)
+        return self._molecular_pack.tools()
+
+    def _study_tools(self) -> list[Tool]:
+        from photomatagent.scientific.applications.vasp.molecular.runtime import (
+            default_molecular_runtime,
+        )
+        from photomatagent.scientific.applications.vasp.study.tools import (
+            VaspStudyCapabilityPack,
+        )
+
+        if self._study_pack is None:
+            runtime = default_molecular_runtime(
+                self.workspace, application=self.application
+            )
+            self._study_pack = VaspStudyCapabilityPack(runtime)
+        return self._study_pack.tools()
 
 
 def vasp_pack(workspace: Any = None) -> VaspCapabilityPack:

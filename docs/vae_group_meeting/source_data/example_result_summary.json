@@ -1,0 +1,31 @@
+{
+  "run_status": "success",
+  "conditioned_property_count": 7,
+  "derived_condition": {
+    "cutoff_wavelength_um_from_gap": 3.5424056685714285
+  },
+  "clipped_condition_fields": [],
+  "decoded_sample_count": 4096,
+  "proposal_count": 8,
+  "novelty_reference_count": 8022,
+  "formulas": [
+    "Te3I5Br4",
+    "BiF",
+    "SrCaO2",
+    "Cu2Hg3Sb3Te4",
+    "HgBiTeI",
+    "Na3Li2As3Br2",
+    "Ba2Na2As3F3",
+    "Te3As2(IBr)2"
+  ],
+  "rejection_counts": {
+    "invalid_stoichiometry": 0,
+    "forbidden_element": 0,
+    "implausible_solid_elements": 1,
+    "not_charge_neutral": 15,
+    "known_formula": 0,
+    "duplicate": 0
+  },
+  "scientific_status": "UNVALIDATED_GENERATED_COMPOSITION",
+  "note": "These formulas were sampled by the conditional VAE and were not retrieved from the candidate database. Novelty only means absence of the reduced formula from the configured training-reference formula set."
+}

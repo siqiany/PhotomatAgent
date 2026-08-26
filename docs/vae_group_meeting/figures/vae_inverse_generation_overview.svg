@@ -1,0 +1,290 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="diagram-title diagram-desc" font-family="Microsoft YaHei, Arial, Helvetica, sans-serif">
+  <title id="diagram-title">多性质条件 VAE：从目标性质逆向生成新化学式</title>
+  <desc id="diagram-desc">The deployed conditional VAE samples new composition fractions from sparse material-property targets and a random latent variable. Database retrieval is not part of generation.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
+    </marker>
+    <style>text { font-family: Microsoft YaHei, Arial, Helvetica, sans-serif; }</style>
+  </defs>
+  <rect width="100%" height="100%" fill="#FFFFFF" id="background" />
+  <text x="800" y="48" text-anchor="middle" font-size="35" font-weight="700" fill="#172033" class="figure-title" font-family="Microsoft YaHei">
+    <tspan x="800" dy="0">多性质条件 VAE：从目标性质逆向生成新化学式</tspan>
+  </text>
+  <text x="800" y="78" text-anchor="middle" font-size="20" font-weight="400" fill="#172033" class="figure-subtitle" font-family="Microsoft YaHei">
+    <tspan x="800" dy="0">Property targets → sparse condition vector → stochastic decoding → chemically filtered formula proposals</tspan>
+  </text>
+  <g id="groups">
+    <g id="input-domain" class="group">
+      <rect x="35" y="115" width="390" height="710" rx="18" fill="#F2F6FA" fill-opacity="0.72" stroke="#6686A3" stroke-width="1.5" vector-effect="non-scaling-stroke" />
+      <text x="51" y="143" text-anchor="start" font-size="15" font-weight="700" fill="#172033" class="group-label" font-family="Microsoft YaHei">
+        <tspan x="51" dy="0">A 智能体输入：稀疏多性质目标</tspan>
+      </text>
+    </g>
+    <g id="model-domain" class="group">
+      <rect x="450" y="115" width="650" height="710" rx="18" fill="#F6F1FB" fill-opacity="0.72" stroke="#8064A2" stroke-width="1.5" vector-effect="non-scaling-stroke" />
+      <text x="466" y="143" text-anchor="start" font-size="15" font-weight="700" fill="#172033" class="group-label" font-family="Microsoft YaHei">
+        <tspan x="466" dy="0">B 条件 VAE：训练与生成路径</tspan>
+      </text>
+    </g>
+    <g id="output-domain" class="group">
+      <rect x="1125" y="115" width="440" height="710" rx="18" fill="#F1F8F5" fill-opacity="0.72" stroke="#4B8C78" stroke-width="1.5" vector-effect="non-scaling-stroke" />
+      <text x="1141" y="143" text-anchor="start" font-size="15" font-weight="700" fill="#172033" class="group-label" font-family="Microsoft YaHei">
+        <tspan x="1141" dy="0">C 新化学式候选与后续验证</tspan>
+      </text>
+    </g>
+  </g>
+  <g id="assets-background" />
+  <g id="edges" fill="none">
+    <path id="edge-1" data-from="agent-request" data-to="tool-schema" data-routing="orthogonal" d="M 230,275 L 230,295 L 230,295 L 230,315" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <g id="edge-label-1" class="edge-label" data-edge="edge-1" data-anchor-x="230" data-anchor-y="295">
+      <rect x="198" y="281" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="230" y="298" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">解析</tspan>
+      </text>
+    </g>
+    <path id="edge-2" data-from="tool-schema" data-to="property-vector" data-routing="orthogonal" d="M 230,430 L 230,450 L 230,450 L 230,470" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <g id="edge-label-2" class="edge-label" data-edge="edge-2" data-anchor-x="230" data-anchor-y="450">
+      <rect x="198" y="436" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="230" y="453" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">结构化</tspan>
+      </text>
+    </g>
+    <path id="edge-3" data-from="property-vector" data-to="normalization" data-routing="orthogonal" d="M 230,625 L 230,647.5 L 230,647.5 L 230,670" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <g id="edge-label-3" class="edge-label" data-edge="edge-3" data-anchor-x="230" data-anchor-y="647.5">
+      <rect x="198" y="633.5" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="230" y="650.5" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">标准化</tspan>
+      </text>
+    </g>
+    <path id="edge-4" data-from="normalization" data-to="condition-copy" data-routing="orthogonal" d="M 395,722.5 L 445,722.5 L 445,634 L 495,634" stroke="#C28B2C" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <g id="edge-label-4" class="edge-label" data-edge="edge-4" data-anchor-x="445" data-anchor-y="678.25">
+      <rect x="413" y="664.25" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="445" y="681.25" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="445" dy="0">c</tspan>
+      </text>
+    </g>
+    <path id="edge-5" data-from="known-composition" data-to="encoder" data-routing="orthogonal" d="M 655,216 L 677.5,216 L 677.5,216 L 700,216" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" stroke-dasharray="8 6" />
+    <g id="edge-label-5" class="edge-label" data-edge="edge-5" data-anchor-x="677.5" data-anchor-y="216">
+      <rect x="645.5" y="202" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="677.5" y="219" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="677.5" dy="0">仅训练</tspan>
+      </text>
+    </g>
+    <path id="edge-6" data-from="encoder" data-to="posterior" data-routing="orthogonal" d="M 885,216 L 907.5,216 L 907.5,216 L 930,216" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" stroke-dasharray="8 6" />
+    <path id="edge-7" data-from="posterior" data-to="concat" data-routing="orthogonal" d="M 997.5,257 L 997.5,348.5 L 817.5,348.5 L 817.5,440" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" stroke-dasharray="8 6" />
+    <g id="edge-label-7" class="edge-label" data-edge="edge-7" data-anchor-x="907.5" data-anchor-y="348.5">
+      <rect x="873.5" y="334.5" width="68" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="907.5" y="351.5" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="907.5" dy="0">训练采样</tspan>
+      </text>
+    </g>
+    <path id="edge-8" data-from="prior" data-to="concat" data-routing="orthogonal" d="M 685,442.5 L 707.5,442.5 L 707.5,485 L 730,485" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <path id="edge-9" data-from="condition-copy" data-to="concat" data-routing="orthogonal" d="M 590,590 L 703.75,590 L 703.75,530 L 817.5,530" stroke="#C28B2C" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <g id="edge-label-9" class="edge-label" data-edge="edge-9" data-anchor-x="703.75" data-anchor-y="560">
+      <rect x="671.75" y="546" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="703.75" y="563" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="703.75" dy="0">条件</tspan>
+      </text>
+    </g>
+    <path id="edge-10" data-from="concat" data-to="decoder" data-routing="orthogonal" d="M 905,485 L 907.5,485 L 907.5,485 L 910,485" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <path id="edge-11" data-from="decoder" data-to="fractions" data-routing="orthogonal" d="M 1085,485 L 1215,485 L 1215,275 L 1345,275" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <g id="edge-label-11" class="edge-label" data-edge="edge-11" data-anchor-x="1215" data-anchor-y="380">
+      <rect x="1183" y="366" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="1215" y="383" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1215" dy="0">生成</tspan>
+      </text>
+    </g>
+    <path id="edge-12" data-from="decoder" data-to="loss" data-routing="orthogonal" d="M 997.5,555 L 997.5,622.5 L 882.5,622.5 L 882.5,690" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" stroke-dasharray="8 6" />
+    <g id="edge-label-12" class="edge-label" data-edge="edge-12" data-anchor-x="940" data-anchor-y="622.5">
+      <rect x="906" y="608.5" width="68" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="940" y="625.5" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="940" dy="0">训练损失</tspan>
+      </text>
+    </g>
+    <path id="edge-13" data-from="fractions" data-to="integerize" data-routing="orthogonal" d="M 1345,275 L 1345,300 L 1345,300 L 1345,325" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <path id="edge-14" data-from="integerize" data-to="filters" data-routing="orthogonal" d="M 1345,430 L 1345,455 L 1345,455 L 1345,480" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <path id="edge-15" data-from="filters" data-to="formulas" data-routing="orthogonal" d="M 1345,585 L 1345,610 L 1345,610 L 1345,635" stroke="#6750A4" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" />
+    <path id="edge-16" data-from="formulas" data-to="validation" data-routing="orthogonal" d="M 1345,725 L 1345,742.5 L 1345,742.5 L 1345,760" stroke="#B65B4B" stroke-width="2.4" marker-end="url(#arrow)" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" class="edge" stroke-dasharray="8 6" />
+    <g id="edge-label-16" class="edge-label" data-edge="edge-16" data-anchor-x="1345" data-anchor-y="742.5">
+      <rect x="1313" y="728.5" width="64" height="25" rx="6" fill="#FFFFFF" fill-opacity="0.95" />
+      <text x="1345" y="745.5" text-anchor="middle" font-size="12" font-weight="500" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">待验证</tspan>
+      </text>
+    </g>
+  </g>
+  <g id="assets-content" />
+  <g id="nodes">
+    <g id="agent-request" class="node">
+      <rect fill="#E5EFF7" stroke="#6686A3" stroke-width="2.4" vector-effect="non-scaling-stroke" x="65" y="165" width="330" height="110" rx="18" ry="18" />
+      <text x="230" y="211" text-anchor="middle" font-size="20" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">智能体自然语言请求</tspan>
+      </text>
+      <text x="230" y="228.8" text-anchor="middle" font-size="17" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">“生成 Eg≈0.35 eV、低形成能、</tspan>
+        <tspan x="230" dy="20.4">高介电常数的红外材料成分”</tspan>
+      </text>
+    </g>
+    <g id="tool-schema" class="node">
+      <rect fill="#FFFFFF" stroke="#6686A3" stroke-width="2.4" vector-effect="non-scaling-stroke" x="65" y="315" width="330" height="115" rx="18" ry="18" />
+      <text x="230" y="363.95" text-anchor="middle" font-size="19" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">generation.vae_formula</tspan>
+      </text>
+      <text x="230" y="380.95" text-anchor="middle" font-size="16" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">14 个材料性质可任意组合 VAE</tspan>
+        <tspan x="230" dy="19.2">采样；不做数据库检索</tspan>
+      </text>
+    </g>
+    <g id="property-vector" class="node">
+      <rect fill="#FFF8E8" stroke="#C28B2C" stroke-width="2.4" vector-effect="non-scaling-stroke" x="65" y="470" width="330" height="155" rx="18" ry="18" />
+      <text x="230" y="539.4" text-anchor="middle" font-size="18" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">目标性质 c（示例）</tspan>
+      </text>
+      <text x="230" y="555.6" text-anchor="middle" font-size="15" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">Eg=.35 | ΔHf=−1.20 | Ehull=.05</tspan>
+        <tspan x="230" dy="18">ρ=6.0 | εmean=15 | me*=.20</tspan>
+      </text>
+    </g>
+    <g id="normalization" class="node">
+      <rect fill="#FFF8E8" stroke="#C28B2C" stroke-width="2.4" vector-effect="non-scaling-stroke" x="65" y="670" width="330" height="105" rx="18" ry="18" />
+      <text x="230" y="714.4" text-anchor="middle" font-size="18" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">按检查点统计量标准化</tspan>
+      </text>
+      <text x="230" y="730.6" text-anchor="middle" font-size="15" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="230" dy="0">缺失维度 = 0（训练时的条件丢弃语义）</tspan>
+        <tspan x="230" dy="18">极端条件裁剪到 [−8, 8]</tspan>
+      </text>
+    </g>
+    <g id="known-composition" class="node">
+      <rect fill="#E9EEF3" stroke="#6B7280" stroke-width="2.4" vector-effect="non-scaling-stroke" x="485" y="175" width="170" height="82" rx="18" ry="18" />
+      <text x="570" y="207.9" text-anchor="middle" font-size="18" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="570" dy="0">训练组成 x</tspan>
+      </text>
+      <text x="570" y="233.1" text-anchor="middle" font-size="15" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="570" dy="0">89 维元素分数</tspan>
+      </text>
+    </g>
+    <g id="encoder" class="node">
+      <rect fill="#E7DDF2" stroke="#8064A2" stroke-width="2.4" vector-effect="non-scaling-stroke" x="700" y="175" width="185" height="82" rx="18" ry="18" />
+      <text x="792.5" y="197.1" text-anchor="middle" font-size="18" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="792.5" dy="0">Encoder</tspan>
+        <tspan x="792.5" dy="21.6">qφ(z|x,c)</tspan>
+      </text>
+      <text x="792.5" y="233.1" text-anchor="middle" font-size="15" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="792.5" dy="0">训练时使用</tspan>
+      </text>
+    </g>
+    <g id="posterior" class="node">
+      <ellipse fill="#E7DDF2" stroke="#8064A2" stroke-width="2.4" vector-effect="non-scaling-stroke" cx="997.5" cy="216" rx="67.5" ry="41" />
+      <text x="997.5" y="207.9" text-anchor="middle" font-size="18" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="997.5" dy="0">μ, log σ²</tspan>
+      </text>
+      <text x="997.5" y="233.1" text-anchor="middle" font-size="15" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="997.5" dy="0">近似后验</tspan>
+      </text>
+    </g>
+    <g id="prior" class="node">
+      <ellipse fill="#DDD1EC" stroke="#6750A4" stroke-width="2.4" vector-effect="non-scaling-stroke" cx="590" cy="442.5" rx="95" ry="52.5" />
+      <text x="590" y="433.5" text-anchor="middle" font-size="20" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="590" dy="0">z ~ N(0, I)</tspan>
+      </text>
+      <text x="590" y="451.3" text-anchor="middle" font-size="17" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="590" dy="0">32 维随机潜变量</tspan>
+        <tspan x="590" dy="20.4">每次采样产生不同候选</tspan>
+      </text>
+    </g>
+    <g id="condition-copy" class="node">
+      <rect fill="#FFF1CC" stroke="#C28B2C" stroke-width="2.4" vector-effect="non-scaling-stroke" x="495" y="590" width="190" height="88" rx="18" ry="18" />
+      <text x="590" y="625.45" text-anchor="middle" font-size="19" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="590" dy="0">条件向量 c</tspan>
+      </text>
+      <text x="590" y="652.05" text-anchor="middle" font-size="16" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="590" dy="0">14 维；可稀疏指定</tspan>
+      </text>
+    </g>
+    <g id="concat" class="node">
+      <polygon fill="#EEE7F6" stroke="#6750A4" stroke-width="2.4" vector-effect="non-scaling-stroke" points="768.5,440 866.5,440 905,485 866.5,530 768.5,530 730,485" />
+      <text x="817.5" y="476.45" text-anchor="middle" font-size="19" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="817.5" dy="0">拼接 [z, c]</tspan>
+      </text>
+      <text x="817.5" y="503.05" text-anchor="middle" font-size="16" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="817.5" dy="0">随机性 + 目标约束</tspan>
+      </text>
+    </g>
+    <g id="decoder" class="node">
+      <rect fill="#DCCFEB" stroke="#6750A4" stroke-width="2.4" vector-effect="non-scaling-stroke" x="910" y="415" width="175" height="140" rx="18" ry="18" />
+      <text x="997.5" y="485" text-anchor="middle" font-size="15" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="997.5" dy="0">Decoder pθ(x|z,c)</tspan>
+      </text>
+    </g>
+    <g id="loss" class="node">
+      <rect fill="#F4F0F8" stroke="#8064A2" stroke-width="2.4" vector-effect="non-scaling-stroke" x="725" y="690" width="315" height="92" rx="18" ry="18" />
+      <text x="882.5" y="727.9" text-anchor="middle" font-size="18" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="882.5" dy="0">训练目标</tspan>
+      </text>
+      <text x="882.5" y="744.1" text-anchor="middle" font-size="15" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="882.5" dy="0">组成重构损失 + β·KL β =</tspan>
+        <tspan x="882.5" dy="18">0.02；条件丢弃 45%</tspan>
+      </text>
+    </g>
+    <g id="fractions" class="node">
+      <rect fill="#E7F2ED" stroke="#4B8C78" stroke-width="2.4" vector-effect="non-scaling-stroke" x="1160" y="170" width="370" height="105" rx="18" ry="18" />
+      <text x="1345" y="213.5" text-anchor="middle" font-size="20" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">连续组成分数</tspan>
+      </text>
+      <text x="1345" y="231.3" text-anchor="middle" font-size="17" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">89 个元素的非负分数；总和为 1</tspan>
+        <tspan x="1345" dy="20.4">这是模型的直接输出</tspan>
+      </text>
+    </g>
+    <g id="integerize" class="node">
+      <rect fill="#FFFFFF" stroke="#4B8C78" stroke-width="2.4" vector-effect="non-scaling-stroke" x="1160" y="325" width="370" height="105" rx="18" ry="18" />
+      <text x="1345" y="368.95" text-anchor="middle" font-size="19" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">离散化为整数化学计量</tspan>
+      </text>
+      <text x="1345" y="385.95" text-anchor="middle" font-size="16" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">最多 4 种元素、12 个原子</tspan>
+        <tspan x="1345" dy="19.2">最小化组成离散化误差</tspan>
+      </text>
+    </g>
+    <g id="filters" class="node">
+      <polygon fill="#E7F2ED" stroke="#4B8C78" stroke-width="2.4" vector-effect="non-scaling-stroke" points="1345,480 1530,532.5 1345,585 1160,532.5" />
+      <text x="1345" y="524.4" text-anchor="middle" font-size="18" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">确定性化学过滤</tspan>
+      </text>
+      <text x="1345" y="540.6" text-anchor="middle" font-size="15" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">固态元素合理性 · 氧化态电中性</tspan>
+        <tspan x="1345" dy="18">训练集化学式新颖性 · 去重</tspan>
+      </text>
+    </g>
+    <g id="formulas" class="node">
+      <rect fill="#DDEFE7" stroke="#2F7664" stroke-width="2.4" vector-effect="non-scaling-stroke" x="1160" y="635" width="370" height="90" rx="18" ry="18" />
+      <text x="1345" y="671" text-anchor="middle" font-size="20" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">新化学式候选</tspan>
+      </text>
+      <text x="1345" y="688.8" text-anchor="middle" font-size="17" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">Te3I5Br4 · BiF · SrCaO2 ;</tspan>
+        <tspan x="1345" dy="20.4">Cu2Hg3Sb3Te4 · HgBiTeI · ...</tspan>
+      </text>
+    </g>
+    <g id="validation" class="node">
+      <rect fill="#FFF0ED" stroke="#B65B4B" stroke-width="2.4" vector-effect="non-scaling-stroke" x="1160" y="760" width="370" height="55" rx="18" ry="18" />
+      <text x="1345" y="779.85" text-anchor="middle" font-size="17" font-weight="600" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">下一步：结构生成 + DFT/实验验证</tspan>
+      </text>
+      <text x="1345" y="803.65" text-anchor="middle" font-size="14" font-weight="400" fill="#172033" class="" font-family="Microsoft YaHei">
+        <tspan x="1345" dy="0">VAE 候选 ≠ 已验证材料</tspan>
+      </text>
+    </g>
+  </g>
+  <g id="assets-foreground" />
+  <g id="legend">
+    <line x1="40" x2="74" y1="868" y2="868" stroke="#6750A4" stroke-width="2" />
+    <text x="84" y="872" font-size="12" fill="#172033" font-family="Microsoft YaHei">模型生成路径</text>
+    <line x1="142" x2="176" y1="868" y2="868" stroke="#8064A2" stroke-width="2" stroke-dasharray="7 5" />
+    <text x="186" y="872" font-size="12" fill="#172033" font-family="Microsoft YaHei">训练专用路径</text>
+    <line x1="244" x2="278" y1="868" y2="868" stroke="#B65B4B" stroke-width="2" stroke-dasharray="7 5" />
+    <text x="288" y="872" font-size="12" fill="#172033" font-family="Microsoft YaHei">尚未完成的物理验证</text>
+  </g>
+</svg>

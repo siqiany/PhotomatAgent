@@ -504,6 +504,198 @@ def test_evidence_extraction_from_bandgap_json(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Phase 4.1: single MCP lifecycle owner + duplicate vasp_molecule entries
+# ---------------------------------------------------------------------------
+
+
+def _real_shaped_workspace(tmp_path) -> Path:
+    """A workspace whose .photomatagent/mcp.json mirrors the real one."""
+    (tmp_path / ".photomatagent").mkdir(exist_ok=True)
+    (tmp_path / ".photomatagent" / "mcp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "materials-project": {
+                        "enabled": True,
+                        "transport": "stdio",
+                        "namespace": "materials_mcp",
+                        "command": "mpmcp",
+                        "args": [],
+                        "env": {"MP_API_KEY": "${MATERIALS_API_KEY}"},
+                        "tool_exposure": "deferred",
+                        "timeout": 60,
+                        "startup_timeout": 30,
+                    },
+                    "scnet": {
+                        "enabled": True,
+                        "transport": "stdio",
+                        "namespace": "scnet_science",
+                        "command": "photomatagent-mcp-scnet",
+                        "args": [],
+                        "env": {
+                            "SCNET_HOST": "${SCNET_HOST}",
+                            "PMG_VASP_PSP_DIR": "${PMG_VASP_PSP_DIR}",
+                        },
+                        "tool_exposure": "deferred",
+                        "timeout": 60,
+                        "startup_timeout": 30,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _mcp_fake_session() -> _FakeSession:
+    empty_schema = {"type": "object", "properties": {}}
+    return _FakeSession(
+        tools=[
+            {
+                "name": "search",
+                "description": "Search materials.",
+                "inputSchema": empty_schema,
+            },
+            {
+                "name": "vasp_capabilities",
+                "description": "Periodic VASP caps.",
+                "inputSchema": empty_schema,
+            },
+            {
+                "name": "vasp_molecule_prepare",
+                "description": "Prepare molecular VASP inputs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"structure_path": {"type": "string"}},
+                    "required": ["structure_path"],
+                },
+            },
+            {
+                "name": "vasp_molecule_capabilities",
+                "description": "Molecular VASP capabilities.",
+                "inputSchema": empty_schema,
+            },
+            {
+                "name": "vasp_study_plan",
+                "description": "Compile a VASP study plan.",
+                "inputSchema": empty_schema,
+            },
+            {
+                "name": "vasp_study_execute",
+                "description": "Execute a VASP study.",
+                "inputSchema": empty_schema,
+            },
+        ]
+    )
+
+
+def test_sync_context_mcp_lifecycle_single_owner_loop(monkeypatch, tmp_path):
+    """Registry build in a sync context must not leak throwaway-loop sessions.
+
+    Regression for "Attempted to exit cancel scope in a different task":
+    register_tools() outside an event loop starts every server on ONE
+    manager-owned lifecycle loop; closing from any other loop dispatches back
+    there, and close_all() shuts everything down on that loop.
+    """
+    session = _mcp_fake_session()
+    _patch_sdk(monkeypatch, session)
+    workspace = _real_shaped_workspace(tmp_path)
+    monkeypatch.setenv("PHOTOMATAGENT_MCP_AUTO_CONNECT", "1")
+    from photomatagent.mcp.config import load_mcp_servers
+    from photomatagent.mcp.manager import MCPServerState
+
+    configs = load_mcp_servers(workspace)
+    manager = MCPServerManager(configs, workspace=workspace)
+    builtin = {
+        "vasp_molecule.prepare",
+        "vasp_molecule.capabilities",
+        "vasp_molecule.submit",
+        "vasp_study.plan",
+        "vasp_study.execute",
+    }
+    tools = manager.register_tools(builtin_tool_names=builtin)
+    names = {tool.name for tool in tools}
+    # Built-in pack is authoritative: the scnet MCP duplicates are skipped...
+    assert "scnet_science.status" in names
+    assert "scnet_science.vasp_capabilities" in names
+    assert "scnet_science.vasp_molecule_prepare" not in names
+    assert "scnet_science.vasp_molecule_capabilities" not in names
+    assert "scnet_science.vasp_study_plan" not in names
+    assert "scnet_science.vasp_study_execute" not in names
+    # ...while other namespaces are untouched.
+    assert "materials_mcp.search" in names
+    assert "materials_mcp.vasp_molecule_prepare" in names
+
+    scnet = manager.handles["scnet"]
+    assert scnet.state is MCPServerState.READY
+    assert manager._lifecycle_loop is not None
+    assert scnet._owner_loop is manager._lifecycle_loop
+
+    # Closing from a different (throwaway) loop is dispatched back to the
+    # owner loop and must not raise "exit cancel scope in a different task".
+    asyncio.run(scnet.close())
+    assert scnet._session is None
+    assert scnet._owner_loop is None
+
+    # Invoking through a throwaway loop reconnects on the SAME lifecycle
+    # loop (never on the throwaway one).
+    adapter = next(tool for tool in tools if tool.name == "materials_mcp.search")
+    result = asyncio.run(adapter.execute({"query": "Li"}))
+    assert not result.is_error
+    materials = manager.handles["materials-project"]
+    assert materials._owner_loop is manager._lifecycle_loop
+
+    manager.close_all()
+    assert scnet._session is None
+    assert scnet._owner_loop is None
+    assert scnet.state is MCPServerState.STOPPED
+    assert manager._lifecycle_loop is None or manager._lifecycle_loop.is_closed()
+
+
+def test_duplicate_molecular_adapters_can_be_reenabled(monkeypatch, tmp_path):
+    session = _mcp_fake_session()
+    _patch_sdk(monkeypatch, session)
+    workspace = _real_shaped_workspace(tmp_path)
+    monkeypatch.setenv("PHOTOMATAGENT_MCP_AUTO_CONNECT", "1")
+    monkeypatch.setenv("PHOTOMATAGENT_MCP_INCLUDE_DUPLICATE_MOLECULAR", "1")
+    from photomatagent.mcp.config import load_mcp_servers
+
+    manager = MCPServerManager(load_mcp_servers(workspace), workspace=workspace)
+    tools = manager.register_tools(
+        builtin_tool_names={"vasp_molecule.prepare", "vasp_study.plan"}
+    )
+    names = {tool.name for tool in tools}
+    assert "scnet_science.vasp_molecule_prepare" in names
+    assert "scnet_science.vasp_study_plan" in names
+    manager.close_all()
+
+
+def test_create_default_registry_real_shaped_workspace_offline(
+    monkeypatch, tmp_path
+):
+    """create_default_registry with the real mcp.json shape stays offline and
+    registers the built-in vasp_molecule.* pack without duplicate MCP entries.
+    """
+    _patch_sdk(monkeypatch, _mcp_fake_session())
+    workspace = _real_shaped_workspace(tmp_path)
+    monkeypatch.setenv("PHOTOMATAGENT_MCP_AUTO_CONNECT", "1")
+    from photomatagent.scientific.state import ScientificState
+    from photomatagent.tools.factory import create_default_registry
+    from photomatagent.workspace import Workspace
+
+    registry = create_default_registry(
+        ScientificState(), Workspace(workspace)
+    )
+    names = {tool.name for tool in registry.list_tools()}
+    assert "vasp_molecule.prepare" in names
+    assert "vasp_molecule.capabilities" in names
+    assert "scnet_science.status" in names
+    assert "materials_mcp.search" in names
+    assert "scnet_science.vasp_molecule_prepare" not in names
+
+
+# ---------------------------------------------------------------------------
 # Live test against a real FastMCP stdio server (official SDK end to end)
 # ---------------------------------------------------------------------------
 

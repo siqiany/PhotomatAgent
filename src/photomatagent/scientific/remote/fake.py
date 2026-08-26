@@ -12,6 +12,10 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from photomatagent.scientific.remote.scheduler import (
+    remote_jobs_by_name_command,
+    remote_read_command,
+)
 from photomatagent.scientific.remote.models import (
     HPCJobState,
     RemoteArtifactRef,
@@ -39,6 +43,8 @@ class FakeSCNetBackend:
         scripted_states: list[HPCJobState] | None = None,
         remote_files: dict[str, dict[str, bytes]] | None = None,
         fail_submit_with: str = "",
+        submit_succeeds_but_times_out: bool = False,
+        strict: bool = False,
     ) -> None:
         self.policy = policy or ResourcePolicy(allow_hpc_submit=True)
         self.scripted_states = list(scripted_states or [])
@@ -46,6 +52,10 @@ class FakeSCNetBackend:
             key: dict(value) for key, value in (remote_files or {}).items()
         }
         self.fail_submit_with = fail_submit_with
+        self.strict = strict
+        # Models the real-world ambiguity: sbatch accepted the job on the
+        # cluster but the client process died/timed out before parsing the id.
+        self.submit_succeeds_but_times_out = submit_succeeds_but_times_out
         # Scripted ``_run_ssh`` replies (substring -> (stdout, ok)) for the
         # read-only probe commands used by application adapters (MAGUS
         # environment probe, pseudopotential checks).
@@ -54,6 +64,7 @@ class FakeSCNetBackend:
         self._state_index: dict[str, int] = {}
         self.uploaded: list[str] = []
         self.submitted_scripts: dict[str, str] = {}
+        self.submitted_job_names: dict[str, str] = {}
         self.cancelled: list[str] = []
 
     # -- helpers ------------------------------------------------------------
@@ -177,8 +188,14 @@ class FakeSCNetBackend:
         if self.fail_submit_with:
             raise RuntimeError(self.fail_submit_with)
         await self.ensure_remote_directory(spec.remote_directory)
+        if self.strict:
+            self._strict_verify_script(spec)
         job_id = self._next_job_id()
         self.submitted_scripts[job_id] = spec.script_name
+        self.submitted_job_names[job_id] = spec.job_name
+        # The job really exists on the (fake) cluster before the timeout.
+        if self.submit_succeeds_but_times_out:
+            raise TimeoutError("sbatch client timed out (job was accepted)")
         return RemoteJobRef(
             backend=self.name,
             application=spec.application,
@@ -190,6 +207,120 @@ class FakeSCNetBackend:
             stderr_ref=f"{spec.remote_directory}/{job_id}.err",
             provenance=spec.provenance,
         )
+
+    def _strict_verify_script(self, spec: RemoteJobSpec) -> None:
+        """Reject the historical false-positive: a submit that would run with
+        no ``run.slurm``, no ``vasp_std`` invocation, or no POTCAR strategy.
+
+        Mirrors the real pre-sbatch gates so offline tests fail loudly when
+        the caller forgot one of: the rendered ``run.slurm`` upload; the
+        actual ``vasp_std`` launcher; or a resolvable POTCAR (local copy or
+        remote PSP assembly declared inside the script).
+        """
+        files = self.remote_files.get(spec.remote_directory, {})
+        if spec.script_name not in files:
+            raise RuntimeError(
+                f"strict backend: {spec.script_name} was not uploaded; "
+                "refusing to submit"
+            )
+        script = files[spec.script_name].decode("utf-8", errors="replace")
+        if "vasp_std" not in script:
+            raise RuntimeError(
+                "strict backend: run.slurm does not invoke vasp_std; "
+                "refusing to submit"
+            )
+        potcar_mode = (spec.provenance or {}).get("potcar_mode", "none")
+        symbols = (spec.provenance or {}).get("potcar_symbols") or []
+        if potcar_mode == "local" and "POTCAR" not in files:
+            raise RuntimeError(
+                "strict backend: local POTCAR declared but not uploaded; "
+                "refusing to submit"
+            )
+        if potcar_mode == "remote":
+            remote_assembly = (
+                "psp_base=" in script and "POTCAR" in script and bool(symbols)
+            )
+            if not remote_assembly:
+                raise RuntimeError(
+                    "strict backend: remote POTCAR assembly strategy missing "
+                    "from run.slurm; refusing to submit"
+                )
+
+    async def jobs_by_name(self, job_name: str) -> list[tuple[str, str]]:
+        """Scripted squeue/sacct lookup; falls back to submitted jobs."""
+        # Scripted needles drive the squeue-then-sacct precedence from the
+        # tests: e.g. only "squeue -h --name" -> running job, or squeue empty
+        # + "sacct -n -X --name" -> completed job.
+        command = remote_jobs_by_name_command(job_name)
+        for needle, (stdout, ok) in sorted(
+            self.ssh_script.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if needle not in command:
+                continue
+            if not needle.startswith(("squeue", "sacct")):
+                continue
+            if not ok:
+                raise RuntimeError("scripted job-name query failure")
+            jobs: list[tuple[str, str]] = []
+            for line in stdout.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[0].isdigit():
+                    jobs.append((parts[0], parts[1]))
+            return jobs
+        return [
+            (job_id, "RUNNING")
+            for job_id, name in self.submitted_job_names.items()
+            if name == job_name
+        ]
+
+    async def read_remote_text(
+        self, remote_directory: str, filename: str, max_bytes: int
+    ) -> str | None:
+        """Read a remote text file; None when absent or scripted as missing."""
+        validate_remote_path(remote_directory)
+        command = remote_read_command(remote_directory, filename, max_bytes)
+        for needle, (stdout, ok) in sorted(
+            self.ssh_script.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            if needle in command:
+                if not ok:
+                    return None
+                return stdout
+        files = self.remote_files.get(remote_directory, {})
+        content = files.get(filename)
+        if content is None:
+            return None
+        return content.decode("utf-8", errors="replace")[:max_bytes]
+
+    async def copy_remote_artifact(
+        self,
+        source_remote_directory: str,
+        destination_remote_directory: str,
+        filename: str,
+    ) -> bool:
+        """In-memory mirror of the SCNet stream copy (allow-listed names)."""
+        validate_remote_path(source_remote_directory)
+        validate_remote_path(destination_remote_directory)
+        from photomatagent.scientific.remote.scnet import _REMOTE_COPY_ALLOWLIST
+
+        if filename not in _REMOTE_COPY_ALLOWLIST:
+            raise ValueError(
+                f"remote artifact copy refuses {filename!r}"
+            )
+        source = self.remote_files.get(source_remote_directory, {}).get(filename)
+        if source is None:
+            return False
+        await self.ensure_remote_directory(destination_remote_directory)
+        self.remote_files[destination_remote_directory][filename] = source
+        return True
+
+    async def verify_remote_inputs(
+        self, remote_directory: str, names: list[str]
+    ) -> list[str]:
+        """Determine which required inputs are missing on the remote dir."""
+        validate_remote_path(remote_directory)
+        files = self.remote_files.get(remote_directory, {})
+        return [name for name in names if name not in files]
 
     async def job_status(self, job_id: str) -> HPCJobState:
         if not job_id.isdigit():

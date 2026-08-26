@@ -14,6 +14,7 @@ from photomatagent.scientific.capabilities.generation.inverse_retrieval import (
 )
 from photomatagent.scientific.capabilities.generation.tools import (
     PACKAGED_VAE_ASSET_ROOT,
+    VAEFormulaTool,
     VAERetrieveTool,
     _resolve_vae_assets,
 )
@@ -88,6 +89,37 @@ def test_packaged_inverse_index_predicts_without_external_files():
     assert len(results) == 2
     assert all(item["metadata"]["jarvis_id"] for item in results)
     assert all("gap_selected_eV" in item["properties"] for item in results)
+
+
+def test_packaged_vae_generates_formulas_from_multiple_properties():
+    pytest.importorskip("torch")
+    result = asyncio.run(
+        VAEFormulaTool().execute(
+            {
+                "target_properties": {
+                    "gap_selected_eV": 0.35,
+                    "formation_energy_eV_per_atom": -0.8,
+                    "density_g_cm3": 6.0,
+                    "dielectric_mean": 15.0,
+                    "avg_electron_mass_m0": 0.2,
+                },
+                "limit": 3,
+                "sample_count": 256,
+                "require_novel": False,
+                "require_charge_neutral": False,
+                "random_seed": 23,
+            }
+        )
+    )
+    assert not result.is_error
+    assert len(result.data["proposals"]) == 3
+    metadata = result.data["metadata"]
+    assert metadata["conditioned_property_count"] == 6
+    assert metadata["target_properties"]["density_g_cm3"] == 6.0
+    assert metadata["target_properties"][
+        "cutoff_wavelength_um_from_gap"
+    ] == pytest.approx(1.239841984 / 0.35)
+    assert metadata["clipped_condition_fields"] == []
 
 
 def test_vae_retrieve_uses_packaged_candidate_metadata(monkeypatch):

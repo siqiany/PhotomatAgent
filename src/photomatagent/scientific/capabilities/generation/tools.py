@@ -48,8 +48,8 @@ PACKAGED_VAE_ASSET_ROOT = (
 class GenerationCapabilitiesTool(Tool):
     name = "generation.capabilities"
     description = (
-        "List candidate-generation capabilities: VAE formula generation "
-        "(composition prior / formula proposal / candidate retrieval) and "
+        "List candidate-generation capabilities: multi-property VAE formula "
+        "generation (composition prior / formula proposal) and "
         "MatterGen structure generation (dft_band_gap / chemical_system "
         "modes, isolated environment). Reports dependency state; generated "
         "candidates are UNVALIDATED_GENERATED_STRUCTURE."
@@ -141,15 +141,18 @@ class VAEFormulaTool(Tool):
     name = "generation.vae_formula"
     description = (
         "Propose integer, charge-balanced (optional novel) compositions "
-        "conditioned on a target band gap or wavelength using a "
-        "property-conditioned VAE. forbidden_elements is an OPTIONAL user "
+        "conditioned on any supported combination of material properties "
+        "using a 14-condition VAE. target_properties may include gap, "
+        "cutoff wavelength, formation/hull energy, density, dielectric "
+        "constant, carrier masses, elastic moduli, exfoliation energy, IR "
+        "modes, and spillage. forbidden_elements is an OPTIONAL user "
         "constraint (default: none). Scope: composition prior / formula "
         "proposal only -- never predicts responsivity/EQE/detectivity/dark "
         "current. Loads the JARVIS conditional-VAE checkpoint packaged with "
         "PhotomatAgent; VAE_CHECKPOINT_PATH is an optional override. Reports "
         "typed missing prerequisites when model assets are unavailable."
     )
-    short_description = "VAE composition proposal for a target gap/wavelength."
+    short_description = "Generate formulas from one or more material properties."
     exposure = ToolExposure.DEFERRED
     namespace = "generation"
     source = "photomatagent VAE formula generator (donor migration)"
@@ -166,6 +169,34 @@ class VAEFormulaTool(Tool):
     input_schema = {
         "type": "object",
         "properties": {
+            "target_properties": {
+                "type": "object",
+                "description": (
+                    "One or more material-level conditions used directly by "
+                    "the trained VAE. Unspecified fields remain unconditioned."
+                ),
+                "properties": {
+                    "gap_selected_eV": {"type": "number", "exclusiveMinimum": 0},
+                    "cutoff_wavelength_um_from_gap": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                    },
+                    "formation_energy_eV_per_atom": {"type": "number"},
+                    "energy_above_hull_eV_per_atom": {"type": "number"},
+                    "density_g_cm3": {"type": "number", "minimum": 0},
+                    "dielectric_mean": {"type": "number", "minimum": 0},
+                    "avg_electron_mass_m0": {"type": "number"},
+                    "avg_hole_mass_m0": {"type": "number"},
+                    "bulk_modulus_GPa": {"type": "number"},
+                    "shear_modulus_GPa": {"type": "number"},
+                    "exfoliation_energy_meV_per_atom": {"type": "number"},
+                    "max_IR_mode_cm-1": {"type": "number"},
+                    "min_IR_mode_cm-1": {"type": "number"},
+                    "spillage": {"type": "number"},
+                },
+                "additionalProperties": False,
+                "minProperties": 1,
+            },
             "target_band_gap_eV": {"type": "number", "minimum": 0},
             "target_wavelength_um": {"type": "number", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 32},
@@ -190,9 +221,16 @@ class VAEFormulaTool(Tool):
         self.config = config
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        target_properties = arguments.get("target_properties") or {}
+        if not isinstance(target_properties, dict):
+            return ScientificToolResult(
+                output="target_properties must be an object",
+                is_error=True,
+                data={"error_type": "invalid_input"},
+            )
         unsupported = sorted(
             key
-            for key in arguments
+            for key in set(arguments) | set(target_properties)
             if key in UNSUPPORTED_DEVICE_PROPERTIES
         )
         if unsupported:
@@ -226,6 +264,7 @@ class VAEFormulaTool(Tool):
         )
         try:
             proposals, metadata = generator.generate(
+                target_properties=target_properties,
                 target_band_gap_eV=(
                     float(arguments["target_band_gap_eV"])
                     if arguments.get("target_band_gap_eV") is not None
@@ -269,8 +308,9 @@ class VAEFormulaTool(Tool):
                 method="property-conditioned CVAE decoding + deterministic filters",
                 fidelity="ml_generated",
                 summary=(
-                    f"{len(proposals)} VAE formula proposal(s) for gap "
-                    f"{metadata['target_band_gap_eV']:.3f} eV"
+                    f"{len(proposals)} VAE formula proposal(s) conditioned "
+                    f"on {metadata['conditioned_property_count']} material "
+                    "property value(s)"
                 ),
                 limitations=(
                     "proposals are UNVALIDATED_GENERATED_STRUCTURE; VAE does "

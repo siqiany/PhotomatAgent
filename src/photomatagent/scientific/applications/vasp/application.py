@@ -43,6 +43,70 @@ from photomatagent.scientific.remote.scnet import SCNetBackend, validate_remote_
 VASP_REQUIRED_INPUTS = ("POSCAR", "INCAR", "KPOINTS")
 
 
+def env_source_preamble(env_script: str, executable: str) -> str:
+    """Bash preamble that sources the SCNet product environment.
+
+    SCNet product ``env.sh`` may end with a best-effort accounting write
+    that returns non-zero for users. Preserve the exported environment,
+    then explicitly verify the executable before running anything.
+    """
+    validate_remote_path(env_script, allow_tilde=False)
+    return (
+        "set +e\n"
+        f"source {shlex.quote(env_script)}\n"
+        "set -e\n"
+        f"command -v {shlex.quote(executable)} >/dev/null"
+    )
+
+
+def potcar_assembly_preamble(
+    remote_psp_dir: str, potcar_symbols: list[str]
+) -> str:
+    """Bash preamble that assembles POTCAR on the remote host, in element
+    order, from ``SCNET_VASP_PSP_DIR``.
+
+    The curated POTCAR datasets stay on the cluster: no POTCAR content is
+    uploaded, logged or returned. Only the element sequence (a list of
+    single-symbol tokens) is interpolated into the script.
+    """
+    validate_remote_path(remote_psp_dir)
+    if remote_psp_dir.startswith("~/"):
+        psp_value = '"${HOME}/' + remote_psp_dir[2:] + '"'
+    else:
+        psp_value = shlex.quote(remote_psp_dir)
+    lines = [
+        "if [ ! -s POTCAR ]; then",
+        f"  psp_base={psp_value}",
+        "  : > POTCAR",
+        (
+            "  # layout detection: direct <root>/<setup>/POTCAR, "
+            "then potpaw_PBE, then legacy potpaw_PBE.64"
+        ),
+        '  for cand in "$psp_base" "$psp_base/potpaw_PBE" '
+        '"$psp_base/potpaw_PBE.64"; do',
+    ]
+    for symbol in potcar_symbols:
+        if not symbol.isalpha():
+            raise ValueError(f"unsafe POTCAR symbol: {symbol!r}")
+        lines.extend(
+            [
+                f'    if [ -z "$psp_lib" ] && [ -s "$cand/{symbol}/POTCAR" ]; then',
+                f'      psp_lib="$cand"',
+            ]
+        )
+    lines.extend(
+        [
+            "  done",
+            '  test -n "$psp_lib"',
+            '  for sym in ' + " ".join(potcar_symbols) + "; do",
+            '    cat "$psp_lib/$sym/POTCAR" >> POTCAR',
+            "  done",
+        ]
+    )
+    lines.append("fi")
+    return "\n".join(lines)
+
+
 class VaspApplication:
     """VASP workflows: profiles, input preparation, submission, validation."""
 
@@ -246,54 +310,20 @@ class VaspApplication:
         preamble = ""
         preamble_parts: list[str] = []
         if self.env_script:
-            validate_remote_path(self.env_script, allow_tilde=False)
-            # SCNet product env.sh may end with a best-effort accounting
-            # write that returns non-zero for users. Preserve the exported
-            # environment, then explicitly verify the executable.
+            # Single source of the product-environment preamble (also reused
+            # by the isolated-molecule runner so there is exactly one Slurm
+            # template instead of divergent copies).
             preamble_parts.append(
-                "set +e\n"
-                f"source {shlex.quote(self.env_script)}\n"
-                "set -e\n"
-                f"command -v {shlex.quote(executable or profile.executable)} "
-                ">/dev/null"
+                env_source_preamble(
+                    self.env_script, executable or profile.executable
+                )
             )
         if self.remote_psp_dir and potcar_symbols:
-            validate_remote_path(self.remote_psp_dir)
-            if self.remote_psp_dir.startswith("~/"):
-                psp_value = '"${HOME}/' + self.remote_psp_dir[2:] + '"'
-            else:
-                psp_value = shlex.quote(self.remote_psp_dir)
-            lines = [
-                "if [ ! -s POTCAR ]; then",
-                f"  psp_base={psp_value}",
-                "  : > POTCAR",
-                (
-                    "  # layout detection: direct <root>/<setup>/POTCAR, "
-                    "then potpaw_PBE, then legacy potpaw_PBE.64"
-                ),
-                '  for cand in "$psp_base" "$psp_base/potpaw_PBE" '
-                '"$psp_base/potpaw_PBE.64"; do',
-            ]
-            for symbol in potcar_symbols:
-                if not symbol.isalpha():
-                    raise ValueError(f"unsafe POTCAR symbol: {symbol!r}")
-                lines.extend(
-                    [
-                        f'    if [ -z "$psp_lib" ] && [ -s "$cand/{symbol}/POTCAR" ]; then',
-                        f'      psp_lib="$cand"',
-                    ]
+            preamble_parts.append(
+                potcar_assembly_preamble(
+                    self.remote_psp_dir, list(potcar_symbols)
                 )
-            lines.extend(
-                [
-                    "  done",
-                    '  test -n "$psp_lib"',
-                    '  for sym in ' + " ".join(potcar_symbols) + "; do",
-                    '    cat "$psp_lib/$sym/POTCAR" >> POTCAR',
-                    "  done",
-                ]
             )
-            lines.append("fi")
-            preamble_parts.append("\n".join(lines))
         preamble = "\n".join(preamble_parts)
         return render_slurm_script(
             job_name=job_name,
@@ -350,9 +380,14 @@ class VaspApplication:
         profile_name: str,
         remote_root: str | None = None,
         resource: ResourceRequest | None = None,
-        unique_remote_directory: bool = False,
+        unique_remote_directory: bool = True,
     ) -> RemoteJobRef:
-        """Upload one stage directory and submit; detached by default."""
+        """Upload one stage directory and submit; detached by default.
+
+        ``unique_remote_directory`` defaults to True: two jobs must never
+        write into the same remote directory. Callers that pass False
+        explicitly accept the (legacy) shared-directory risk.
+        """
         if self.backend is None:
             raise RuntimeError("VASP backend is not configured")
         profile = get_profile(profile_name)

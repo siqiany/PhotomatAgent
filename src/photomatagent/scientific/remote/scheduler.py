@@ -135,6 +135,22 @@ def remote_status_command(job_id: str) -> str:
     ).format(jid=job_id)
 
 
+def remote_jobs_by_name_command(job_name: str) -> str:
+    """Query every Slurm job matching a name: squeue first, sacct fallback.
+
+    Used by reconciliation: a unique per-request job name plus ``squeue``/
+    ``sacct`` decides whether a timed-out sbatch actually created a job.
+    Output lines are ``<jobid> <state>`` (both sources use that order).
+    """
+    safe = sanitize_job_name(job_name, max_len=64)
+    return (
+        "state=$(squeue -h --name={name} -o \"%i %T\" 2>/dev/null); "
+        "if [ -z \"$state\" ]; then "
+        "sacct -n -X --name={name} -o JobID,State 2>/dev/null | head -n 50; "
+        "else printf '%s\\n' \"$state\"; fi"
+    ).format(name=shlex.quote(safe))
+
+
 def remote_cancel_command(job_id: str) -> str:
     validate_job_id(job_id)
     return f"scancel {job_id}"
@@ -181,4 +197,17 @@ def remote_artifact_sizes_command(remote_directory: str) -> str:
     return (
         f"cd {shlex.quote(remote_directory)} 2>/dev/null && "
         "for f in *; do [ -f \"$f\" ] && stat -c '%n %s' \"$f\"; done 2>/dev/null"
+    )
+
+
+def remote_copy_artifact_command(
+    source_remote_directory: str,
+    destination_remote_directory: str,
+    filename: str,
+) -> str:
+    """Copy one validated artifact between remote job directories."""
+    return (
+        f"cp -f "
+        f"{_remote_path_expression(source_remote_directory + '/' + filename)} "
+        f"{_remote_path_expression(destination_remote_directory + '/')}"
     )

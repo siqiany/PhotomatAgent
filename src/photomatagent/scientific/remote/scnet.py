@@ -24,6 +24,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from photomatagent.scientific.remote.cache import CapabilityCache
 from photomatagent.scientific.remote.models import (
     HPCJobState,
     RemoteArtifactRef,
@@ -37,6 +38,8 @@ from photomatagent.scientific.remote.models import (
 from photomatagent.scientific.remote.scheduler import (
     parse_sbatch_job_id,
     remote_cancel_command,
+    remote_copy_artifact_command,
+    remote_jobs_by_name_command,
     remote_ls_command,
     remote_mkdir_command,
     remote_read_command,
@@ -56,6 +59,9 @@ class RemotePathError(ValueError):
 
 class RemoteSubmissionBlocked(RuntimeError):
     """Resource policy refused an HPC submission (deterministic)."""
+
+
+_REMOTE_COPY_ALLOWLIST = {"WAVECAR", "CHGCAR", "LOCPOT", "CONTCAR"}
 
 
 def validate_remote_path(path: str, *, allow_tilde: bool = True) -> str:
@@ -93,6 +99,7 @@ class SCNetBackend:
         ssh_executable: str = "ssh",
         scp_executable: str = "scp",
         control_persist_seconds: int = 600,
+        capability_cache: CapabilityCache | None = None,
     ) -> None:
         self.config = config
         self.policy = policy or ResourcePolicy.from_environment()
@@ -100,6 +107,9 @@ class SCNetBackend:
         self.ssh_executable = ssh_executable
         self.scp_executable = scp_executable
         self.control_persist_seconds = control_persist_seconds
+        self.capability_cache = capability_cache or CapabilityCache(
+            ttl_seconds=300.0
+        )
         identity = (
             f"{self.config.destination}:{self.config.port}:"
             f"{self.config.private_key_path}"
@@ -159,7 +169,7 @@ class SCNetBackend:
         self, remote_command: str, *, timeout_seconds: float | None = None
     ) -> RemoteExecutionResult:
         """Run one remote command via ssh argv list (never shell=True)."""
-        timeout = timeout_seconds or self.config.connect_timeout_seconds * 5
+        timeout = timeout_seconds or self.config.command_timeout_seconds
         command = " ".join(
             [*[shlex.quote(part) for part in self._ssh_base()], shlex.quote(remote_command)]
         )
@@ -209,6 +219,12 @@ class SCNetBackend:
 
     async def check_connection(self) -> dict[str, str]:
         """Read-only probe: hostname + availability of sbatch/squeue."""
+        return await self.capability_cache.get_or_call(
+            "connection",
+            self._check_connection_uncached,
+        )
+
+    async def _check_connection_uncached(self) -> dict[str, str]:
         result = await self._run_ssh(
             "printf 'host='; hostname; "
             "printf 'sbatch='; command -v sbatch || true; "
@@ -246,6 +262,12 @@ class SCNetBackend:
 
     async def available_partitions(self) -> list[str]:
         """Return SCNet partitions using its helper, with a Slurm fallback."""
+        return await self.capability_cache.get_or_call(
+            "partitions",
+            self._available_partitions_uncached,
+        )
+
+    async def _available_partitions_uncached(self) -> list[str]:
         result = await self._run_ssh(
             "if command -v whichpartition >/dev/null 2>&1; then "
             "whichpartition; else sinfo -h -o %P; fi"
@@ -272,6 +294,14 @@ class SCNetBackend:
         self, module_name: str, executable: str
     ) -> dict[str, str]:
         """Check one configured module and executable without running a job."""
+        return await self.capability_cache.get_or_call(
+            f"module:{module_name}:{executable}",
+            lambda: self._probe_module_uncached(module_name, executable),
+        )
+
+    async def _probe_module_uncached(
+        self, module_name: str, executable: str
+    ) -> dict[str, str]:
         if not module_name:
             candidates = await self._run_ssh(
                 ". /etc/profile >/dev/null 2>&1 || true; "
@@ -298,12 +328,89 @@ class SCNetBackend:
             "error": "" if result.ok else (result.error or "module/executable unavailable"),
         }
 
+    async def jobs_by_name(self, job_name: str) -> list[tuple[str, str]]:
+        """All Slurm jobs matching a job name: [(job_id, state), ...]."""
+        result = await self._run_ssh(remote_jobs_by_name_command(job_name))
+        if not result.ok:
+            raise RuntimeError(f"job-name query failed: {result.error}")
+        jobs: list[tuple[str, str]] = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            job_id, state = parts[0], parts[1]
+            if job_id.isdigit():
+                jobs.append((job_id, state))
+        return jobs
+
+    async def read_remote_text(
+        self, remote_directory: str, filename: str, max_bytes: int
+    ) -> str | None:
+        """Read a small remote text file (marker); None when absent."""
+        validate_remote_path(remote_directory)
+        if not _REMOTE_PATH_OK.match(filename):
+            raise RemotePathError(f"unsafe remote filename: {filename!r}")
+        result = await self._run_ssh(
+            remote_read_command(remote_directory, filename, int(max_bytes))
+        )
+        if not result.ok:
+            return None
+        return result.stdout
+
+    async def copy_remote_artifact(
+        self,
+        source_remote_directory: str,
+        destination_remote_directory: str,
+        filename: str,
+    ) -> bool:
+        """Copy one allow-listed artifact between remote job directories."""
+        if filename not in _REMOTE_COPY_ALLOWLIST:
+            raise RemotePathError(
+                f"remote artifact copy refuses {filename!r}: allowed names "
+                f"are {sorted(_REMOTE_COPY_ALLOWLIST)}"
+            )
+        validate_remote_path(source_remote_directory)
+        validate_remote_path(destination_remote_directory)
+        result = await self._run_ssh(
+            remote_copy_artifact_command(
+                source_remote_directory,
+                destination_remote_directory,
+                filename,
+            )
+        )
+        return result.ok
+
     async def ensure_remote_directory(self, remote_directory: str) -> bool:
         validate_remote_path(remote_directory)
         result = await self._run_ssh(remote_mkdir_command(remote_directory))
         if not result.ok:
             raise RuntimeError(f"mkdir on SCNet failed: {result.error}")
         return True
+
+    async def verify_remote_inputs(
+        self, remote_directory: str, names: list[str]
+    ) -> list[str]:
+        """Return the requested inputs missing on the remote directory.
+
+        A verification failure (or an unreachable listing) is conservative:
+        every requested name is reported missing rather than allowing sbatch
+        to run on an incomplete directory.
+        """
+        validate_remote_path(remote_directory)
+        result = await self._run_ssh(remote_ls_command(remote_directory))
+        if not result.ok:
+            return list(names)
+        present: set[str] = set()
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            name = parts[0].lstrip("./")
+            if len(parts) >= 2 and parts[1].isdigit():
+                present.add(name)
+            else:
+                present.add(name)
+        return [name for name in names if name not in present]
 
     async def upload_files(
         self, local_paths: list[Path], remote_directory: str
@@ -374,6 +481,12 @@ class SCNetBackend:
             spec.remote_directory, spec.script_name
         ))
         if not result.ok:
+            if "timed out" in (result.error or ""):
+                # The ssh client died before sbatch's reply arrived: whether
+                # the job was accepted is UNKNOWN. Raise TimeoutError so the
+                # lifecycle treats this as ambiguous (reconciliation), never
+                # as a deterministic failure.
+                raise TimeoutError(f"sbatch client timed out: {result.error}")
             raise RuntimeError(f"sbatch failed: {result.error}")
         job_id = parse_sbatch_job_id(result.stdout)
         if not job_id:

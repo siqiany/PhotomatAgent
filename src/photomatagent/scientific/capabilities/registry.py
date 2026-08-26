@@ -42,6 +42,9 @@ def build_scientific_tools(
     from photomatagent.scientific.capabilities.generation.tools import (
         generation_pack,
     )
+    from photomatagent.scientific.capabilities.chemistry.tools import (
+        chemistry_pack,
+    )
 
     effective_config = config or ScientificConfig.from_environment(
         workspace=workspace.root if workspace else None
@@ -66,6 +69,7 @@ def build_scientific_tools(
         namd_pack(effective_workspace),
         magus_pack(effective_workspace),
         generation_pack(effective_config),
+        chemistry_pack(),
     ]
     tools: list[Tool] = []
     for pack in packs:
@@ -74,23 +78,35 @@ def build_scientific_tools(
         except Exception:
             # A broken pack must never take down agent startup.
             continue
-    tools.extend(_mcp_gateway_tools(effective_config, effective_workspace))
+    builtin_names = {getattr(tool, "name", "") for tool in tools}
+    tools.extend(
+        _mcp_gateway_tools(
+            effective_config, effective_workspace, builtin_names
+        )
+    )
     return tools
 
 
 def _mcp_gateway_tools(
-    config: ScientificConfig, workspace: Workspace
+    config: ScientificConfig,
+    workspace: Workspace,
+    builtin_tool_names: set[str] | None = None,
 ) -> list[Tool]:
     """Register configured MCP servers as deferred tools through the gateway.
 
     Uses the workspace ``.photomatagent/mcp.json`` configuration. A failing
     server degrades to a ``<namespace>.status`` stub; it never raises.
+    Adapters that merely duplicate tools the local packs already register
+    (the SCNet MCP ``vasp_molecule_*`` family) are skipped by default so the
+    agent never sees two entry points for the same capability; set
+    ``PHOTOMATAGENT_MCP_INCLUDE_DUPLICATE_MOLECULAR=1`` to keep the MCP
+    copies.
     """
     from photomatagent.mcp.manager import MCPServerManager
 
     manager = MCPServerManager(config.mcp_servers, workspace=workspace.root)
     try:
-        return manager.register_tools()
+        return manager.register_tools(builtin_tool_names)
     except Exception:
         return []
 

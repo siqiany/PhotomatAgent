@@ -141,6 +141,7 @@ class RemoteServerConfig(BaseModel):
     private_key_path: str = ""
     remote_root: str = "~/photomatagent"
     connect_timeout_seconds: float = Field(default=20.0, gt=0)
+    command_timeout_seconds: float = Field(default=120.0, gt=0)
     transfer_timeout_seconds: float = Field(default=3600.0, gt=0)
     ssh_batch_mode: bool = True
 
@@ -165,6 +166,7 @@ class RemoteJobSpec(BaseModel):
     application: str
     job_name: str
     remote_directory: str
+    request_id: str = ""
     script_name: str = "run.slurm"
     resource: ResourceRequest = Field(default_factory=ResourceRequest)
     module_load: str = ""

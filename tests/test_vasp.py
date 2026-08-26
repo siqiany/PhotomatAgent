@@ -507,16 +507,22 @@ As  As  0.25 0.25 0.25
         output_dir=workflow_dir,
     )
     vasprun_bytes = write_vasprun(tmp_path / "fixture").read_bytes()
-    # pre-populate remote results for every stage remote directory
-    for stage in ("relax", "static", "band", "dos"):
-        remote = f"~/photomatagent/vasp/wf-{stage}"
-        app.backend.add_remote_file(remote, "vasprun.xml", vasprun_bytes)
-        app.backend.add_remote_file(remote, "OUTCAR", "reached required accuracy\n")
-        app.backend.add_remote_file(remote, "CONTCAR", "fake contcar")
-        if stage in {"band", "dos"}:
-            app.backend.add_remote_file(remote, "CHGCAR", "fake")
-        else:
-            app.backend.add_remote_file(remote, "CHGCAR", "fake")
+    # Every stage now lands in its own unique remote directory (the runner
+    # consumes ``job_ref.remote_directory``), so results are seeded at upload
+    # time instead of guessing directory names.
+    original_upload = app.backend.upload_files
+
+    async def upload_with_results(local_paths, remote_directory):
+        names = await original_upload(local_paths, remote_directory)
+        app.backend.add_remote_file(remote_directory, "vasprun.xml", vasprun_bytes)
+        app.backend.add_remote_file(
+            remote_directory, "OUTCAR", "reached required accuracy\n"
+        )
+        app.backend.add_remote_file(remote_directory, "CONTCAR", "fake contcar")
+        app.backend.add_remote_file(remote_directory, "CHGCAR", "fake")
+        return names
+
+    app.backend.upload_files = upload_with_results
 
     async def scenario():
         report = await app.submit_workflow(

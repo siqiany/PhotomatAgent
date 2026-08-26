@@ -124,12 +124,61 @@ def test_vae_missing_checkpoint_is_typed_failure():
     assert "checkpoint" in str(excinfo.value)
 
 
-def test_vae_target_requires_exactly_one():
+def test_vae_requires_a_target_and_rejects_inconsistent_gap_wavelength():
     generator = make_generator()
     with pytest.raises(ValueError):
         generator.generate()
     with pytest.raises(ValueError):
         generator.generate(target_band_gap_eV=0.5, target_wavelength_um=3.0)
+
+
+def test_vae_accepts_sparse_multi_property_conditions_without_retrieval():
+    fields = [
+        "gap_selected_eV",
+        "cutoff_wavelength_um_from_gap",
+        "density_g_cm3",
+        "dielectric_mean",
+    ]
+    generator = make_generator(
+        property_fields=fields,
+        condition_center=np.asarray([0.5, 2.5, 5.0, 10.0]),
+        condition_scale=np.asarray([0.25, 1.0, 2.0, 5.0]),
+        require_novel=False,
+    )
+    condition, targets, clipped = generator.condition(
+        target_properties={"density": 7.0, "dielectric_mean": 20.0}
+    )
+    assert targets == {"density_g_cm3": 7.0, "dielectric_mean": 20.0}
+    assert np.allclose(condition, [0.0, 0.0, 1.0, 2.0])
+    assert clipped == []
+
+    proposals, metadata = generator.generate(
+        target_properties={"density_g_cm3": 7.0, "dielectric_mean": 20.0}
+    )
+    assert proposals[0].formula == "NaCl"
+    assert metadata["conditioned_property_count"] == 2
+    assert metadata["target_band_gap_eV"] is None
+    assert "gap_selected_eV" in metadata["unspecified_properties"]
+
+
+def test_vae_gap_condition_derives_consistent_cutoff_and_clips_extremes():
+    generator = make_generator(
+        property_fields=[
+            "gap_selected_eV",
+            "cutoff_wavelength_um_from_gap",
+            "density_g_cm3",
+        ],
+        condition_center=np.asarray([0.5, 2.5, 5.0]),
+        condition_scale=np.asarray([0.25, 1.0, 1.0]),
+    )
+    condition, targets, clipped = generator.condition(
+        target_properties={"band_gap_eV": 0.5, "density_g_cm3": 100.0}
+    )
+    assert targets["cutoff_wavelength_um_from_gap"] == pytest.approx(
+        1.239841984 / 0.5
+    )
+    assert condition[2] == 8.0
+    assert clipped == ["density_g_cm3"]
 
 
 def test_vae_tool_rejects_device_properties():
@@ -147,6 +196,46 @@ def test_vae_tool_rejects_device_properties():
     )
     assert result.is_error
     assert result.data["error_type"] == "unsupported_device_property"
+
+
+def test_vae_tool_rejects_nested_device_properties():
+    from photomatagent.scientific.capabilities.generation.tools import (
+        VAEFormulaTool,
+    )
+
+    result = asyncio.run(
+        VAEFormulaTool().execute(
+            {"target_properties": {"detectivity_jones": 1e10}}
+        )
+    )
+    assert result.is_error
+    assert result.data["error_type"] == "unsupported_device_property"
+
+
+def test_vae_tool_schema_exposes_all_trained_material_properties():
+    from photomatagent.scientific.capabilities.generation.tools import (
+        VAEFormulaTool,
+    )
+
+    properties = VAEFormulaTool.input_schema["properties"][
+        "target_properties"
+    ]["properties"]
+    assert set(properties) == {
+        "gap_selected_eV",
+        "cutoff_wavelength_um_from_gap",
+        "formation_energy_eV_per_atom",
+        "energy_above_hull_eV_per_atom",
+        "density_g_cm3",
+        "dielectric_mean",
+        "avg_electron_mass_m0",
+        "avg_hole_mass_m0",
+        "bulk_modulus_GPa",
+        "shear_modulus_GPa",
+        "exfoliation_energy_meV_per_atom",
+        "max_IR_mode_cm-1",
+        "min_IR_mode_cm-1",
+        "spillage",
+    }
 
 
 def test_vae_tool_missing_prerequisite_when_checkpoint_is_invalid():
@@ -208,10 +297,15 @@ def test_vae_checkpoint_decoder_is_loadable_and_deterministic(tmp_path):
         random_seed=17,
     )
     generator._load_torch_decoder()
-    condition = generator.condition(
+    condition, targets, clipped = generator.condition(
         target_band_gap_eV=0.5,
         target_wavelength_um=2.5,
     )
+    assert targets == {
+        "gap_selected_eV": 0.5,
+        "cutoff_wavelength_um_from_gap": 2.5,
+    }
+    assert clipped == []
     first = generator.decode_samples(condition, 8)
     second = generator.decode_samples(condition, 8)
     assert first.shape == (8, len(VOCABULARY))

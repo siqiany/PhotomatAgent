@@ -269,6 +269,325 @@ async def vasp_run_workflow(
 
 
 # ---------------------------------------------------------------------------
+# vasp_molecule.* tools (isolated-molecule DAG)
+# ---------------------------------------------------------------------------
+
+
+def _molecular_tool(name: str) -> Any:
+    """Find one registered ``vasp_molecule.*`` Tool instance."""
+    from photomatagent.scientific.applications.vasp.molecular.tool_pack import (
+        molecular_vasp_pack,
+    )
+
+    pack = molecular_vasp_pack()
+    for tool in pack.tools():
+        if tool.name == name:
+            return tool
+    raise KeyError(name)
+
+
+async def _call_molecular(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    tool = _molecular_tool(name)
+    try:
+        result = await tool.execute(arguments)
+    except Exception as exc:
+        return _error(
+            f"{name} failed: {type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
+    payload = dict(result.data) if getattr(result, "data", None) else {}
+    payload.setdefault("output", getattr(result, "output", ""))
+    payload["is_error"] = bool(getattr(result, "is_error", False))
+    return payload
+
+
+@mcp.tool()
+async def vasp_molecule_capabilities() -> dict[str, Any]:
+    """List the isolated-molecule VASP runtime configuration (backend, pseudopotential dirs, module/environment, workspace paths) and the typed stage DAG. Read-only; never submits."""
+    return await _call_molecular("vasp_molecule.capabilities", {})
+
+
+@mcp.tool()
+async def vasp_molecule_prepare(
+    structure_path: str,
+    total_charge: int,
+    name: str | None = None,
+    box_ang: float = 30.0,
+    spin_multiplicity: int = 1,
+    calculation_purpose: str = "unspecified",
+    conformer_id: str | None = None,
+    encut_ev: float | None = None,
+    include_orbital_homo: bool = True,
+    include_orbital_lumo: bool = True,
+    include_esp: bool = True,
+    include_hse06: bool = False,
+    workflow_dir: str | None = None,
+) -> dict[str, Any]:
+    """Generate the isolated-molecule VASP stage tree + deterministic preflight offline. total_charge is explicit and NEVER inferred from names. Never submits."""
+    arguments: dict[str, Any] = {
+        "structure_path": structure_path,
+        "total_charge": total_charge,
+        "name": name,
+        "box_ang": box_ang,
+        "spin_multiplicity": spin_multiplicity,
+        "calculation_purpose": calculation_purpose,
+        "conformer_id": conformer_id,
+        "encut_ev": encut_ev,
+        "include_orbital_homo": include_orbital_homo,
+        "include_orbital_lumo": include_orbital_lumo,
+        "include_esp": include_esp,
+        "include_hse06": include_hse06,
+        "workflow_dir": workflow_dir,
+    }
+    arguments = {key: value for key, value in arguments.items() if value is not None}
+    return await _call_molecular("vasp_molecule.prepare", arguments)
+
+
+@mcp.tool()
+async def vasp_molecule_preflight(workflow_dir: str) -> dict[str, Any]:
+    """Run the deterministic offline molecular preflight (charge, POTCAR order, NELECT parity, vacuum, Gamma-only, DIPOL rendering, dependencies). Writes preflight.json."""
+    return await _call_molecular(
+        "vasp_molecule.preflight", {"workflow_dir": workflow_dir}
+    )
+
+
+@mcp.tool()
+async def vasp_molecule_submit(
+    workflow_dir: str,
+    stage: str,
+    wait: bool = False,
+    wait_timeout_seconds: float = 3600.0,
+    force_new_attempt: bool = False,
+) -> dict[str, Any]:
+    """Submit ONE isolated-molecule stage under the submit-once contract (unique remote dir, generated run.slurm, remote POTCAR assembly). Requires SCNET config + PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1."""
+    return await _call_molecular(
+        "vasp_molecule.submit",
+        {
+            "workflow_dir": workflow_dir,
+            "stage": stage,
+            "wait": wait,
+            "wait_timeout_seconds": wait_timeout_seconds,
+            "force_new_attempt": force_new_attempt,
+        },
+    )
+
+
+@mcp.tool()
+async def vasp_molecule_status(workflow_dir: str, stage: str) -> dict[str, Any]:
+    """Read lifecycle + scheduler state of one isolated-molecule stage. Query failures are UNKNOWN, never job failures."""
+    return await _call_molecular(
+        "vasp_molecule.status", {"workflow_dir": workflow_dir, "stage": stage}
+    )
+
+
+@mcp.tool()
+async def vasp_molecule_collect(
+    workflow_dir: str, stage: str, local_dir: str | None = None
+) -> dict[str, Any]:
+    """Download and validate one finished stage: COMPLETED -> COLLECTED -> VALIDATED. Evidence only when validation passes; task_state.json and the SQLite registry stay in sync."""
+    arguments: dict[str, Any] = {"workflow_dir": workflow_dir, "stage": stage}
+    if local_dir:
+        arguments["local_dir"] = local_dir
+    return await _call_molecular("vasp_molecule.collect", arguments)
+
+
+@mcp.tool()
+async def vasp_molecule_analyze_orbitals(
+    result_dir: str,
+    charge: int = 0,
+    spin_multiplicity: int = 1,
+    box_ang: float | None = None,
+) -> dict[str, Any]:
+    """HOMO/LUMO identification + vacuum alignment from EIGENVAL + LOCPOT (offline). Raw values must never be compared across molecules."""
+    arguments: dict[str, Any] = {
+        "result_dir": result_dir,
+        "charge": charge,
+        "spin_multiplicity": spin_multiplicity,
+    }
+    if box_ang is not None:
+        arguments["box_ang"] = box_ang
+    return await _call_molecular("vasp_molecule.analyze_orbitals", arguments)
+
+
+@mcp.tool()
+async def vasp_molecule_analyze_esp(result_dir: str) -> dict[str, Any]:
+    """ESP/LOCPOT grid metadata (offline); the potential grid content stays on disk."""
+    return await _call_molecular(
+        "vasp_molecule.analyze_esp", {"result_dir": result_dir}
+    )
+
+
+@mcp.tool()
+async def vasp_molecule_binding_energy(
+    complex_name: str,
+    complex_dir: str,
+    references: list[dict[str, Any]],
+    alternative_references: list[dict[str, Any]] | None = None,
+    charge: int = 0,
+) -> dict[str, Any]:
+    """Electronic binding energy (ΔE/ΔΔE) from validated E0 values with box/functional/ENCUT consistency checks. Electronic-only; no vibrational/thermal terms are claimed."""
+    arguments: dict[str, Any] = {
+        "complex_name": complex_name,
+        "complex_dir": complex_dir,
+        "references": references,
+        "charge": charge,
+    }
+    if alternative_references:
+        arguments["alternative_references"] = alternative_references
+    return await _call_molecular("vasp_molecule.binding_energy", arguments)
+
+
+@mcp.tool()
+async def vasp_molecule_resume_workflow(
+    workflow_dir: str,
+    wait: bool = True,
+    collect: bool = True,
+    stop_on_failure: bool = True,
+    only: list[str] | None = None,
+    wait_timeout_seconds: float = 3600.0,
+) -> dict[str, Any]:
+    """Run or resume the full isolated-molecule DAG from task_state.json. Completed stages are never resubmitted; failures block dependents."""
+    arguments: dict[str, Any] = {
+        "workflow_dir": workflow_dir,
+        "wait": wait,
+        "collect": collect,
+        "stop_on_failure": stop_on_failure,
+        "wait_timeout_seconds": wait_timeout_seconds,
+    }
+    if only:
+        arguments["only"] = only
+    return await _call_molecular("vasp_molecule.resume_workflow", arguments)
+
+
+# ---------------------------------------------------------------------------
+# vasp_study.* orchestration tools (thin adapters over the study pack)
+# ---------------------------------------------------------------------------
+
+
+def _study_tool(name: str) -> Any:
+    """Find one registered ``vasp_study.*`` Tool instance."""
+    from photomatagent.scientific.applications.vasp.study.tools import (
+        vasp_study_pack,
+    )
+
+    pack = vasp_study_pack()
+    for tool in pack.tools():
+        if tool.name == name:
+            return tool
+    raise KeyError(name)
+
+
+async def _call_study(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    tool = _study_tool(name)
+    try:
+        result = await tool.execute(arguments)
+    except Exception as exc:
+        return _error(
+            f"{name} failed: {type(exc).__name__}: {exc}",
+            error_type=type(exc).__name__,
+        )
+    payload = dict(result.data) if getattr(result, "data", None) else {}
+    payload.setdefault("output", getattr(result, "output", ""))
+    payload["is_error"] = bool(getattr(result, "is_error", False))
+    return payload
+
+
+@mcp.tool()
+async def vasp_study_plan(
+    systems: list[dict[str, Any]],
+    original_request: str = "",
+    study_id: str = "",
+    property_requests: list[str] | None = None,
+    allow_assumed_structures: bool = True,
+    max_candidates_per_system: int = 3,
+    user_requested_computation: bool = False,
+    max_core_hours: float = 64.0,
+    functional: str = "PBE-D3(BJ)",
+    encut_ev: float | None = None,
+    box_ang: float = 20.0,
+    workspace: str = "",
+) -> dict[str, Any]:
+    """Compile a typed VASP study plan (offline; never submits)."""
+    return await _call_study(
+        "vasp_study.plan",
+        {
+            "systems": systems,
+            "original_request": original_request,
+            "study_id": study_id,
+            "property_requests": property_requests or [],
+            "allow_assumed_structures": allow_assumed_structures,
+            "max_candidates_per_system": max_candidates_per_system,
+            "user_requested_computation": user_requested_computation,
+            "max_core_hours": max_core_hours,
+            "functional": functional,
+            "encut_ev": encut_ev,
+            "box_ang": box_ang,
+            "workspace": workspace,
+        },
+    )
+
+
+@mcp.tool()
+async def vasp_study_execute(
+    study_id: str,
+    study_dir: str = "",
+    user_requested_computation: bool = False,
+    wait: bool = True,
+) -> dict[str, Any]:
+    """Execute or resume a planned study through vasp_molecule.*."""
+    return await _call_study(
+        "vasp_study.execute",
+        {
+            "study_id": study_id,
+            "study_dir": study_dir,
+            "user_requested_computation": user_requested_computation,
+            "wait": wait,
+        },
+    )
+
+
+@mcp.tool()
+async def vasp_study_status(study_id: str, study_dir: str = "") -> dict[str, Any]:
+    """Read persisted study task/binding states."""
+    return await _call_study(
+        "vasp_study.status", {"study_id": study_id, "study_dir": study_dir}
+    )
+
+
+@mcp.tool()
+async def vasp_study_resume(
+    study_id: str,
+    study_dir: str = "",
+    user_requested_computation: bool = False,
+) -> dict[str, Any]:
+    """Resume an interrupted study (molecular resume semantics)."""
+    return await _call_study(
+        "vasp_study.resume",
+        {
+            "study_id": study_id,
+            "study_dir": study_dir,
+            "user_requested_computation": user_requested_computation,
+        },
+    )
+
+
+@mcp.tool()
+async def vasp_study_collect(study_id: str, study_dir: str = "") -> dict[str, Any]:
+    """Collect + validate scheduler-COMPLETED / COLLECTED tasks."""
+    return await _call_study(
+        "vasp_study.collect", {"study_id": study_id, "study_dir": study_dir}
+    )
+
+
+@mcp.tool()
+async def vasp_study_report(study_id: str, study_dir: str = "") -> dict[str, Any]:
+    """Generate results.json / results.csv / figures / report.md."""
+    return await _call_study(
+        "vasp_study.report", {"study_id": study_id, "study_dir": study_dir}
+    )
+
+
+# ---------------------------------------------------------------------------
 # namd.* tools
 # ---------------------------------------------------------------------------
 

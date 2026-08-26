@@ -18,13 +18,38 @@ import math
 from dataclasses import dataclass
 from functools import reduce
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
 from photomatagent.scientific.errors import MissingScientificPrerequisite
 
 HC_EV_UM = 1.239841984
+
+PROPERTY_ALIASES = {
+    "band_gap_eV": "gap_selected_eV",
+    "bandgap_eV": "gap_selected_eV",
+    "cutoff_um": "cutoff_wavelength_um_from_gap",
+    "formation_energy": "formation_energy_eV_per_atom",
+    "ehull": "energy_above_hull_eV_per_atom",
+    "density": "density_g_cm3",
+    "dielectric": "dielectric_mean",
+    "electron_mass": "avg_electron_mass_m0",
+    "hole_mass": "avg_hole_mass_m0",
+    "bulk_modulus": "bulk_modulus_GPa",
+    "shear_modulus": "shear_modulus_GPa",
+    "exfoliation_energy": "exfoliation_energy_meV_per_atom",
+}
+
+UNSUPPORTED_DEVICE_PROPERTIES = {
+    "responsivity_a_w",
+    "detectivity_jones",
+    "dark_current_a",
+    "dark_current_density_a_cm2",
+    "response_time_s",
+    "external_quantum_efficiency",
+    "noise_equivalent_power_w_hz_0p5",
+}
 
 Decoder = Callable[[np.ndarray, int], np.ndarray]
 
@@ -217,36 +242,103 @@ class VAEFormulaGenerator:
     def condition(
         self,
         *,
-        target_band_gap_eV: float,
-        target_wavelength_um: float,
-    ) -> np.ndarray:
-        """Normalized property condition vector."""
+        target_properties: Mapping[str, float] | None = None,
+        target_band_gap_eV: float | None = None,
+        target_wavelength_um: float | None = None,
+    ) -> tuple[np.ndarray, dict[str, float], list[str]]:
+        """Build a sparse normalized property condition vector.
+
+        A zero in an unspecified position has the same meaning used during
+        condition-dropout training.  It is not a request for the physical
+        value zero.
+        """
+        targets = self._normalize_targets(
+            target_properties=target_properties,
+            target_band_gap_eV=target_band_gap_eV,
+            target_wavelength_um=target_wavelength_um,
+        )
         if self.center is None or self.scale is None:
             # No checkpoint statistics: use a unit-normalized proxy so the
             # decoder interface stays deterministic.
             condition = np.zeros(len(self.property_fields), dtype=np.float32)
-            if "gap_selected_eV" in self.property_fields:
-                condition[self.property_fields.index("gap_selected_eV")] = (
-                    float(target_band_gap_eV) / 1.0
-                )
-            if "cutoff_wavelength_um_from_gap" in self.property_fields:
-                condition[
-                    self.property_fields.index("cutoff_wavelength_um_from_gap")
-                ] = float(target_wavelength_um)
-            return condition
+            for field, value in targets.items():
+                condition[self.property_fields.index(field)] = value
+            return condition, targets, []
         condition = np.zeros(len(self.property_fields), dtype=np.float32)
-        targets = {
-            "gap_selected_eV": float(target_band_gap_eV),
-            "cutoff_wavelength_um_from_gap": float(target_wavelength_um),
-        }
+        clipped_fields: list[str] = []
         for field, value in targets.items():
-            if field not in self.property_fields:
-                continue
             index = self.property_fields.index(field)
-            condition[index] = (value - self.center[index]) / max(
+            normalized = (value - self.center[index]) / max(
                 abs(self.scale[index]), 1e-12
             )
-        return condition
+            clipped = float(np.clip(normalized, -8.0, 8.0))
+            if clipped != normalized:
+                clipped_fields.append(field)
+            condition[index] = clipped
+        return condition, targets, clipped_fields
+
+    def _normalize_targets(
+        self,
+        *,
+        target_properties: Mapping[str, float] | None,
+        target_band_gap_eV: float | None,
+        target_wavelength_um: float | None,
+    ) -> dict[str, float]:
+        raw_targets: dict[str, float] = dict(target_properties or {})
+        if target_band_gap_eV is not None:
+            raw_targets["gap_selected_eV"] = target_band_gap_eV
+        if target_wavelength_um is not None:
+            raw_targets["cutoff_wavelength_um_from_gap"] = target_wavelength_um
+        if not raw_targets:
+            raise ValueError("provide at least one target material property")
+
+        unsupported = sorted(set(raw_targets) & UNSUPPORTED_DEVICE_PROPERTIES)
+        if unsupported:
+            raise ValueError(
+                "unsupported device-level properties without paired training "
+                f"labels: {', '.join(unsupported)}"
+            )
+
+        gap_field = "gap_selected_eV"
+        wavelength_field = "cutoff_wavelength_um_from_gap"
+        linked_optical_fields = {gap_field, wavelength_field}
+        targets: dict[str, float] = {}
+        for supplied_field, supplied_value in raw_targets.items():
+            field = PROPERTY_ALIASES.get(supplied_field, supplied_field)
+            if (
+                field not in self.property_fields
+                and field not in linked_optical_fields
+            ):
+                raise ValueError(f"unknown VAE target property: {supplied_field}")
+            value = float(supplied_value)
+            if not math.isfinite(value):
+                raise ValueError(f"target property must be finite: {supplied_field}")
+            targets[field] = value
+
+        gap = targets.get(gap_field)
+        wavelength = targets.get(wavelength_field)
+        if gap is not None and gap <= 0:
+            raise ValueError("target band gap must be positive")
+        if wavelength is not None and wavelength <= 0:
+            raise ValueError("target cutoff wavelength must be positive")
+        if gap is not None and wavelength is not None:
+            expected = HC_EV_UM / gap
+            if not math.isclose(wavelength, expected, rel_tol=0.02, abs_tol=1e-6):
+                raise ValueError(
+                    "target band gap and cutoff wavelength are inconsistent"
+                )
+        elif gap is not None and wavelength_field in self.property_fields:
+            targets[wavelength_field] = HC_EV_UM / gap
+        elif wavelength is not None and gap_field in self.property_fields:
+            targets[gap_field] = HC_EV_UM / wavelength
+        conditioned_targets = {
+            field: value
+            for field, value in targets.items()
+            if field in self.property_fields
+        }
+        if not conditioned_targets:
+            raise ValueError("none of the target properties are supported")
+        return conditioned_targets
 
     # -- filtering ----------------------------------------------------------
 
@@ -353,6 +445,7 @@ class VAEFormulaGenerator:
     def generate(
         self,
         *,
+        target_properties: Mapping[str, float] | None = None,
         target_band_gap_eV: float | None = None,
         target_wavelength_um: float | None = None,
         limit: int = 8,
@@ -363,25 +456,12 @@ class VAEFormulaGenerator:
         ``forbidden_elements`` is an explicit optional user constraint; it
         defaults to empty (heavy infrared elements are legitimate).
         """
-        if (target_band_gap_eV is None) == (target_wavelength_um is None):
-            raise ValueError(
-                "provide exactly one of target_band_gap_eV / "
-                "target_wavelength_um"
-            )
-        if target_band_gap_eV is not None:
-            band_gap = float(target_band_gap_eV)
-            wavelength_um = HC_EV_UM / band_gap
-        else:
-            assert target_wavelength_um is not None  # mutual exclusion above
-            wavelength_um = float(target_wavelength_um)
-            band_gap = HC_EV_UM / wavelength_um
-        if band_gap <= 0:
-            raise ValueError("target band gap must be positive")
         self._load_torch_decoder()
         self._load_novelty_reference()
-        condition = self.condition(
-            target_band_gap_eV=band_gap,
-            target_wavelength_um=wavelength_um,
+        condition, normalized_targets, clipped_fields = self.condition(
+            target_properties=target_properties,
+            target_band_gap_eV=target_band_gap_eV,
+            target_wavelength_um=target_wavelength_um,
         )
         decoded = self.decode_samples(condition, self.sample_count)
         if decoded.ndim != 2 or decoded.shape[1] != len(self.vocabulary):
@@ -455,8 +535,20 @@ class VAEFormulaGenerator:
                 if self.checkpoint_path
                 else None
             ),
-            "target_band_gap_eV": band_gap,
-            "target_wavelength_um": wavelength_um,
+            "target_properties": normalized_targets,
+            "conditioned_property_count": len(normalized_targets),
+            "unspecified_properties": [
+                field
+                for field in self.property_fields
+                if field not in normalized_targets
+            ],
+            "clipped_condition_fields": clipped_fields,
+            "target_band_gap_eV": normalized_targets.get(
+                "gap_selected_eV"
+            ),
+            "target_wavelength_um": normalized_targets.get(
+                "cutoff_wavelength_um_from_gap"
+            ),
             "decoded_sample_count": self.sample_count,
             "proposal_count": len(proposals),
             "rejection_counts": rejection_counts,
