@@ -15,6 +15,8 @@ build/
 *.egg-info/
 output/
 tmp/
+user_output/*
+!user_output/.gitkeep
 vasp_sio2/
 data/photoelectric_vae/training/raw/
 cs2hgbi6/

@@ -6,12 +6,27 @@ from pathlib import Path
 
 from photomatagent.errors import ToolExecutionError
 
+USER_OUTPUT_DIRNAME = "user_output"
+TMP_DIRNAME = "tmp"
+
 
 class Workspace:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root).expanduser().resolve()
         if not self.root.is_dir():
             raise ValueError(f"workspace root is not a directory: {self.root}")
+        self.user_output_dir.mkdir(parents=True, exist_ok=True)
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def user_output_dir(self) -> Path:
+        """Folder for deliverables the agent hands back to the user."""
+        return self.root / USER_OUTPUT_DIRNAME
+
+    @property
+    def tmp_dir(self) -> Path:
+        """Folder for intermediate/scratch files the user does not need."""
+        return self.root / TMP_DIRNAME
 
     def resolve(self, path: str, *, must_exist: bool = True) -> Path:
         candidate = Path(path).expanduser()

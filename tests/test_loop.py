@@ -122,7 +122,14 @@ async def test_glob_then_read_then_final_multi_turn(tmp_path):
     events = await collect(runtime, "find the loop")
     assert [event.tool_name for event in events if event.kind == "tool_completed"] == ["glob", "read"]
     assert len(model.requests) == 3
-    assert model.requests[2].messages[-1].tool_call_id == "read-1"
+    result = next(
+        message
+        for message in reversed(model.requests[2].messages)
+        if isinstance(message, ToolResultMessage)
+    )
+    assert result.tool_call_id == "read-1"
+    # The trailing message is the appended latest scientific-state snapshot.
+    assert "Current scientific state" in model.requests[2].messages[-1].content
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,16 @@
-"""Render initial/system context around a ContextEngine-selected message set."""
+"""Render initial/system context around a ContextEngine-selected message set.
+
+Cache-friendly layout: the system message is intentionally static for the whole
+session (base instructions + skill index + capability manifest). Everything that
+changes between loop iterations -- the scientific state and the derived
+investigation ledger -- is appended as a single trailing user message so the
+provider's prompt-cache prefix (system + conversation history) stays stable and
+only the final "latest state" line is re-processed.
+"""
 
 from __future__ import annotations
 
-from photomatagent.models.types import ModelMessage, SystemMessage
+from photomatagent.models.types import ModelMessage, SystemMessage, UserMessage
 from photomatagent.runtime.state import ConversationState
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.state import ScientificState
@@ -16,6 +24,15 @@ Be concise, cite evidence from your scientific state, and mark uncertainty expli
 Before invoking another tool, check whether current observations already support a reliable answer.
 Use another tool only to resolve a meaningful uncertainty, verify a material claim, or obtain
 information required to complete the task. Do not gather evidence solely for completeness.
+
+File organization (mandatory):
+- Deliver every user-facing output (final reports, figures, data files, artifacts) under a
+  newly created subfolder in user_output/ named after the task or deliverable, e.g.
+  user_output/<task-name>/. Create the folder with your file tools before writing deliverables.
+- Keep every intermediate/scratch file you must generate while working but the user does not
+  need (temporary inputs, staging, downloads, transfer scratch, per-step logs) under tmp/.
+- Never write intermediate or temporary files into user_output/, and never scatter
+  user-facing deliverables next to source files or inside tmp/.
 """
 
 
@@ -108,16 +125,30 @@ class ContextBuilder:
         investigation_state: str = "",
         compaction_state: object | None = None,
     ) -> list[ModelMessage]:
+        """Return [static system, compaction?, conversation..., latest state].
+
+        The scientific state and bounded investigation ledger are appended as the
+        final message instead of being baked into the system prompt. That keeps
+        the system + conversation prefix byte-identical between loop iterations,
+        preserving provider prompt-cache hits while only the trailing snapshot is
+        updated.
+        """
         scientific_section = format_scientific_state(scientific)
         skill_index = format_skill_index(self.skill_loader)
         capability_section = capability_manifest or "(no deferred capabilities)"
         system = SystemMessage(
             content=(
-                f"{SYSTEM_PROMPT}\n\n--- Current scientific state ---\n{scientific_section}"
-                f"\n\n--- Available skills (index only) ---\n{skill_index}"
+                f"{SYSTEM_PROMPT}\n\n--- Available skills (index only) ---\n{skill_index}"
                 "\nUse skill_view(name[, path]) to load a skill or one reference when needed."
                 f"\n\n--- Deferred capability manifest ---\n{capability_section}"
-                f"\n\n--- Investigation state (bounded, derived) ---\n"
+            ),
+        )
+        latest_state = UserMessage(
+            content=(
+                "--- Current scientific state (latest snapshot; supersedes any earlier "
+                "state in this conversation) ---\n"
+                f"{scientific_section}"
+                "\n\n--- Investigation state (bounded, derived) ---\n"
                 f"{investigation_state or '(none yet)'}"
             ),
         )
@@ -132,4 +163,4 @@ class ContextBuilder:
 
             state = CompactionState.model_validate(compaction_state)
             compacted.append(SystemMessage(content=format_compaction_state(state)))
-        return [system, *compacted, *messages]
+        return [system, *compacted, *messages, latest_state]

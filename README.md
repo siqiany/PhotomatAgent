@@ -168,6 +168,18 @@ Deferred execution still follows the same sensitive-path checks, permission poli
 
 `ScientificState` is maintained independently and can receive claims, evidence, calculation records, and tasks through tool result `state_updates`.
 
+The prompt layout is cache-friendly: the system message stays static for the whole
+session (base instructions, skill index, capability manifest). The live scientific
+state and the derived investigation ledger are appended as a single trailing
+user message each loop iteration, so provider prompt-cache prefixes (system +
+conversation history) stay byte-identical and only the final snapshot is
+re-processed when state updates.
+
+File layout is enforced in the system prompt: user-facing deliverables go under
+a new folder in `user_output/` (e.g. `user_output/<task-name>/`), while all
+intermediate/scratch files that the user does not need go under `tmp/`. Both
+directories are created automatically in every workspace.
+
 ## Scientific capabilities
 
 Capability packs are registered from `src/photomatagent/scientific/capabilities/registry.py`. Optional dependencies are checked at runtime; unavailable packs should report their status rather than prevent the base runtime from starting.
@@ -251,6 +263,8 @@ skills/              # domain SOP content
 tests/               # pytest suite
 experiments/         # runnable experiment specifications and vertical slices
 docs/                # supplementary design and domain documentation
+user_output/         # agent deliverables handed back to the user (per-task subfolders)
+tmp/                 # intermediate/scratch files the user does not need
 ```
 
 ## Safety notes
