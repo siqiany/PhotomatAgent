@@ -23,6 +23,7 @@ from photomatagent.runtime.permissions import (
     default_permission_policy,
 )
 from photomatagent.scientific.state import ScientificState
+from photomatagent.sessions.store import SessionSnapshot
 from photomatagent.tools.factory import create_default_registry
 from photomatagent.workspace import Workspace
 
@@ -38,6 +39,7 @@ def build_runtime(
     max_iterations: int = 25,
     prompt_session: PromptSession | None = None,
     session_dir: Path | str | None = None,
+    session_id: str | None = None,
     log_events: bool = True,
 ) -> tuple[AgentRuntime, EventLogger | None]:
     workspace = Workspace(workspace_root or Path.cwd())
@@ -57,7 +59,11 @@ def build_runtime(
         policy = DenyAllPolicy()
 
     sinks: list[EventSink] = []
-    logger = EventLogger(session_dir or default_sessions_dir()) if log_events else None
+    logger = (
+        EventLogger(session_dir or default_sessions_dir(), session_id=session_id)
+        if log_events
+        else None
+    )
     if logger is not None:
         sinks.append(logger.log)
 
@@ -78,7 +84,13 @@ def build_runtime(
     return runtime, logger
 
 
-async def run_goal(console: Console, runtime: AgentRuntime, goal: str) -> None:
+async def run_goal(
+    console: Console,
+    runtime: AgentRuntime,
+    goal: str,
+    *,
+    session_dir: Path | str | None = None,
+) -> None:
     renderer = ChatRenderer(console)
     try:
         async for event in runtime.run(goal):
@@ -89,14 +101,37 @@ async def run_goal(console: Console, runtime: AgentRuntime, goal: str) -> None:
         pass
     finally:
         renderer.flush_agent_text()
+        if session_dir is not None:
+            from photomatagent.sessions.store import (
+                save_session_snapshot,
+                snapshot_path,
+            )
+
+            save_session_snapshot(
+                session_dir,
+                conversation=runtime.conversation_state,
+                scientific=runtime.scientific_state,
+                engine=runtime.context_engine.snapshot(),
+            )
+            console.print(f"[dim]session state saved: {snapshot_path(session_dir)}[/]")
 
 
 async def run_interactive_chat(
-    console: Console, runtime: AgentRuntime, session: PromptSession
+    console: Console,
+    runtime: AgentRuntime,
+    session: PromptSession,
+    *,
+    logger: EventLogger | None = None,
 ) -> None:
     from photomatagent.cli.commands import ChatCommandRouter
 
-    commands = ChatCommandRouter(console, runtime, runtime.workspace)
+    commands = ChatCommandRouter(
+        console,
+        runtime,
+        runtime.workspace,
+        logger=logger,
+        sessions_dir=(logger.session_dir.parent if logger is not None else None),
+    )
     console.print(
         "[dim]Type your research goal or [/][bold]/help[/][dim] for commands; "
         "[/][bold]/exit[/][dim] quits.[/]"
@@ -113,7 +148,38 @@ async def run_interactive_chat(
             await commands.execute(goal.strip())
             continue
         if goal.strip():
-            await run_goal(console, runtime, goal)
+            await run_goal(
+                console,
+                runtime,
+                goal,
+                session_dir=logger.session_dir if logger is not None else None,
+            )
+
+
+def _load_resume_snapshot(
+    resume: str,
+    console: Console,
+    *,
+    sessions_dir: Path | str | None = None,
+) -> tuple[Path, SessionSnapshot]:
+    """Resolve a resume target and load its snapshot."""
+    from photomatagent.observability.trace import resolve_session_path
+    from photomatagent.sessions.store import load_session_snapshot, session_is_resumable
+
+    session_dir = resolve_session_path(resume, sessions_dir)
+    if not session_is_resumable(session_dir):
+        console.print(
+            f"[red]session {session_dir.name} has no resumable state "
+            "(session_state.json). It can only be replayed.[/]"
+        )
+        raise FileNotFoundError(f"session snapshot not found in {session_dir}")
+    snapshot = load_session_snapshot(session_dir)
+    console.print(
+        f"[dim]已加载历史 session {session_dir.name}："
+        f"{len(snapshot.conversation.messages)} 条消息，"
+        f"{len(snapshot.scientific.evidence)} 条证据。可直接继续追问。[/]"
+    )
+    return session_dir, snapshot
 
 
 async def run_chat(
@@ -125,9 +191,18 @@ async def run_chat(
     max_iterations: int = 25,
     log_events: bool = True,
     goal: str | None = None,
+    resume: str | None = None,
+    sessions_dir: Path | str | None = None,
 ) -> None:
     console = Console()
     prompt_session = make_prompt_session() if goal is None or approval == "ask" else None
+    resume_session_dir: Path | None = None
+    if resume is not None:
+        resume_session_dir, snapshot = _load_resume_snapshot(
+            resume, console, sessions_dir=sessions_dir
+        )
+    sessions_base = resume_session_dir.parent if resume_session_dir is not None else None
+    resumed_session_id = resume_session_dir.name if resume_session_dir is not None else None
     runtime, logger = build_runtime(
         provider=provider,
         model=model,
@@ -135,12 +210,24 @@ async def run_chat(
         approval=approval,
         max_iterations=max_iterations,
         prompt_session=prompt_session,
+        session_dir=sessions_base or sessions_dir,
+        session_id=resumed_session_id,
         log_events=log_events,
     )
+    if resume is not None:
+        assert resume_session_dir is not None
+        runtime.restore_session(snapshot)
     if goal is not None:
-        await run_goal(console, runtime, goal)
+        await run_goal(
+            console, runtime, goal, session_dir=logger.session_dir if logger else None
+        )
     else:
         assert prompt_session is not None
-        await run_interactive_chat(console, runtime, prompt_session)
+        await run_interactive_chat(
+            console,
+            runtime,
+            prompt_session,
+            logger=logger,
+        )
     if logger is not None:
         console.print(f"[dim]events logged: {logger.events_path}[/]")

@@ -83,6 +83,7 @@ from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.state import ScientificState
 from photomatagent.scientific.tasks import ScientificTask
+from photomatagent.sessions.store import SessionSnapshot
 from photomatagent.tools.base import ToolResult
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.exposure import ToolExposure
@@ -104,6 +105,7 @@ class AgentRuntime:
         tools: ToolRegistry,
         workspace: Workspace | Path | str | None = None,
         scientific_state: ScientificState | None = None,
+        conversation_state: ConversationState | None = None,
         context_builder: ContextBuilder | None = None,
         tool_surface_planner: ToolSurfacePlanner | None = None,
         tool_surface_config: ToolSurfaceConfig | None = None,
@@ -148,7 +150,7 @@ class AgentRuntime:
         self._budget = budget or BudgetState()
         self._approval_handler = approval_handler
         self._event_sinks = list(event_sinks or [])
-        self._conversation = ConversationState()
+        self._conversation = conversation_state or ConversationState()
         self._session_id = session_id or uuid4().hex
         self._run_id: str | None = None
         self._run_meta: dict[str, Any] = {}
@@ -177,6 +179,20 @@ class AgentRuntime:
     @property
     def workspace(self) -> Workspace:
         return self._workspace
+
+    def restore_session(self, snapshot: SessionSnapshot) -> None:
+        """Reload a saved session snapshot and continue on top of it.
+
+        Mutates the existing live scientific state object in place so tool
+        registries that hold a reference to it keep observing state updates.
+        The conversation and ContextEngine compaction cursor are replaced.
+        """
+        restored_scientific = snapshot.scientific
+        self._scientific.__dict__.clear()
+        self._scientific.__dict__.update(restored_scientific.__dict__)
+        self._conversation = snapshot.conversation
+        if snapshot.engine is not None:
+            self._context_engine.restore(**snapshot.engine.model_dump(mode="json"))
 
     async def run(self, goal: str) -> AsyncIterator[RuntimeEvent]:
         """Run one user turn while preserving conversation and scientific state."""

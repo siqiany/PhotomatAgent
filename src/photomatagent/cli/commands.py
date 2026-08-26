@@ -6,10 +6,12 @@ import asyncio
 import re
 import shlex
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.console import Console
 
 from photomatagent.cli.render import ChatRenderer
+from photomatagent.logging.event_logger import EventLogger
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import ApprovalScope, SwitchablePermissionPolicy
 from photomatagent.workspace import Workspace
@@ -74,6 +76,7 @@ COMMANDS = (
     CommandSpec("/experiments compare <a> <b>", "比较两份实验结果"),
     CommandSpec("/configure [options]", "配置工作区 LLM（可能交互询问）"),
     CommandSpec("/compact", "压缩较早的工作上下文"),
+    CommandSpec("/resume <id|目录|latest>", "回溯加载历史 session，并在其基础上继续追问"),
     CommandSpec("/exit 或 /quit", "退出当前聊天"),
 )
 
@@ -90,10 +93,20 @@ class ChatCommandRouter:
         "sessions": "list",
     }
 
-    def __init__(self, console: Console, runtime: AgentRuntime, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        console: Console,
+        runtime: AgentRuntime,
+        workspace: Workspace,
+        *,
+        logger: EventLogger | None = None,
+        sessions_dir: Path | str | None = None,
+    ) -> None:
         self.console = console
         self.runtime = runtime
         self.workspace = workspace
+        self.logger = logger
+        self.sessions_dir = sessions_dir
 
     async def execute(self, line: str) -> bool:
         try:
@@ -111,6 +124,8 @@ class ChatCommandRouter:
             self._approve(args)
         elif command == "/compact":
             await self._compact()
+        elif command == "/resume":
+            await self._resume(args)
         elif command == "/doctor":
             await self._run_cli(["doctor", *args])
         elif command == "/configure":
@@ -164,6 +179,51 @@ class ChatCommandRouter:
             renderer.handle(event)
         if not events:
             self.console.print("[dim]No eligible old turns to compact.[/]")
+
+    async def _resume(self, args: list[str]) -> None:
+        """Load a historical session into the running chat and continue on it."""
+        from photomatagent.observability.trace import TraceError, resolve_session_path
+        from photomatagent.sessions.store import (
+            load_session_snapshot,
+            save_session_snapshot,
+            session_is_resumable,
+        )
+
+        if not args:
+            self.console.print("[yellow]用法：/resume <session-id | 会话目录 | latest>[/]")
+            return
+        try:
+            session_dir = resolve_session_path(args[0], self.sessions_dir)
+        except TraceError as exc:
+            self.console.print(f"[red]{exc}[/]")
+            return
+        if not session_is_resumable(session_dir):
+            self.console.print(
+                f"[red]session {session_dir.name} 没有可恢复的状态（只有离线轨迹），"
+                "只能 /sessions replay。[/]"
+            )
+            return
+        if self.logger is not None:
+            # Persist the current in-chat session state before switching away.
+            save_session_snapshot(
+                self.logger.session_dir,
+                conversation=self.runtime.conversation_state,
+                scientific=self.runtime.scientific_state,
+                engine=self.runtime.context_engine.snapshot(),
+            )
+        snapshot = load_session_snapshot(session_dir)
+        self.runtime.restore_session(snapshot)
+        if self.logger is not None:
+            # Follow-up turns continue in the resumed session's trace.
+            self.logger.session_id = session_dir.name
+            self.logger.session_dir = session_dir
+            self.logger.events_path = session_dir / "events.jsonl"
+        self.console.print(
+            f"[green]已回溯到 session {session_dir.name}："
+            f"{len(snapshot.conversation.messages)} 条消息，"
+            f"{len(snapshot.scientific.evidence)} 条证据，"
+            f"{len(snapshot.scientific.claims)} 条结论；可直接继续追问。[/]"
+        )
 
     async def _run_cli(self, args: list[str]) -> None:
         """Invoke the existing Typer command surface in-process and capture output."""

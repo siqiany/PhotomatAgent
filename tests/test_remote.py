@@ -31,6 +31,46 @@ from photomatagent.scientific.remote.scnet import (
 )
 
 
+def test_ssh_and_scp_disable_locale_forwarding_to_login_shell():
+    """SCNet login shells hang on forwarded LC_ALL/LANG; never send them."""
+    backend = SCNetBackend(RemoteServerConfig(host="login.scnet.cn", username="u"))
+    for args in (backend._ssh_base(), backend._scp_base()):
+        assert "SendEnv=-*" in args
+        assert "SetEnv=LC_ALL=C LANG=C" in args
+
+
+@pytest.mark.asyncio
+async def test_check_connection_does_not_cache_failures():
+    class FlakyBackend(SCNetBackend):
+        def __init__(self) -> None:
+            super().__init__(RemoteServerConfig(host="login.scnet.cn", username="u"))
+            self.attempts = 0
+
+        async def _check_connection_uncached(self) -> dict[str, str]:
+            self.attempts += 1
+            if self.attempts == 1:
+                return {
+                    "connected": "false",
+                    "error": "ssh timed out after 40s",
+                    "host": "",
+                    "sbatch": "",
+                    "squeue": "",
+                }
+            return {
+                "connected": "true",
+                "host": "login.scnet.cn",
+                "sbatch": "/usr/bin/sbatch",
+                "squeue": "/usr/bin/squeue",
+            }
+
+    backend = FlakyBackend()
+    first = await backend.check_connection()
+    assert first["connected"] == "false"
+    second = await backend.check_connection()
+    assert second["connected"] == "true"
+    assert backend.attempts == 2
+
+
 # -- scheduler ----------------------------------------------------------------
 
 

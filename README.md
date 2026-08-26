@@ -129,6 +129,10 @@ uv run photomatagent sessions list
 uv run photomatagent sessions stats latest
 uv run photomatagent sessions replay latest
 
+# Resume a historical session and keep asking on top of it
+uv run photomatagent sessions resume latest --goal "Continue the previous task"
+uv run photomatagent chat --resume <session-id>
+
 # Run deterministic experiment definitions
 uv run photomatagent experiments run experiments/offline-smoke.json
 ```
@@ -224,6 +228,19 @@ When event logging is enabled, runtime events are written under:
 ```
 
 The session tools can list, summarize, inspect working-context metrics, and replay those traces without rerunning a model or tool.
+
+Sessions are also **resumable**: after each run the live state (conversation,
+scientific state, and the compaction cursor) is snapshotted next to the trace
+as `session_state.json`. `photomatagent chat --resume <id>` (or
+`photomatagent sessions resume <id>`) reloads that snapshot into a fresh
+runtime and appends follow-up turns to the same session directory, so the
+whole conversation stays in one replayable trace. `sessions list` shows which
+sessions have a saved resumable state.
+
+Inside a running interactive chat you can jump onto a past task directly with
+`/resume <id|directory|latest>`: the historical conversation and scientific
+state are restored into the live runtime, the logger switches to that session's
+trace, and you keep asking follow-up questions without restarting.
 
 Experiment JSON files define independent tasks and deterministic expectations. The runner creates a fresh runtime and trace for each task, then stores experiment results under `.photomatagent/experiments/`.
 

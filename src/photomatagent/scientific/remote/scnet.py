@@ -61,6 +61,14 @@ class RemoteSubmissionBlocked(RuntimeError):
     """Resource policy refused an HPC submission (deterministic)."""
 
 
+class _ConnectionProbeFailed(RuntimeError):
+    """Internal marker: a connection probe failed; never cached."""
+
+    def __init__(self, info: dict[str, str]) -> None:
+        super().__init__(info.get("error") or "connection probe failed")
+        self.info = info
+
+
 _REMOTE_COPY_ALLOWLIST = {"WAVECAR", "CHGCAR", "LOCPOT", "CONTCAR"}
 
 
@@ -126,6 +134,14 @@ class SCNetBackend:
             self.ssh_executable,
             "-o",
             "BatchMode=yes",
+            # Do not forward the local locale to the login shell: SCNet's
+            # profile chokes/hangs on e.g. LC_ALL=C.UTF-8 (setlocale warnings
+            # followed by a blocked shell). A clean C locale keeps every
+            # remote command responsive and preserves prompt-cache behavior.
+            "-o",
+            "SendEnv=-*",
+            "-o",
+            "SetEnv=LC_ALL=C LANG=C",
             "-o",
             f"ConnectTimeout={int(self.config.connect_timeout_seconds)}",
             "-o",
@@ -149,6 +165,10 @@ class SCNetBackend:
             str(self.config.port),
             "-o",
             "BatchMode=yes",
+            "-o",
+            "SendEnv=-*",
+            "-o",
+            "SetEnv=LC_ALL=C LANG=C",
             "-o",
             "ControlMaster=auto",
             "-o",
@@ -219,10 +239,19 @@ class SCNetBackend:
 
     async def check_connection(self) -> dict[str, str]:
         """Read-only probe: hostname + availability of sbatch/squeue."""
-        return await self.capability_cache.get_or_call(
-            "connection",
-            self._check_connection_uncached,
-        )
+
+        async def probe() -> dict[str, str]:
+            info = await self._check_connection_uncached()
+            if info.get("connected") != "true":
+                # A transient SSH failure must not poison the 5-minute cache;
+                # only successful probes are memoized.
+                raise _ConnectionProbeFailed(info)
+            return info
+
+        try:
+            return await self.capability_cache.get_or_call("connection", probe)
+        except _ConnectionProbeFailed as exc:
+            return exc.info
 
     async def _check_connection_uncached(self) -> dict[str, str]:
         result = await self._run_ssh(
@@ -231,7 +260,9 @@ class SCNetBackend:
             "printf 'squeue='; command -v squeue || true; "
             "printf 'scancel='; command -v scancel || true; "
             "printf 'sacct='; command -v sacct || true",
-            timeout_seconds=self.config.connect_timeout_seconds * 2,
+            # SCNet login shells take tens of seconds to start on a cold
+            # connection; give the probe the standard per-command budget.
+            timeout_seconds=self.config.command_timeout_seconds,
         )
         if not result.ok:
             failure_info = {

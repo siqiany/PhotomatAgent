@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -163,6 +163,29 @@ class ContextEngine:
     @property
     def compaction_count(self) -> int:
         return self._compaction_count
+
+    def snapshot(self) -> dict[str, Any]:
+        """Serialize the compaction cursor for session persistence."""
+        return {
+            "compaction_state": (
+                self._compaction_state.model_dump(mode="json")
+                if self._compaction_state is not None
+                else None
+            ),
+            "compacted_message_count": self._compacted_message_count,
+            "compaction_count": self._compaction_count,
+        }
+
+    def restore(self, **snapshot: Any) -> None:
+        """Restore a previously saved compaction cursor (from ``snapshot()``)."""
+        raw_state = snapshot.get("compaction_state")
+        self._compaction_state = (
+            CompactionState.model_validate(raw_state) if raw_state else None
+        )
+        self._compacted_message_count = int(
+            snapshot.get("compacted_message_count") or 0
+        )
+        self._compaction_count = int(snapshot.get("compaction_count") or 0)
 
     async def build(
         self,

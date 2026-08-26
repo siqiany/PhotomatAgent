@@ -30,8 +30,9 @@ class EventLogger:
         sessions_dir: Path | str | None = None,
         *,
         redactor: Redactor | None = None,
+        session_id: str | None = None,
     ) -> None:
-        self.session_id = _session_id()
+        self.session_id = session_id or _session_id()
         base = Path(sessions_dir) if sessions_dir is not None else default_sessions_dir()
         self.session_dir = base / self.session_id
         self.session_dir.mkdir(parents=True, exist_ok=True)

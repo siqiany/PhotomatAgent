@@ -63,6 +63,14 @@ uv run photomatagent scientific scnet-doctor      # SSH + Slurm + VASP/NAMD/MAGU
 photomatagent-mcp-scnet --doctor                  # MCP server 的诊断模式
 ```
 
+> **SSH 连接卡死（已修复）**：SCNet 登录 shell 无法处理被 OpenSSH 默认
+> 转发的 `LC_ALL=C.UTF-8` 等 locale，会报 `setlocale` 警告后阻塞，导致每个
+> 远程命令永久挂起（表现为智能体「连不上 SCNet」）。`SCNetBackend` 现在对
+> 所有 ssh/scp 会话禁用环境转发（`SendEnv=-*`）并固定远端 `LC_ALL=C
+> LANG=C`。注意登录节点每个命令仍需约 20 秒（远端 login shell 初始化
+> 开销），因此 `.photomatagent/mcp.json` 中 `scnet` 的 tool `timeout` 需要
+> 大于单条命令耗时与命令数量乘积（建议 ≥300s）。
+
 ## 离线测试策略
 
 默认 `uv run pytest` 不触碰 SCNet：`FakeSCNetBackend`（内存文件系统 +

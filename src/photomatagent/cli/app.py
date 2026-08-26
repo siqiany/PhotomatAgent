@@ -38,6 +38,7 @@ from photomatagent.scientific.capabilities.status import (
     format_status_table,
     probe_all_capabilities,
 )
+from photomatagent.sessions.store import session_is_resumable
 from photomatagent.models.factory import api_key_status
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
 from photomatagent.runtime.budget import BudgetState
@@ -87,8 +88,13 @@ def chat(
     approval: str = typer.Option("ask", "--approval", help="ask | auto | deny"),
     max_iterations: int = typer.Option(25, "--max-iterations", min=1),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
+    resume: str | None = typer.Option(
+        None,
+        "--resume",
+        help="Resume a historical session: a session id, directory, or 'latest'.",
+    ),
 ) -> None:
-    """Start an interactive or one-goal scientific agent session."""
+    """Start an interactive or one-goal scientific agent session (optionally resuming a historical session)."""
     _launch_chat(
         goal=goal,
         provider=provider,
@@ -97,6 +103,7 @@ def chat(
         approval=approval,
         max_iterations=max_iterations,
         log_events=log_events,
+        resume=resume,
     )
 
 
@@ -109,6 +116,7 @@ def _launch_chat(
     approval: str,
     max_iterations: int,
     log_events: bool,
+    resume: str | None = None,
 ) -> None:
     if approval not in {"ask", "auto", "deny"}:
         raise typer.BadParameter("--approval must be ask | auto | deny")
@@ -132,10 +140,11 @@ def _launch_chat(
                 model=config.model,
                 workspace_root=workspace,
                 approval=approval,  # type: ignore[arg-type]
-                max_iterations=max_iterations,
-                log_events=log_events,
-                goal=goal,
-            )
+            max_iterations=max_iterations,
+            log_events=log_events,
+            goal=goal,
+            resume=resume,
+        )
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -499,11 +508,13 @@ app.add_typer(sessions_app, name="sessions")
 @sessions_app.command("list")
 def sessions_list() -> None:
     sessions = list_sessions()
-    table = Table("Session ID", "Model", "Iterations", "Tools", "Duration", "Stop")
+    table = Table("Session ID", "Resumable", "Model", "Iterations", "Tools", "Duration", "Stop")
     for session in sessions:
         stats = read_session_stats(session)
+        resumable = "yes" if session_is_resumable(session) else "—"
         table.add_row(
             session.name,
+            resumable,
             f"{stats.provider}/{stats.model}",
             str(stats.iterations),
             str(stats.tool_calls),
@@ -618,6 +629,28 @@ def sessions_stats(target: str = typer.Argument("latest")) -> None:
     ]
     for label, value in rows:
         console.print(f"- {label}: {value}")
+
+
+@sessions_app.command("resume")
+def sessions_resume(
+    target: str = typer.Argument(
+        "latest", help="Session id, directory, or 'latest'."
+    ),
+    goal: str | None = typer.Option(None, "--goal", "-g"),
+    approval: str = typer.Option("ask", "--approval", help="ask | auto | deny"),
+    max_iterations: int = typer.Option(25, "--max-iterations", min=1),
+) -> None:
+    """Load a historical session and continue asking questions on top of it."""
+    _launch_chat(
+        goal=goal,
+        provider=None,
+        model=None,
+        workspace=Path.cwd(),
+        approval=approval,
+        max_iterations=max_iterations,
+        log_events=True,
+        resume=target,
+    )
 
 
 @sessions_app.command("context")
