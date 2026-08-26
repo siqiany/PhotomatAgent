@@ -19,4 +19,5 @@ vasp_sio2/
 data/photoelectric_vae/training/raw/
 cs2hgbi6/
 gel_electrolyte_dft/
-drylab_vasp/prep/
+drylab_vasp/
+reports/
