@@ -838,6 +838,63 @@ def _format_delta(value: float | int | None) -> str:
 
 
 @app.command()
+def loop(
+    goal: str | None = typer.Option(None, "--goal", "-g"),
+    target_json: str | None = typer.Option(
+        None,
+        "--target-json",
+        help="Explicit JSON TargetSpec (mode A); overrides --demo.",
+    ),
+    demo: bool = typer.Option(
+        False,
+        "--demo",
+        help="Use the built-in 8-14 um LWIR photodetector demo target.",
+    ),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Override .env preference: fake | openai | anthropic",
+    ),
+    model: str | None = typer.Option(None, "--model"),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+    approval: str = typer.Option(
+        "auto", "--approval", help="ask | auto | deny"
+    ),
+    max_rounds: int = typer.Option(6, "--max-rounds", min=1),
+    patience: int = typer.Option(3, "--patience", min=1),
+    min_confidence: float = typer.Option(
+        0.6, "--min-confidence", min=0.0, max=1.0
+    ),
+    log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
+) -> None:
+    """Run the Evidence-Guided Scientific Feedback Loop.
+
+    The scientific outer loop drives the normal AgentRuntime (Maker) toward a
+    machine-verifiable TargetSpec: deterministic evaluation, structured
+    feedback, convergence policy and stagnation detection decide when the
+    science is done -- never the model's own "final answer".
+    """
+    if approval not in {"ask", "auto", "deny"}:
+        raise typer.BadParameter("--approval must be ask | auto | deny")
+    from photomatagent.cli.loop import run_scientific_loop_cli
+
+    exit_code = run_scientific_loop_cli(
+        goal=goal,
+        target_json=target_json,
+        demo=demo,
+        workspace=workspace,
+        approval=approval,  # type: ignore[arg-type]
+        provider=provider,
+        model=model,
+        max_rounds=max_rounds,
+        patience=patience,
+        min_confidence=min_confidence,
+        log_events=log_events,
+    )
+    raise typer.Exit(code=exit_code)
+
+
+@app.command()
 def doctor(
     provider: str | None = typer.Option(
         None, "--provider", help="Override .env preference: fake | openai | anthropic"

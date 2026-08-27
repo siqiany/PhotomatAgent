@@ -317,6 +317,69 @@ class LoopFailed(RuntimeEvent):
     error_type: str | None = None
 
 
+class ScientificLoopStarted(RuntimeEvent):
+    """Outer scientific feedback loop began a new controller run."""
+
+    kind: Literal["scientific_loop_started"] = "scientific_loop_started"
+    goal: str
+    max_rounds: int = 0
+    min_confidence: float = 0.0
+
+
+class CandidateProposed(RuntimeEvent):
+    kind: Literal["candidate_proposed"] = "candidate_proposed"
+    round: int
+    candidate_id: str
+    label: str = ""
+    fingerprint: str = ""
+    generation_method: str = ""
+
+
+class CandidateEvaluated(RuntimeEvent):
+    kind: Literal["candidate_evaluated"] = "candidate_evaluated"
+    round: int
+    candidate_id: str
+    score: float = 0.0
+    verdict: str = "INCONCLUSIVE"
+    violations: list[str] = Field(default_factory=list)
+    evidence_gaps: list[str] = Field(default_factory=list)
+
+
+class ScientificFeedbackGenerated(RuntimeEvent):
+    kind: Literal["scientific_feedback_generated"] = "scientific_feedback_generated"
+    round: int
+    candidate_id: str
+    decision: str = "CONTINUE"
+    summary: str = ""
+
+
+class ScientificLoopDecisionMade(RuntimeEvent):
+    kind: Literal["scientific_loop_decision_made"] = "scientific_loop_decision_made"
+    round: int
+    action: str
+    reason: str = ""
+    best_candidate_id: str | None = None
+    best_score: float = 0.0
+
+
+class ScientificLoopCompleted(RuntimeEvent):
+    kind: Literal["scientific_loop_completed"] = "scientific_loop_completed"
+    status: str
+    rounds: int
+    candidate_count: int
+    best_candidate_id: str | None = None
+    best_score: float = 0.0
+    termination_reason: str = ""
+
+
+class ScientificLoopStalled(RuntimeEvent):
+    kind: Literal["scientific_loop_stalled"] = "scientific_loop_stalled"
+    rounds: int
+    best_score: float = 0.0
+    best_candidate_id: str | None = None
+    no_progress_rounds: int = 0
+
+
 AnyRuntimeEvent = Annotated[
     Union[
         LoopStarted,
@@ -346,6 +409,13 @@ AnyRuntimeEvent = Annotated[
         BudgetUpdated,
         LoopCompleted,
         LoopFailed,
+        ScientificLoopStarted,
+        CandidateProposed,
+        CandidateEvaluated,
+        ScientificFeedbackGenerated,
+        ScientificLoopDecisionMade,
+        ScientificLoopCompleted,
+        ScientificLoopStalled,
     ],
     Field(discriminator="kind"),
 ]

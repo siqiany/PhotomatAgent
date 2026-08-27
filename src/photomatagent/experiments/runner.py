@@ -15,12 +15,13 @@ from photomatagent.experiments.models import (
     ExperimentSummary,
     ExperimentTaskRun,
     ExperimentTask,
+    ScientificLoopVariant,
 )
 from photomatagent.experiments.storage import new_experiment_id
 from photomatagent.logging.event_logger import EventLogger, default_sessions_dir
 from photomatagent.models.factory import create_provider
 from photomatagent.models.types import AssistantMessage
-from photomatagent.observability.analyzer import SessionSummary, analyze_trace
+from photomatagent.observability.analyzer import analyze_trace
 from photomatagent.observability.trace import load_trace
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context import (
@@ -83,14 +84,22 @@ async def run_experiment(
             session_id=logger.session_id,
         )
         runtime_error: str | None = None
-        try:
-            async for _ in runtime.run(task.prompt):
-                pass
-        except Exception as exc:
-            runtime_error = f"{type(exc).__name__}: {exc}"
+        if config.loop is not None:
+            answer, runtime_error = await _run_loop_task(
+                runtime=runtime,
+                logger=logger,
+                loop=config.loop,
+                prompt=task.prompt,
+            )
+        else:
+            try:
+                async for _ in runtime.run(task.prompt):
+                    pass
+            except Exception as exc:
+                runtime_error = f"{type(exc).__name__}: {exc}"
+            answer = _final_answer(runtime)
         trace = load_trace(logger.session_dir)
         session_summary = analyze_trace(trace)
-        answer = _final_answer(runtime)
         evaluation = evaluate_expectations(
             task.expect, answer=answer, summary=session_summary
         )
@@ -234,6 +243,68 @@ def summarize_experiment(
         compaction_count=sum(summary.compaction_count for summary in summaries),
         compaction_failures=sum(summary.compaction_failures for summary in summaries),
     )
+
+
+async def _run_loop_task(
+    *,
+    runtime: AgentRuntime,
+    logger: EventLogger,
+    loop: ScientificLoopVariant,
+    prompt: str,
+) -> tuple[str, str | None]:
+    """Run one task through the Evidence-Guided Scientific Feedback Loop.
+
+    The loop summary text becomes the task's ``answer`` so the standard
+    expectation checks (answer_contains, tools_used, ...) keep working; the
+    full event trajectory (inner runtime + outer loop) lands in the same
+    JSONL session.
+    """
+    from photomatagent.scientific.loop.controller import (
+        ScientificLoopConfig,
+        ScientificLoopController,
+    )
+
+    error: str | None = None
+    controller = ScientificLoopController(
+        target=loop.target,
+        runtime=runtime,
+        config=ScientificLoopConfig(
+            max_rounds=loop.max_rounds,
+            max_candidates=loop.max_candidates,
+            patience=loop.patience,
+            min_confidence=loop.min_confidence,
+        ),
+        event_sinks=[logger.log],
+        session_id=logger.session_id,
+    )
+    try:
+        async for _ in controller.run(goal=prompt):
+            pass
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    return _loop_summary_text(controller.summary), error
+
+
+def _loop_summary_text(summary) -> str:
+    if summary is None:
+        return "Scientific loop completed: INCONCLUSIVE (no summary)"
+    lines = [
+        f"Scientific loop completed: {summary.status}",
+        f"Rounds: {summary.rounds}",
+        f"Candidates evaluated: {summary.candidate_count}",
+        f"Best candidate: {summary.best_candidate_id or '-'}",
+        f"Score: {summary.best_score:.3f}",
+    ]
+    if summary.unresolved_violations:
+        lines.append(
+            "Unresolved: "
+            + "; ".join(v.short() for v in summary.unresolved_violations)
+        )
+    if summary.unresolved_evidence_gaps:
+        lines.append(
+            "Evidence gaps: " + ", ".join(summary.unresolved_evidence_gaps)
+        )
+    return "\n".join(lines)
 
 
 def _final_answer(runtime: AgentRuntime) -> str:

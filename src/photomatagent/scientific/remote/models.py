@@ -70,9 +70,9 @@ class ResourcePolicy(BaseModel):
     """
 
     allow_hpc_submit: bool = False
-    max_nodes: int = 1
+    max_nodes: int = 32
     max_tasks_per_node: int = 64
-    max_walltime_minutes: int = 720
+    max_walltime_minutes: int = 36000
     allowed_partitions: list[str] = Field(default_factory=list)
 
     @classmethod

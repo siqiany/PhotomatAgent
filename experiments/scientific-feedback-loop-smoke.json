@@ -1,0 +1,61 @@
+{
+  "name": "scientific-feedback-loop-smoke",
+  "variant": {
+    "provider": "fake",
+    "model": "fake",
+    "max_iterations": 12,
+    "approval": "auto",
+    "label": "v0.5-evidence-guided-feedback-loop-smoke"
+  },
+  "loop": {
+    "max_rounds": 4,
+    "max_candidates": 8,
+    "patience": 2,
+    "min_confidence": 0.6,
+    "target": {
+      "goal": "Design an LWIR photodetector material: spectral range 8-14 um, band gap <= 0.155 eV, responsivity >= 1 A/W at 77 K.",
+      "constraints": [
+        {
+          "property": "band_gap",
+          "operator": "le",
+          "value": 0.155,
+          "unit": "eV",
+          "severity": "HARD",
+          "description": "material band gap must be small enough for 8-14 um detection"
+        },
+        {
+          "property": "responsivity",
+          "operator": "ge",
+          "value": 1.0,
+          "unit": "A/W",
+          "severity": "HARD",
+          "description": "device responsivity must reach 1 A/W in band"
+        }
+      ],
+      "objectives": [
+        "spectral compatibility with the 8-14 um atmospheric window",
+        "operable at 77 K (dark-current suppression)"
+      ],
+      "operating_conditions": {
+        "spectral_range_um": [8.0, 14.0],
+        "temperature_k": 77
+      },
+      "metadata": {
+        "demo": "photodetector vertical slice"
+      }
+    }
+  },
+  "tasks": [
+    {
+      "id": "lwir-loop-terminates",
+      "prompt": "investigate material InAs for an LWIR photodetector",
+      "expect": {
+        "answer_contains": ["Scientific loop completed", "band_gap"],
+        "tools_used": ["mock.run_calculation"],
+        "tools_not_used": ["bash"],
+        "max_tool_calls": 12,
+        "max_iterations": 12
+      }
+    }
+  ]
+}

@@ -7,6 +7,19 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from photomatagent.observability.analyzer import SessionSummary
+from photomatagent.scientific.loop.target import TargetSpec
+
+
+class ScientificLoopVariant(BaseModel):
+    """Drives each task through the Evidence-Guided Scientific Feedback Loop."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: TargetSpec
+    max_rounds: int = Field(default=5, ge=1)
+    max_candidates: int = Field(default=10, ge=1)
+    patience: int = Field(default=2, ge=1)
+    min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
 
 
 class Expectations(BaseModel):
@@ -57,6 +70,7 @@ class ExperimentConfig(BaseModel):
     name: str = Field(min_length=1)
     tasks: list[ExperimentTask] = Field(min_length=1)
     variant: ExperimentVariant = Field(default_factory=ExperimentVariant)
+    loop: ScientificLoopVariant | None = None
 
 
 class ConfigurationSnapshot(BaseModel):

@@ -13,6 +13,10 @@ It is designed to run as a CLI application. The runtime owns context constructio
 - Workspace-scoped file and shell tools with approval policies and sensitive-path blocking.
 - Durable conversation history plus a bounded working context with tool-result pruning and optional structured compaction.
 - Structured `ScientificState` for claims, evidence, calculations, tasks, questions, and contradictions.
+- **Evidence-Guided Scientific Feedback Loop**: a machine-verifiable outer loop
+  (`TargetSpec` → candidates → deterministic evaluation → structured feedback →
+  convergence policy → stagnation detection) that decides scientific success
+  from evidence and constraints — never from the model's own "final answer".
 - Capability packs for materials databases, literature retrieval, crystal structures, electronic structure, infrared constraints, quantum dots, detector metrics, and more.
 - Optional VASP, Hefei-NAMD, MAGUS, Slurm/SCNet, and MCP integrations.
 - JSONL execution traces, replay, session analysis, and deterministic experiment runs.
@@ -243,6 +247,70 @@ state are restored into the live runtime, the logger switches to that session's
 trace, and you keep asking follow-up questions without restarting.
 
 Experiment JSON files define independent tasks and deterministic expectations. The runner creates a fresh runtime and trace for each task, then stores experiment results under `.photomatagent/experiments/`.
+
+## Evidence-Guided Scientific Feedback Loop
+
+The main `AgentRuntime` remains the **inner execution loop** (the Maker). A
+separate **scientific outer loop** (`src/photomatagent/scientific/loop/`)
+wraps it so that "the model stopped calling tools" no longer counts as
+scientific success. Success is decided by a deterministic Checker, not by the
+Maker.
+
+```text
+Scientific Goal → TargetSpec → Maker (AgentRuntime + scientific tools)
+  → CandidateState → ScientificEvaluator (Checker)
+  → EvaluationReport → ScientificLoopPolicy
+       ├─ PASS + confidence  → SUCCESS
+       ├─ violation / gap    → FeedbackSignal → next round instruction
+       ├─ stagnation         → STALLED
+       └─ budget exceeded    → BUDGET_EXHAUSTED
+```
+
+Design invariants:
+
+- `TargetSpec` expresses hard/soft constraints checked **deterministically**
+  (`evaluate_constraint`), never by the LLM: "is 0.21 eV ≤ 0.155 eV" is a
+  program decision.
+- The Checker is separate from the Maker: the model never grades its own
+  candidate (Invariant C). `Generation.vae_formula` output stays
+  `UNVALIDATED_GENERATED_STRUCTURE` until it passes the evaluator.
+- Missing evidence is `UNKNOWN`, never `PASS` (Invariant B).
+- Identical candidates share a deterministic fingerprint; repeats never count
+  as progress (Invariant D).
+- Feedback is structured (`FeedbackSignal`): what failed, why, missing
+  evidence, next priorities, and what must not be repeated. It enters the
+  next maker turn as an explicit research instruction appended to the
+  conversation (the static system prompt and cache-friendly layout are
+  untouched).
+- Expensive tools still run only through the runtime's permission /
+  approval / HPC gating (Invariant E); the outer loop never calls a backend
+  directly.
+- The full trajectory is reconstructible from the JSONL event stream via new
+  event kinds (`candidate_proposed`, `candidate_evaluated`,
+  `scientific_feedback_generated`, `scientific_loop_decision_made`, ...).
+
+Run a verifiable loop offline (fake provider, built-in 8–14 µm LWIR demo
+target):
+
+```bash
+uv run photomatagent loop --demo --max-rounds 4 --provider fake --approval auto
+```
+
+Or supply an explicit `TargetSpec` (mode A):
+
+```bash
+uv run photomatagent loop \
+  --goal "Design an LWIR detector material..." \
+  --target-json '{"goal":"...","constraints":[{"property":"band_gap","operator":"le","value":0.155,"unit":"eV","severity":"HARD"}]}' \
+  --max-rounds 6
+```
+
+Loop experiments run through the normal experiment runner and support the
+fake provider for CI:
+
+```bash
+uv run photomatagent experiments run experiments/scientific-feedback-loop-smoke.json
+```
 
 ## Development
 
