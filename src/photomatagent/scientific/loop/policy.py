@@ -4,6 +4,12 @@
 max iterations, provider completion). This policy decides whether the science
 has converged -- SUCCESS, CONTINUE, ESCALATE, STALLED, INCONCLUSIVE or
 BUDGET_EXHAUSTED -- from evidence, constraints, confidence and budgets.
+
+The optional LLM Scientific Judge is strictly advisory here: it can only hold
+back SUCCESS when it raises concerns about an otherwise deterministic pass
+(``judge_min_quality`` / ``require_judge``). It can never turn a deterministic
+FAIL or UNKNOWN into a PASS, and it never rescinds a hard-constraint
+violation.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from pydantic import BaseModel, Field
 from photomatagent.scientific.loop.candidate import CandidateState
 from photomatagent.scientific.loop.evaluation import EvaluationReport
 from photomatagent.scientific.loop.feedback import FeedbackSignal
+from photomatagent.scientific.loop.judge import JudgeReport
 from photomatagent.scientific.loop.stagnation import StagnationDetector
 from photomatagent.scientific.loop.target import (
     ConstraintViolation,
@@ -90,10 +97,24 @@ class ScientificLoopSummary(BaseModel):
     unresolved_violations: list[ConstraintViolation] = Field(default_factory=list)
     unresolved_evidence_gaps: list[str] = Field(default_factory=list)
     termination_reason: str = ""
+    judge_report: JudgeReport | None = None
 
 
 class ScientificLoopPolicy:
-    """Deterministic scientific convergence policy."""
+    """Deterministic scientific convergence policy.
+
+    ``judge_min_quality`` and ``require_judge`` only gate the SUCCESS path:
+    they never create a SUCCESS and never change a FAIL/UNKNOWN verdict.
+    """
+
+    def __init__(
+        self,
+        *,
+        judge_min_quality: float = 0.6,
+        require_judge: bool = False,
+    ) -> None:
+        self.judge_min_quality = judge_min_quality
+        self.require_judge = require_judge
 
     def decide(
         self,
@@ -106,6 +127,7 @@ class ScientificLoopPolicy:
         min_confidence: float,
         escalate_requested: bool = False,
         inconclusive_reason: str | None = None,
+        judge: JudgeReport | None = None,
     ) -> ScientificLoopDecision:
         if state.round > max_rounds or len(state.candidates) > max_candidates:
             return ScientificLoopDecision(
@@ -131,33 +153,62 @@ class ScientificLoopPolicy:
                 reason="no candidate could be constructed from structured state",
                 best_candidate_id=state.best_candidate_id,
             )
-        if (
+        deterministic_ok = (
             evaluation.verdict == "PASS"
             and not evaluation.critical_evidence_gaps
             and evaluation.confidence >= min_confidence
-        ):
+        )
+        if not deterministic_ok:
+            # The judge is advisory; regardless of what it says, deterministic
+            # FAIL/UNKNOWN/low confidence can never become SUCCESS.
+            if escalate_requested:
+                return ScientificLoopDecision(
+                    action="ESCALATE",
+                    reason="key constraints need higher-fidelity evidence",
+                    best_candidate_id=state.best_candidate_id,
+                )
+            if inconclusive_reason:
+                return ScientificLoopDecision(
+                    action="INCONCLUSIVE",
+                    reason=inconclusive_reason,
+                    best_candidate_id=state.best_candidate_id,
+                )
+            return ScientificLoopDecision(
+                action="CONTINUE",
+                reason=(
+                    f"verdict={evaluation.verdict}; resolvable violations or "
+                    "evidence gaps remain"
+                ),
+                best_candidate_id=state.best_candidate_id,
+            )
+        judge_ok = self._judge_ok(judge)
+        if judge_ok:
             return ScientificLoopDecision(
                 action="SUCCESS",
                 reason=(
                     f"all hard constraints satisfied (score {evaluation.score:.3f}, "
                     f"confidence {evaluation.confidence:.3f} >= {min_confidence})"
-                ),
-                best_candidate_id=state.best_candidate_id,
-            )
-        if escalate_requested:
-            return ScientificLoopDecision(
-                action="ESCALATE",
-                reason="key constraints need higher-fidelity evidence",
-                best_candidate_id=state.best_candidate_id,
-            )
-        if inconclusive_reason:
-            return ScientificLoopDecision(
-                action="INCONCLUSIVE",
-                reason=inconclusive_reason,
+                )
+                + self._judge_reason_suffix(judge),
                 best_candidate_id=state.best_candidate_id,
             )
         return ScientificLoopDecision(
             action="CONTINUE",
-            reason=f"verdict={evaluation.verdict}; resolvable violations or evidence gaps remain",
+            reason=(
+                "deterministic constraints pass, but the scientific judge "
+                f"raised concerns: {judge.summary_line() if judge else 'judge required but unavailable'}"
+            ),
             best_candidate_id=state.best_candidate_id,
         )
+
+    def _judge_ok(self, judge: JudgeReport | None) -> bool:
+        if judge is None or judge.status == "UNAVAILABLE":
+            # Missing or failed judge: SUCCESS is blocked only when a judge is
+            # strictly required; otherwise the judge stays advisory.
+            return not self.require_judge
+        return judge.scientific_quality >= self.judge_min_quality
+
+    def _judge_reason_suffix(self, judge: JudgeReport | None) -> str:
+        if judge is None:
+            return ""
+        return f"; judge quality {judge.scientific_quality:.2f}"

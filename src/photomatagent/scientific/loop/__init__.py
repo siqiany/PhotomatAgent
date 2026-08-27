@@ -33,6 +33,11 @@ from photomatagent.scientific.loop.feedback import (
     build_feedback,
     format_feedback_for_model,
 )
+from photomatagent.scientific.loop.judge import (
+    JudgeIssue,
+    JudgeReport,
+    ScientificJudge,
+)
 from photomatagent.scientific.loop.policy import (
     ScientificLoopDecision,
     ScientificLoopPolicy,
@@ -63,9 +68,12 @@ __all__ = [
     "ConstraintViolation",
     "EvaluationReport",
     "FeedbackSignal",
+    "JudgeIssue",
+    "JudgeReport",
     "PropertyEvaluation",
     "RecommendedAction",
     "ScientificEvaluator",
+    "ScientificJudge",
     "ScientificLoopConfig",
     "ScientificLoopController",
     "ScientificLoopDecision",

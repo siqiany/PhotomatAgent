@@ -2,6 +2,11 @@
 
 Feedback is never "try again". It states: what failed, why, what evidence is
 missing, what to do next and in what order, and what must not be repeated.
+
+An optional advisory ``JudgeReport`` (LLM Scientific Judge) is embedded into
+the signal: its significant concerns become validation actions and priority
+lines. Judge concerns can keep the loop investigating, but they never remove
+deterministic violations or gaps, and they never convert a PASS into a FAIL.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from photomatagent.scientific.loop.candidate import (
     candidate_fingerprint,
 )
 from photomatagent.scientific.loop.evaluation import EvaluationReport
+from photomatagent.scientific.loop.judge import JudgeIssue, JudgeReport
 from photomatagent.scientific.loop.target import (
     ConstraintSpec,
     ConstraintViolation,
@@ -49,6 +55,7 @@ class FeedbackSignal(BaseModel):
     recommended_actions: list[RecommendedAction] = Field(default_factory=list)
     prohibited_repeats: list[str] = Field(default_factory=list)
     summary: str = ""
+    judge: JudgeReport | None = None
 
 
 def build_feedback(
@@ -56,13 +63,21 @@ def build_feedback(
     candidate: CandidateState,
     evaluation: EvaluationReport,
     history: list[CandidateState],
+    judge: JudgeReport | None = None,
 ) -> FeedbackSignal | None:
     """Build the next-round feedback for one evaluated candidate.
 
-    Returns ``None`` when the candidate already PASSes: a passing candidate
-    needs no feedback -- the loop policy decides SUCCESS instead.
+    Returns ``None`` when there is nothing actionable: a deterministic PASS
+    with no significant judge concerns needs no feedback -- the loop policy
+    decides SUCCESS instead.
+
+    The judge NEVER overrides hard constraints: deterministic violations and
+    gaps are always kept; judge concerns are appended as advisory actions.
     """
-    if evaluation.verdict == "PASS":
+    judge_concerns = (
+        list(judge.significant_issues) if judge is not None and judge.available else []
+    )
+    if evaluation.verdict == "PASS" and not judge_concerns:
         return None
 
     prohibited: list[str] = []
@@ -94,6 +109,9 @@ def build_feedback(
         decision = "REJECT" if duplicate else "REVISE"
     elif evaluation.verdict == "INCONCLUSIVE" and decision == "REVISE":
         decision = "CONTINUE"
+    elif evaluation.verdict == "PASS" and judge_concerns:
+        # Deterministic pass but the judge wants more certainty: keep going.
+        decision = "CONTINUE"
 
     actions = _recommended_actions(
         target=target,
@@ -103,6 +121,7 @@ def build_feedback(
         soft_violations=soft_violations,
         low_fidelity_critical=low_fidelity_critical,
         duplicate=duplicate,
+        judge_concerns=judge_concerns,
     )
     summary = _summarize(
         target=target,
@@ -111,6 +130,7 @@ def build_feedback(
         duplicate=duplicate,
         prohibited=prohibited,
         actions=actions,
+        judge=judge,
     )
     return FeedbackSignal(
         candidate_id=candidate.candidate_id,
@@ -121,6 +141,7 @@ def build_feedback(
         recommended_actions=actions,
         prohibited_repeats=prohibited,
         summary=summary,
+        judge=judge,
     )
 
 
@@ -147,7 +168,10 @@ def _recommended_actions(
     soft_violations: list[ConstraintViolation],
     low_fidelity_critical: bool,
     duplicate: bool,
+    judge_concerns: list[JudgeIssue] | None = None,
 ) -> list[RecommendedAction]:
+    if judge_concerns is None:
+        judge_concerns = []
     actions: list[RecommendedAction] = []
     priority = 1
 
@@ -228,6 +252,27 @@ def _recommended_actions(
         )
         priority += 1
 
+    # Advisory judge concerns: always after the deterministic actions, so they
+    # can never crowd out hard-constraint work.
+    for issue in judge_concerns:
+        if issue.severity == "LOW":
+            continue
+        if issue.category == "evidence_gap":
+            action_type: ActionType = "CALCULATE"
+        elif issue.category == "evidence_quality":
+            action_type = "ESCALATE_FIDELITY"
+        else:
+            action_type = "VALIDATE"
+        actions.append(
+            RecommendedAction(
+                action_type=action_type,
+                description=f"judge concern ({issue.category}): {issue.description}",
+                target_property=issue.property,
+                priority=priority,
+            )
+        )
+        priority += 1
+
     if not actions:
         actions.append(
             RecommendedAction(
@@ -247,6 +292,7 @@ def _summarize(
     duplicate: bool,
     prohibited: list[str],
     actions: list[RecommendedAction],
+    judge: JudgeReport | None = None,
 ) -> str:
     lines: list[str] = [
         f"Candidate {candidate.label or candidate.candidate_id} does not satisfy "
@@ -262,6 +308,19 @@ def _summarize(
         lines.append("This candidate repeats an already-proposed candidate.")
     if prohibited:
         lines.append("Do not repeat: " + ", ".join(prohibited))
+    if judge is not None and judge.available:
+        concerns = judge.significant_issues
+        if concerns:
+            lines.append(
+                "Judge concerns: "
+                + "; ".join(
+                    f"[{issue.severity}] {issue.description}" for issue in concerns
+                )
+            )
+        if judge.recommendations:
+            lines.append(
+                "Judge recommendations: " + "; ".join(judge.recommendations)
+            )
     if actions:
         lines.append(
             "Priority: " + "; ".join(f"{a.priority}. {a.description}" for a in actions)
@@ -301,6 +360,11 @@ def format_feedback_for_model(signal: FeedbackSignal, *, round_number: int) -> s
     if signal.contradictions:
         lines.append("Contradictions:")
         lines += [f"- {item}" for item in signal.contradictions]
+    if signal.judge is not None and signal.judge.available:
+        concerns = signal.judge.significant_issues
+        if concerns:
+            lines.append("Judge concerns (advisory):")
+            lines += [f"- {issue.description}" for issue in concerns]
     if signal.prohibited_repeats:
         lines.append("Do not repeat:")
         lines += [f"- {item}" for item in signal.prohibited_repeats]

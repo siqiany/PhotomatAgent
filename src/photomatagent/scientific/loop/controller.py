@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from photomatagent.runtime.events import (
     CandidateEvaluated,
+    CandidateJudged,
     CandidateProposed,
     RuntimeEvent,
     ScientificFeedbackGenerated,
@@ -50,6 +51,7 @@ from photomatagent.scientific.loop.feedback import (
     build_feedback,
     format_feedback_for_model,
 )
+from photomatagent.scientific.loop.judge import JudgeReport, ScientificJudge
 from photomatagent.scientific.loop.policy import (
     ScientificLoopDecision,
     ScientificLoopPolicy,
@@ -69,9 +71,13 @@ class ScientificLoopConfig(BaseModel):
     patience: int = Field(default=3, ge=1)
     epsilon: float = Field(default=1e-3, ge=0.0)
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    judge_min_quality: float = Field(default=0.6, ge=0.0, le=1.0)
+    require_judge: bool = Field(default=False)
 
 
-def format_loop_state_snapshot(state: ScientificLoopState) -> str:
+def format_loop_state_snapshot(
+    state: ScientificLoopState, judge: JudgeReport | None = None
+) -> str:
     """Compact dynamic loop context rendered as a trailing instruction.
 
     Kept bounded: best candidate, current violations, gaps, previous
@@ -89,6 +95,13 @@ def format_loop_state_snapshot(state: ScientificLoopState) -> str:
         if latest.critical_evidence_gaps:
             lines.append("Evidence gaps:")
             lines += [f"- {gap}" for gap in latest.critical_evidence_gaps]
+    if judge is not None and judge.available and judge.significant_issues:
+        lines.append("Judge concerns (advisory):")
+        lines += [
+            f"- [{'HIGH' if issue.severity == 'HIGH' else 'MEDIUM'}] "
+            f"{issue.description}"
+            for issue in judge.significant_issues
+        ]
     if state.feedback_history:
         last = state.feedback_history[-1]
         if last.prohibited_repeats:
@@ -117,24 +130,30 @@ class ScientificLoopController:
         stagnation: StagnationDetector | None = None,
         config: ScientificLoopConfig | None = None,
         candidate_extractor: CandidateExtractor | None = None,
+        judge: ScientificJudge | None = None,
         event_sinks: list[EventSink] | None = None,
         session_id: str | None = None,
     ) -> None:
         self.target = target
         self.runtime = runtime
         self.evaluator = evaluator or ScientificEvaluator(target)
-        self.policy = policy or ScientificLoopPolicy()
         self.config = config or ScientificLoopConfig()
+        self.policy = policy or ScientificLoopPolicy(
+            judge_min_quality=self.config.judge_min_quality,
+            require_judge=self.config.require_judge,
+        )
         self.stagnation = stagnation or StagnationDetector(
             patience=self.config.patience, epsilon=self.config.epsilon
         )
         self.candidate_extractor = candidate_extractor or extract_candidate_from_state
+        self.judge = judge
         self.event_sinks = list(event_sinks or [])
         self.session_id = session_id
         self.run_id: str | None = None
         self.state = ScientificLoopState(target=target)
         self.summary: ScientificLoopSummary | None = None
         self._note: str | None = None
+        self._last_judge_report: JudgeReport | None = None
 
     # ------------------------------------------------------------------ #
     # public API
@@ -219,12 +238,34 @@ class ScientificLoopController:
                 )
             )
 
+            judge_report = await self._assess_judge(
+                scientific=scientific,
+                candidate=candidate,
+                evaluation=evaluation,
+            )
+            self._last_judge_report = judge_report if candidate is not None else None
+            if judge_report is not None:
+                yield await self._emit(
+                    CandidateJudged(
+                        round=self.state.round,
+                        candidate_id=candidate.candidate_id if candidate else "",
+                        status=judge_report.status,
+                        quality=judge_report.scientific_quality,
+                        issues=[
+                            f"[{issue.severity}] {issue.category}: {issue.description}"
+                            for issue in judge_report.issues
+                        ],
+                        summary=judge_report.rationale[:200],
+                    )
+                )
+
             feedback = (
                 build_feedback(
                     self.target,
                     candidate,
                     evaluation,
                     self.state.candidates,
+                    judge=judge_report,
                 )
                 if candidate is not None
                 else None
@@ -247,6 +288,7 @@ class ScientificLoopController:
                     feedback is not None and feedback.decision == "ESCALATE"
                 ),
                 inconclusive_reason=inconclusive_reason,
+                judge=self._last_judge_report,
             )
             yield await self._emit(
                 ScientificLoopDecisionMade(
@@ -314,8 +356,40 @@ class ScientificLoopController:
             # PASS verdict without sufficient confidence produces no feedback
             # by design (section 10); the loop-state snapshot still guides the
             # next maker turn.
-            parts.append(format_loop_state_snapshot(self.state))
+            parts.append(format_loop_state_snapshot(self.state, self._last_judge_report))
         return "\n\n".join(parts)
+
+    async def _assess_judge(
+        self,
+        *,
+        scientific: ScientificState,
+        candidate: CandidateState | None,
+        evaluation: EvaluationReport,
+    ) -> JudgeReport | None:
+        """Run the advisory LLM judge, isolated and read-only.
+
+        The judge can never overturn a deterministic verdict: failures here
+        degrade to an UNAVAILABLE report, and judge availability never
+        changes a FAIL/UNKNOWN. Returns None when no judge is configured or
+        there is no candidate to judge.
+        """
+        if self.judge is None or candidate is None:
+            return None
+        try:
+            return await self.judge.assess(
+                target=self.target,
+                candidate=candidate,
+                scientific=scientific,
+                evaluation=evaluation,
+                round_number=self.state.round,
+            )
+        except Exception as exc:
+            return JudgeReport(
+                status="UNAVAILABLE",
+                provider=getattr(self.judge.model, "provider", "unknown"),
+                model=getattr(self.judge.model, "model", "unknown"),
+                error=f"judge failure must not break the loop: {type(exc).__name__}: {exc}",
+            )
 
     def _extract(self, scientific: ScientificState, round_number: int) -> CandidateState | None:
         try:
@@ -344,6 +418,7 @@ class ScientificLoopController:
                 else []
             ),
             termination_reason=decision.reason,
+            judge_report=self._last_judge_report,
         )
 
     async def _emit(self, event: RuntimeEvent) -> RuntimeEvent:

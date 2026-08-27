@@ -282,11 +282,17 @@ Design invariants:
   next maker turn as an explicit research instruction appended to the
   conversation (the static system prompt and cache-friendly layout are
   untouched).
+- An optional **isolated, structured, read-only LLM Scientific Judge**
+  (`--judge-provider`) reviews each candidate **after** the deterministic
+  evaluator. Its `JudgeReport` is embedded into the feedback signal and can
+  only *hold back* SUCCESS (`--judge-min-quality`, `--require-judge`): it can
+  never turn a deterministic FAIL/UNKNOWN into a PASS, never rescinds a hard
+  constraint, and never calls tools (its request carries `tools=[]`).
 - Expensive tools still run only through the runtime's permission /
   approval / HPC gating (Invariant E); the outer loop never calls a backend
   directly.
 - The full trajectory is reconstructible from the JSONL event stream via new
-  event kinds (`candidate_proposed`, `candidate_evaluated`,
+  event kinds (`candidate_proposed`, `candidate_evaluated`, `candidate_judged`,
   `scientific_feedback_generated`, `scientific_loop_decision_made`, ...).
 
 Run a verifiable loop offline (fake provider, built-in 8–14 µm LWIR demo
@@ -294,6 +300,13 @@ target):
 
 ```bash
 uv run photomatagent loop --demo --max-rounds 4 --provider fake --approval auto
+```
+
+With the advisory LLM judge enabled (real provider for meaningful output):
+
+```bash
+uv run photomatagent loop --demo --judge-provider openai --judge-model gpt-4o \
+  --judge-min-quality 0.6 --max-rounds 6
 ```
 
 Or supply an explicit `TargetSpec` (mode A):

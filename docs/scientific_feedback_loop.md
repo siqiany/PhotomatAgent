@@ -62,12 +62,44 @@ Outer loop (new):                ScientificLoopController
 
 ## Feedback
 
-`build_feedback(target, candidate, evaluation, history)` returns a structured
-`FeedbackSignal` or `None` (a PASSing candidate needs no feedback). It states
-what failed, why, missing evidence, next priorities, and what must not be
-repeated. The controller appends the rendered signal to the next maker
-instruction (never into the static system prompt, preserving the
-cache-friendly trailing-snapshot layout).
+`build_feedback(target, candidate, evaluation, history[, judge])` returns a
+structured `FeedbackSignal` or `None` (a PASSing candidate with no judge
+concerns needs no feedback). It states what failed, why, missing evidence,
+next priorities, and what must not be repeated. The controller appends the
+rendered signal to the next maker instruction (never into the static system
+prompt, preserving the cache-friendly trailing-snapshot layout).
+
+## Advisory LLM Scientific Judge
+
+After the deterministic evaluator, an optional, isolated, structured, read-
+only LLM judge (`scientific/loop/judge.py`) reviews the candidate:
+
+- **Isolated**: it uses its own `ModelProvider` and its `ModelRequest` has
+  `tools=[]` — it cannot call tools, permissions, or backends by
+  construction.
+- **Structured**: the prompt demands a schema-validated `JudgeReport` JSON
+  object (`scientific_quality`, `issues`, `recommendations`, `rationale`).
+- **Read-only**: `assess()` takes an immutable JSON snapshot of target,
+  candidate, evaluation and bounded evidence; it never mutates
+  `ScientificState`, `ScientificLoopState` or the conversation.
+- **Non-authoritative (hard invariant)**: the judge is explicitly told it
+  does not decide whether constraints pass or fail. It can never convert a
+  deterministic FAIL/UNKNOWN into a PASS, never rescind a hard-constraint
+  violation, and cannot manufacture SUCCESS without evidence. Its concerns
+  are embedded into `FeedbackSignal` (validation actions, priority lines) and
+  can only *hold back* SUCCESS (`judge_min_quality`, `require_judge`).
+- **Graceful**: provider failure, non-JSON output or schema mismatch degrade
+  to `JudgeReport(status=UNAVAILABLE)`; the deterministic loop keeps working
+  and SUCCESS is not blocked unless `require_judge=True`.
+
+```text
+Maker -> candidate -> ScientificEvaluator (deterministic, authoritative)
+        -> ScientificJudge (advisory, read-only)
+        -> EvaluationReport + JudgeReport -> FeedbackSignal -> Policy
+```
+
+New event kind: `candidate_judged` (round, candidate_id, status, quality,
+issues, summary) joins the JSONL trajectory.
 
 ## Stagnation and termination
 
@@ -80,8 +112,8 @@ score improvements accumulate toward `STALLED`.
 
 | Decision | Condition |
 | --- | --- |
-| SUCCESS | all HARD constraints pass, no critical evidence gap, confidence ≥ threshold |
-| CONTINUE | resolvable violation or evidence gap remains |
+| SUCCESS | all HARD constraints pass, no critical evidence gap, confidence ≥ threshold, and (judge absent, or judge available with quality ≥ threshold, or unavailable without `require_judge`) |
+| CONTINUE | resolvable violation or evidence gap remains; or deterministic pass held back by judge concerns |
 | ESCALATE | critical constraints rest on cheap evidence (higher-fidelity needed) |
 | STALLED | stagnation detector tripped |
 | INCONCLUSIVE | no candidate / no evidence possible (capability unavailable, tool failures) |
@@ -91,9 +123,10 @@ score improvements accumulate toward `STALLED`.
 
 New kinds appended to the existing `AnyRuntimeEvent` union and JSONL stream:
 `scientific_loop_started`, `candidate_proposed`, `candidate_evaluated`,
-`scientific_feedback_generated`, `scientific_loop_decision_made`,
-`scientific_loop_completed`, `scientific_loop_stalled`. The JSONL trace can
-answer: what was proposed each round, why it failed, what evidence was used,
+`candidate_judged`, `scientific_feedback_generated`,
+`scientific_loop_decision_made`, `scientific_loop_completed`,
+`scientific_loop_stalled`. The JSONL trace can answer: what was proposed each
+round, why it failed, what evidence was used, what the advisory judge said,
 why the strategy changed, which candidate is best, and why the loop stopped.
 
 ## CLI
@@ -101,6 +134,8 @@ why the strategy changed, which candidate is best, and why the loop stopped.
 ```bash
 uv run photomatagent loop --demo --provider fake --approval auto --max-rounds 6
 uv run photomatagent loop --target-json '<TargetSpec JSON>' --goal "..." ...
+uv run photomatagent loop --demo --judge-provider openai --judge-model gpt-4o \
+  --judge-min-quality 0.6 --require-judge
 uv run photomatagent experiments run experiments/scientific-feedback-loop-smoke.json
 ```
 
@@ -114,6 +149,10 @@ subsequent rounds, and deterministic termination are all exercised.
   list sorting is future work.
 - Evidence is matched per property; per-candidate binding uses subject/formula
   when named, with a documented fallback when the evidence names no material.
+- The LLM judge is advisory only and never auto-submits HPC jobs; it adds
+  concerns/validation work and can hold back SUCCESS
+  (`require_judge`/`judge_min_quality`), but it cannot create SUCCESS and
+  never overrides deterministic hard constraints.
 - Escalation is a decision aid: `ESCALATE_FIDELITY` recommends higher-fidelity
   work but never auto-submits HPC jobs; permissions/approval/HPC gating stay
   authoritative.

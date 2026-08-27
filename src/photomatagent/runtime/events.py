@@ -345,6 +345,22 @@ class CandidateEvaluated(RuntimeEvent):
     evidence_gaps: list[str] = Field(default_factory=list)
 
 
+class CandidateJudged(RuntimeEvent):
+    """Advisory LLM Scientific Judge output for one candidate.
+
+    Never authoritative: deterministic constraint results always win; a
+    judge assessment can only hold back SUCCESS or add validation work.
+    """
+
+    kind: Literal["candidate_judged"] = "candidate_judged"
+    round: int
+    candidate_id: str
+    status: str = "UNAVAILABLE"
+    quality: float = 0.0
+    issues: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
 class ScientificFeedbackGenerated(RuntimeEvent):
     kind: Literal["scientific_feedback_generated"] = "scientific_feedback_generated"
     round: int
@@ -412,6 +428,7 @@ AnyRuntimeEvent = Annotated[
         ScientificLoopStarted,
         CandidateProposed,
         CandidateEvaluated,
+        CandidateJudged,
         ScientificFeedbackGenerated,
         ScientificLoopDecisionMade,
         ScientificLoopCompleted,

@@ -273,6 +273,8 @@ async def _run_loop_task(
             max_candidates=loop.max_candidates,
             patience=loop.patience,
             min_confidence=loop.min_confidence,
+            judge_min_quality=loop.judge_min_quality,
+            require_judge=loop.require_judge,
         ),
         event_sinks=[logger.log],
         session_id=logger.session_id,

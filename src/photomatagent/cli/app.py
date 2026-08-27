@@ -865,6 +865,20 @@ def loop(
     min_confidence: float = typer.Option(
         0.6, "--min-confidence", min=0.0, max=1.0
     ),
+    judge_provider: str | None = typer.Option(
+        None,
+        "--judge-provider",
+        help="Enable the advisory LLM Scientific Judge (fake | openai | anthropic).",
+    ),
+    judge_model: str | None = typer.Option(None, "--judge-model"),
+    judge_min_quality: float = typer.Option(
+        0.6, "--judge-min-quality", min=0.0, max=1.0
+    ),
+    require_judge: bool = typer.Option(
+        False,
+        "--require-judge",
+        help="Block SUCCESS while the judge is unavailable or below quality.",
+    ),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
 ) -> None:
     """Run the Evidence-Guided Scientific Feedback Loop.
@@ -872,7 +886,9 @@ def loop(
     The scientific outer loop drives the normal AgentRuntime (Maker) toward a
     machine-verifiable TargetSpec: deterministic evaluation, structured
     feedback, convergence policy and stagnation detection decide when the
-    science is done -- never the model's own "final answer".
+    science is done -- never the model's own "final answer". An optional
+    advisory LLM Scientific Judge (--judge-provider) reviews candidates
+    read-only; it can only raise concerns, never override hard constraints.
     """
     if approval not in {"ask", "auto", "deny"}:
         raise typer.BadParameter("--approval must be ask | auto | deny")
@@ -889,6 +905,10 @@ def loop(
         max_rounds=max_rounds,
         patience=patience,
         min_confidence=min_confidence,
+        judge_provider=judge_provider,
+        judge_model=judge_model,
+        judge_min_quality=judge_min_quality,
+        require_judge=require_judge,
         log_events=log_events,
     )
     raise typer.Exit(code=exit_code)

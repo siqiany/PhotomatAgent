@@ -20,6 +20,8 @@ class ScientificLoopVariant(BaseModel):
     max_candidates: int = Field(default=10, ge=1)
     patience: int = Field(default=2, ge=1)
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    judge_min_quality: float = Field(default=0.6, ge=0.0, le=1.0)
+    require_judge: bool = Field(default=False)
 
 
 class Expectations(BaseModel):
