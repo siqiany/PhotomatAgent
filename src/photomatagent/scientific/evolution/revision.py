@@ -42,16 +42,13 @@ _EVIDENCE_REFERENCE = re.compile(
     r"\bevidence(?:[_ -]?id)?\s*[:=]\s*([A-Za-z0-9_-]{1,200})\b",
     re.IGNORECASE,
 )
-_INVALIDATION_TERMS = (
-    "invalidate",
-    "invalidated",
-    "remove",
-    "reject",
-    "discard",
-    "supersede",
-    "失效",
-    "作废",
-    "删除",
+_EXPLICIT_INVALIDATION_ACTION = re.compile(
+    r"^(?:"
+    r"(?:invalidate|remove|reject|discard|supersede)\s+(?:the\s+)?"
+    r"|(?:失效|作废|删除)\s*"
+    r")evidence(?:[_ -]?id)?\s*[:=：]\s*"
+    r"([A-Za-z0-9_-]{1,200})[.!。]?$",
+    re.IGNORECASE,
 )
 
 
@@ -104,8 +101,10 @@ def build_revision_plan(
             )
 
         preserve_refs = _evidence_references(preserve)
-        invalidation_refs = _invalidation_evidence_references(
-            [_bounded(item.problem), *actions]
+        invalidation_refs = (
+            _explicit_invalidation_references(actions)
+            if item.status == "CORRECTION"
+            else []
         )
         for evidence_id, disposition in (
             *((value, "preserve") for value in preserve_refs),
@@ -385,11 +384,11 @@ def _evidence_references(values: Iterable[str]) -> list[str]:
     )
 
 
-def _invalidation_evidence_references(values: Iterable[str]) -> list[str]:
-    return _evidence_references(
-        value
+def _explicit_invalidation_references(values: Iterable[str]) -> list[str]:
+    return _dedupe(
+        match.group(1)
         for value in values
-        if any(term in value.lower() for term in _INVALIDATION_TERMS)
+        if (match := _EXPLICIT_INVALIDATION_ACTION.fullmatch(value)) is not None
     )
 
 

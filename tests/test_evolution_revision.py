@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 from photomatagent.scientific.evolution.models import (
     ExpertFeedbackRecord,
     FeedbackCompilation,
     FeedbackDelta,
+    FeedbackItemStatus,
+    RevisionPlan,
     RubricScores,
 )
 from photomatagent.scientific.evolution.revision import (
@@ -178,7 +182,7 @@ def _strategy_delta(
     item_id: str,
     *,
     category: str,
-    status: str,
+    status: FeedbackItemStatus,
     severity: str,
     module: str,
 ) -> FeedbackDelta:
@@ -373,6 +377,105 @@ def test_unknown_explicit_evidence_reference_is_warned_and_never_added() -> None
     assert plan.preserved_evidence_ids == []
     assert plan.invalidated_evidence_ids == []
     assert any("Unknown evidence ID sev_unknown" in value for value in plan.warnings)
+
+
+def _summary_with_known_evidence() -> ScientificLoopSummary:
+    return ScientificLoopSummary(
+        status="INCONCLUSIVE",
+        rounds=1,
+        candidate_count=1,
+        best_candidate_id="cand_1",
+        best_score=0.2,
+        final_evaluation=EvaluationReport(
+            candidate_id="cand_1",
+            constraint_results=[
+                PropertyEvaluation(
+                    property="band_gap",
+                    result="PASS",
+                    evidence_ids=["sev_known"],
+                )
+            ],
+        ),
+    )
+
+
+def _plan_for_invalidation_case(
+    *,
+    status: str,
+    action: str,
+) -> RevisionPlan:
+    return build_revision_plan(
+        feedback=_feedback(),
+        compilation=_compilation(
+            FeedbackDelta(
+                item_id="item_invalidation",
+                category="EVIDENCE_SUFFICIENCY",
+                status=status,
+                severity="HIGH",
+                responsible_module="retrieval",
+                problem="Review the evidence disposition",
+                requested_actions=(action,),
+                acceptance_test="Disposition is explicitly resolved",
+                confidence=1.0,
+                source_span="source",
+            )
+        ),
+        previous_summary=_summary_with_known_evidence(),
+    )
+
+
+def test_query_evidence_reference_remains_non_authoritative() -> None:
+    plan = _plan_for_invalidation_case(
+        status="QUERY",
+        action="Invalidate evidence_id:sev_known",
+    )
+
+    assert plan.invalidated_evidence_ids == []
+    assert plan.evidence_requirements == ["Invalidate evidence_id:sev_known"]
+    assert plan.human_acceptance_tests == [
+        "QUERY item_invalidation: Disposition is explicitly resolved"
+    ]
+
+
+def test_positive_signal_evidence_reference_never_invalidates() -> None:
+    plan = _plan_for_invalidation_case(
+        status="POSITIVE_SIGNAL",
+        action="Invalidate evidence_id:sev_known",
+    )
+
+    assert plan.invalidated_evidence_ids == []
+
+
+def test_uncertain_invalidation_phrase_never_invalidates() -> None:
+    plan = _plan_for_invalidation_case(
+        status="CORRECTION",
+        action="Uncertain whether to invalidate evidence_id:sev_known",
+    )
+
+    assert plan.invalidated_evidence_ids == []
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "Do not invalidate evidence_id:sev_known",
+        "不要作废 evidence_id:sev_known",
+        "不得删除 evidence_id:sev_known",
+    ],
+)
+def test_negated_invalidation_phrase_never_invalidates(action: str) -> None:
+    plan = _plan_for_invalidation_case(status="CORRECTION", action=action)
+
+    assert plan.invalidated_evidence_ids == []
+
+
+def test_explicit_correction_disposition_invalidates_known_evidence() -> None:
+    plan = _plan_for_invalidation_case(
+        status="CORRECTION",
+        action="Invalidate evidence_id:sev_known",
+    )
+
+    assert plan.invalidated_evidence_ids == ["sev_known"]
 
 
 def test_whitespace_only_critical_positive_signal_is_blocking() -> None:
