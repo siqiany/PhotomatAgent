@@ -250,13 +250,16 @@ class EpisodeRecord(StrictModel):
     strategy_id: ManagedId | None = Field(default=None, frozen=True)
     strategy_arm: StrategyArm = Field(default="STATIC", frozen=True)
     scientific_state_path: str | None = None
-    task_snapshot: dict[str, Any]
-    target_snapshot: TargetSpec
-    provider: str | None = None
-    model: str | None = None
-    tool_surface_fingerprint: Sha256 | None = None
-    capability_fingerprint: Sha256 | None = None
-    data_source_fingerprints: dict[str, Sha256] = Field(default_factory=dict)
+    task_snapshot: dict[str, Any] = Field(frozen=True)
+    target_snapshot: TargetSpec = Field(frozen=True)
+    provider: str | None = Field(default=None, frozen=True)
+    model: str | None = Field(default=None, frozen=True)
+    tool_surface_fingerprint: Sha256 | None = Field(default=None, frozen=True)
+    capability_fingerprint: Sha256 | None = Field(default=None, frozen=True)
+    data_source_fingerprints: dict[str, Sha256] = Field(
+        default_factory=dict,
+        frozen=True,
+    )
     started_at: UtcDatetime | None = None
     completed_at: UtcDatetime | None = None
     summary: ScientificLoopSummary | None = None
@@ -264,13 +267,18 @@ class EpisodeRecord(StrictModel):
     cost: CostSnapshot = Field(default_factory=CostSnapshot)
     acceptance_results: list[AcceptanceResult] = Field(default_factory=list)
     error: str | None = None
-    created_at: UtcDatetime = Field(default_factory=utc_now, frozen=True)
+    created_at: UtcDatetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
     def isolate_input_snapshots(self) -> Self:
         object.__setattr__(self, "task_snapshot", deepcopy(self.task_snapshot))
         object.__setattr__(
             self, "target_snapshot", self.target_snapshot.model_copy(deep=True)
+        )
+        object.__setattr__(
+            self,
+            "data_source_fingerprints",
+            deepcopy(self.data_source_fingerprints),
         )
         return self
 

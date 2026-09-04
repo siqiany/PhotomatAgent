@@ -10,6 +10,7 @@ from photomatagent.scientific.evolution.models import (
     ComparisonReport,
     ConstraintChangeSummary,
     CostDelta,
+    CostSnapshot,
     EpisodeRecord,
     EvidenceChangeSummary,
     EvolutionTask,
@@ -29,8 +30,8 @@ from photomatagent.scientific.evolution.models import (
     new_strategy_id,
     validate_managed_id,
 )
-from photomatagent.scientific.loop import TargetSpec
 from photomatagent.scientific.evolution.rubric import assess_hard_caps, expert_utility
+from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
 
 
 def _scores(value: int = 5) -> RubricScores:
@@ -57,6 +58,23 @@ def _task(**updates: object) -> EvolutionTask:
     }
     data.update(updates)
     return EvolutionTask.model_validate(data)
+
+
+def _episode(**updates: object) -> EpisodeRecord:
+    data: dict[str, object] = {
+        "evolution_id": "evo_test",
+        "episode_id": "ep_test",
+        "version": "v001",
+        "task_snapshot": {"nested": {"value": 1}},
+        "target_snapshot": _target(),
+        "provider": "fake",
+        "model": "fake-model",
+        "tool_surface_fingerprint": "c" * 64,
+        "capability_fingerprint": "d" * 64,
+        "data_source_fingerprints": {"catalog": "e" * 64},
+    }
+    data.update(updates)
+    return EpisodeRecord.model_validate(data)
 
 
 def test_feedback_scores_are_bounded_integers():
@@ -370,6 +388,72 @@ def test_task_and_episode_snapshots_are_independent_of_caller_inputs():
     assert episode.target_snapshot is not None
     assert episode.target_snapshot.metadata["nested"]["value"] == 1
     assert episode.task_snapshot["nested"]["value"] == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("task_snapshot", {"changed": True}),
+        ("target_snapshot", TargetSpec(goal="changed")),
+        ("provider", "other-provider"),
+        ("model", "other-model"),
+        ("tool_surface_fingerprint", "f" * 64),
+        ("capability_fingerprint", "0" * 64),
+        ("data_source_fingerprints", {"other": "1" * 64}),
+    ],
+)
+def test_episode_execution_context_fields_cannot_be_reassigned(field, replacement):
+    episode = _episode()
+    with pytest.raises(ValidationError):
+        setattr(episode, field, replacement)
+
+
+def test_episode_defensively_copies_nested_context_and_fingerprint_mapping():
+    task_snapshot = {"nested": {"value": 1}}
+    target_snapshot = _target()
+    data_sources = {"catalog": "e" * 64}
+    episode = _episode(
+        task_snapshot=task_snapshot,
+        target_snapshot=target_snapshot,
+        data_source_fingerprints=data_sources,
+    )
+
+    task_snapshot["nested"]["value"] = 2
+    target_snapshot.metadata["nested"]["value"] = 2
+    data_sources["catalog"] = "f" * 64
+
+    assert episode.task_snapshot["nested"]["value"] == 1
+    assert episode.target_snapshot.metadata["nested"]["value"] == 1
+    assert episode.data_source_fingerprints == {"catalog": "e" * 64}
+
+
+def test_episode_lifecycle_fields_remain_mutable():
+    episode = _episode()
+    started = datetime(2026, 9, 4, 2, 0, tzinfo=UTC)
+    completed = datetime(2026, 9, 4, 2, 1, tzinfo=UTC)
+    summary = ScientificLoopSummary(
+        status="INCONCLUSIVE",
+        rounds=1,
+        candidate_count=0,
+        best_candidate_id=None,
+        best_score=0.0,
+        final_evaluation=None,
+    )
+    cost = CostSnapshot(input_tokens=12, runtime_seconds=60.0)
+
+    episode.status = "RUNNING"
+    episode.created_at = started
+    episode.started_at = started
+    episode.completed_at = completed
+    episode.summary = summary
+    episode.cost = cost
+
+    assert episode.status == "RUNNING"
+    assert episode.created_at == started
+    assert episode.started_at == started
+    assert episode.completed_at == completed
+    assert episode.summary == summary
+    assert episode.cost == cost
 
 
 def test_explicit_datetimes_reject_naive_values_and_normalize_to_utc():
