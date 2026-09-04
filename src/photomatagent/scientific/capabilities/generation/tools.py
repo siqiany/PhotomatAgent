@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, IO, Iterable, Mapping
 
 from photomatagent.scientific.capabilities.base import (
     CapabilityPack,
@@ -248,13 +248,13 @@ class VAEFormulaTool(Tool):
                     "unsupported": unsupported,
                 },
             )
-        checkpoint, metadata = _resolve_vae_assets(
+        checkpoint, asset_metadata = _resolve_vae_assets(
             checkpoint_path=arguments.get("checkpoint_path"),
             metadata_path=arguments.get("metadata_path"),
         )
         generator = VAEFormulaGenerator(
             checkpoint_path=checkpoint,
-            metadata_path=metadata,
+            metadata_path=asset_metadata,
             sample_count=int(arguments.get("sample_count", 512)),
             random_seed=int(arguments.get("random_seed", 42)),
             require_charge_neutral=bool(
@@ -263,7 +263,7 @@ class VAEFormulaTool(Tool):
             require_novel=bool(arguments.get("require_novel", True)),
         )
         try:
-            proposals, metadata = generator.generate(
+            proposals, generation_metadata = generator.generate(
                 target_properties=target_properties,
                 target_band_gap_eV=(
                     float(arguments["target_band_gap_eV"])
@@ -295,7 +295,9 @@ class VAEFormulaTool(Tool):
             )
         payload = {
             "proposals": [proposal.as_dict() for proposal in proposals],
-            "metadata": {key: value for key, value in metadata.items()},
+            "metadata": {
+                key: value for key, value in generation_metadata.items()
+            },
         }
         evidence = [
             ScientificEvidence(
@@ -309,7 +311,8 @@ class VAEFormulaTool(Tool):
                 fidelity="ml_generated",
                 summary=(
                     f"{len(proposals)} VAE formula proposal(s) conditioned "
-                    f"on {metadata['conditioned_property_count']} material "
+                    "on "
+                    f"{generation_metadata['conditioned_property_count']} material "
                     "property value(s)"
                 ),
                 limitations=(
@@ -381,6 +384,8 @@ class VAERetrieveTool(Tool):
             )
         max_results = int(arguments.get("max_results", 10))
         matches: list[dict[str, Any]] = []
+        rows: Iterable[Mapping[str, Any]]
+        handle: IO[str] | None = None
         try:
             if path.suffix.lower() == ".json":
                 raw_rows = json.loads(path.read_text(encoding="utf-8"))
@@ -403,7 +408,7 @@ class VAERetrieveTool(Tool):
                     if len(matches) >= max_results:
                         break
             finally:
-                if path.suffix.lower() != ".json":
+                if handle is not None:
                     handle.close()
         except Exception as exc:
             return ScientificToolResult(
@@ -616,7 +621,7 @@ def _canonical_system(value: str) -> str:
     )
 
 
-def _row_chemical_system(row: dict[str, Any]) -> str:
+def _row_chemical_system(row: Mapping[str, Any]) -> str:
     value = str(
         row.get("chemical_system") or row.get("elements") or ""
     ).strip()

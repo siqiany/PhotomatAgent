@@ -18,573 +18,206 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
-
-from photomatagent.scientific.applications.vasp.application import (
-    VaspApplication,
-    default_vasp_application,
-)
 
 SERVER_NAME = "scnet-science"
 
 mcp = FastMCP(SERVER_NAME)
 
+_MAX_ERROR_CHARS = 512
+_SENSITIVE_KEY_VALUE = re.compile(
+    r"(?i)\b(?:password|token|secret|private[_-]?key|api[_-]?key)\b\s*[:=]\s*"
+    r"(?:'[^']*'|\"[^\"]*\"|\S+)"
+)
+_ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/(?:[^\s'\"\\]|\\.)+")
+_PYDANTIC_INPUT_LINE = re.compile(r"(?im)^\s*input_value\s*=\s*.*$")
+_PYDANTIC_INPUT_INLINE = re.compile(
+    r"(?i)\binput_value\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^,\]]*)"
+)
 
-def _application() -> VaspApplication | None:
-    return default_vasp_application()
 
-
-def _result_payload(result: Any) -> dict[str, Any]:
-    """Convert a ScientificToolResult into a JSON-safe MCP payload."""
-    payload = dict(result.data) if getattr(result, "data", None) else {}
-    payload.setdefault("output", getattr(result, "output", ""))
-    payload["is_error"] = bool(getattr(result, "is_error", False))
-    return payload
+def _safe_error_message(message: str) -> str:
+    """Bound and redact potentially untrusted backend or validation text."""
+    sanitized = _PYDANTIC_INPUT_LINE.sub(
+        "input_value=<redacted>", str(message)
+    )
+    sanitized = _PYDANTIC_INPUT_INLINE.sub(
+        "input_value=<redacted>", sanitized
+    )
+    sanitized = _SENSITIVE_KEY_VALUE.sub("<redacted>", sanitized)
+    sanitized = _ABSOLUTE_PATH.sub("<path>", sanitized)
+    sanitized = " ".join(sanitized.split())
+    if len(sanitized) > _MAX_ERROR_CHARS:
+        sanitized = sanitized[: _MAX_ERROR_CHARS - 1] + "…"
+    return sanitized or "operation failed"
 
 
 def _error(message: str, error_type: str = "missing_prerequisites") -> dict[str, Any]:
+    safe_message = _safe_error_message(message)
     return {
         "is_error": True,
         "error_type": error_type,
-        "message": message,
-        "output": message,
+        "message": safe_message,
+        "output": safe_message,
     }
 
+_vasp_graph: Any | None = None
 
-def _vasp_or_error() -> tuple[VaspApplication | None, dict[str, Any] | None]:
-    application = _application()
-    if application is None:
-        return None, _error(
-            "VASP is UNCONFIGURED: set SCNET_HOST / SCNET_USERNAME "
-            "(or SUPERCOMPUTING_HOST / SUPERCOMPUTING_USERNAME)"
+
+def _unified_vasp_service() -> Any:
+    """Return the process-lifetime VASP service (test injection only)."""
+    global _vasp_graph
+    if _vasp_graph is None:
+        from photomatagent.scientific.applications.vasp.application import (
+            default_vasp_application,
         )
-    return application, None
+        from photomatagent.scientific.applications.vasp.unified.factory import (
+            build_unified_vasp_graph,
+        )
+
+        _vasp_graph = build_unified_vasp_graph(
+            application=default_vasp_application(), workspace=Path.cwd()
+        )
+    return getattr(_vasp_graph, "service", _vasp_graph)
 
 
-# ---------------------------------------------------------------------------
-# vasp.* tools (deferred application surface)
-# ---------------------------------------------------------------------------
+def _set_unified_vasp_graph_for_test(graph: Any | None) -> None:
+    """Inject/reset the server graph for deterministic in-process tests."""
+    global _vasp_graph
+    _vasp_graph = graph
 
 
-@mcp.tool()
-async def vasp_capabilities() -> dict[str, Any]:
-    """List VASP capabilities: profiles, SOC support, backend state, POTCAR policy, resource limits. Read-only; never submits."""
-    application, error = _vasp_or_error()
-    if error:
-        return error
-    from photomatagent.scientific.applications.vasp.profiles import profiles
-
-    payload = await application.probe_environment_async()  # type: ignore[union-attr]
-    payload["profiles"] = [
-        {
-            "name": profile.name,
-            "description": profile.description,
-            "soc": profile.soc,
-            "stages": profile.stages,
-            "needs_configuration": profile.needs_configuration,
+def _bounded_json(value: Any) -> Any:
+    """Remove secrets and cap recursively serialized service output."""
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_json(item)
+            for key, item in list(value.items())[:64]
+            if not any(secret in str(key).lower() for secret in ("password", "token", "secret", "private_key"))
         }
-        for profile in profiles()
-    ]
-    payload["cost_class"] = "EXPENSIVE"
+    if isinstance(value, list):
+        return [_bounded_json(item) for item in value[:64]]
+    if isinstance(value, str):
+        return _safe_error_message(value) if len(value) > 0 else value
+    return value
+
+
+def _service_payload(result: Any) -> dict[str, Any]:
+    payload = _bounded_json(result)
+    if not isinstance(payload, dict):
+        payload = {"data": payload}
+    payload.setdefault("ok", not bool(payload.get("errors")))
+    payload["is_error"] = not bool(payload["ok"])
     return payload
 
 
+def _validated_plan(workflow_kind: str, scientific_spec: dict[str, Any]) -> Any:
+    from photomatagent.scientific.applications.vasp.unified.models import (
+        UnifiedVaspRequest,
+    )
+
+    return UnifiedVaspRequest.model_validate(
+        {"workflow_kind": workflow_kind, "scientific_spec": scientific_spec}
+    )
+
+
+def _validated_report(report_request: dict[str, Any]) -> Any:
+    from photomatagent.scientific.applications.vasp.unified.models import ReportRequest
+
+    return ReportRequest.model_validate(report_request)
+
+
 @mcp.tool()
-async def vasp_prepare(
-    structure_path: str,
-    profile: str,
-    output_dir: str | None = None,
-    encut_ev: float | None = None,
-    kpoint_density: int | None = None,
-    kpoint_grid: list[int] | None = None,
-) -> dict[str, Any]:
-    """Prepare VASP inputs for a profile from a structure file (CIF/POSCAR). Generates POSCAR/INCAR/KPOINTS + POTCAR.policy and workflow.json locally. NEVER submits. POTCAR is resolved at submit time from PMG_VASP_PSP_DIR or a remote pseudopotential location."""
-    application, error = _vasp_or_error()
-    if error:
-        return error
-    overrides: dict[str, Any] = {}
-    if encut_ev is not None:
-        overrides["encut_ev"] = encut_ev
-    if kpoint_density is not None:
-        overrides["kpoint_density"] = kpoint_density
-    if kpoint_grid is not None:
-        overrides["kpoint_grid"] = kpoint_grid
+async def vasp_capabilities(workflow_kind: str | None = None) -> dict[str, Any]:
+    """List the unified VASP lifecycle capability surface."""
     try:
-        manifest = application.prepare_inputs(  # type: ignore[union-attr]
-            structure_path=structure_path,
-            profile_name=profile,
-            output_dir=output_dir,
-            spec_overrides=overrides,
-        )
+        return _service_payload(_unified_vasp_service().capabilities(workflow_kind))
     except Exception as exc:
-        return _error(
-            f"vasp.prepare failed: {type(exc).__name__}: {exc}",
-            error_type=type(exc).__name__,
-        )
-    manifest["submitted"] = False
-    return manifest
+        return _error(str(exc), type(exc).__name__)
 
 
 @mcp.tool()
-async def vasp_submit(
-    job_name: str,
-    input_dir: str,
-    profile: str,
-    partition: str | None = None,
-    nodes: int = 1,
-    tasks_per_node: int = 32,
-    walltime_minutes: int = 240,
+async def vasp_plan(
+    workflow_kind: str, scientific_spec: dict[str, Any]
 ) -> dict[str, Any]:
-    """Submit one prepared VASP stage directory to SCNet via Slurm. Requires PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1 and a passing resource policy. Returns a detached job ref; poll with vasp_status."""
-    from photomatagent.scientific.remote.models import ResourceRequest
-
-    application, error = _vasp_or_error()
-    if error:
-        return error
+    """Create a unified periodic, molecular, or study workflow manifest."""
     try:
-        selected_partition = partition or os.environ.get("SCNET_PARTITION", "").strip()
-        if not selected_partition:
-            return _error(
-                "partition is required: call scnet_partitions (SCNet "
-                "whichpartition) and pass one result, or set SCNET_PARTITION",
-                error_type="missing_partition",
-            )
-        ref = await application.submit_stage(  # type: ignore[union-attr]
-            job_name=job_name,
-            input_dir=input_dir,
-            profile_name=profile,
-            resource=ResourceRequest(
-                partition=selected_partition,
-                nodes=nodes,
-                tasks_per_node=tasks_per_node,
-                walltime_minutes=walltime_minutes,
-            ),
-            unique_remote_directory=True,
-        )
+        return _service_payload(_unified_vasp_service().plan(_validated_plan(workflow_kind, scientific_spec)))
     except Exception as exc:
-        return _error(
-            f"vasp.submit refused: {type(exc).__name__}: {exc}",
-            error_type=type(exc).__name__,
-        )
-    payload = ref.model_dump(mode="json")
-    payload["note"] = (
-        "detached job: poll with vasp_status; Slurm COMPLETED is not "
-        "scientific validity -- collect with vasp_collect"
-    )
-    return payload
+        return _error(str(exc), type(exc).__name__)
 
 
-@mcp.tool()
-async def vasp_status(job_id: str) -> dict[str, Any]:
-    """Query the Slurm state of a VASP job id (PENDING/RUNNING/COMPLETED/FAILED/...). Scheduler state only; COMPLETED does not imply scientific validity."""
-    application, error = _vasp_or_error()
-    if error:
-        return error
+async def _workflow_call(method: str, workflow_id: str, *args: Any) -> dict[str, Any]:
+    if not workflow_id:
+        return _error("workflow_id is required", "ValidationError")
     try:
-        state = await application.status(job_id)  # type: ignore[union-attr]
+        result = await getattr(_unified_vasp_service(), method)(workflow_id, *args)
+        return _service_payload(result)
     except Exception as exc:
-        return _error(f"vasp.status failed: {type(exc).__name__}: {exc}")
-    return {
-        "job_id": job_id,
-        "state": state.value,
-        "terminal": state.terminal,
-        "note": "scheduler state only; use vasp_collect for validation",
-    }
+        return _error(str(exc), type(exc).__name__)
 
 
 @mcp.tool()
-async def vasp_collect(
-    job_id: str, remote_directory: str, profile: str, local_dir: str | None = None
-) -> dict[str, Any]:
-    """Download a finished VASP job's results, validate the vasprun.xml contract, and parse bounded values into evidence. Returns validation problems explicitly."""
-    from photomatagent.scientific.remote.models import RemoteJobRef
+async def vasp_prepare(workflow_id: str) -> dict[str, Any]:
+    """Prepare one planned unified VASP workflow."""
+    return await _workflow_call("prepare", workflow_id)
 
-    application, error = _vasp_or_error()
-    if error:
-        return error
-    job_ref = RemoteJobRef(
-        backend="scnet",
-        application="vasp",
-        job_id=job_id,
-        remote_directory=remote_directory,
-    )
+
+@mcp.tool()
+async def vasp_preflight(workflow_id: str) -> dict[str, Any]:
+    """Run deterministic preflight for one unified workflow."""
+    return await _workflow_call("preflight", workflow_id)
+
+
+@mcp.tool()
+async def vasp_submit(workflow_id: str, stage: str | None = None) -> dict[str, Any]:
+    """Submit a workflow stage through the idempotent unified lifecycle."""
+    return await _workflow_call("submit", workflow_id, stage)
+
+
+@mcp.tool()
+async def vasp_status(workflow_id: str) -> dict[str, Any]:
+    """Read unified VASP workflow status."""
+    return await _workflow_call("status", workflow_id)
+
+
+@mcp.tool()
+async def vasp_wait(workflow_id: str) -> dict[str, Any]:
+    """Check the unified lifecycle at its bounded wait boundary."""
+    return await _workflow_call("wait", workflow_id)
+
+
+@mcp.tool()
+async def vasp_resume(workflow_id: str) -> dict[str, Any]:
+    """Reconcile or resume a workflow under the unified policy."""
+    return await _workflow_call("resume", workflow_id)
+
+
+@mcp.tool()
+async def vasp_collect(workflow_id: str) -> dict[str, Any]:
+    """Collect and validate a workflow's scientific outputs."""
+    return await _workflow_call("collect", workflow_id)
+
+
+@mcp.tool()
+async def vasp_report(
+    workflow_id: str, report_request: dict[str, Any]
+) -> dict[str, Any]:
+    """Produce a typed report from a unified workflow."""
     try:
-        report = await application.collect(  # type: ignore[union-attr]
-            job_ref=job_ref,
-            local_dir=local_dir or "output/vasp_results",
-            profile_name=profile,
+        result = await _unified_vasp_service().report(
+            workflow_id, _validated_report(report_request)
         )
+        return _service_payload(result)
     except Exception as exc:
-        return _error(f"vasp.collect failed: {type(exc).__name__}: {exc}")
-    return report
-
-
-@mcp.tool()
-async def vasp_inspect_result(result_dir: str, profile: str) -> dict[str, Any]:
-    """Validate and parse a local VASP result directory (vasprun.xml + OUTCAR) without remote contact."""
-    application, error = _vasp_or_error()
-    if error:
-        return error
-    problems = application.validate_output(result_dir, profile_name=profile)  # type: ignore[union-attr]
-    parsed = application.parse_result(result_dir)  # type: ignore[union-attr]
-    return {
-        "result_dir": result_dir,
-        "profile": profile,
-        "validation_problems": problems,
-        "scientifically_valid": not problems,
-        "parsed": parsed,
-    }
-
-
-@mcp.tool()
-async def vasp_run_workflow(
-    workflow_dir: str,
-    profile: str,
-    poll_interval_seconds: float = 30.0,
-    timeout_seconds: float = 86400.0,
-) -> dict[str, Any]:
-    """Bounded convenience API: submit every prepared stage sequentially, wait for each job, collect and validate. Production use should prefer detached jobs."""
-    application, error = _vasp_or_error()
-    if error:
-        return error
-    from photomatagent.scientific.applications.vasp.workflow import (
-        run_vasp_workflow,
-    )
-    from pathlib import Path
-
-    try:
-        report = await run_vasp_workflow(
-            application=application,
-            workflow_dir=Path(workflow_dir),
-            profile_name=profile,
-            poll_interval_seconds=poll_interval_seconds,
-            timeout_seconds=timeout_seconds,
-        )
-    except Exception as exc:
-        return _error(f"vasp.run_workflow failed: {type(exc).__name__}: {exc}")
-    return report
-
-
-# ---------------------------------------------------------------------------
-# vasp_molecule.* tools (isolated-molecule DAG)
-# ---------------------------------------------------------------------------
-
-
-def _molecular_tool(name: str) -> Any:
-    """Find one registered ``vasp_molecule.*`` Tool instance."""
-    from photomatagent.scientific.applications.vasp.molecular.tool_pack import (
-        molecular_vasp_pack,
-    )
-
-    pack = molecular_vasp_pack()
-    for tool in pack.tools():
-        if tool.name == name:
-            return tool
-    raise KeyError(name)
-
-
-async def _call_molecular(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    tool = _molecular_tool(name)
-    try:
-        result = await tool.execute(arguments)
-    except Exception as exc:
-        return _error(
-            f"{name} failed: {type(exc).__name__}: {exc}",
-            error_type=type(exc).__name__,
-        )
-    payload = dict(result.data) if getattr(result, "data", None) else {}
-    payload.setdefault("output", getattr(result, "output", ""))
-    payload["is_error"] = bool(getattr(result, "is_error", False))
-    return payload
-
-
-@mcp.tool()
-async def vasp_molecule_capabilities() -> dict[str, Any]:
-    """List the isolated-molecule VASP runtime configuration (backend, pseudopotential dirs, module/environment, workspace paths) and the typed stage DAG. Read-only; never submits."""
-    return await _call_molecular("vasp_molecule.capabilities", {})
-
-
-@mcp.tool()
-async def vasp_molecule_prepare(
-    structure_path: str,
-    total_charge: int,
-    name: str | None = None,
-    box_ang: float = 30.0,
-    spin_multiplicity: int = 1,
-    calculation_purpose: str = "unspecified",
-    conformer_id: str | None = None,
-    encut_ev: float | None = None,
-    include_orbital_homo: bool = True,
-    include_orbital_lumo: bool = True,
-    include_esp: bool = True,
-    include_hse06: bool = False,
-    workflow_dir: str | None = None,
-) -> dict[str, Any]:
-    """Generate the isolated-molecule VASP stage tree + deterministic preflight offline. total_charge is explicit and NEVER inferred from names. Never submits."""
-    arguments: dict[str, Any] = {
-        "structure_path": structure_path,
-        "total_charge": total_charge,
-        "name": name,
-        "box_ang": box_ang,
-        "spin_multiplicity": spin_multiplicity,
-        "calculation_purpose": calculation_purpose,
-        "conformer_id": conformer_id,
-        "encut_ev": encut_ev,
-        "include_orbital_homo": include_orbital_homo,
-        "include_orbital_lumo": include_orbital_lumo,
-        "include_esp": include_esp,
-        "include_hse06": include_hse06,
-        "workflow_dir": workflow_dir,
-    }
-    arguments = {key: value for key, value in arguments.items() if value is not None}
-    return await _call_molecular("vasp_molecule.prepare", arguments)
-
-
-@mcp.tool()
-async def vasp_molecule_preflight(workflow_dir: str) -> dict[str, Any]:
-    """Run the deterministic offline molecular preflight (charge, POTCAR order, NELECT parity, vacuum, Gamma-only, DIPOL rendering, dependencies). Writes preflight.json."""
-    return await _call_molecular(
-        "vasp_molecule.preflight", {"workflow_dir": workflow_dir}
-    )
-
-
-@mcp.tool()
-async def vasp_molecule_submit(
-    workflow_dir: str,
-    stage: str,
-    wait: bool = False,
-    wait_timeout_seconds: float = 3600.0,
-    force_new_attempt: bool = False,
-) -> dict[str, Any]:
-    """Submit ONE isolated-molecule stage under the submit-once contract (unique remote dir, generated run.slurm, remote POTCAR assembly). Requires SCNET config + PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1."""
-    return await _call_molecular(
-        "vasp_molecule.submit",
-        {
-            "workflow_dir": workflow_dir,
-            "stage": stage,
-            "wait": wait,
-            "wait_timeout_seconds": wait_timeout_seconds,
-            "force_new_attempt": force_new_attempt,
-        },
-    )
-
-
-@mcp.tool()
-async def vasp_molecule_status(workflow_dir: str, stage: str) -> dict[str, Any]:
-    """Read lifecycle + scheduler state of one isolated-molecule stage. Query failures are UNKNOWN, never job failures."""
-    return await _call_molecular(
-        "vasp_molecule.status", {"workflow_dir": workflow_dir, "stage": stage}
-    )
-
-
-@mcp.tool()
-async def vasp_molecule_collect(
-    workflow_dir: str, stage: str, local_dir: str | None = None
-) -> dict[str, Any]:
-    """Download and validate one finished stage: COMPLETED -> COLLECTED -> VALIDATED. Evidence only when validation passes; task_state.json and the SQLite registry stay in sync."""
-    arguments: dict[str, Any] = {"workflow_dir": workflow_dir, "stage": stage}
-    if local_dir:
-        arguments["local_dir"] = local_dir
-    return await _call_molecular("vasp_molecule.collect", arguments)
-
-
-@mcp.tool()
-async def vasp_molecule_analyze_orbitals(
-    result_dir: str,
-    charge: int = 0,
-    spin_multiplicity: int = 1,
-    box_ang: float | None = None,
-) -> dict[str, Any]:
-    """HOMO/LUMO identification + vacuum alignment from EIGENVAL + LOCPOT (offline). Raw values must never be compared across molecules."""
-    arguments: dict[str, Any] = {
-        "result_dir": result_dir,
-        "charge": charge,
-        "spin_multiplicity": spin_multiplicity,
-    }
-    if box_ang is not None:
-        arguments["box_ang"] = box_ang
-    return await _call_molecular("vasp_molecule.analyze_orbitals", arguments)
-
-
-@mcp.tool()
-async def vasp_molecule_analyze_esp(result_dir: str) -> dict[str, Any]:
-    """ESP/LOCPOT grid metadata (offline); the potential grid content stays on disk."""
-    return await _call_molecular(
-        "vasp_molecule.analyze_esp", {"result_dir": result_dir}
-    )
-
-
-@mcp.tool()
-async def vasp_molecule_binding_energy(
-    complex_name: str,
-    complex_dir: str,
-    references: list[dict[str, Any]],
-    alternative_references: list[dict[str, Any]] | None = None,
-    charge: int = 0,
-) -> dict[str, Any]:
-    """Electronic binding energy (ΔE/ΔΔE) from validated E0 values with box/functional/ENCUT consistency checks. Electronic-only; no vibrational/thermal terms are claimed."""
-    arguments: dict[str, Any] = {
-        "complex_name": complex_name,
-        "complex_dir": complex_dir,
-        "references": references,
-        "charge": charge,
-    }
-    if alternative_references:
-        arguments["alternative_references"] = alternative_references
-    return await _call_molecular("vasp_molecule.binding_energy", arguments)
-
-
-@mcp.tool()
-async def vasp_molecule_resume_workflow(
-    workflow_dir: str,
-    wait: bool = True,
-    collect: bool = True,
-    stop_on_failure: bool = True,
-    only: list[str] | None = None,
-    wait_timeout_seconds: float = 3600.0,
-) -> dict[str, Any]:
-    """Run or resume the full isolated-molecule DAG from task_state.json. Completed stages are never resubmitted; failures block dependents."""
-    arguments: dict[str, Any] = {
-        "workflow_dir": workflow_dir,
-        "wait": wait,
-        "collect": collect,
-        "stop_on_failure": stop_on_failure,
-        "wait_timeout_seconds": wait_timeout_seconds,
-    }
-    if only:
-        arguments["only"] = only
-    return await _call_molecular("vasp_molecule.resume_workflow", arguments)
-
-
-# ---------------------------------------------------------------------------
-# vasp_study.* orchestration tools (thin adapters over the study pack)
-# ---------------------------------------------------------------------------
-
-
-def _study_tool(name: str) -> Any:
-    """Find one registered ``vasp_study.*`` Tool instance."""
-    from photomatagent.scientific.applications.vasp.study.tools import (
-        vasp_study_pack,
-    )
-
-    pack = vasp_study_pack()
-    for tool in pack.tools():
-        if tool.name == name:
-            return tool
-    raise KeyError(name)
-
-
-async def _call_study(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    tool = _study_tool(name)
-    try:
-        result = await tool.execute(arguments)
-    except Exception as exc:
-        return _error(
-            f"{name} failed: {type(exc).__name__}: {exc}",
-            error_type=type(exc).__name__,
-        )
-    payload = dict(result.data) if getattr(result, "data", None) else {}
-    payload.setdefault("output", getattr(result, "output", ""))
-    payload["is_error"] = bool(getattr(result, "is_error", False))
-    return payload
-
-
-@mcp.tool()
-async def vasp_study_plan(
-    systems: list[dict[str, Any]],
-    original_request: str = "",
-    study_id: str = "",
-    property_requests: list[str] | None = None,
-    allow_assumed_structures: bool = True,
-    max_candidates_per_system: int = 3,
-    user_requested_computation: bool = False,
-    max_core_hours: float = 64.0,
-    functional: str = "PBE-D3(BJ)",
-    encut_ev: float | None = None,
-    box_ang: float = 20.0,
-    workspace: str = "",
-) -> dict[str, Any]:
-    """Compile a typed VASP study plan (offline; never submits)."""
-    return await _call_study(
-        "vasp_study.plan",
-        {
-            "systems": systems,
-            "original_request": original_request,
-            "study_id": study_id,
-            "property_requests": property_requests or [],
-            "allow_assumed_structures": allow_assumed_structures,
-            "max_candidates_per_system": max_candidates_per_system,
-            "user_requested_computation": user_requested_computation,
-            "max_core_hours": max_core_hours,
-            "functional": functional,
-            "encut_ev": encut_ev,
-            "box_ang": box_ang,
-            "workspace": workspace,
-        },
-    )
-
-
-@mcp.tool()
-async def vasp_study_execute(
-    study_id: str,
-    study_dir: str = "",
-    user_requested_computation: bool = False,
-    wait: bool = True,
-) -> dict[str, Any]:
-    """Execute or resume a planned study through vasp_molecule.*."""
-    return await _call_study(
-        "vasp_study.execute",
-        {
-            "study_id": study_id,
-            "study_dir": study_dir,
-            "user_requested_computation": user_requested_computation,
-            "wait": wait,
-        },
-    )
-
-
-@mcp.tool()
-async def vasp_study_status(study_id: str, study_dir: str = "") -> dict[str, Any]:
-    """Read persisted study task/binding states."""
-    return await _call_study(
-        "vasp_study.status", {"study_id": study_id, "study_dir": study_dir}
-    )
-
-
-@mcp.tool()
-async def vasp_study_resume(
-    study_id: str,
-    study_dir: str = "",
-    user_requested_computation: bool = False,
-) -> dict[str, Any]:
-    """Resume an interrupted study (molecular resume semantics)."""
-    return await _call_study(
-        "vasp_study.resume",
-        {
-            "study_id": study_id,
-            "study_dir": study_dir,
-            "user_requested_computation": user_requested_computation,
-        },
-    )
-
-
-@mcp.tool()
-async def vasp_study_collect(study_id: str, study_dir: str = "") -> dict[str, Any]:
-    """Collect + validate scheduler-COMPLETED / COLLECTED tasks."""
-    return await _call_study(
-        "vasp_study.collect", {"study_id": study_id, "study_dir": study_dir}
-    )
-
-
-@mcp.tool()
-async def vasp_study_report(study_id: str, study_dir: str = "") -> dict[str, Any]:
-    """Generate results.json / results.csv / figures / report.md."""
-    return await _call_study(
-        "vasp_study.report", {"study_id": study_id, "study_dir": study_dir}
-    )
+        return _error(str(exc), type(exc).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +241,21 @@ def _namd_or_error() -> tuple[Any | None, dict[str, Any] | None]:
             "SCNET_NAMD_MODULE"
         )
     return application, None
+
+
+def _partition_backend() -> Any | None:
+    """Return the configured SCNet backend for queue discovery only.
+
+    This is intentionally independent of the unified VASP lifecycle: queue
+    discovery remains available to NAMD and MAGUS without exposing a second
+    VASP execution path.
+    """
+    from photomatagent.scientific.applications.vasp.application import (
+        default_vasp_application,
+    )
+
+    application = default_vasp_application()
+    return application.backend if application is not None else None
 
 
 @mcp.tool()
@@ -758,12 +406,13 @@ async def namd_inspect_result(result_dir: str) -> dict[str, Any]:
 @mcp.tool()
 async def scnet_partitions() -> dict[str, Any]:
     """Read-only queue discovery using SCNet whichpartition (sinfo fallback)."""
-    application, error = _vasp_or_error()
-    if error:
-        return error
-    assert application is not None and application.backend is not None
+    backend = _partition_backend()
+    if backend is None:
+        return _error(
+            "SCNet is UNCONFIGURED: set SCNET_HOST / SCNET_USERNAME",
+        )
     try:
-        partitions = await application.backend.available_partitions()
+        partitions = await backend.available_partitions()
     except Exception as exc:
         return _error(f"partition discovery failed: {type(exc).__name__}: {exc}")
     return {
@@ -1016,9 +665,12 @@ async def build_doctor_report() -> dict[str, Any]:
     from photomatagent.scientific.applications.namd.application import (
         NamdApplication,
     )
+    from photomatagent.scientific.applications.vasp.application import (
+        default_vasp_application,
+    )
 
     report: dict[str, Any] = {}
-    application = _application()
+    application = default_vasp_application()
     if application is not None:
         try:
             assert application.backend is not None

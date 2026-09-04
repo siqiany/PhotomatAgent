@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from photomatagent.scientific.applications.vasp.application import (
     VaspApplication,
@@ -33,6 +33,11 @@ from photomatagent.scientific.remote.models import (
 )
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
+
+if TYPE_CHECKING:
+    from photomatagent.scientific.applications.vasp.unified.factory import (
+        UnifiedVaspGraph,
+    )
 
 
 def _evidence_from_collect(
@@ -77,7 +82,9 @@ class VaspCapabilitiesTool(Tool):
         "optical spectrum, and SOC calculations on SCNet."
     )
     short_description = "VASP profiles, backend state, and limits."
-    exposure = ToolExposure.DEFERRED
+    # Retained only for Python-level migration compatibility.  The unified
+    # capability pack is the sole model-visible VASP surface.
+    exposure = ToolExposure.HIDDEN
     namespace = "vasp"
     source = "application metadata"
     tags = ("vasp", "dft", "capabilities", "scnet")
@@ -135,7 +142,7 @@ class VaspPrepareTool(Tool):
         "band structure, DOS, geometry relaxation, and optics stages."
     )
     short_description = "Generate VASP inputs for a profile (no submit)."
-    exposure = ToolExposure.DEFERRED
+    exposure = ToolExposure.HIDDEN
     namespace = "vasp"
     source = "photomatagent VASP input generator"
     tags = ("vasp", "dft", "input generation", "incar")
@@ -213,7 +220,7 @@ class VaspSubmitTool(Tool):
         "vasp.status."
     )
     short_description = "Submit a VASP stage to SCNet (detached job)."
-    exposure = ToolExposure.DEFERRED
+    exposure = ToolExposure.HIDDEN
     namespace = "vasp"
     source = "SCNet VASP application"
     tags = ("vasp", "dft", "scnet", "slurm", "hpc")
@@ -286,7 +293,7 @@ class VaspStatusTool(Tool):
         "vasprun.xml."
     )
     short_description = "Poll Slurm state of a VASP job."
-    exposure = ToolExposure.DEFERRED
+    exposure = ToolExposure.HIDDEN
     namespace = "vasp"
     source = "SCNet scheduler"
     tags = ("vasp", "slurm", "status", "hpc")
@@ -338,7 +345,7 @@ class VaspCollectTool(Tool):
         "without an empty problems list."
     )
     short_description = "Download, validate, and parse a VASP job result."
-    exposure = ToolExposure.DEFERRED
+    exposure = ToolExposure.HIDDEN
     namespace = "vasp"
     source = "SCNet VASP application"
     tags = ("vasp", "dft", "validation", "results")
@@ -397,7 +404,7 @@ class VaspInspectResultTool(Tool):
         "energy, dielectric summary. Use on collected artifacts."
     )
     short_description = "Parse a local VASP result directory."
-    exposure = ToolExposure.DEFERRED
+    exposure = ToolExposure.HIDDEN
     namespace = "vasp"
     source = "photomatagent vasprun parser"
     tags = ("vasp", "dft", "vasprun", "parse")
@@ -458,7 +465,7 @@ class VaspRunWorkflowTool(Tool):
         "Requires PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1."
     )
     short_description = "Run a full prepared VASP workflow (bounded)."
-    exposure = ToolExposure.DEFERRED
+    exposure = ToolExposure.HIDDEN
     namespace = "vasp"
     source = "SCNet VASP application"
     tags = ("vasp", "dft", "workflow", "hpc")
@@ -531,8 +538,8 @@ class VaspCapabilityPack(CapabilityPack):
                 workspace or Path.cwd()
             )
         ).expanduser().resolve()
-        self._molecular_pack: Any = None
-        self._study_pack: Any = None
+        self._unified_capability_pack: Any = None
+        self._unified_graph: Any = None
 
     def probe(self) -> ProbeResult:
         if self.application is None:
@@ -554,48 +561,28 @@ class VaspCapabilityPack(CapabilityPack):
         )
 
     def tools(self) -> list[Tool]:
-        return [
-            VaspCapabilitiesTool(self.application),
-            VaspPrepareTool(self.application),
-            VaspSubmitTool(self.application),
-            VaspStatusTool(self.application),
-            VaspCollectTool(self.application),
-            VaspInspectResultTool(self.application),
-            VaspRunWorkflowTool(self.application),
-            *self._molecular_tools(),
-            *self._study_tools(),
-        ]
+        # Task 12: only the unified-name surface is registered.
+        return self._unified_pack().tools()
 
-    def _molecular_tools(self) -> list[Tool]:
-        from photomatagent.scientific.applications.vasp.molecular.runtime import (
-            default_molecular_runtime,
-        )
-        from photomatagent.scientific.applications.vasp.molecular.tool_pack import (
-            MolecularVaspCapabilityPack,
+    def _unified_pack(self) -> Any:
+        if self._unified_capability_pack is not None:
+            return self._unified_capability_pack
+        from photomatagent.scientific.applications.vasp.unified.factory import (
+            build_unified_vasp_graph,
         )
 
-        if self._molecular_pack is None:
-            runtime = default_molecular_runtime(
-                self.workspace, application=self.application
-            )
-            self._molecular_pack = MolecularVaspCapabilityPack(runtime)
-        return self._molecular_pack.tools()
-
-    def _study_tools(self) -> list[Tool]:
-        from photomatagent.scientific.applications.vasp.molecular.runtime import (
-            default_molecular_runtime,
+        self._unified_graph = build_unified_vasp_graph(
+            application=self.application, workspace=self.workspace
         )
-        from photomatagent.scientific.applications.vasp.study.tools import (
-            VaspStudyCapabilityPack,
-        )
+        self._unified_capability_pack = self._unified_graph.tool_pack
+        return self._unified_capability_pack
 
-        if self._study_pack is None:
-            runtime = default_molecular_runtime(
-                self.workspace, application=self.application
-            )
-            self._study_pack = VaspStudyCapabilityPack(runtime)
-        return self._study_pack.tools()
-
+    @property
+    def unified_graph(self) -> UnifiedVaspGraph:
+        """Return this pack's named, cached unified VASP composition graph."""
+        self._unified_pack()
+        assert self._unified_graph is not None
+        return self._unified_graph
 
 def vasp_pack(workspace: Any = None) -> VaspCapabilityPack:
     return VaspCapabilityPack(workspace=workspace)

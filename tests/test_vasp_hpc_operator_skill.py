@@ -106,7 +106,7 @@ def test_skill_body_contains_non_negotiable_behavior_rules():
     behaviors = [
         "capabilities/doctor",      # rule 1
         "PHOTOMATAGENT_ALLOW_HPC_SUBMIT",  # rule 2: gate explicit
-        "vasp_study.*",             # rule 3: typed entry points
+        "vasp.*",                 # rule 3: unified public entry points
         "total_charge",             # rule 4: explicit charge
         "preflight",                # rule 5: chain order
         "status query",             # rule 6: no resubmit on query failure

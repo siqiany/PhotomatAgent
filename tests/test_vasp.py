@@ -595,11 +595,20 @@ def test_tool_search_finds_vasp_tools():
 
     pack = VaspCapabilityPack(application=None)
     names = [tool.name for tool in pack.tools()]
-    assert "vasp.capabilities" in names
-    assert "vasp.prepare" in names
-    assert "vasp.submit" in names
-    assert "vasp.status" in names
-    assert "vasp.collect" in names
-    assert "vasp.inspect_result" in names
-    assert "vasp.run_workflow" in names
+    assert set(names) == {
+        "vasp.capabilities",
+        "vasp.plan",
+        "vasp.prepare",
+        "vasp.preflight",
+        "vasp.submit",
+        "vasp.status",
+        "vasp.wait",
+        "vasp.resume",
+        "vasp.collect",
+        "vasp.report",
+    }
+    assert "vasp.inspect_result" not in names
+    assert "vasp.run_workflow" not in names
+    assert "vasp_molecule.capabilities" not in names
+    assert "vasp_study.plan" not in names
     assert all(tool.exposure.value == "deferred" for tool in pack.tools())

@@ -20,6 +20,7 @@ from photomatagent.scientific.applications.vasp.profiles import (
     VaspProfile,
     get_profile,
 )
+from photomatagent.scientific.applications.vasp.psp import potcar_element_name
 
 
 def _kpoint_grid_density(
@@ -249,7 +250,10 @@ class VaspInputGenerator:
                 (output / "POSCAR").write_text(source.read_text(encoding="utf-8"))
         (output / "INCAR").write_text(_render_incar(incar), encoding="utf-8")
         (output / "KPOINTS").write_text(_render_kpoints(grid), encoding="utf-8")
-        symbols = [str(element.symbol) for element in structure.composition.elements]
+        symbols = [
+            potcar_element_name(str(element.symbol))
+            for element in structure.composition.elements
+        ]
         (output / "POTCAR.policy").write_text(
             self.potcar_policy_text(symbols, profile), encoding="utf-8"
         )

@@ -7,13 +7,19 @@ a typed missing-prerequisite result when the ML extra is unavailable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
+torch: Any
+nn: Any
 try:
-    import torch
-    from torch import nn
+    import torch as _torch
+    from torch import nn as _nn
 except ImportError:  # pragma: no cover - depends on the installed extras
     torch = None
     nn = None
+else:
+    torch = _torch
+    nn = _nn
 
 
 @dataclass(frozen=True)

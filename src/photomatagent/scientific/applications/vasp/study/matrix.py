@@ -177,6 +177,23 @@ def build_calculation_matrix(
             continue
         structures = resolved.get(system.system_id) or []
         if not structures:
+            # Preserve the declared binding relationship even when the
+            # complex itself could not be resolved.  Downstream reporting
+            # must fail closed with the missing identifier, never fabricate a
+            # reference or silently omit the group.
+            if PropertyRequest.BINDING_ENERGY in _system_properties(system, request):
+                missing = [system.system_id.strip().lower()]
+                binding_groups.append(
+                    BindingGroup(
+                        complex_task_id=missing[0],
+                        fragment_task_ids=[],
+                        missing_fragment_ids=missing,
+                        label=f"E({system.display_name or system.system_id}) - sum E(fragments)",
+                        total_charge=system.total_charge or 0,
+                        state=StudyTaskState.FAILED.value,
+                        error="missing complex structure; binding not computable",
+                    )
+                )
             continue
         complex_structure = structures[0]
         complex_identity = complex_structure.identity
@@ -199,9 +216,11 @@ def build_calculation_matrix(
             tasks[complex_key] = complex_task
         fragment_ids: list[str] = []
         fragment_charges: list[int] = []
+        missing_fragment_ids: list[str] = []
         for parent_id in complex_structure.provenance.parent_structures:
             fragment_structures = resolved.get(parent_id) or []
             if not fragment_structures:
+                missing_fragment_ids.append(parent_id.strip().lower())
                 notes.append(
                     f"binding fragment {parent_id} of "
                     f"{complex_identity.system_id} has no structure"
@@ -226,34 +245,57 @@ def build_calculation_matrix(
                 )
             fragment_ids.append(fragment_key)
             fragment_charges.append(fragment_identity.total_charge)
-        if fragment_charges and sum(fragment_charges) != complex_identity.total_charge:
+        if missing_fragment_ids:
+            notes.append(
+                f"{complex_identity.system_id}: binding group has missing "
+                f"fragment IDs {', '.join(missing_fragment_ids)}"
+            )
+        if (
+            not missing_fragment_ids
+            and fragment_charges
+            and sum(fragment_charges) != complex_identity.total_charge
+        ):
             notes.append(
                 f"{complex_identity.system_id}: charge contract violated "
                 f"(complex {complex_identity.total_charge:+d} vs fragments "
                 f"{sum(fragment_charges):+d}); binding group marked invalid"
             )
-        if fragment_ids:
+        if (
+            fragment_ids
+            or missing_fragment_ids
+            or not complex_structure.provenance.parent_structures
+        ):
             complex_task.depends_on = list(
                 dict.fromkeys([*complex_task.depends_on, *fragment_ids])
             )
+            binding_state = (
+                StudyTaskState.PLANNED.value
+                if (
+                    not missing_fragment_ids
+                    and bool(complex_structure.provenance.parent_structures)
+                    and sum(fragment_charges) == complex_identity.total_charge
+                )
+                else StudyTaskState.FAILED.value
+            )
+            if missing_fragment_ids:
+                binding_error = "missing fragment structures; binding not computed"
+            elif not complex_structure.provenance.parent_structures:
+                binding_error = "no declared fragment references; binding not computed"
+            elif sum(fragment_charges) != complex_identity.total_charge:
+                binding_error = "charge contract violated; binding not computed"
+            else:
+                binding_error = ""
             binding_groups.append(
                 BindingGroup(
                     complex_task_id=complex_key,
                     fragment_task_ids=list(dict.fromkeys(fragment_ids)),
+                    missing_fragment_ids=list(dict.fromkeys(missing_fragment_ids)),
                     label=(
                         f"E({complex_identity.display_name}) - sum E(fragments)"
                     ),
                     total_charge=complex_identity.total_charge,
-                    state=(
-                        StudyTaskState.PLANNED.value
-                        if sum(fragment_charges) == complex_identity.total_charge
-                        else StudyTaskState.FAILED.value
-                    ),
-                    error=(
-                        ""
-                        if sum(fragment_charges) == complex_identity.total_charge
-                        else "charge contract violated; binding not computed"
-                    ),
+                    state=binding_state,
+                    error=binding_error,
                 )
             )
 

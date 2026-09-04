@@ -61,12 +61,18 @@ def derive_study_id(request: VaspStudyRequest) -> str:
 def plan_study(
     request: VaspStudyRequest,
     workspace: str | Path,
+    *,
+    study_dir: str | Path | None = None,
 ) -> VaspStudySpec:
     """Resolve structures, build the matrix and persist plan artifacts."""
     workspace_path = Path(workspace).expanduser().resolve()
     study_id = derive_study_id(request)
-    study_dir = workspace_path / "output" / "vasp_study" / study_id
-    structures_dir = study_dir / "structures"
+    resolved_study_dir = (
+        Path(study_dir).expanduser().resolve()
+        if study_dir is not None
+        else workspace_path / "output" / "vasp_study" / study_id
+    )
+    structures_dir = resolved_study_dir / "structures"
     structures_dir.mkdir(parents=True, exist_ok=True)
 
     policy = request.structure_policy
@@ -74,13 +80,16 @@ def plan_study(
     resolved: dict[str, list[Any]] = {}
     for system in request.systems:
         try:
+            source_path = system.structure_path
+            if source_path is not None and not source_path.is_absolute():
+                source_path = workspace_path / source_path
             structures = resolve_structure(
                 StructureRequest(
                     system_id=system.system_id,
                     display_name=system.display_name or system.system_id,
                     aliases=list(system.aliases),
                     smiles=system.smiles,
-                    structure_path=system.structure_path,
+                    structure_path=source_path,
                     total_charge=system.total_charge,
                     spin_multiplicity=system.spin_multiplicity,
                     role=system.role,
@@ -94,7 +103,7 @@ def plan_study(
             # A failing structure never blocks the whole study: the system
             # enters the matrix as SKIPPED_PROXY.
             resolved[system.system_id] = []
-            (study_dir / "structure_errors.jsonl").open("a", encoding="utf-8").write(
+            (resolved_study_dir / "structure_errors.jsonl").open("a", encoding="utf-8").write(
                 json.dumps(
                     {
                         "system_id": system.system_id,
@@ -129,20 +138,20 @@ def plan_study(
 
     manifest_path = write_structure_manifest(
         [structure for structures in resolved.values() for structure in structures],
-        study_dir / "structure_manifest.json",
+        resolved_study_dir / "structure_manifest.json",
     )
     write_structure_thumbnails(
         [structure for structures in resolved.values() for structure in structures],
-        study_dir / "figures" / "structures",
+        resolved_study_dir / "figures" / "structures",
     )
 
     matrix = build_calculation_matrix(request, resolved)
-    (study_dir / "study_request.json").write_text(
+    (resolved_study_dir / "study_request.json").write_text(
         json.dumps(request.model_dump(mode="json"), indent=2, ensure_ascii=False)
         + "\n",
         encoding="utf-8",
     )
-    (study_dir / "calculation_matrix.json").write_text(
+    (resolved_study_dir / "calculation_matrix.json").write_text(
         json.dumps(matrix.model_dump(mode="json"), indent=2, ensure_ascii=False)
         + "\n",
         encoding="utf-8",
@@ -150,7 +159,7 @@ def plan_study(
     return VaspStudySpec(
         study_id=study_id,
         request=request,
-        study_dir=study_dir,
+        study_dir=resolved_study_dir,
         calculation_matrix=matrix,
         structure_manifest_path=manifest_path,
     )

@@ -105,7 +105,7 @@ def run_scientific_loop_cli(
         model=config.model,
         workspace_root=workspace,
         approval=approval,
-        max_iterations=25,
+        max_iterations=10000,
         log_events=log_events,
     )
     sinks: list = []

@@ -25,6 +25,7 @@ from photomatagent.scientific.applications.vasp.molecular.psp_metadata import (
     PspError,
 )
 from photomatagent.scientific.applications.vasp.psp import (
+    is_safe_potcar_symbol,
     resolve_local_psp_library,
 )
 from photomatagent.scientific.remote.models import ResourceRequest
@@ -173,7 +174,7 @@ def materialize_stage_potcar(
     try:
         with target.open("wb") as destination:
             for symbol in symbols:
-                if not symbol.isalpha():
+                if not is_safe_potcar_symbol(symbol):
                     raise PspError(
                         f"unsafe POTCAR symbol {symbol!r}",
                         code="PSP_SYMBOL_UNSAFE",

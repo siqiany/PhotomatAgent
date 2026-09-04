@@ -1,14 +1,18 @@
-"""Registered ``vasp_molecule.*`` tools for the agent runtime.
+"""Legacy ``vasp_molecule.*`` tool pack (migration only).
 
-Every tool stays DEFERRED: discovery happens only through ``tool_search`` /
-``tool_describe``, and each call returns a bounded payload (``<= 4000``
-characters) with no source code, no full file listings and no POTCAR
-content. Scheduling states never become scientific evidence by themselves:
-evidence is attached only when result validation passes.
+These classes are retained as internal compatibility helpers while the
+unified ``vasp.*`` surface is authoritative. They are NOT registered in the
+model-visible ToolRegistry and are NOT DEFERRED model tools.
+
+Every tool stays HIDDEN in this legacy module and is never registered in the
+model-visible registry. Direct Python callers still receive the same bounded
+payload (``<= 4000`` characters) with no source code, no full file listings
+and no POTCAR content. Scheduling states never become scientific evidence by
+themselves: evidence is attached only when result validation passes.
 
 The tools are thin adapters over :class:`MolecularVaspTools`: exactly the
 same deterministic generator / preflight / lifecycle / parser that the
-offline tests exercise.
+offline tests exercise. New code should use the unified service instead.
 """
 
 from __future__ import annotations
@@ -75,7 +79,8 @@ class _MolecularTool(Tool):
 
     namespace = "vasp_molecule"
     source = "photomatagent molecular VASP"
-    exposure = ToolExposure.DEFERRED
+    # Migration-only compatibility helpers are never model-visible.
+    exposure = ToolExposure.HIDDEN
     tags = ("vasp", "molecule", "dft")
     cost_class = "EXPENSIVE"
 
@@ -513,7 +518,7 @@ class MolecularVaspResumeWorkflowTool(_MolecularTool):
 
 
 class MolecularVaspCapabilityPack(CapabilityPack):
-    """Deferred pack exposing the ``vasp_molecule.*`` tool family."""
+    """Hidden migration pack for the retired ``vasp_molecule.*`` family."""
 
     name = "vasp_molecule"
     description = (

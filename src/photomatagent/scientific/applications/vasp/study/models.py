@@ -34,6 +34,8 @@ class StudyTaskState(str, Enum):
     SKIPPED_PROXY = "SKIPPED_PROXY"
     SKIPPED_BUDGET = "SKIPPED_BUDGET"
     BLOCKED_NO_AUTHORIZATION = "BLOCKED_NO_AUTHORIZATION"
+    AWAITING_RESOURCE_CONFIRMATION = "AWAITING_RESOURCE_CONFIRMATION"
+    AWAITING_SCIENTIFIC_CONFIRMATION = "AWAITING_SCIENTIFIC_CONFIRMATION"
     UNKNOWN = "UNKNOWN"
 
 
@@ -164,6 +166,10 @@ class BindingGroup(BaseModel):
 
     complex_task_id: str
     fragment_task_ids: list[str]
+    # Declared provenance references for which no resolved structure/child
+    # exists.  These are never silently dropped: a group with missing IDs is
+    # non-computable even when the remaining charges happen to balance.
+    missing_fragment_ids: list[str] = Field(default_factory=list)
     label: str
     total_charge: int
     state: str = StudyTaskState.PLANNED.value

@@ -1,11 +1,16 @@
-"""Deferred ``vasp_study.*`` tools: plan / execute / status / resume /
-collect / report.
+"""Hidden migration-only ``vasp_study.*`` helpers: plan / execute / status /
+resume / collect / report.
 
-The study layer is a thin orchestrator over the existing ``vasp_molecule.*``
-executor plus the generic ``chemistry`` package. Natural-language input is
-never parsed by an embedded LLM: the outer agent maps the request to typed
-``VaspStudyRequest`` parameters and calls ``vasp_study.plan``.
+The study layer is a thin orchestrator over the existing molecular executor
+plus the generic ``chemistry`` package. Natural-language input is never
+parsed by an embedded LLM. These helpers are retained only for direct Python
+migration callers; the outer agent uses the unified ``vasp.*`` service.
 """
+
+# Migration-only module: legacy vasp_study.* Tool classes are not
+# registered in the model-visible ToolRegistry. New public entry points
+# use the unified vasp.* service.
+
 
 from __future__ import annotations
 
@@ -135,7 +140,8 @@ class _StudyTool(Tool):
 
     namespace = "vasp_study"
     source = "photomatagent study orchestration"
-    exposure = ToolExposure.DEFERRED
+    # Migration-only compatibility helpers are never model-visible.
+    exposure = ToolExposure.HIDDEN
     tags = ("vasp", "study", "molecule", "dft")
     cost_class = "EXPENSIVE"
 
@@ -609,6 +615,11 @@ class VaspStudyReportTool(_StudyTool):
         executor = self._executor(study_dir)
         state = executor.load_state()
         executor._sync_matrix_from_state(state)
+        # ``load_planned_study`` contains the original matrix, before runtime
+        # structure selection and child-workflow paths were persisted.  The
+        # executor has just merged those durable fields from study_state.json;
+        # use that synchronized spec for analysis and figure structure lookup.
+        spec = executor.spec
         results = analyze_study(spec)
         figures_dir = study_dir / "figures"
         figures_dir.mkdir(parents=True, exist_ok=True)
@@ -622,7 +633,10 @@ class VaspStudyReportTool(_StudyTool):
             plot_orbital_levels(orbital_rows, levels)
             generated_figures.append(str(levels))
         for row in results["systems"]:
-            workflow_dir = study_dir / "workflows" / row["system"]
+            workflow_dir = _row_workflow_dir(study_dir, row)
+            figure_id = str(
+                row.get("system_id") or row["task_id"].split("|", 1)[0]
+            )
             structure_path = _row_structure_path(spec, row)
             for stage, tag in (
                 ("orbital_homo", "homo"),
@@ -631,7 +645,7 @@ class VaspStudyReportTool(_StudyTool):
                 stage_dir = workflow_dir / "results" / stage
                 parchg_files = sorted(stage_dir.glob("PARCHG*"))
                 for parchg in parchg_files[:1]:
-                    out = figures_dir / f"{tag}_isosurface_{row['system']}.png"
+                    out = figures_dir / f"{tag}_isosurface_{figure_id}.png"
                     try:
                         plot_orbital_isosurface(parchg, structure_path, out)
                         generated_figures.append(str(out))
@@ -639,7 +653,7 @@ class VaspStudyReportTool(_StudyTool):
                         pass
             locpot = workflow_dir / "results" / "esp" / "LOCPOT"
             if locpot.is_file():
-                out = figures_dir / f"esp_surface_{row['system']}.png"
+                out = figures_dir / f"esp_surface_{figure_id}.png"
                 try:
                     plot_esp_surface(locpot, structure_path, out)
                     generated_figures.append(str(out))
@@ -689,13 +703,32 @@ class VaspStudyReportTool(_StudyTool):
 
 def _row_structure_path(spec: Any, row: dict[str, Any]) -> Path:
     for task in spec.calculation_matrix.tasks:
-        if task.task_id == row["task_id"] and task.structure_path:
+        if task.task_id != row["task_id"]:
+            continue
+        if task.structure_path:
             return Path(task.structure_path)
+        # Backward-compatible recovery for study_state files written before
+        # the selected structure path was persisted.  The conformer index is
+        # durable, and candidates remain part of the planned matrix.
+        if task.structure_candidates:
+            index = min(task.conformer_index, len(task.structure_candidates) - 1)
+            return Path(task.structure_candidates[index])
     return Path.cwd()
 
 
+def _row_workflow_dir(study_dir: Path, row: dict[str, Any]) -> Path:
+    """Return a persisted child path only when it remains inside the study."""
+    candidate = Path(str(row.get("workflow_dir") or "")).expanduser().resolve()
+    study_root = study_dir.resolve()
+    try:
+        candidate.relative_to(study_root)
+    except ValueError:
+        return study_root / "workflows" / "missing"
+    return candidate
+
+
 class VaspStudyCapabilityPack(CapabilityPack):
-    """Deferred pack exposing the ``vasp_study.*`` tool family."""
+    """Hidden migration pack for the retired ``vasp_study.*`` family."""
 
     name = "vasp_study"
     description = (

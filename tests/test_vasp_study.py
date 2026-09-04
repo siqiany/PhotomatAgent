@@ -47,6 +47,19 @@ ZVAL_ENMAX = {
     "S": (6.0, 400.0),
 }
 
+UNIFIED_VASP_TOOL_NAMES = {
+    "vasp.capabilities",
+    "vasp.plan",
+    "vasp.prepare",
+    "vasp.preflight",
+    "vasp.submit",
+    "vasp.status",
+    "vasp.wait",
+    "vasp.resume",
+    "vasp.collect",
+    "vasp.report",
+}
+
 
 def make_psp(tmp_path: Path) -> Path:
     library = tmp_path / "psp" / "potpaw_PBE.64"
@@ -607,7 +620,7 @@ async def test_budget_stops_new_jobs_and_keeps_partial_report(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_default_registry_registers_study_and_chemistry_tools(tmp_path):
+def test_default_registry_routes_studies_through_unified_tools(tmp_path):
     from photomatagent.scientific.state import ScientificState
     from photomatagent.tools.factory import create_default_registry
     from photomatagent.tools.surface import ToolCatalog
@@ -617,12 +630,7 @@ def test_default_registry_registers_study_and_chemistry_tools(tmp_path):
         ScientificState(), Workspace(tmp_path)
     )
     names = {tool.name for tool in registry.list_tools()}
-    assert "vasp_study.plan" in names
-    assert "vasp_study.execute" in names
-    assert "vasp_study.status" in names
-    assert "vasp_study.resume" in names
-    assert "vasp_study.collect" in names
-    assert "vasp_study.report" in names
+    assert {name for name in names if name.startswith("vasp")} == UNIFIED_VASP_TOOL_NAMES
     assert "chemistry.resolve_structure" in names
     assert "chemistry.generate_conformers" in names
     assert "chemistry.build_complex" in names
@@ -630,4 +638,5 @@ def test_default_registry_registers_study_and_chemistry_tools(tmp_path):
     assert "chemistry.validate_structure" in names
     catalog = ToolCatalog(registry)
     matches = catalog.search("vasp study", limit=20)
-    assert any(item.entry.name == "vasp_study.plan" for item in matches)
+    assert any(item.entry.name == "vasp.plan" for item in matches)
+    assert all(item.entry.name in UNIFIED_VASP_TOOL_NAMES for item in matches if item.entry.name.startswith("vasp"))

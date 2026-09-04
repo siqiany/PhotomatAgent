@@ -96,11 +96,8 @@ def _mcp_gateway_tools(
 
     Uses the workspace ``.photomatagent/mcp.json`` configuration. A failing
     server degrades to a ``<namespace>.status`` stub; it never raises.
-    Adapters that merely duplicate tools the local packs already register
-    (the SCNet MCP ``vasp_molecule_*`` family) are skipped by default so the
-    agent never sees two entry points for the same capability; set
-    ``PHOTOMATAGENT_MCP_INCLUDE_DUPLICATE_MOLECULAR=1`` to keep the MCP
-    copies.
+    SCNet MCP VASP adapters are skipped whenever the local unified VASP pack
+    is present, so the agent never sees two entry points for one lifecycle.
     """
     from photomatagent.mcp.manager import MCPServerManager
 

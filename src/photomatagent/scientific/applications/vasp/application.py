@@ -24,6 +24,9 @@ from photomatagent.scientific.applications.vasp.profiles import (
     VaspProfile,
     get_profile,
 )
+from photomatagent.scientific.applications.vasp.psp import (
+    is_safe_potcar_symbol,
+)
 from photomatagent.scientific.applications.vasp.validation import (
     REQUIRED_VASP_RESULT_FILES,
     parse_result,
@@ -86,7 +89,7 @@ def potcar_assembly_preamble(
         '"$psp_base/potpaw_PBE.64"; do',
     ]
     for symbol in potcar_symbols:
-        if not symbol.isalpha():
+        if not is_safe_potcar_symbol(symbol):
             raise ValueError(f"unsafe POTCAR symbol: {symbol!r}")
         lines.extend(
             [
@@ -267,8 +270,13 @@ class VaspApplication:
         )
 
     def resolve_potcar(self, input_dir: str | Path) -> Path | None:
-        """Assemble POTCAR from the local psp dir; None when unresolvable."""
+        """Assemble POTCAR from the local psp dir; None when unresolvable.
+
+        Every required setup is verified BEFORE the target file is opened:
+        a missing dataset never leaves a partial/empty POTCAR behind.
+        """
         from photomatagent.scientific.applications.vasp.psp import (
+            is_safe_potcar_symbol,
             resolve_local_psp_library,
         )
 
@@ -282,17 +290,19 @@ class VaspApplication:
         if policy.is_file():
             for line in policy.read_text(encoding="utf-8").splitlines():
                 if line.startswith("  ") and ": " in line:
-                    symbol = line.strip().split(":")[0].strip()
-                    if symbol.isalpha():
+                    symbol = line.strip().split(":", 1)[0].strip()
+                    if is_safe_potcar_symbol(symbol):
                         symbols.append(symbol)
         if not symbols:
             return None
+        sources = [psp / symbol / "POTCAR" for symbol in symbols]
+        if any(not source.is_file() for source in sources):
+            # Missing setup: never leave a torn POTCAR in the stage dir.
+            (input_dir / "POTCAR").unlink(missing_ok=True)
+            return None
         target = input_dir / "POTCAR"
         with target.open("wb") as destination:
-            for symbol in symbols:
-                source = psp / symbol / "POTCAR"
-                if not source.is_file():
-                    return None
+            for source in sources:
                 with source.open("rb") as handle:
                     shutil.copyfileobj(handle, destination)
         return target
@@ -335,13 +345,17 @@ class VaspApplication:
 
     @staticmethod
     def _potcar_symbols(input_dir: Path) -> list[str]:
+        from photomatagent.scientific.applications.vasp.psp import (
+            is_safe_potcar_symbol,
+        )
+
         policy = input_dir / "POTCAR.policy"
         symbols: list[str] = []
         if policy.is_file():
             for line in policy.read_text(encoding="utf-8").splitlines():
                 if line.startswith("  ") and ": " in line:
                     symbol = line.strip().split(":", 1)[0]
-                    if symbol.isalpha() and symbol not in symbols:
+                    if is_safe_potcar_symbol(symbol) and symbol not in symbols:
                         symbols.append(symbol)
         return symbols
 
@@ -384,10 +398,22 @@ class VaspApplication:
     ) -> RemoteJobRef:
         """Upload one stage directory and submit; detached by default.
 
+        Deprecated: public lifecycle ownership is moving to
+        ``PeriodicVaspExecutor`` and ``SubmitOnceSession``. This method is
+        retained for legacy callers and will be removed after migration.
+
         ``unique_remote_directory`` defaults to True: two jobs must never
         write into the same remote directory. Callers that pass False
         explicitly accept the (legacy) shared-directory risk.
         """
+        import warnings
+
+        warnings.warn(
+            "VaspApplication.submit_stage is deprecated; use "
+            "PeriodicVaspExecutor + SubmitOnceSession",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if self.backend is None:
             raise RuntimeError("VASP backend is not configured")
         profile = get_profile(profile_name)

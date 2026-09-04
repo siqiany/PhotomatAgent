@@ -10,7 +10,7 @@ monitoring, collection, scientific acceptance, restarts and recovery on the
 configured SCNet backend. It deliberately does NOT plan full molecular
 studies from natural language (that is `molecular-vasp-study`), does NOT
 generate novel structures, and never re-implements SSH/Slurm/POTCAR handling
-(all of that stays inside `vasp_molecule.*` / `vasp_study.*`).
+(all of that stays inside the unified `vasp.*` service).
 
 ## Scope of one operator session
 
@@ -24,19 +24,19 @@ generate novel structures, and never re-implements SSH/Slurm/POTCAR handling
 ## Non-negotiable rules
 
 1. ALWAYS start with the VASP capabilities/doctor probe
-   (`vasp_molecule.capabilities` or `photomatagent scientific
+   (`vasp.capabilities` or `photomatagent scientific
    scnet-doctor`) and confirm configuration, partition, VASP version and
    the pseudopotential strategy before touching any job.
 2. Submit a REAL calculation only when the user explicitly asked for real
    computation AND the HPC submit gate is open
    (`PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1` + `ResourcePolicy` caps); never
    bypass the gate.
-3. Use `vasp_study.*` or `vasp_molecule.*` tools; never hand-assemble
+3. Use the unified `vasp.*` tools; never hand-assemble
    lower-level lifecycle calls for the user.
 4. `total_charge` must always be explicit; it is never guessed from a
    molecule name, file name or formula.
-5. Follow the fixed chain: prepare → preflight → submit → status/resume →
-   collect → validate → analyze/report.
+5. Follow the fixed chain: prepare → preflight → submit → status/wait →
+   resume → collect → validate → analyze/report.
 6. A failed status query NEVER triggers a resubmission (refresh/reconcile
    only; UNKNOWN stays UNKNOWN until proven otherwise).
 7. An ambiguous sbatch result MUST be reconciled (registry + marker +
@@ -66,14 +66,20 @@ generate novel structures, and never re-implements SSH/Slurm/POTCAR handling
     markers).
 18. Every response returns job_id, remote directory, current scientific
     state and the next step — never just "已完成".
+19. WAIT, do not busy-poll. After `vasp.submit`, call `vasp.wait` (it polls
+    internally with a timer and costs ONE model round-trip) and then react
+    to the settled state. Repeatedly calling `vasp.status` (or filling the
+    time with unrelated tools) burns tokens for no information: while a job
+    is RUNNING there is nothing new to learn. Do unrelated analysis only
+    when it genuinely advances the task.
 
 ## Worked flows
 
 ### Continue / retry a submitted job ("继续/重试/查看作业")
 
-1. `vasp_study.status` / `vasp_molecule.status` for the recorded request.
+1. `vasp.status` for the recorded request.
 2. Never re-sbatch on a status failure; reconcile ambiguous submissions.
-3. `vasp_study.collect` (or `vasp_molecule.collect`) to download and
+3. `vasp.collect` to download and
    validate; only VALIDATED results generate evidence.
 
 ### Slurm completed but not converged
@@ -101,6 +107,6 @@ generate novel structures, and never re-implements SSH/Slurm/POTCAR handling
 ## Boundaries
 
 - Planning new studies, structure generation and full-study reporting →
-  `molecular-vasp-study` / `vasp_study.*`.
+  `molecular-vasp-study` / `vasp.plan` / `vasp.report`.
 - Generic materials questions, literature-only requests → NOT this skill.
 

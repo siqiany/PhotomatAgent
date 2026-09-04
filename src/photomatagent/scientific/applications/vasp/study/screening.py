@@ -123,7 +123,7 @@ class ConformerScreener:
             MolecularVaspTools,
         )
 
-        scores: list[tuple[int, float | None, ConformerScreenRecord]] = []
+        scores: list[tuple[int, float, ConformerScreenRecord]] = []
         for index, candidate in enumerate(candidates):
             molecule = MoleculeSpec(
                 name=f"{task.display_name}_screen_{index}",
@@ -204,7 +204,7 @@ class ConformerScreener:
             )
         else:
             report.screen_complete = True
-            scores.sort(key=lambda item: (item[1], item[0]))  # type: ignore[arg-type]
+            scores.sort(key=lambda item: (item[1], item[0]))
             best_index, best_e0, best_record = scores[0]
             report.selected_structure_path = best_record.structure_path
             report.selected_candidate_index = best_index

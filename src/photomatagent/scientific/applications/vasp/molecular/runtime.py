@@ -205,7 +205,8 @@ def default_molecular_runtime(
         or (app.remote_psp_dir if app is not None else "")
     )
     remote_root = (
-        os.environ.get("SCNET_REMOTE_ROOT", "~/photomatagent").strip()
+        os.environ.get("SCNET_REMOTE_ROOT", "").strip()
+        or (app.remote_root if app is not None else "")
         or "~/photomatagent"
     )
     return MolecularVaspRuntime(

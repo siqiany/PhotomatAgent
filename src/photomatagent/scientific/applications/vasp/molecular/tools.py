@@ -29,6 +29,7 @@ from photomatagent.scientific.applications.vasp.molecular.models import (
     StageName,
     WorkflowSpec,
 )
+from photomatagent.scientific.remote.models import ResourceRequest
 
 MAX_TOOL_CHARS = 4000
 
@@ -267,6 +268,8 @@ class MolecularVaspTools:
         wait: bool = False,
         wait_timeout_seconds: float = 3600.0,
         force_new_attempt: bool = False,
+        resource: ResourceRequest | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         """Submit one stage under the preflight gate (submit-once semantics)."""
         from photomatagent.scientific.applications.vasp.molecular.preflight import (
@@ -432,9 +435,10 @@ class MolecularVaspTools:
                 job_name=f"{workflow.molecule.name}-{stage_name.value}",
                 local_input_dir=stage_dir,
                 gate=gate,
-                resource=sanitize_resource(workflow, stage_spec),
+                resource=resource or sanitize_resource(workflow, stage_spec),
                 executable="vasp_std",
                 script_name="run.slurm",
+                request_id=request_id,
                 force_new_attempt=force_new_attempt,
                 remote_copies=remote_copies,
                 script_renderer=lambda job_name, resource: render_stage_slurm(

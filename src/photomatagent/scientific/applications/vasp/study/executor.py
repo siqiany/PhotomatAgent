@@ -33,6 +33,8 @@ from photomatagent.scientific.applications.vasp.study.models import (
 )
 from photomatagent.scientific.applications.vasp.study.planner import (
     budget_status,
+    load_planned_study,
+    plan_study,
 )
 from photomatagent.scientific.capabilities.chemistry.storage import read_xyz
 
@@ -112,6 +114,9 @@ class StudyExecutor:
                 task.conformer_index = stored.get(
                     "conformer_index", task.conformer_index
                 )
+                stored_structure = stored.get("structure_path")
+                if stored_structure:
+                    task.structure_path = Path(stored_structure)
                 task.error = stored.get("error", task.error)
                 task.workflow_dir = stored.get(
                     "workflow_dir", task.workflow_dir
@@ -132,6 +137,9 @@ class StudyExecutor:
                     "state": task.state,
                     "request_id": task.request_id,
                     "conformer_index": task.conformer_index,
+                    "structure_path": (
+                        str(task.structure_path) if task.structure_path else ""
+                    ),
                     "error": task.error,
                     "workflow_dir": task.workflow_dir,
                     "results_dir": task.results_dir,
@@ -148,6 +156,26 @@ class StudyExecutor:
                 for group in self.spec.calculation_matrix.binding_groups
             },
         }
+
+    def plan_only(self) -> VaspStudySpec:
+        """Resolve and persist a study plan without executing any task.
+
+        Unified study lifecycle code uses this narrow phase to build the
+        calculation matrix and child specifications.  In particular, this
+        method never constructs the molecular tool facade and never submits,
+        waits for, or collects a child workflow.
+        """
+        matrix_path = Path(self.spec.study_dir) / "calculation_matrix.json"
+        request_path = Path(self.spec.study_dir) / "study_request.json"
+        if not self.spec.calculation_matrix.tasks and matrix_path.is_file() and request_path.is_file():
+            self.spec = load_planned_study(self.spec.study_dir)
+        elif not self.spec.calculation_matrix.tasks:
+            self.spec = plan_study(
+                self.spec.request,
+                Path(self.spec.study_dir).parent,
+                study_dir=self.spec.study_dir,
+            )
+        return self.spec
 
     # -- per-task helpers -----------------------------------------------------
 

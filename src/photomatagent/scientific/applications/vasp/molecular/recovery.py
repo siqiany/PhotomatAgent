@@ -346,7 +346,7 @@ def decide_recovery(
             )
         # practical convergence: forces below the RELAXED threshold (recorded
         # explicitly; never claimed as the original EDIFFG).
-        changes: dict[str, Any] = {}
+        nsw_changes: dict[str, Any] = {}
         practical = False
         practical_note = ""
         if (
@@ -358,7 +358,7 @@ def decide_recovery(
         ):
             old = ediffg
             new = round(ediffg * policy.ediffg_relax_factor, 6)
-            changes["EDIFFG"] = -new
+            nsw_changes["EDIFFG"] = -new
             practical = True
             practical_note = (
                 f"EDIFFG relaxed -{old:.6f} -> -{new:.6f} eV/A (reason: "
@@ -371,9 +371,9 @@ def decide_recovery(
         return restart_decision(
             restart_from="CONTCAR",
             parameter_changes=[
-                *(f"{key} = {value}" for key, value in changes.items()),
+                *(f"{key} = {value}" for key, value in nsw_changes.items()),
             ],
-            incar_changes=changes,
+            incar_changes=nsw_changes,
             reason=(
                 "NSW exhausted: restart from CONTCAR with a new attempt "
                 "(never from the initial POSCAR)"
@@ -391,25 +391,25 @@ def decide_recovery(
                 new_attempt_id=attempt_id,
                 provenance=provenance,
             )
-        changes: dict[str, Any] = {}
+        plateau_changes: dict[str, Any] = {}
         if policy.allow_potim_reduction:
-            changes["POTIM"] = 0.5
+            plateau_changes["POTIM"] = 0.5
         elif policy.allow_ibrion_switch:
-            changes["IBRION"] = 1
+            plateau_changes["IBRION"] = 1
         return restart_decision(
             restart_from="CONTCAR",
             parameter_changes=[
-                f"{key} = {value}" for key, value in changes.items()
+                f"{key} = {value}" for key, value in plateau_changes.items()
             ],
-            incar_changes=changes,
+            incar_changes=plateau_changes,
             reason=(
                 "force plateau detected; "
                 + (
                     "reduce POTIM to 0.5"
-                    if changes.get("POTIM") is not None
+                    if plateau_changes.get("POTIM") is not None
                     else (
                         "switch IBRION to 1"
-                        if changes.get("IBRION") is not None
+                        if plateau_changes.get("IBRION") is not None
                         else "no typed parameter change available; STOP"
                     )
                 )
@@ -455,9 +455,10 @@ def apply_incar_changes(incar_text: str, changes: dict[str, Any]) -> str:
     if not changes:
         return incar_text
     lines = incar_text.splitlines()
-    rendered = render_incar(changes).splitlines()
+    rendered_lines = render_incar(changes).splitlines()
     updates = {
-        rendered_line.split(" = ")[0]: rendered_line for rendered_line in rendered
+        rendered_line.split(" = ")[0]: rendered_line
+        for rendered_line in rendered_lines
     }
     out: list[str] = []
     seen: set[str] = set()
@@ -472,9 +473,9 @@ def apply_incar_changes(incar_text: str, changes: dict[str, Any]) -> str:
             seen.add(key)
         else:
             out.append(line)
-    for key, rendered in updates.items():
+    for key, rendered_line in updates.items():
         if key not in seen:
-            out.append(rendered)
+            out.append(rendered_line)
     return "\n".join(out) + "\n"
 
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -56,6 +56,19 @@ ZVAL_ENMAX = {
     "H": (1.0, 250.0),
     "Li": (1.0, 140.0),
     "F": (7.0, 400.0),
+}
+
+UNIFIED_VASP_TOOL_NAMES = {
+    "vasp.capabilities",
+    "vasp.plan",
+    "vasp.prepare",
+    "vasp.preflight",
+    "vasp.submit",
+    "vasp.status",
+    "vasp.wait",
+    "vasp.resume",
+    "vasp.collect",
+    "vasp.report",
 }
 
 
@@ -268,47 +281,42 @@ def registry(tmp_path_factory) -> Any:
     return create_default_registry(ScientificState(), Workspace(root))
 
 
-def test_default_registry_registers_all_molecular_tools(registry):
+def test_default_registry_routes_molecular_workflows_through_unified_tools(registry):
     tool_names = {tool.name for tool in registry.list_tools()}
-    assert {
-        "vasp_molecule.capabilities",
-        "vasp_molecule.prepare",
-        "vasp_molecule.preflight",
-        "vasp_molecule.submit",
-        "vasp_molecule.status",
-        "vasp_molecule.collect",
-        "vasp_molecule.analyze_orbitals",
-        "vasp_molecule.analyze_esp",
-        "vasp_molecule.binding_energy",
-        "vasp_molecule.resume_workflow",
-    } <= tool_names
+    assert {name for name in tool_names if name.startswith("vasp")} == UNIFIED_VASP_TOOL_NAMES
 
 
-def test_tool_search_finds_molecular_vasp(registry):
+def test_tool_search_finds_unified_molecular_vasp_entry_points(registry):
     catalog = ToolCatalog(registry)
     matches = catalog.search("isolated molecule VASP", limit=20)
     names = {match.entry.name for match in matches}
-    assert "vasp_molecule.prepare" in names
-    assert "vasp_molecule.preflight" in names
-    assert "vasp_molecule.submit" in names
+    assert "vasp.plan" in names
+    assert "vasp.prepare" in names
+    assert "vasp.submit" in names
+    assert {
+        name for name in names if name.startswith("vasp")
+    } <= UNIFIED_VASP_TOOL_NAMES
 
 
-def test_tool_describe_returns_schema(registry):
+def test_tool_describe_returns_unified_plan_schema(registry):
     catalog = ToolCatalog(registry)
-    entry = catalog.get("vasp_molecule.prepare")
+    entry = catalog.get("vasp.plan")
     assert entry is not None
     required = entry.required_parameters
-    assert "structure_path" in required
-    assert "total_charge" in required
+    assert "workflow_kind" in required
+    assert "scientific_spec" in required
     schema = entry.full_schema_reference.input_schema
-    assert schema["properties"]["total_charge"]["type"] == "integer"
-    assert entry.namespace == "vasp_molecule"
+    assert schema["properties"]["workflow_kind"]["type"] == "string"
+    assert entry.namespace == "vasp"
 
 
-def test_all_molecular_tools_are_deferred(registry):
+def test_all_registered_vasp_tools_are_deferred_without_legacy_molecular_tools(registry):
     for tool in registry.list_tools():
-        if tool.name.startswith("vasp_molecule."):
+        if tool.name.startswith("vasp"):
             assert tool.exposure is ToolExposure.DEFERRED
+    assert {
+        tool.name for tool in registry.list_tools() if tool.name.startswith("vasp")
+    } == UNIFIED_VASP_TOOL_NAMES
 
 
 # --------------------------------------------------------------------------
@@ -634,23 +642,29 @@ async def test_collect_failed_validation_stays_collected_without_evidence(tmp_pa
 # --------------------------------------------------------------------------
 
 
-async def test_scnet_mcp_boundary_prepare(tmp_path):
-    psp = make_psp(tmp_path)
-    runtime = make_runtime(tmp_path, psp=psp)
-    molecule = dme_li_molecule(tmp_path)
+async def test_scnet_mcp_boundary_prepare_delegates_to_unified_service():
     from photomatagent.mcp_servers.scnet import server
 
-    tool = MolecularVaspPrepareTool(runtime)
-    with patch.object(server, "_molecular_tool", return_value=tool):
-        result = await server._call_molecular(
-            "vasp_molecule.prepare",
-            {
-                "structure_path": str(molecule.structure_path),
-                "name": "DME_Li",
-                "total_charge": 1,
-                "box_ang": 20.0,
-                "workflow_dir": str(tmp_path / "mcpflow"),
-            },
-        )
+    class FakeService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def prepare(self, workflow_id: str) -> dict[str, Any]:
+            self.calls.append(("prepare", workflow_id))
+            return {
+                "ok": True,
+                "workflow_id": workflow_id,
+                "state": "PREPARED",
+                "data": {"delegated": True},
+            }
+
+    service = FakeService()
+    server._set_unified_vasp_graph_for_test(SimpleNamespace(service=service))
+    try:
+        result = await server.vasp_prepare("vasp_0123456789abcdef")
+    finally:
+        server._set_unified_vasp_graph_for_test(None)
+
     assert result.get("is_error") is False
-    assert result["summary"]["preflight_passed"] is True
+    assert service.calls == [("prepare", "vasp_0123456789abcdef")]
+    assert result["data"]["delegated"] is True

@@ -986,7 +986,8 @@ def analyze_outcar_convergence(
     incar = dict(incar_dict or {})
     ediff_value = _plain(incar.get("EDIFF")) if incar.get("EDIFF") is not None else ediff_ev
     ediffg_raw = incar.get("EDIFFG")
-    ediffg = abs(_plain(ediffg_raw)) if ediffg_raw is not None else None
+    ediffg_value = _plain(ediffg_raw) if ediffg_raw is not None else None
+    ediffg = abs(ediffg_value) if ediffg_value is not None else None
     nsw_limit = nsw
     if nsw_limit == 0:
         raw_nsw = _plain(incar.get("NSW")) if incar.get("NSW") is not None else None

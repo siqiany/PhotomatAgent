@@ -14,12 +14,40 @@ No POTCAR content is ever read, copied or logged here.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
 PSPLayout = Literal["direct", "potpaw_PBE", "potpaw_PBE.64"]
 
 _PROBE_SETUPS = ("In", "Al", "C")
+
+# Deterministic element -> POTCAR setup SUFFIX mapping.
+#
+# The VASP PBE POTCAR libraries (potpaw_PBE, potpaw_PBE.64) ship no plain
+# ``Ba`` dataset: barium only exists as ``Ba_sv`` (10 valence electrons,
+# s/p/d semicore), which is the canonical PBE choice. Keeping the suffix
+# here means policy generation, local resolution and remote assembly all
+# agree on the same full setup name (``Ba`` -> ``Ba_sv``). Elements absent
+# from the table stay bare.
+ELEMENT_SETUP_DEFAULTS: dict[str, str] = {
+    "Ba": "_sv",
+}
+
+# POTCAR setup directory names must stay shell/argv safe: letters, digits
+# and an optional ``_setup`` suffix only -- never path separators,
+# whitespace, quotes or ``..``.
+_SAFE_POTCAR_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def potcar_element_name(element: str) -> str:
+    """Full POTCAR directory name for a chemical element symbol."""
+    return f"{element}{ELEMENT_SETUP_DEFAULTS.get(element, '')}"
+
+
+def is_safe_potcar_symbol(symbol: str) -> bool:
+    """True for a safe POTCAR setup name (bare element or ``X_sv``-style)."""
+    return bool(_SAFE_POTCAR_NAME.fullmatch(symbol))
 
 
 def _layout_for_local(root: Path) -> PSPLayout | None:

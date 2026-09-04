@@ -203,7 +203,8 @@ Capability packs are registered from `src/photomatagent/scientific/capabilities/
 | `photodetector` | EQE/responsivity conversion and target checks. |
 | `defects`, `transport`, `device`, `optics`, `interface`, `kp` | Optional domain-specific calculations and diagnostics. |
 | `generation` | Formula retrieval/validation and optional generative workflows. |
-| `vasp`, `namd`, `magus` | Prepare, submit, monitor, collect, and inspect high-cost workflows. |
+| `vasp` | Unified deferred `vasp.*` family: capabilities, plan, prepare, preflight, submit, status, resume, collect, report. |
+| `namd`, `magus` | Prepare, submit, monitor, collect, and inspect high-cost workflows. |
 
 Check the capabilities actually available in the current environment:
 

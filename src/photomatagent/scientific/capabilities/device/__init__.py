@@ -8,6 +8,8 @@ not a general-purpose Python execution tool.
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import importlib.metadata
 import json
 import multiprocessing
@@ -212,10 +214,17 @@ class DeviceRunScriptTool(Tool):
                 is_error=True,
                 data={"error": "not_devsim_script"},
             )
-        import asyncio
-
         timeout = float(arguments.get("timeout_seconds", 60))
-        result = await asyncio.to_thread(self._execute_script, script, source, timeout)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            execution = executor.submit(
+                self._execute_script,
+                script,
+                source,
+                timeout,
+            )
+            while not execution.done():
+                await asyncio.sleep(0.01)
+            result = execution.result()
         if result.get("timeout"):
             return ScientificToolResult(
                 output=f"device script timed out after {timeout:g}s and was terminated",

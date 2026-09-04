@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import re
 import shlex
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ COMMANDS = (
     CommandSpec("/tools search <query>", "搜索延迟暴露工具"),
     CommandSpec("/skills [list]", "查看可用技能"),
     CommandSpec("/scientific [status]", "查看所有科学能力包及依赖状态"),
+    CommandSpec("/scientific approve <decision-id>", "显示并确认批准 VASP 应用级决策（仅用户）"),
     CommandSpec("/scientific scnet-doctor", "诊断 SCNet、Slurm 与科学应用"),
     CommandSpec("/mcp [list]", "列出 MCP 服务配置"),
     CommandSpec("/mcp status", "连接并探测 MCP 服务状态"),
@@ -233,7 +235,16 @@ class ChatCommandRouter:
 
         if "--workspace" not in args and args[0] not in {"sessions", "skills"}:
             args.extend(["--workspace", str(self.workspace.root)])
-        result = await asyncio.to_thread(CliRunner().invoke, app, args)
+        # CliRunner temporarily replaces process-global standard streams.  On
+        # some Click/Python combinations that can lose the event-loop wakeup
+        # used by ``asyncio.to_thread`` even though the worker has completed.
+        # Polling the plain concurrent Future keeps async CLI implementations
+        # off this running loop without depending on that cross-thread wakeup.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            invocation = executor.submit(CliRunner().invoke, app, args)
+            while not invocation.done():
+                await asyncio.sleep(0.01)
+            result = invocation.result()
         if result.stdout:
             # The CLI module console may render ANSI styles into the captured
             # buffer (it fixes its color system at import time, when stdout is

@@ -616,7 +616,11 @@ class SubmitOnceSession:
         # POTCAR is only uploaded when the caller explicitly opts into the
         # local (materialized) mode; a real POTCAR sitting in the input dir
         # is never swept up by a generic submit (mode defaults to "none").
-        local_potcar = potcar_mode == "local" and (input_dir / "POTCAR").is_file()
+        local_potcar = (
+            potcar_mode == "local"
+            and (input_dir / "POTCAR").is_file()
+            and (input_dir / "POTCAR").stat().st_size > 0
+        )
         if local_potcar:
             names.append("POTCAR")
         if not names:
@@ -633,8 +637,12 @@ class SubmitOnceSession:
                 error="no input files found in local input dir",
             )
         # -- deterministic POTCAR policy -----------------------------------
+        from photomatagent.scientific.applications.vasp.psp import (
+            is_safe_potcar_symbol,
+        )
+
         for symbol in potcar_symbols:
-            if not symbol.isalpha():
+            if not is_safe_potcar_symbol(symbol):
                 self.registry.update(
                     request_id,
                     state=JobLifecycleState.FAILED,
@@ -702,6 +710,23 @@ class SubmitOnceSession:
                 record=current.public_dict(),
                 blocked=True,
                 error="local POTCAR requested but not present in the input dir",
+            )
+        elif potcar_mode == "local" and (input_dir / "POTCAR").stat().st_size == 0:
+            self.registry.update(
+                request_id,
+                state=JobLifecycleState.FAILED,
+                last_error="local POTCAR requested but the file is empty",
+            )
+            current = self.registry.get(request_id)
+            assert current is not None
+            return SubmitOnceResult(
+                request_id=request_id,
+                record=current.public_dict(),
+                blocked=True,
+                error=(
+                    "local POTCAR is empty; upload and sbatch refused "
+                    "(resolve POTCAR before submitting)"
+                ),
             )
         elif potcar_mode not in {"none", "local", "remote"}:
             self.registry.update(

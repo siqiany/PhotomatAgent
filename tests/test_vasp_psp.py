@@ -12,7 +12,9 @@ import pytest
 
 from photomatagent.scientific.applications.vasp.application import VaspApplication
 from photomatagent.scientific.applications.vasp.psp import (
+    is_safe_potcar_symbol,
     local_potcar_check,
+    potcar_element_name,
     remote_potcar_check,
     resolve_local_psp_library,
     resolve_remote_psp_library,
@@ -181,8 +183,105 @@ def test_remote_potcar_check_missing_list():
 
     async def scenario():
         missing = await remote_potcar_check(
-            backend, "/lib", [("In", ""), ("As", "")], 
+            backend, "/lib", [("In", ""), ("As", "")],
         )
         assert missing == ["As"]
 
     asyncio.run(scenario())
+
+
+def test_potcar_element_name_maps_barium_to_semicore_setup():
+    """VASP PBE libraries ship no plain ``Ba``; it maps to ``Ba_sv``."""
+    assert potcar_element_name("Ba") == "Ba_sv"
+    assert potcar_element_name("Ti") == "Ti"
+    assert potcar_element_name("Te") == "Te"
+
+
+def test_is_safe_potcar_symbol_accepts_setups_but_rejects_path_tricks():
+    assert is_safe_potcar_symbol("Ba")
+    assert is_safe_potcar_symbol("Ba_sv")
+    assert is_safe_potcar_symbol("Ti_pv")
+    for unsafe in (
+        "Ba/../evil",
+        "../Ba",
+        "Ba sv",
+        "Ba;rm",
+        "Ba$X",
+        "",
+        ".",
+    ):
+        assert not is_safe_potcar_symbol(unsafe), unsafe
+
+
+@pytest.mark.asyncio
+async def test_preflight_reports_unresolvable_potcar(tmp_path):
+    """A periodic workflow whose POTCAR cannot be supplied must fail
+    preflight with a clear message instead of submitting a doomed job."""
+    from pymatgen.core import Lattice, Structure
+
+    from photomatagent.scientific.applications.vasp.unified.fingerprints import (
+        scientific_fingerprint,
+    )
+    from photomatagent.scientific.applications.vasp.unified.models import (
+        PeriodicScientificSpec,
+        UnifiedStage,
+        UnifiedVaspManifest,
+        VaspWorkflowKind,
+    )
+    from photomatagent.scientific.applications.vasp.unified.periodic import (
+        PeriodicVaspExecutor,
+    )
+
+    structure = Structure(
+        Lattice.cubic(4.3),
+        ["Ba", "Ti", "Te", "Te", "Te"],
+        [[0, 0, 0], [0.5, 0.5, 0.5], [0.25, 0.25, 0.25],
+         [0.75, 0.75, 0.75], [0, 0.5, 0.5]],
+    )
+    cif = tmp_path / "BaTiTe3.cif"
+    structure.to(filename=str(cif), fmt="cif")
+    (tmp_path / "source").mkdir(exist_ok=True)
+    (tmp_path / "source" / "structure.cif").write_bytes(cif.read_bytes())
+
+    app = VaspApplication(workspace=tmp_path)
+    app.generator.psp_dir = tmp_path / "no_such_psp"  # local unresolvable
+    app.remote_psp_dir = ""  # remote unconfigured
+    executor = PeriodicVaspExecutor.__new__(PeriodicVaspExecutor)
+    executor.application = app
+
+    spec = PeriodicScientificSpec(
+        structure_path="source/structure.cif",
+        profile="narrow_gap_soc",
+        scientific_overrides={},
+    )
+    manifest = UnifiedVaspManifest(
+        workflow_id="vasp_0123456789abcdef",
+        workflow_kind=VaspWorkflowKind.PERIODIC,
+        scientific_spec=spec,
+        scientific_fingerprint=scientific_fingerprint(spec),
+        stages=[UnifiedStage(name="relax")],
+    )
+    result = await executor.preflight(manifest)
+    assert not result.passed
+    assert any("POTCAR cannot be resolved" in problem for problem in result.errors)
+
+    # With a remote PSP directory configured the same workflow becomes ready.
+    app.remote_psp_dir = "/public/home/scniv4a4go/potpaw_PBE"
+    assert (await executor.preflight(manifest)).passed
+
+
+def test_resolve_potcar_leaves_no_empty_file_when_unresolvable(tmp_path):
+    """A missing setup must not leave a torn/empty POTCAR behind."""
+    from photomatagent.scientific.applications.vasp.psp import (
+        resolve_local_psp_library,
+    )
+
+    app = VaspApplication(workspace=tmp_path)
+    stage = make_input_dir(tmp_path / "stage", ["Ba_sv", "Ti"])
+    fake_library = make_library(
+        tmp_path / "fake", "direct", ["In", "Ti"]  # probe element + Ti; Ba_sv absent
+    )
+    app.generator.psp_dir = tmp_path / "fake"
+    assert resolve_local_psp_library(app.generator.psp_dir) is not None
+    assert app.resolve_potcar(stage) is None
+    assert not (stage / "POTCAR").exists()

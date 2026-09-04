@@ -67,6 +67,7 @@ def task_result_row(
     )
     return {
         "task_id": task.task_id,
+        "system_id": task.system_id,
         "system": task.display_name,
         "role": task.role,
         "formula": task.formula,

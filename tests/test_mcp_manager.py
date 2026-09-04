@@ -608,17 +608,22 @@ def test_sync_context_mcp_lifecycle_single_owner_loop(monkeypatch, tmp_path):
     configs = load_mcp_servers(workspace)
     manager = MCPServerManager(configs, workspace=workspace)
     builtin = {
-        "vasp_molecule.prepare",
-        "vasp_molecule.capabilities",
-        "vasp_molecule.submit",
-        "vasp_study.plan",
-        "vasp_study.execute",
+        "vasp.capabilities",
+        "vasp.plan",
+        "vasp.prepare",
+        "vasp.preflight",
+        "vasp.submit",
+        "vasp.status",
+        "vasp.wait",
+        "vasp.resume",
+        "vasp.collect",
+        "vasp.report",
     }
     tools = manager.register_tools(builtin_tool_names=builtin)
     names = {tool.name for tool in tools}
-    # Built-in pack is authoritative: the scnet MCP duplicates are skipped...
+    # Built-in unified pack is authoritative: every scnet VASP adapter is skipped.
     assert "scnet_science.status" in names
-    assert "scnet_science.vasp_capabilities" in names
+    assert "scnet_science.vasp_capabilities" not in names
     assert "scnet_science.vasp_molecule_prepare" not in names
     assert "scnet_science.vasp_molecule_capabilities" not in names
     assert "scnet_science.vasp_study_plan" not in names
@@ -653,7 +658,23 @@ def test_sync_context_mcp_lifecycle_single_owner_loop(monkeypatch, tmp_path):
     assert manager._lifecycle_loop is None or manager._lifecycle_loop.is_closed()
 
 
-def test_duplicate_molecular_adapters_can_be_reenabled(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_cross_loop_stall_times_out_and_cancels_submitted_work() -> None:
+    """A live-but-stalled owner loop cannot make a caller poll forever."""
+    config = MCPServerConfig(name="stalled", timeout_seconds=0.05)
+    handle = MCPServerHandle(config)
+    owner = asyncio.new_event_loop()
+    try:
+        task = asyncio.create_task(handle._run_on_loop(owner, asyncio.sleep(60)))
+        with pytest.raises(TimeoutError, match="stalled"):
+            await task
+        assert task.done()
+        assert not owner.is_closed()
+    finally:
+        owner.close()
+
+
+def test_duplicate_vasp_adapters_cannot_be_reenabled(monkeypatch, tmp_path):
     session = _mcp_fake_session()
     _patch_sdk(monkeypatch, session)
     workspace = _real_shaped_workspace(tmp_path)
@@ -663,11 +684,23 @@ def test_duplicate_molecular_adapters_can_be_reenabled(monkeypatch, tmp_path):
 
     manager = MCPServerManager(load_mcp_servers(workspace), workspace=workspace)
     tools = manager.register_tools(
-        builtin_tool_names={"vasp_molecule.prepare", "vasp_study.plan"}
+        builtin_tool_names={
+            "vasp.capabilities",
+            "vasp.plan",
+            "vasp.prepare",
+            "vasp.preflight",
+            "vasp.submit",
+            "vasp.status",
+            "vasp.wait",
+            "vasp.resume",
+            "vasp.collect",
+            "vasp.report",
+        }
     )
     names = {tool.name for tool in tools}
-    assert "scnet_science.vasp_molecule_prepare" in names
-    assert "scnet_science.vasp_study_plan" in names
+    assert "scnet_science.vasp_molecule_prepare" not in names
+    assert "scnet_science.vasp_study_plan" not in names
+    assert "scnet_science.vasp_capabilities" not in names
     manager.close_all()
 
 
@@ -688,11 +721,15 @@ def test_create_default_registry_real_shaped_workspace_offline(
         ScientificState(), Workspace(workspace)
     )
     names = {tool.name for tool in registry.list_tools()}
-    assert "vasp_molecule.prepare" in names
-    assert "vasp_molecule.capabilities" in names
+    assert "vasp.plan" in names
+    assert "vasp.preflight" in names
+    assert "vasp.submit" in names
+    assert "vasp_molecule.prepare" not in names
+    assert "vasp_molecule.capabilities" not in names
     assert "scnet_science.status" in names
     assert "materials_mcp.search" in names
     assert "scnet_science.vasp_molecule_prepare" not in names
+    assert "scnet_science.vasp_capabilities" not in names
 
 
 # ---------------------------------------------------------------------------

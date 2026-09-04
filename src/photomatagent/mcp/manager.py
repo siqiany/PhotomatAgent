@@ -162,7 +162,22 @@ class MCPServerHandle:
     ) -> Any:
         """Await ``coro`` on ``loop`` from a different loop."""
         future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return await asyncio.wrap_future(future)
+        # Some host event loops can drop a cross-thread selector wakeup while
+        # a short-lived caller loop awaits the concurrent future.  Polling the
+        # completed state from that caller keeps the persistent owner loop and
+        # session untouched, and avoids blocking a worker thread on an already
+        # completed cross-thread future.
+        deadline = time.monotonic() + self.config.timeout_seconds
+        while not future.done():
+            if time.monotonic() >= deadline:
+                cancelled_before_start = future.cancel()
+                if cancelled_before_start:
+                    coro.close()
+                raise TimeoutError(
+                    f"MCP owner loop stalled for {self.config.timeout_seconds}s"
+                )
+            await asyncio.sleep(0.01)
+        return future.result()
 
     async def _run_on_owner(self, coro: Any) -> Any:
         """Await ``coro`` on the owner loop from a different loop."""
@@ -565,12 +580,29 @@ class MCPServerManager:
         if self._lifecycle_loop is not None and not self._lifecycle_loop.is_closed():
             return self._lifecycle_loop
         loop = asyncio.new_event_loop()
+        started = threading.Event()
+
+        def run_loop() -> None:
+            asyncio.set_event_loop(loop)
+
+            def wake_pending_callbacks() -> None:
+                """Bound selector sleep on hosts that drop cross-thread wakes."""
+                if not loop.is_closed():
+                    loop.call_later(0.01, wake_pending_callbacks)
+
+            loop.call_soon(wake_pending_callbacks)
+            started.set()
+            loop.run_forever()
+
         thread = threading.Thread(
-            target=loop.run_forever,
+            target=run_loop,
             name=f"mcp-lifecycle-{id(self)}",
             daemon=True,
         )
         thread.start()
+        if not started.wait(timeout=1.0):
+            loop.close()
+            raise RuntimeError("MCP lifecycle loop did not start")
         self._lifecycle_loop = loop
         self._lifecycle_thread = thread
         self._lifecycle_started = True
@@ -674,11 +706,10 @@ class MCPServerManager:
         Never raises: unreadable servers degrade to a status stub whose
         invocation reports the typed failure instead of crashing the agent.
         ``builtin_tool_names`` lets the gateway skip MCP adapters that merely
-        duplicate tools the local packs already register (the SCNet MCP
-        ``vasp_molecule_*`` / ``vasp_study_*`` families duplicate the built-in
-        ``vasp_molecule.*`` / ``vasp_study.*`` packs); set
-        ``PHOTOMATAGENT_MCP_INCLUDE_DUPLICATE_MOLECULAR=1`` to re-enable the
-        MCP copies.
+        duplicate tools the local packs already register. When the unified
+        built-in VASP pack is present, every ``scnet_science.vasp_*``,
+        ``vasp_molecule_*``, and ``vasp_study_*`` adapter is skipped locally;
+        no environment override can re-enable duplicate local VASP adapters.
         """
         tools: list[Tool] = []
         for handle in self.handles.values():
@@ -700,10 +731,8 @@ class MCPServerManager:
                 if skipped:
                     handle.detail = (
                         f"{handle.detail}; skipped {skipped} duplicate "
-                        "vasp_molecule_* MCP adapters (built-in pack is "
-                        "authoritative; set "
-                        "PHOTOMATAGENT_MCP_INCLUDE_DUPLICATE_MOLECULAR=1 "
-                        "to re-enable)"
+                        "VASP MCP adapters (the built-in unified pack is "
+                        "authoritative)"
                     ).lstrip("; ")
         return tools
 
@@ -713,33 +742,33 @@ class MCPServerManager:
         spec: RemoteToolSpec,
         builtin_tool_names: set[str] | None,
     ) -> bool:
-        """True when an SCNet MCP tool duplicates a built-in local pack tool."""
+        """True when an SCNet MCP tool duplicates a built-in local pack tool.
+
+        When the unified built-in VASP pack is present, all VASP-family MCP
+        adapters are skipped. There is no environment escape hatch for
+        duplicate local VASP adapters.
+        """
         if not builtin_tool_names:
             return False
         if handle.config.effective_namespace != "scnet_science":
             return False
-        prefixes = ("vasp_molecule_", "vasp_study_")
-        prefix = next(
-            (
-                candidate
-                for candidate in prefixes
-                if spec.name.startswith(candidate)
-            ),
-            None,
-        )
-        if prefix is None:
+        required_unified_surface = {
+            "vasp.capabilities",
+            "vasp.plan",
+            "vasp.prepare",
+            "vasp.preflight",
+            "vasp.submit",
+            "vasp.status",
+            "vasp.wait",
+            "vasp.resume",
+            "vasp.collect",
+            "vasp.report",
+        }
+        if not required_unified_surface.issubset(builtin_tool_names):
             return False
-        override = (
-            os.environ.get(
-                "PHOTOMATAGENT_MCP_INCLUDE_DUPLICATE_MOLECULAR", ""
-            )
-            .strip()
-            .lower()
-        )
-        if override in {"1", "true", "yes", "on"}:
+        if not spec.name.startswith("vasp"):
             return False
-        local_name = prefix.rstrip("_") + "." + spec.name[len(prefix):]
-        return local_name in builtin_tool_names
+        return True
 
     def _start_handle_sync(self, handle: MCPServerHandle) -> None:
         try:

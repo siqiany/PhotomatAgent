@@ -70,7 +70,7 @@ def default_command(ctx: typer.Context) -> None:
             model=None,
             workspace=Path.cwd(),
             approval="ask",
-            max_iterations=25,
+            max_iterations=10000,
             log_events=True,
         )
 
@@ -86,7 +86,7 @@ def chat(
     model: str | None = typer.Option(None, "--model"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
     approval: str = typer.Option("ask", "--approval", help="ask | auto | deny"),
-    max_iterations: int = typer.Option(25, "--max-iterations", min=1),
+    max_iterations: int = typer.Option(10000, "--max-iterations", min=1),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
     resume: str | None = typer.Option(
         None,
@@ -348,6 +348,52 @@ def scientific_scnet_doctor(
     report = asyncio.run(build_doctor_report())
     # plain print: rich wraps long lines and would break the JSON output
     print(_json.dumps(report, ensure_ascii=False, indent=2))
+
+
+@scientific_app.command("approve")
+def scientific_approve(
+    decision_id: str = typer.Argument(..., help="VASP pending decision ID"),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Approve a pending VASP application-level decision (user-only)."""
+    import getpass
+    import os
+
+    from photomatagent.scientific.applications.vasp.unified.approvals import (
+        ApprovalReceiptStore,
+    )
+
+    store = ApprovalReceiptStore(workspace)
+    pending = store.load_pending(decision_id)
+    if pending is None:
+        console.print(f"[red]unknown pending decision: {decision_id}[/]")
+        raise typer.Exit(code=1)
+
+    console.print(f"workflow_id: {pending.workflow_id}")
+    console.print(f"approval kind: {pending.kind.value}")
+    console.print(f"decision hash: {pending.decision_hash}")
+    if pending.changes:
+        table = Table("Parameter", "Old", "New", "Reason")
+        for change in pending.changes:
+            table.add_row(
+                str(change.parameter),
+                str(change.old_value),
+                str(change.new_value),
+                change.reason,
+            )
+        console.print(table)
+    else:
+        console.print("changes: (none)")
+
+    if not typer.confirm("确认批准该 VASP 应用级决策？"):
+        console.print("[yellow]已取消，未写入批准回执。[/]")
+        return
+
+    approved_by = f"local:{os.environ.get('USER') or getpass.getuser()}"
+    receipt = store.approve(decision_id, approved_by=approved_by)
+    console.print(
+        f"[green]已批准 {receipt.decision_id} (receipt {receipt.receipt_id})[/]"
+    )
 
 
 mcp_app = typer.Typer(
@@ -638,7 +684,7 @@ def sessions_resume(
     ),
     goal: str | None = typer.Option(None, "--goal", "-g"),
     approval: str = typer.Option("ask", "--approval", help="ask | auto | deny"),
-    max_iterations: int = typer.Option(25, "--max-iterations", min=1),
+    max_iterations: int = typer.Option(10000, "--max-iterations", min=1),
 ) -> None:
     """Load a historical session and continue asking questions on top of it."""
     _launch_chat(

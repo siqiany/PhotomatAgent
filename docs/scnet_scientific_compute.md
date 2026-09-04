@@ -146,14 +146,16 @@ E-Shell 的“SSH连接”重新选择有效期并下载密钥，同时复制该
 端口和用户名；这四项必须来自同一次连接信息。旧密钥、另一中心的用户名或
 过期有效期都会在进入 Slurm 前被拒绝。
 
-### VASP MCP 运行链
+### VASP MCP 运行链（统一 vasp.* 表面）
 
-1. `vasp_capabilities`：确认 SSH、Slurm、队列、VASP 模块与赝势策略。
-2. `vasp_prepare`：生成 POSCAR/INCAR/KPOINTS 和工作流。
-3. `vasp_submit`：显式传入 `scnet_partitions` 返回的队列；脚本执行
+> 迁移提示：旧的外部 MCP 别名 `scnet_science.vasp_capabilities` / `vasp_prepare` / `vasp_submit` 等仅在兼容层中存在，调用同一统一服务；模型可见表面只有九个小写点号 `vasp.*` 工具。
+
+1. `vasp.capabilities`：确认 SSH、Slurm、队列、VASP 模块与赝势策略。
+2. `vasp.plan` + `vasp.prepare`：创建统一工作流并生成 POSCAR/INCAR/KPOINTS。
+3. `vasp.preflight` + `vasp.submit`：通过统一服务提交；脚本执行
    `module purge`、`module load`、`srun --mpi=pmi2 vasp_std|vasp_ncl`，并设置
    `ulimit -s unlimited`。
-4. `vasp_status`，结束后 `vasp_collect`；调度状态 COMPLETED 不替代科学结果校验。
+4. `vasp.status`，结束后 `vasp.collect`；调度状态 COMPLETED 不替代科学结果校验。
 
 ### Hefei-NAMD MCP 运行链
 
