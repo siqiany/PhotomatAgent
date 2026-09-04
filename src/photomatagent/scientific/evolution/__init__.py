@@ -57,9 +57,11 @@ from photomatagent.scientific.evolution.rubric import (
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
     EvolutionConflictError,
+    EvolutionCorruptRecordError,
     EvolutionLockError,
     EvolutionStore,
     EvolutionStoreError,
+    EvolutionUnsupportedSchemaError,
 )
 
 __all__ = [
@@ -79,9 +81,11 @@ __all__ = [
     "EvolutionStatus",
     "EvolutionAlreadyExistsError",
     "EvolutionConflictError",
+    "EvolutionCorruptRecordError",
     "EvolutionLockError",
     "EvolutionStore",
     "EvolutionStoreError",
+    "EvolutionUnsupportedSchemaError",
     "EvolutionTask",
     "ExecutionMode",
     "ExperienceMaturity",
