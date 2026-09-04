@@ -17,6 +17,7 @@ from photomatagent.runtime.events import (
     EvolutionTaskAccepted,
     EvolutionTaskCreated,
     EvolutionTaskStopped,
+    ExpertFeedbackCompiled,
     ExpertFeedbackRecorded,
     RevisionPlanConfirmed,
     RuntimeEvent,
@@ -34,6 +35,7 @@ from photomatagent.scientific.evolution.models import (
     ExecutionMode,
     ExpertFeedbackDraft,
     ExpertFeedbackRecord,
+    FeedbackCompilation,
     RevisionPlan,
     Sha256,
     TargetSnapshot,
@@ -614,6 +616,169 @@ class EvolutionService:
                 "actionability": persisted.scores.actionability,
                 "overall": persisted.scores.overall,
             },
+        )
+        return MutationResult(persisted, (event,))
+
+    def compilation_context(
+        self,
+        evolution_id: str,
+        version: EpisodeVersion | None = None,
+    ) -> tuple[EvolutionTask, EpisodeRecord, ExpertFeedbackRecord]:
+        """Resolve and verify the one active review and its exact result."""
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.status != "FEEDBACK_RECORDED":
+                raise InvalidEvolutionTransition(
+                    "feedback compilation requires FEEDBACK_RECORDED"
+                )
+            selected = version or task.last_completed_version
+            if selected is None or selected != task.last_completed_version:
+                raise InvalidEvolutionTransition(
+                    "compilation version must be the latest completed episode"
+                )
+            episode = transaction.load_episode(selected)
+            if episode.status != "COMPLETED":
+                raise InvalidEvolutionTransition(
+                    "feedback compilation requires a completed episode"
+                )
+            artifact = self._verify_artifact(episode.artifact)
+            feedback = self._active_feedback(
+                self.store.list_feedback(evolution_id),
+                selected,
+            )
+            if (
+                feedback is None
+                or not task.feedback_ids
+                or task.feedback_ids[-1] != feedback.feedback_id
+            ):
+                raise EvolutionOperationConflict(
+                    "task manifest does not name the active feedback"
+                )
+            if feedback.result_sha256 != artifact.sha256:
+                raise ArtifactMismatchError(
+                    "active feedback hash does not match the persisted result"
+                )
+            return task, episode, feedback
+
+    def available_compilation(
+        self,
+        evolution_id: str,
+        feedback_id: str,
+    ) -> FeedbackCompilation | None:
+        """Return a durable successful compilation for this feedback, if any."""
+
+        task = self.store.load_task(evolution_id)
+        by_id = {
+            item.compilation_id: item
+            for item in self.store.list_compilations(evolution_id)
+        }
+        for compilation_id in task.compilation_ids:
+            item = by_id.get(compilation_id)
+            if item is not None and item.feedback_id == feedback_id and item.status == "AVAILABLE":
+                return item
+        # Recover an immutable write that completed immediately before a task
+        # manifest update was interrupted.
+        return next(
+            (
+                item
+                for item in by_id.values()
+                if item.feedback_id == feedback_id and item.status == "AVAILABLE"
+            ),
+            None,
+        )
+
+    def save_compilation(
+        self,
+        evolution_id: str,
+        compilation: FeedbackCompilation,
+    ) -> MutationResult[FeedbackCompilation]:
+        """Persist and link one compilation without rewriting source feedback."""
+
+        if compilation.status == "PENDING" or compilation.compilation_id is None:
+            raise InvalidEvolutionTransition(
+                "only a completed compilation attempt can be persisted"
+            )
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.status != "FEEDBACK_RECORDED":
+                raise InvalidEvolutionTransition(
+                    "feedback compilation requires FEEDBACK_RECORDED"
+                )
+            if task.last_completed_version is None:
+                raise InvalidEvolutionTransition(
+                    "feedback compilation requires a completed episode"
+                )
+            episode = transaction.load_episode(task.last_completed_version)
+            artifact = self._verify_artifact(episode.artifact)
+            feedback = self._active_feedback(
+                self.store.list_feedback(evolution_id),
+                task.last_completed_version,
+            )
+            if (
+                feedback is None
+                or not task.feedback_ids
+                or task.feedback_ids[-1] != feedback.feedback_id
+                or compilation.evolution_id != evolution_id
+                or compilation.feedback_id != feedback.feedback_id
+                or compilation.episode_version != episode.version
+            ):
+                raise EvolutionOperationConflict(
+                    "compilation does not match the active feedback"
+                )
+            if feedback.result_sha256 != artifact.sha256:
+                raise ArtifactMismatchError(
+                    "active feedback hash does not match the persisted result"
+                )
+
+            successful = next(
+                (
+                    item
+                    for item in self.store.list_compilations(evolution_id)
+                    if item.feedback_id == feedback.feedback_id
+                    and item.status == "AVAILABLE"
+                    and item.compilation_id != compilation.compilation_id
+                ),
+                None,
+            )
+            if successful is not None:
+                persisted = successful
+            else:
+                try:
+                    existing = transaction.load_compilation(
+                        compilation.compilation_id
+                    )
+                except FileNotFoundError:
+                    transaction.write_compilation(compilation)
+                    persisted = transaction.load_compilation(
+                        compilation.compilation_id
+                    )
+                else:
+                    if existing != compilation:
+                        raise EvolutionOperationConflict(
+                            f"compilation ID {compilation.compilation_id} "
+                            "names different content"
+                        )
+                    persisted = existing
+
+            persisted_id = persisted.compilation_id
+            if persisted_id is None or persisted.episode_version is None:
+                raise EvolutionOperationConflict(
+                    "persisted compilation is missing authoritative identity"
+                )
+            if persisted_id not in task.compilation_ids:
+                updated = task.model_copy(
+                    update={
+                        "compilation_ids": self._append_once(
+                            task.compilation_ids,
+                            persisted_id,
+                        )
+                    }
+                )
+                transaction.save_task(updated, expected_revision=task.revision)
+        event = ExpertFeedbackCompiled(
+            evolution_id=evolution_id,
+            episode_version=persisted.episode_version,
         )
         return MutationResult(persisted, (event,))
 

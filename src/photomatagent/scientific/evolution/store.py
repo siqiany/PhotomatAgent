@@ -21,6 +21,7 @@ from photomatagent.scientific.evolution.models import (
     EpisodeStatus,
     EvolutionTask,
     ExpertFeedbackRecord,
+    FeedbackCompilation,
     RevisionPlan,
     StrategyVersion,
     utc_now,
@@ -193,6 +194,26 @@ class EvolutionTransaction:
             filename=f"{feedback.feedback_id}.json",
             record=feedback,
             model_type=ExpertFeedbackRecord,
+        )
+
+    def load_compilation(self, compilation_id: str) -> FeedbackCompilation:
+        self._require_active()
+        return self.store.load_compilation(self.evolution_id, compilation_id)
+
+    def write_compilation(self, compilation: FeedbackCompilation) -> Path:
+        self._require_active()
+        if compilation.evolution_id != self.evolution_id:
+            raise EvolutionConflictError(
+                "compilation belongs to a different transaction"
+            )
+        if compilation.compilation_id is None:
+            raise ValueError("persisted compilation requires compilation_id")
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="compilations",
+            filename=f"{compilation.compilation_id}.json",
+            record=compilation,
+            model_type=FeedbackCompilation,
         )
 
     def load_revision(self, revision_id: str) -> RevisionPlan:
@@ -459,6 +480,49 @@ class EvolutionStore:
             records.append(self.load_feedback(evolution_id, path.stem))
         return records
 
+    def load_compilation(
+        self,
+        evolution_id: str,
+        compilation_id: str,
+    ) -> FeedbackCompilation:
+        """Load one immutable compilation bound to its managed identity."""
+
+        self._validate_id(compilation_id)
+        path = self._managed_path(
+            evolution_id,
+            "compilations",
+            f"{compilation_id}.json",
+        )
+        compilation = self._load_model(
+            path,
+            FeedbackCompilation,
+            require_schema_version=True,
+        )
+        if (
+            compilation.evolution_id != evolution_id
+            or compilation.compilation_id != compilation_id
+        ):
+            raise EvolutionCorruptRecordError(
+                path,
+                "compilation identity does not match its managed path",
+            )
+        return compilation
+
+    def list_compilations(self, evolution_id: str) -> list[FeedbackCompilation]:
+        """Load every immutable compilation attempt for one task."""
+
+        directory = self._managed_path(evolution_id, "compilations")
+        if not directory.is_dir():
+            return []
+        records: list[FeedbackCompilation] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                self._validate_id(path.stem)
+            except (TypeError, ValueError):
+                continue
+            records.append(self.load_compilation(evolution_id, path.stem))
+        return records
+
     def load_revision(self, evolution_id: str, revision_id: str) -> RevisionPlan:
         """Load one revision plan bound to its managed identity."""
 
@@ -515,6 +579,22 @@ class EvolutionStore:
             filename=f"{feedback.feedback_id}.json",
             record=feedback,
             model_type=ExpertFeedbackRecord,
+        )
+
+    def write_compilation(self, compilation: FeedbackCompilation) -> Path:
+        """Persist one immutable feedback-compilation attempt."""
+
+        if compilation.compilation_id is None:
+            raise ValueError("persisted compilation requires compilation_id")
+        self._validate_id(compilation.compilation_id)
+        if compilation.evolution_id is None:
+            raise ValueError("persisted compilation requires evolution_id")
+        return self._write_record(
+            evolution_id=compilation.evolution_id,
+            directory="compilations",
+            filename=f"{compilation.compilation_id}.json",
+            record=compilation,
+            model_type=FeedbackCompilation,
         )
 
     def write_revision(self, revision: RevisionPlan) -> Path:

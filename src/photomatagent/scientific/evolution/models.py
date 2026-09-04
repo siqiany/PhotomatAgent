@@ -47,6 +47,16 @@ FeedbackItemStatus = Literal[
     "CORRECTION", "QUERY", "PREFERENCE", "POSITIVE_SIGNAL"
 ]
 FeedbackSeverity = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+FeedbackCategory = Literal[
+    "TASK_DEFINITION",
+    "SCIENTIFIC_CORRECTNESS",
+    "EVIDENCE_SUFFICIENCY",
+    "NOVELTY",
+    "DELIVERABLE_COMPLETENESS",
+    "ACTIONABILITY",
+    "SAFETY",
+    "OTHER",
+]
 CompilationStatus = Literal["PENDING", "AVAILABLE", "UNAVAILABLE"]
 AcceptanceStatus = Literal["PENDING", "PASS", "FAIL", "NEEDS_HUMAN_REVIEW"]
 ExperienceMaturity = Literal[
@@ -197,6 +207,10 @@ def new_episode_id() -> str:
 
 def new_feedback_id() -> str:
     return f"fb_{secrets.token_hex(5)}"
+
+
+def new_compilation_id() -> str:
+    return f"comp_{secrets.token_hex(5)}"
 
 
 def new_revision_id() -> str:
@@ -429,31 +443,59 @@ class EpisodeRecord(StrictModel):
 
 class FeedbackDelta(StrictModel):
     item_id: ManagedId | None = None
-    category: str = Field(min_length=1)
+    category: FeedbackCategory
     status: FeedbackItemStatus
     severity: FeedbackSeverity
-    responsible_module: str = Field(min_length=1)
-    problem: str = Field(min_length=1)
-    requested_actions: list[str] = Field(default_factory=list)
-    acceptance_test: str | None = None
-    preserve: list[str] = Field(default_factory=list)
+    responsible_module: str = Field(min_length=1, max_length=200)
+    problem: str = Field(min_length=1, max_length=4_000)
+    requested_actions: list[str] = Field(default_factory=list, max_length=20)
+    acceptance_test: str | None = Field(default=None, max_length=4_000)
+    preserve: list[str] = Field(default_factory=list, max_length=20)
     confidence: float = Field(ge=0.0, le=1.0)
-    source_span: str = Field(min_length=1)
+    source_span: str = Field(min_length=1, max_length=4_000)
 
 
 class FeedbackCompilation(StrictModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)
+
     schema_version: SchemaVersion = 1
     compilation_id: ManagedId | None = None
     evolution_id: ManagedId | None = None
     feedback_id: ManagedId | None = None
     episode_version: EpisodeVersion | None = None
     status: CompilationStatus = "PENDING"
-    items: list[FeedbackDelta] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    provider: str | None = None
-    model: str | None = None
-    error: str | None = None
+    items: list[FeedbackDelta] = Field(default_factory=list, max_length=100)
+    warnings: list[str] = Field(default_factory=list, max_length=100)
+    provider: str | None = Field(default=None, max_length=200)
+    model: str | None = Field(default=None, max_length=200)
+    error: str | None = Field(default=None, max_length=1_000)
     created_at: UtcDatetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_compiled_record(self) -> Self:
+        if self.status == "PENDING":
+            return self
+        required = {
+            "compilation_id": self.compilation_id,
+            "evolution_id": self.evolution_id,
+            "feedback_id": self.feedback_id,
+            "episode_version": self.episode_version,
+            "provider": self.provider,
+            "model": self.model,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(
+                "completed compilation requires provenance: " + ", ".join(missing)
+            )
+        if self.status == "AVAILABLE" and self.error is not None:
+            raise ValueError("available compilation cannot contain an error")
+        if self.status == "UNAVAILABLE":
+            if not self.error:
+                raise ValueError("unavailable compilation requires an error")
+            if self.items:
+                raise ValueError("unavailable compilation cannot contain feedback items")
+        return self
 
 
 class ExpertFeedbackRecord(ExpertFeedbackDraft):

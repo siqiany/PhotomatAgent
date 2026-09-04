@@ -30,12 +30,14 @@ from photomatagent.scientific.evolution.executor import (
     EventSink,
     ScientificEpisodeExecutor,
 )
+from photomatagent.scientific.evolution.feedback import FeedbackCompiler
 from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
     EpisodeVersion,
     EvolutionTask,
     ExpertFeedbackDraft,
     ExpertFeedbackRecord,
+    FeedbackCompilation,
     RubricFlags,
     RubricScores,
     new_feedback_id,
@@ -87,7 +89,7 @@ class FeedbackEntryCancelled(Exception):
 evolve_app = typer.Typer(
     help=(
         "Run persistent expert-feedback evolution tasks. "
-        "The iterate and compilation entry points are planned but not available yet."
+        "The iterate entry point is planned but not available yet."
     ),
 )
 console = Console()
@@ -443,6 +445,106 @@ def evolve_cancel(
             param_hint="evolution_id",
         ) from exc
     _render_task_details(cancelled.entity, boundary.root)
+
+
+@evolve_app.command("compile")
+def evolve_compile(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    version: str | None = typer.Option(
+        None,
+        "--version",
+        help="Feedback episode version; defaults to the latest completed version.",
+    ),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Compiler provider override: fake | openai | anthropic",
+    ),
+    model: str | None = typer.Option(None, "--model"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Compile the active immutable review through an isolated tool-free model."""
+
+    try:
+        boundary = Workspace(workspace)
+        service = EvolutionService(EvolutionStore(boundary))
+        config = _resolve_provider_config(boundary.root, provider, model)
+        compiler = _build_feedback_compiler(config)
+        compilation = asyncio.run(
+            run_compilation_flow(
+                service=service,
+                evolution_id=evolution_id,
+                version=cast(EpisodeVersion | None, version),
+                compiler=compiler,
+            )
+        )
+    except (OSError, UnicodeError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        raise typer.Exit(code=2) from None
+
+    _render_compilation(console, compilation)
+    _render_task_details(service.get(evolution_id), boundary.root)
+    if compilation.status == "UNAVAILABLE":
+        raise typer.Exit(code=1)
+
+
+async def run_compilation_flow(
+    *,
+    service: EvolutionService,
+    evolution_id: str,
+    version: EpisodeVersion | None,
+    compiler: FeedbackCompiler,
+) -> FeedbackCompilation:
+    """Resolve, compile, and persist exactly the active feedback record."""
+
+    task, episode, feedback = service.compilation_context(evolution_id, version)
+    existing = service.available_compilation(evolution_id, feedback.feedback_id)
+    if existing is not None:
+        mutation = service.save_compilation(evolution_id, existing)
+        await service.publish(mutation)
+        return mutation.entity
+    if episode.artifact is None:  # guarded by compilation_context
+        raise ValueError("selected episode has no primary result artifact")
+    path = service.store.workspace.resolve(episode.artifact.path, must_exist=True)
+    with path.open("r", encoding="utf-8") as handle:
+        result_text = handle.read(12_001)
+    compilation = await compiler.compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text=result_text,
+    )
+    mutation = service.save_compilation(evolution_id, compilation)
+    await service.publish(mutation)
+    return mutation.entity
+
+
+def _build_feedback_compiler(config: LLMConfig) -> FeedbackCompiler:
+    from photomatagent.models.factory import create_provider
+
+    return FeedbackCompiler(create_provider(config.provider, config.model))
+
+
+def _render_compilation(output: Console, compilation: FeedbackCompilation) -> None:
+    table = Table("Field", "Value")
+    table.add_row("Compilation", compilation.compilation_id or "—")
+    table.add_row("Status", compilation.status)
+    table.add_row("Provider", compilation.provider or "—")
+    table.add_row("Model", compilation.model or "—")
+    table.add_row("Items", str(len(compilation.items)))
+    if compilation.error:
+        table.add_row("Error", redact_text(compilation.error))
+    output.print(table)
+    for item in compilation.items:
+        output.print(
+            f"[{item.severity}] {item.status} {item.category}: "
+            f"{redact_text(item.problem)}",
+            soft_wrap=True,
+        )
+    for warning in compilation.warnings:
+        output.print(f"[yellow]Warning: {redact_text(warning)}[/]", soft_wrap=True)
 
 
 def load_feedback_file(path: Path) -> ExpertFeedbackDraft:
@@ -881,5 +983,6 @@ __all__ = [
     "collect_expert_feedback",
     "evolve_app",
     "load_feedback_file",
+    "run_compilation_flow",
     "run_feedback_flow",
 ]
