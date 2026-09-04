@@ -1,4 +1,4 @@
-"""Application service enforcing the persistent evolution lifecycle."""
+"""Transactional application service for the scientific evolution lifecycle."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import hashlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Iterable
-from typing import cast
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Generic, TypeVar, cast
 
 from photomatagent.runtime.events import (
     EvolutionEpisodeCompleted,
@@ -19,10 +21,14 @@ from photomatagent.runtime.events import (
     RevisionPlanConfirmed,
     RuntimeEvent,
 )
+from photomatagent.errors import ToolExecutionError
+from photomatagent.redaction import redact_secrets
 from photomatagent.scientific.evolution.events import bounded_summary
 from photomatagent.scientific.evolution.models import (
+    ArtifactRef,
     EpisodeRecord,
     EpisodeVersion,
+    EvolutionResumeStatus,
     EvolutionStatus,
     EvolutionTask,
     ExecutionMode,
@@ -31,16 +37,27 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     Sha256,
     TargetSnapshot,
-    new_episode_id,
     new_evolution_id,
-    new_feedback_id,
     utc_now,
 )
 from photomatagent.scientific.evolution.rubric import assess_hard_caps
-from photomatagent.scientific.evolution.store import EvolutionStore
+from photomatagent.scientific.evolution.store import (
+    EvolutionStore,
+    EvolutionTransaction,
+)
 from photomatagent.scientific.loop import TargetSpec
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
+_EntityT = TypeVar("_EntityT", covariant=True)
+
+
+@dataclass(frozen=True, slots=True)
+class MutationResult(Generic[_EntityT]):
+    """One mutation's persisted entity and caller-owned lifecycle events."""
+
+    entity: _EntityT
+    events: tuple[RuntimeEvent, ...] = ()
+
 
 ALLOWED_TRANSITIONS: dict[EvolutionStatus, frozenset[EvolutionStatus]] = {
     "CREATED": frozenset({"RUNNING", "STOPPED"}),
@@ -64,15 +81,19 @@ class EvolutionServiceError(RuntimeError):
 
 
 class InvalidEvolutionTransition(EvolutionServiceError):
-    """Raised when an operation is not legal in the authoritative state."""
+    """Raised when an operation is not legal in authoritative persisted state."""
+
+
+class EvolutionOperationConflict(EvolutionServiceError):
+    """Raised when a stable operation identity names different durable content."""
 
 
 class ArtifactMismatchError(EvolutionServiceError):
-    """Raised when feedback is not bound to the persisted result artifact."""
+    """Raised when a declared result artifact is absent or does not match bytes."""
 
 
 class EvolutionService:
-    """Coordinate lifecycle records without executing models or scientific tools."""
+    """Coordinate durable lifecycle records without running models or tools."""
 
     def __init__(
         self,
@@ -82,11 +103,8 @@ class EvolutionService:
     ) -> None:
         self.store = store
         self.event_sink = event_sink
-        self._pending_events: list[RuntimeEvent] = []
 
     def get(self, evolution_id: str) -> EvolutionTask:
-        """Return the authoritative persisted task manifest."""
-
         return self.store.load_task(evolution_id)
 
     def create_task(
@@ -97,9 +115,7 @@ class EvolutionService:
         task_group_id: str | None = None,
         input_sha256: str | None = None,
         evolution_id: str | None = None,
-    ) -> EvolutionTask:
-        """Persist a new task before any episode is reserved or executed."""
-
+    ) -> MutationResult[EvolutionTask]:
         resolved_id = evolution_id or new_evolution_id()
         task = EvolutionTask(
             evolution_id=resolved_id,
@@ -109,13 +125,11 @@ class EvolutionService:
             input_sha256=input_sha256 or self._input_hash(goal, target),
         )
         created = self.store.create_task(task)
-        self._queue(
-            EvolutionTaskCreated(
-                evolution_id=created.evolution_id,
-                goal_summary=bounded_summary(created.goal),
-            )
+        event = EvolutionTaskCreated(
+            evolution_id=created.evolution_id,
+            goal_summary=bounded_summary(created.goal),
         )
-        return created
+        return MutationResult(created, (event,))
 
     def reserve_episode(
         self,
@@ -127,58 +141,85 @@ class EvolutionService:
         tool_surface_fingerprint: Sha256 | None = None,
         capability_fingerprint: Sha256 | None = None,
         data_source_fingerprints: dict[str, Sha256] | None = None,
-    ) -> EpisodeRecord:
-        """Persist the next monotonic episode, then advance the task to RUNNING."""
-
-        task = self.get(evolution_id)
-        first = task.current_version is None
-        required_status: EvolutionStatus = "CREATED" if first else "REVISION_READY"
-        if task.status != required_status:
-            raise InvalidEvolutionTransition(
-                f"cannot reserve an episode while task is {task.status}; "
-                f"required {required_status}"
-            )
-        if first and mode != "NORMAL":
-            raise InvalidEvolutionTransition("the first episode must use NORMAL mode")
-        if not first and mode == "NORMAL":
-            raise InvalidEvolutionTransition(
-                "a revised episode must use an explicit evidence or evaluation mode"
-            )
-        self.validate_transition(task.status, "RUNNING")
-        version = self._next_version(task.current_version)
-        episode = EpisodeRecord(
-            evolution_id=evolution_id,
-            episode_id=new_episode_id(),
-            version=version,
-            parent_version=task.last_completed_version,
-            applied_feedback_id=(task.feedback_ids[-1] if task.feedback_ids else None),
-            revision_plan_id=(task.revision_ids[-1] if task.revision_ids else None),
-            execution_mode=mode,
-            task_snapshot=task.model_dump(mode="json"),
-            target_snapshot=TargetSnapshot.model_validate(task.target),
-            provider=provider,
-            model=model,
-            tool_surface_fingerprint=tool_surface_fingerprint,
-            capability_fingerprint=capability_fingerprint,
-            data_source_fingerprints=data_source_fingerprints or {},
-        )
-        self.store.write_episode(episode)
-        updated = task.model_copy(
-            update={
-                "status": "RUNNING",
-                "current_version": version,
-                "episode_ids": [*task.episode_ids, episode.episode_id],
-            }
-        )
-        self.store.save_task(updated, expected_revision=task.revision)
-        if not first:
-            self._queue(
-                EvolutionIterationStarted(
-                    evolution_id=evolution_id,
-                    episode_version=version,
+    ) -> MutationResult[EpisodeRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            initial = task.last_completed_version is None
+            required_status: EvolutionStatus = "CREATED" if initial else "REVISION_READY"
+            if task.status == "RUNNING" and task.current_version is not None:
+                existing = transaction.load_episode(task.current_version)
+                self._validate_reservation(
+                    existing,
+                    task,
+                    mode,
+                    provider,
+                    model,
+                    tool_surface_fingerprint,
+                    capability_fingerprint,
+                    data_source_fingerprints or {},
                 )
+                return MutationResult(existing, self._reservation_events(existing, initial))
+            if task.status != required_status:
+                raise InvalidEvolutionTransition(
+                    f"cannot reserve an episode while task is {task.status}; "
+                    f"required {required_status}"
+                )
+            if initial and mode != "NORMAL":
+                raise InvalidEvolutionTransition("an initial or retry episode must use NORMAL")
+            if not initial and mode == "NORMAL":
+                raise InvalidEvolutionTransition(
+                    "a revised episode requires an explicit evidence/evaluation mode"
+                )
+            self.validate_transition(task.status, "RUNNING")
+            version = self._next_version(task.current_version)
+            episode = EpisodeRecord(
+                evolution_id=evolution_id,
+                episode_id=self._episode_id(evolution_id, version),
+                version=version,
+                parent_version=task.last_completed_version,
+                applied_feedback_id=(task.feedback_ids[-1] if task.feedback_ids else None),
+                revision_plan_id=(task.revision_ids[-1] if task.revision_ids else None),
+                execution_mode=mode,
+                task_snapshot=task.model_dump(mode="json"),
+                target_snapshot=TargetSnapshot.model_validate(task.target),
+                provider=provider,
+                model=model,
+                tool_surface_fingerprint=tool_surface_fingerprint,
+                capability_fingerprint=capability_fingerprint,
+                data_source_fingerprints=data_source_fingerprints or {},
             )
-        return episode
+            try:
+                existing = transaction.load_episode(version)
+            except FileNotFoundError:
+                transaction.write_episode(episode)
+                persisted = episode
+            else:
+                self._validate_reservation(
+                    existing,
+                    task,
+                    mode,
+                    provider,
+                    model,
+                    tool_surface_fingerprint,
+                    capability_fingerprint,
+                    data_source_fingerprints or {},
+                )
+                persisted = existing
+            updated = task.model_copy(
+                update={
+                    "status": "RUNNING",
+                    "resume_status": None,
+                    "current_version": version,
+                    "episode_ids": self._append_once(
+                        task.episode_ids, persisted.episode_id
+                    ),
+                }
+            )
+            transaction.save_task(updated, expected_revision=task.revision)
+            return MutationResult(
+                persisted,
+                self._reservation_events(persisted, initial),
+            )
 
     def mark_episode_running(
         self,
@@ -187,30 +228,40 @@ class EvolutionService:
         *,
         runtime_session_id: str | None = None,
         event_log_path: str | None = None,
-    ) -> EpisodeRecord:
-        """Start exactly the currently reserved episode."""
-
-        task, episode = self._current_episode(evolution_id, version)
-        if task.status != "RUNNING" or episode.status != "RESERVED":
-            raise InvalidEvolutionTransition(
-                "episode can start only from task RUNNING / episode RESERVED"
-            )
-        running = episode.model_copy(
-            update={
-                "status": "RUNNING",
-                "runtime_session_id": runtime_session_id,
-                "event_log_path": event_log_path,
-                "started_at": utc_now(),
-            }
+    ) -> MutationResult[EpisodeRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            task, episode = self._current_episode(transaction, version)
+            if task.status != "RUNNING":
+                raise InvalidEvolutionTransition("task must be RUNNING")
+            if episode.status == "RUNNING":
+                if (
+                    episode.runtime_session_id != runtime_session_id
+                    or episode.event_log_path != event_log_path
+                ):
+                    raise EvolutionOperationConflict(
+                        "running episode provenance differs from retry"
+                    )
+                saved = episode
+            elif episode.status == "RESERVED":
+                running = episode.model_copy(
+                    update={
+                        "status": "RUNNING",
+                        "runtime_session_id": runtime_session_id,
+                        "event_log_path": event_log_path,
+                        "started_at": utc_now(),
+                    }
+                )
+                saved = transaction.transition_episode(
+                    running,
+                    expected_status="RESERVED",
+                )
+            else:
+                raise InvalidEvolutionTransition("only a reserved episode can start")
+        event = EvolutionEpisodeStarted(
+            evolution_id=evolution_id,
+            episode_version=version,
         )
-        saved = self.store.transition_episode(running, expected_status="RESERVED")
-        self._queue(
-            EvolutionEpisodeStarted(
-                evolution_id=evolution_id,
-                episode_version=version,
-            )
-        )
-        return saved
+        return MutationResult(saved, (event,))
 
     def complete_episode(
         self,
@@ -218,100 +269,453 @@ class EvolutionService:
         version: EpisodeVersion,
         *,
         result: EpisodeRecord,
-    ) -> EpisodeRecord:
-        """Persist a reviewable terminal result before exposing it for feedback."""
-
-        task, episode = self._current_episode(evolution_id, version)
-        if task.status != "RUNNING" or episode.status != "RUNNING":
-            raise InvalidEvolutionTransition(
-                "episode can complete only from task RUNNING / episode RUNNING"
-            )
-        self._validate_result_identity(result, episode)
-        if result.artifact is None:
-            raise InvalidEvolutionTransition(
-                "a completed episode requires a program-selected primary artifact"
-            )
-        self.validate_transition(task.status, "AWAITING_EXPERT_FEEDBACK")
-        completed = result.model_copy(
-            update={
-                "status": "COMPLETED",
-                "completed_at": result.completed_at or utc_now(),
-                "error": None,
-            }
+    ) -> MutationResult[EpisodeRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            task, episode = self._current_episode(transaction, version)
+            self._validate_result_identity(result, episode)
+            artifact = self._verify_artifact(result.artifact)
+            if episode.status == "COMPLETED":
+                self._validate_completed_retry(episode, result, artifact)
+                saved_episode = episode
+            elif episode.status == "RUNNING":
+                if task.status != "RUNNING":
+                    raise InvalidEvolutionTransition("task must be RUNNING")
+                completed = result.model_copy(
+                    update={
+                        "status": "COMPLETED",
+                        "artifact": artifact,
+                        "completed_at": result.completed_at or utc_now(),
+                        "error": None,
+                    }
+                )
+                saved_episode = transaction.transition_episode(
+                    completed,
+                    expected_status="RUNNING",
+                )
+            else:
+                raise InvalidEvolutionTransition("only a running episode can complete")
+            if task.status == "RUNNING":
+                self.validate_transition(task.status, "AWAITING_EXPERT_FEEDBACK")
+                updated = task.model_copy(
+                    update={
+                        "status": "AWAITING_EXPERT_FEEDBACK",
+                        "resume_status": None,
+                        "last_completed_version": version,
+                    }
+                )
+                transaction.save_task(updated, expected_revision=task.revision)
+            elif not (
+                task.status == "AWAITING_EXPERT_FEEDBACK"
+                and task.last_completed_version == version
+            ):
+                raise InvalidEvolutionTransition(
+                    "completed episode cannot reconcile with task state"
+                )
+        event = EvolutionEpisodeCompleted(
+            evolution_id=evolution_id,
+            episode_version=version,
         )
-        saved_episode = self.store.transition_episode(
-            completed,
-            expected_status="RUNNING",
-        )
-        updated = task.model_copy(
-            update={
-                "status": "AWAITING_EXPERT_FEEDBACK",
-                "last_completed_version": version,
-            }
-        )
-        self.store.save_task(updated, expected_revision=task.revision)
-        self._queue(
-            EvolutionEpisodeCompleted(
-                evolution_id=evolution_id,
-                episode_version=version,
-            )
-        )
-        return saved_episode
+        return MutationResult(saved_episode, (event,))
 
     def fail_episode(
         self,
         evolution_id: str,
         version: EpisodeVersion,
         error: str,
-    ) -> EpisodeRecord:
-        """Persist a failed attempt while retaining the last completed result."""
-
-        task, episode = self._current_episode(evolution_id, version)
-        if task.status != "RUNNING" or episode.status not in {"RESERVED", "RUNNING"}:
-            raise InvalidEvolutionTransition(
-                "only the active reserved or running episode may fail"
-            )
-        self.validate_transition(task.status, "BLOCKED")
-        failed = episode.model_copy(
-            update={
-                "status": "FAILED",
-                "completed_at": utc_now(),
-                "error": error,
-            }
-        )
-        saved_episode = self.store.transition_episode(
-            failed,
-            expected_status=episode.status,
-        )
-        updated = task.model_copy(update={"status": "BLOCKED"})
-        self.store.save_task(updated, expected_revision=task.revision)
-        return saved_episode
+    ) -> MutationResult[EpisodeRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            task, episode = self._current_episode(transaction, version)
+            if episode.status == "FAILED":
+                if episode.error != error:
+                    raise EvolutionOperationConflict("failed episode error differs from retry")
+                saved_episode = episode
+            elif episode.status in {"RESERVED", "RUNNING"} and task.status == "RUNNING":
+                failed = episode.model_copy(
+                    update={
+                        "status": "FAILED",
+                        "completed_at": utc_now(),
+                        "error": error,
+                    }
+                )
+                saved_episode = transaction.transition_episode(
+                    failed,
+                    expected_status=episode.status,
+                )
+            else:
+                raise InvalidEvolutionTransition("only the active episode may fail")
+            if task.status == "RUNNING":
+                self.validate_transition(task.status, "BLOCKED")
+                checkpoint: EvolutionResumeStatus = (
+                    "CREATED" if task.last_completed_version is None else "REVISION_READY"
+                )
+                updated = task.model_copy(
+                    update={"status": "BLOCKED", "resume_status": checkpoint}
+                )
+                transaction.save_task(updated, expected_revision=task.revision)
+            elif task.status != "BLOCKED":
+                raise InvalidEvolutionTransition(
+                    "failed episode cannot reconcile with task state"
+                )
+        return MutationResult(saved_episode)
 
     def attach_feedback(
         self,
         evolution_id: str,
         version: EpisodeVersion,
         *,
+        feedback_id: str,
         draft: ExpertFeedbackDraft,
         result_sha256: Sha256,
         raw_input: str | None = None,
         hard_cap_override_reason: str | None = None,
-    ) -> ExpertFeedbackRecord:
-        """Bind one immutable active expert review to the exact result hash."""
+    ) -> MutationResult[ExpertFeedbackRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            task, episode = self._current_episode(transaction, version)
+            if episode.status != "COMPLETED":
+                raise InvalidEvolutionTransition("feedback requires a completed episode")
+            artifact = self._verify_artifact(episode.artifact)
+            if artifact.sha256 != result_sha256:
+                raise ArtifactMismatchError(
+                    "feedback hash does not match the persisted primary artifact"
+                )
+            feedback = self._build_feedback(
+                feedback_id=feedback_id,
+                evolution_id=evolution_id,
+                version=version,
+                draft=draft,
+                result_sha256=result_sha256,
+                raw_input=raw_input,
+                hard_cap_override_reason=hard_cap_override_reason,
+            )
+            all_feedback = self.store.list_feedback(evolution_id)
+            active = self._active_feedback(all_feedback, version)
+            if active is not None and active.feedback_id != feedback_id:
+                raise EvolutionOperationConflict(
+                    f"episode {version} already has active feedback {active.feedback_id}"
+                )
+            existing = next(
+                (item for item in all_feedback if item.feedback_id == feedback_id),
+                None,
+            )
+            if existing is not None:
+                self._require_matching_feedback(existing, feedback)
+                persisted = existing
+            else:
+                transaction.write_feedback(feedback)
+                persisted = feedback
+            if task.status == "AWAITING_EXPERT_FEEDBACK":
+                self.validate_transition(task.status, "FEEDBACK_RECORDED")
+                updated = task.model_copy(
+                    update={
+                        "status": "FEEDBACK_RECORDED",
+                        "feedback_ids": self._append_once(
+                            task.feedback_ids, persisted.feedback_id
+                        ),
+                    }
+                )
+                transaction.save_task(updated, expected_revision=task.revision)
+            elif not (
+                task.status == "FEEDBACK_RECORDED"
+                and persisted.feedback_id in task.feedback_ids
+            ):
+                raise InvalidEvolutionTransition(
+                    "feedback cannot reconcile with current task state"
+                )
+        event = ExpertFeedbackRecorded(
+            evolution_id=evolution_id,
+            episode_version=version,
+            feedback_id=persisted.feedback_id,
+            result_sha256=result_sha256,
+            scores={
+                "scientific_correctness": persisted.scores.scientific_correctness,
+                "evidence_sufficiency": persisted.scores.evidence_sufficiency,
+                "novelty": persisted.scores.novelty,
+                "actionability": persisted.scores.actionability,
+                "overall": persisted.scores.overall,
+            },
+        )
+        return MutationResult(persisted, (event,))
 
-        task, episode = self._current_episode(evolution_id, version)
-        if task.status != "AWAITING_EXPERT_FEEDBACK" or episode.status != "COMPLETED":
+    def confirm_revision(
+        self,
+        evolution_id: str,
+        plan: RevisionPlan,
+    ) -> MutationResult[RevisionPlan]:
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            self._validate_revision(task, evolution_id, plan)
+            confirmed = plan.model_copy(
+                update={"confirmed_at": plan.confirmed_at or utc_now()}
+            )
+            competing = next(
+                (
+                    item
+                    for item in self.store.list_revisions(evolution_id)
+                    if item.source_version == plan.source_version
+                    and item.feedback_id == plan.feedback_id
+                    and item.revision_id != plan.revision_id
+                ),
+                None,
+            )
+            if competing is not None:
+                raise EvolutionOperationConflict(
+                    "active feedback already has a different durable revision "
+                    f"{competing.revision_id}"
+                )
+            try:
+                existing = transaction.load_revision(plan.revision_id)
+            except FileNotFoundError:
+                transaction.write_revision(confirmed)
+                persisted = confirmed
+            else:
+                self._require_matching_revision(existing, confirmed)
+                persisted = existing
+            if task.status == "FEEDBACK_RECORDED":
+                self.validate_transition(task.status, "REVISION_READY")
+                updated = task.model_copy(
+                    update={
+                        "status": "REVISION_READY",
+                        "revision_ids": self._append_once(
+                            task.revision_ids, persisted.revision_id
+                        ),
+                    }
+                )
+                transaction.save_task(updated, expected_revision=task.revision)
+            elif not (
+                task.status == "REVISION_READY"
+                and persisted.revision_id in task.revision_ids
+            ):
+                raise InvalidEvolutionTransition(
+                    "revision cannot reconcile with current task state"
+                )
+        event = RevisionPlanConfirmed(
+            evolution_id=evolution_id,
+            episode_version=persisted.source_version,
+        )
+        return MutationResult(persisted, (event,))
+
+    def accept(
+        self,
+        evolution_id: str,
+        version: EpisodeVersion,
+    ) -> MutationResult[EvolutionTask]:
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.status != "AWAITING_EXPERT_FEEDBACK":
+                raise InvalidEvolutionTransition(
+                    "accept requires AWAITING_EXPERT_FEEDBACK"
+                )
+            episode = transaction.load_episode(version)
+            if episode.status != "COMPLETED":
+                raise InvalidEvolutionTransition("accepted version must be completed")
+            self._verify_artifact(episode.artifact)
+            self.validate_transition(task.status, "ACCEPTED")
+            saved = transaction.save_task(
+                task.model_copy(
+                    update={
+                        "status": "ACCEPTED",
+                        "resume_status": None,
+                        "accepted_version": version,
+                    }
+                ),
+                expected_revision=task.revision,
+            )
+        event = EvolutionTaskAccepted(
+            evolution_id=evolution_id,
+            episode_version=version,
+        )
+        return MutationResult(saved, (event,))
+
+    def stop(self, evolution_id: str) -> MutationResult[EvolutionTask]:
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            self.validate_transition(task.status, "STOPPED")
+            if task.status in {"BLOCKED", "BUDGET_EXHAUSTED"}:
+                checkpoint = task.resume_status
+            else:
+                checkpoint = cast(EvolutionResumeStatus, task.status)
+            if checkpoint is None:
+                raise InvalidEvolutionTransition("paused task has no resume checkpoint")
+            saved = transaction.save_task(
+                task.model_copy(
+                    update={"status": "STOPPED", "resume_status": checkpoint}
+                ),
+                expected_revision=task.revision,
+            )
+        return MutationResult(
+            saved,
+            (EvolutionTaskStopped(evolution_id=evolution_id),),
+        )
+
+    def reopen(self, evolution_id: str) -> MutationResult[EvolutionTask]:
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.status == "ACCEPTED":
+                checkpoint: EvolutionStatus = "AWAITING_EXPERT_FEEDBACK"
+            elif task.status in {"STOPPED", "BLOCKED", "BUDGET_EXHAUSTED"}:
+                if task.resume_status is None:
+                    raise InvalidEvolutionTransition("paused task has no resume checkpoint")
+                checkpoint = task.resume_status
+            else:
+                raise InvalidEvolutionTransition(
+                    f"cannot reopen an active task from {task.status}"
+                )
+            saved = transaction.save_task(
+                task.model_copy(
+                    update={"status": checkpoint, "resume_status": None}
+                ),
+                expected_revision=task.revision,
+            )
+        return MutationResult(saved)
+
+    async def publish(
+        self,
+        result: MutationResult[object] | Iterable[RuntimeEvent],
+    ) -> None:
+        """Explicitly publish one result's events; never drive an event loop."""
+
+        if self.event_sink is None:
+            return
+        events = result.events if isinstance(result, MutationResult) else result
+        for event in events:
+            pending = self.event_sink(event)
+            if inspect.isawaitable(pending):
+                await pending
+
+    @staticmethod
+    def validate_transition(source: str, target: str) -> None:
+        if source not in ALLOWED_TRANSITIONS:
+            raise InvalidEvolutionTransition(f"unknown evolution status: {source}")
+        typed_source = cast(EvolutionStatus, source)
+        if target not in ALLOWED_TRANSITIONS[typed_source]:
             raise InvalidEvolutionTransition(
-                "feedback requires an awaiting task and a completed episode"
+                f"invalid evolution transition: {source} -> {target}"
             )
-        if episode.artifact is None or episode.artifact.sha256 != result_sha256:
-            raise ArtifactMismatchError(
-                "expert feedback hash does not match the persisted primary artifact"
+
+    def _current_episode(
+        self,
+        transaction: EvolutionTransaction,
+        version: EpisodeVersion,
+    ) -> tuple[EvolutionTask, EpisodeRecord]:
+        task = transaction.load_task()
+        if task.current_version != version:
+            raise InvalidEvolutionTransition(
+                f"episode version {version} is not current version {task.current_version}"
             )
-        self.validate_transition(task.status, "FEEDBACK_RECORDED")
+        return task, transaction.load_episode(version)
+
+    def _verify_artifact(self, artifact: ArtifactRef | None) -> ArtifactRef:
+        if artifact is None:
+            raise ArtifactMismatchError("a completed episode requires an artifact")
+        if Path(artifact.path).is_absolute():
+            raise ArtifactMismatchError("artifact path must be workspace-relative")
+        try:
+            path = self.store.workspace.resolve(artifact.path, must_exist=True)
+        except (OSError, ValueError, ToolExecutionError) as exc:
+            raise ArtifactMismatchError(f"artifact is unavailable: {artifact.path}") from exc
+        if not path.is_file():
+            raise ArtifactMismatchError("artifact is not a regular file")
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    size += len(chunk)
+                    digest.update(chunk)
+        except OSError as exc:
+            raise ArtifactMismatchError(f"artifact cannot be read: {artifact.path}") from exc
+        if size != artifact.size_bytes or digest.hexdigest() != artifact.sha256:
+            raise ArtifactMismatchError("artifact bytes do not match declared size and SHA-256")
+        return artifact
+
+    @staticmethod
+    def _validate_result_identity(result: EpisodeRecord, episode: EpisodeRecord) -> None:
+        if result.evolution_id != episode.evolution_id or result.version != episode.version:
+            raise InvalidEvolutionTransition(
+                "episode result identity does not match the active episode"
+            )
+        for field in ("runtime_session_id", "event_log_path", "started_at"):
+            if getattr(result, field) != getattr(episode, field):
+                raise EvolutionOperationConflict(
+                    f"episode result changed running provenance field {field}"
+                )
+
+    @staticmethod
+    def _validate_completed_retry(
+        existing: EpisodeRecord,
+        result: EpisodeRecord,
+        artifact: ArtifactRef,
+    ) -> None:
+        fields = (
+            "scientific_state_path",
+            "summary",
+            "cost",
+            "acceptance_results",
+        )
+        if existing.artifact != artifact or any(
+            getattr(existing, field) != getattr(result, field) for field in fields
+        ):
+            raise EvolutionOperationConflict(
+                "completed episode content differs from retry result"
+            )
+
+    @staticmethod
+    def _validate_reservation(
+        episode: EpisodeRecord,
+        task: EvolutionTask,
+        mode: ExecutionMode,
+        provider: str | None,
+        model: str | None,
+        tool_surface_fingerprint: Sha256 | None,
+        capability_fingerprint: Sha256 | None,
+        data_source_fingerprints: dict[str, Sha256],
+    ) -> None:
+        expected_version = (
+            task.current_version
+            if task.status == "RUNNING" and task.current_version is not None
+            else EvolutionService._next_version(task.current_version)
+        )
+        expected_id = EvolutionService._episode_id(task.evolution_id, expected_version)
+        if (
+            episode.status != "RESERVED"
+            or episode.episode_id != expected_id
+            or episode.version != expected_version
+            or episode.execution_mode != mode
+            or episode.provider != provider
+            or episode.model != model
+            or episode.tool_surface_fingerprint != tool_surface_fingerprint
+            or episode.capability_fingerprint != capability_fingerprint
+            or episode.data_source_fingerprints != data_source_fingerprints
+            or episode.parent_version != task.last_completed_version
+            or episode.applied_feedback_id
+            != (task.feedback_ids[-1] if task.feedback_ids else None)
+            or episode.revision_plan_id
+            != (task.revision_ids[-1] if task.revision_ids else None)
+            or (
+                task.status != "RUNNING"
+                and episode.task_snapshot != task.model_dump(mode="json")
+            )
+            or episode.target_snapshot
+            != TargetSnapshot.model_validate(task.target)
+        ):
+            raise EvolutionOperationConflict(
+                f"mismatched durable reservation for {expected_version}"
+            )
+
+    @staticmethod
+    def _build_feedback(
+        *,
+        feedback_id: str,
+        evolution_id: str,
+        version: EpisodeVersion,
+        draft: ExpertFeedbackDraft,
+        result_sha256: Sha256,
+        raw_input: str | None,
+        hard_cap_override_reason: str | None,
+    ) -> ExpertFeedbackRecord:
         assessment = assess_hard_caps(draft.scores, draft.flags)
-        feedback = ExpertFeedbackRecord(
-            feedback_id=new_feedback_id(),
+        return ExpertFeedbackRecord(
+            feedback_id=feedback_id,
             evolution_id=evolution_id,
             episode_version=version,
             result_sha256=result_sha256,
@@ -328,40 +732,50 @@ class EvolutionService:
             hard_cap_reasons=assessment.reasons,
             hard_cap_override_reason=hard_cap_override_reason,
         )
-        self.store.write_feedback(feedback)
-        updated = task.model_copy(
-            update={
-                "status": "FEEDBACK_RECORDED",
-                "feedback_ids": [*task.feedback_ids, feedback.feedback_id],
-            }
-        )
-        self.store.save_task(updated, expected_revision=task.revision)
-        self._queue(
-            ExpertFeedbackRecorded(
-                evolution_id=evolution_id,
-                episode_version=version,
-                feedback_id=feedback.feedback_id,
-                result_sha256=result_sha256,
-                scores={
-                    "scientific_correctness": feedback.scores.scientific_correctness,
-                    "evidence_sufficiency": feedback.scores.evidence_sufficiency,
-                    "novelty": feedback.scores.novelty,
-                    "actionability": feedback.scores.actionability,
-                    "overall": feedback.scores.overall,
-                },
-            )
-        )
-        return feedback
 
-    def confirm_revision(
-        self,
+    @staticmethod
+    def _active_feedback(
+        feedback: list[ExpertFeedbackRecord],
+        version: EpisodeVersion,
+    ) -> ExpertFeedbackRecord | None:
+        superseded = {
+            item.supersedes_feedback_id
+            for item in feedback
+            if item.supersedes_feedback_id is not None
+        }
+        active = [
+            item
+            for item in feedback
+            if item.episode_version == version and item.feedback_id not in superseded
+        ]
+        if len(active) > 1:
+            raise EvolutionOperationConflict(
+                f"episode {version} has multiple active feedback records"
+            )
+        return active[0] if active else None
+
+    @staticmethod
+    def _require_matching_feedback(
+        existing: ExpertFeedbackRecord,
+        candidate: ExpertFeedbackRecord,
+    ) -> None:
+        ignored = {"confirmed_at"}
+        existing_payload = existing.model_dump(mode="json", exclude=ignored)
+        candidate_payload = redact_secrets(
+            candidate.model_dump(mode="json", exclude=ignored)
+        )
+        if existing_payload != candidate_payload:
+            raise EvolutionOperationConflict(
+                f"feedback ID {candidate.feedback_id} names different content"
+            )
+
+    @staticmethod
+    def _validate_revision(
+        task: EvolutionTask,
         evolution_id: str,
         plan: RevisionPlan,
-    ) -> RevisionPlan:
-        """Persist a human-confirmed revision contract before iteration."""
-
-        task = self.get(evolution_id)
-        if task.status != "FEEDBACK_RECORDED":
+    ) -> None:
+        if task.status not in {"FEEDBACK_RECORDED", "REVISION_READY"}:
             raise InvalidEvolutionTransition(
                 "revision confirmation requires FEEDBACK_RECORDED"
             )
@@ -378,121 +792,38 @@ class EvolutionService:
             or plan.feedback_id != task.feedback_ids[-1]
         ):
             raise InvalidEvolutionTransition(
-                "revision plan does not match the active task version and feedback"
+                "revision plan does not match active task version and feedback"
             )
-        self.validate_transition(task.status, "REVISION_READY")
-        confirmed = plan.model_copy(update={"confirmed_at": plan.confirmed_at or utc_now()})
-        self.store.write_revision(confirmed)
-        updated = task.model_copy(
-            update={
-                "status": "REVISION_READY",
-                "revision_ids": [*task.revision_ids, confirmed.revision_id],
-            }
-        )
-        self.store.save_task(updated, expected_revision=task.revision)
-        self._queue(
-            RevisionPlanConfirmed(
-                evolution_id=evolution_id,
-                episode_version=confirmed.source_version,
-            )
-        )
-        return confirmed
-
-    def accept(self, evolution_id: str, version: EpisodeVersion) -> EvolutionTask:
-        """Select a completed result without changing its scientific verdict."""
-
-        task = self.get(evolution_id)
-        if task.status != "AWAITING_EXPERT_FEEDBACK":
-            raise InvalidEvolutionTransition(
-                "accept requires AWAITING_EXPERT_FEEDBACK"
-            )
-        episode = self.store.load_episode(evolution_id, version)
-        if episode.status != "COMPLETED" or version != task.last_completed_version:
-            raise InvalidEvolutionTransition(
-                "accepted version must be the latest completed episode"
-            )
-        self.validate_transition(task.status, "ACCEPTED")
-        updated = task.model_copy(
-            update={"status": "ACCEPTED", "accepted_version": version}
-        )
-        saved = self.store.save_task(updated, expected_revision=task.revision)
-        self._queue(
-            EvolutionTaskAccepted(
-                evolution_id=evolution_id,
-                episode_version=version,
-            )
-        )
-        return saved
-
-    def stop(self, evolution_id: str) -> EvolutionTask:
-        """Explicitly stop a task from a state allowed by the transition table."""
-
-        task = self.get(evolution_id)
-        self.validate_transition(task.status, "STOPPED")
-        updated = task.model_copy(update={"status": "STOPPED"})
-        saved = self.store.save_task(updated, expected_revision=task.revision)
-        self._queue(EvolutionTaskStopped(evolution_id=evolution_id))
-        return saved
-
-    def reopen(self, evolution_id: str) -> EvolutionTask:
-        """Return an explicitly closed or paused task to human review."""
-
-        task = self.get(evolution_id)
-        if task.status not in {"ACCEPTED", "STOPPED", "BUDGET_EXHAUSTED", "BLOCKED"}:
-            raise InvalidEvolutionTransition(
-                f"cannot reopen an active task from {task.status}"
-            )
-        self.validate_transition(task.status, "AWAITING_EXPERT_FEEDBACK")
-        updated = task.model_copy(update={"status": "AWAITING_EXPERT_FEEDBACK"})
-        return self.store.save_task(updated, expected_revision=task.revision)
-
-    def drain_events(self) -> list[RuntimeEvent]:
-        """Return generated events so the caller can persist them explicitly."""
-
-        events = self._pending_events
-        self._pending_events = []
-        return events
-
-    async def publish_events(self, events: Iterable[RuntimeEvent]) -> None:
-        """Send returned events through the configured sink without a hidden loop."""
-
-        if self.event_sink is None:
-            return
-        for event in events:
-            pending = self.event_sink(event)
-            if inspect.isawaitable(pending):
-                await pending
 
     @staticmethod
-    def validate_transition(source: str, target: str) -> None:
-        """Validate one lifecycle edge against the single explicit table."""
-
-        if source not in ALLOWED_TRANSITIONS:
-            raise InvalidEvolutionTransition(f"unknown evolution status: {source}")
-        typed_source = cast(EvolutionStatus, source)
-        if target not in ALLOWED_TRANSITIONS[typed_source]:
-            raise InvalidEvolutionTransition(
-                f"invalid evolution transition: {source} -> {target}"
+    def _require_matching_revision(existing: RevisionPlan, candidate: RevisionPlan) -> None:
+        ignored = {"confirmed_at", "created_at"}
+        existing_payload = existing.model_dump(mode="json", exclude=ignored)
+        candidate_payload = redact_secrets(
+            candidate.model_dump(mode="json", exclude=ignored)
+        )
+        if existing_payload != candidate_payload:
+            raise EvolutionOperationConflict(
+                f"revision ID {candidate.revision_id} names different content"
             )
-
-    def _current_episode(
-        self,
-        evolution_id: str,
-        version: EpisodeVersion,
-    ) -> tuple[EvolutionTask, EpisodeRecord]:
-        task = self.get(evolution_id)
-        if task.current_version != version:
-            raise InvalidEvolutionTransition(
-                f"episode version {version} is not current version {task.current_version}"
-            )
-        return task, self.store.load_episode(evolution_id, version)
 
     @staticmethod
-    def _validate_result_identity(result: EpisodeRecord, episode: EpisodeRecord) -> None:
-        if result.evolution_id != episode.evolution_id or result.version != episode.version:
-            raise InvalidEvolutionTransition(
-                "episode result identity does not match the active episode version"
-            )
+    def _append_once(values: list[str], value: str) -> list[str]:
+        return values if value in values else [*values, value]
+
+    @staticmethod
+    def _reservation_events(
+        episode: EpisodeRecord,
+        initial: bool,
+    ) -> tuple[RuntimeEvent, ...]:
+        if initial:
+            return ()
+        return (
+            EvolutionIterationStarted(
+                evolution_id=episode.evolution_id,
+                episode_version=episode.version,
+            ),
+        )
 
     @staticmethod
     def _next_version(current: EpisodeVersion | None) -> EpisodeVersion:
@@ -500,6 +831,11 @@ class EvolutionService:
         if value > 999:
             raise InvalidEvolutionTransition("episode version space is exhausted")
         return cast(EpisodeVersion, f"v{value:03d}")
+
+    @staticmethod
+    def _episode_id(evolution_id: str, version: EpisodeVersion) -> str:
+        digest = hashlib.sha256(f"{evolution_id}:{version}".encode()).hexdigest()[:10]
+        return f"ep_{digest}"
 
     @staticmethod
     def _input_hash(goal: str, target: TargetSpec) -> str:
@@ -511,15 +847,14 @@ class EvolutionService:
         ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
-    def _queue(self, event: RuntimeEvent) -> None:
-        self._pending_events.append(event)
-
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "ArtifactMismatchError",
     "EventSink",
+    "EvolutionOperationConflict",
     "EvolutionService",
     "EvolutionServiceError",
     "InvalidEvolutionTransition",
+    "MutationResult",
 ]

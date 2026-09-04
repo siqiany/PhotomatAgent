@@ -15,6 +15,7 @@ from photomatagent.scientific.evolution.models import (
     EpisodeVersion,
     EvidenceChangeSummary,
     EvolutionStatus,
+    EvolutionResumeStatus,
     EvolutionTask,
     ExecutionMode,
     ExperienceMaturity,
@@ -57,9 +58,11 @@ from photomatagent.scientific.evolution.rubric import (
 from photomatagent.scientific.evolution.service import (
     ALLOWED_TRANSITIONS,
     ArtifactMismatchError,
+    EvolutionOperationConflict,
     EvolutionService,
     EvolutionServiceError,
     InvalidEvolutionTransition,
+    MutationResult,
 )
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
@@ -68,6 +71,7 @@ from photomatagent.scientific.evolution.store import (
     EvolutionLockError,
     EvolutionStore,
     EvolutionStoreError,
+    EvolutionTransaction,
     EvolutionUnsupportedSchemaError,
 )
 
@@ -88,14 +92,17 @@ __all__ = [
     "EpisodeVersion",
     "EvidenceChangeSummary",
     "EvolutionStatus",
+    "EvolutionResumeStatus",
     "EvolutionService",
     "EvolutionServiceError",
+    "EvolutionOperationConflict",
     "EvolutionAlreadyExistsError",
     "EvolutionConflictError",
     "EvolutionCorruptRecordError",
     "EvolutionLockError",
     "EvolutionStore",
     "EvolutionStoreError",
+    "EvolutionTransaction",
     "EvolutionUnsupportedSchemaError",
     "EvolutionTask",
     "ExecutionMode",
@@ -109,6 +116,7 @@ __all__ = [
     "FidelityChangeSummary",
     "HardCapAssessment",
     "InvalidEvolutionTransition",
+    "MutationResult",
     "ManagedId",
     "RUBRIC_ANCHORS",
     "RUBRIC_DIMENSIONS",

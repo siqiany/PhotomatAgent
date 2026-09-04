@@ -33,6 +33,7 @@ _EPISODE_VERSION = re.compile(r"^v[0-9]{3}$")
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _TASK_MUTABLE_FIELDS = (
     "status",
+    "resume_status",
     "current_version",
     "last_completed_version",
     "accepted_version",
@@ -76,6 +77,11 @@ _EPISODE_TRANSITIONS: dict[EpisodeStatus, frozenset[EpisodeStatus]] = {
     "COMPLETED": frozenset(),
     "FAILED": frozenset(),
 }
+_EPISODE_RUNNING_PROVENANCE_FIELDS = (
+    "runtime_session_id",
+    "event_log_path",
+    "started_at",
+)
 
 
 class EvolutionStoreError(RuntimeError):
@@ -115,6 +121,90 @@ class EvolutionUnsupportedSchemaError(EvolutionStoreError):
         )
 
 
+class EvolutionTransaction:
+    """Operations performed while one evolution task lock is held."""
+
+    def __init__(self, store: EvolutionStore, evolution_id: str) -> None:
+        self.store = store
+        self.evolution_id = evolution_id
+        self._active = False
+
+    def _require_active(self) -> None:
+        if not self._active:
+            raise EvolutionLockError("evolution transaction is no longer active")
+
+    def load_task(self) -> EvolutionTask:
+        self._require_active()
+        return self.store.load_task(self.evolution_id)
+
+    def save_task(
+        self,
+        task: EvolutionTask,
+        *,
+        expected_revision: int,
+    ) -> EvolutionTask:
+        self._require_active()
+        return self.store._save_task_locked(task, expected_revision)
+
+    def load_episode(self, version: str) -> EpisodeRecord:
+        self._require_active()
+        return self.store.load_episode(self.evolution_id, version)
+
+    def write_episode(self, episode: EpisodeRecord) -> Path:
+        self._require_active()
+        if episode.evolution_id != self.evolution_id:
+            raise EvolutionConflictError("episode belongs to a different transaction")
+        self.store._validate_episode_version(episode.version)
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="episodes",
+            filename=f"{episode.version}.json",
+            record=episode,
+            model_type=EpisodeRecord,
+        )
+
+    def transition_episode(
+        self,
+        episode: EpisodeRecord,
+        *,
+        expected_status: EpisodeStatus,
+    ) -> EpisodeRecord:
+        self._require_active()
+        return self.store._transition_episode_locked(episode, expected_status)
+
+    def load_feedback(self, feedback_id: str) -> ExpertFeedbackRecord:
+        self._require_active()
+        return self.store.load_feedback(self.evolution_id, feedback_id)
+
+    def write_feedback(self, feedback: ExpertFeedbackRecord) -> Path:
+        self._require_active()
+        if feedback.evolution_id != self.evolution_id:
+            raise EvolutionConflictError("feedback belongs to a different transaction")
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="feedback",
+            filename=f"{feedback.feedback_id}.json",
+            record=feedback,
+            model_type=ExpertFeedbackRecord,
+        )
+
+    def load_revision(self, revision_id: str) -> RevisionPlan:
+        self._require_active()
+        return self.store.load_revision(self.evolution_id, revision_id)
+
+    def write_revision(self, revision: RevisionPlan) -> Path:
+        self._require_active()
+        if revision.evolution_id != self.evolution_id:
+            raise EvolutionConflictError("revision belongs to a different transaction")
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="revisions",
+            filename=f"{revision.revision_id}.json",
+            record=revision,
+            model_type=RevisionPlan,
+        )
+
+
 class EvolutionStore:
     """Persist evolution tasks and immutable records inside one workspace."""
 
@@ -126,6 +216,19 @@ class EvolutionStore:
         self.root = workspace.resolve(_STORE_PATH, must_exist=False)
         self.root.mkdir(parents=True, exist_ok=True)
         self.root = workspace.resolve(_STORE_PATH, must_exist=True)
+
+    @contextmanager
+    def transaction(self, evolution_id: str) -> Iterator[EvolutionTransaction]:
+        """Hold the authoritative task lock across one logical mutation."""
+
+        task_dir = self._task_dir(evolution_id)
+        transaction = EvolutionTransaction(self, evolution_id)
+        with self._task_lock(task_dir):
+            transaction._active = True
+            try:
+                yield transaction
+            finally:
+                transaction._active = False
 
     def create_task(self, task: EvolutionTask) -> EvolutionTask:
         """Create a new revision-zero task without replacing an existing task."""
@@ -154,6 +257,15 @@ class EvolutionStore:
         self, task: EvolutionTask, expected_revision: int
     ) -> EvolutionTask:
         """Save a task only if its stored revision matches the caller's view."""
+        task_dir = self._task_dir(task.evolution_id)
+        with self._task_lock(task_dir):
+            return self._save_task_locked(task, expected_revision)
+
+    def _save_task_locked(
+        self,
+        task: EvolutionTask,
+        expected_revision: int,
+    ) -> EvolutionTask:
         if (
             isinstance(expected_revision, bool)
             or not isinstance(expected_revision, int)
@@ -161,38 +273,36 @@ class EvolutionStore:
         ):
             raise ValueError("expected_revision must be a non-negative integer")
         candidate, _ = self._prepare_model(task, EvolutionTask)
-        task_dir = self._task_dir(candidate.evolution_id)
-        with self._task_lock(task_dir):
-            if candidate.revision != expected_revision:
-                raise EvolutionConflictError(
-                    f"stale evolution task write for {candidate.evolution_id}: "
-                    f"caller revision={candidate.revision}, "
-                    f"expected={expected_revision}"
-                )
-            current = self.load_task(candidate.evolution_id)
-            if current.revision != expected_revision:
-                raise EvolutionConflictError(
-                    f"stale evolution task write for {candidate.evolution_id}: "
-                    f"stored revision={current.revision}, "
-                    f"expected={expected_revision}"
-                )
-            for field in _TASK_IMMUTABLE_FIELDS:
-                if getattr(candidate, field) != getattr(current, field):
-                    raise EvolutionConflictError(
-                        f"immutable task field differs from stored record for "
-                        f"{candidate.evolution_id}: {field}"
-                    )
-            updated_data = current.model_dump(mode="python")
-            for field in _TASK_MUTABLE_FIELDS:
-                updated_data[field] = getattr(candidate, field)
-            updated_data["revision"] = current.revision + 1
-            updated_data["updated_at"] = utc_now()
-            updated = EvolutionTask.model_validate(updated_data)
-            updated, payload = self._prepare_model(updated, EvolutionTask)
-            self._write_json_atomic(
-                self._task_path(candidate.evolution_id),
-                payload,
+        if candidate.revision != expected_revision:
+            raise EvolutionConflictError(
+                f"stale evolution task write for {candidate.evolution_id}: "
+                f"caller revision={candidate.revision}, "
+                f"expected={expected_revision}"
             )
+        current = self.load_task(candidate.evolution_id)
+        if current.revision != expected_revision:
+            raise EvolutionConflictError(
+                f"stale evolution task write for {candidate.evolution_id}: "
+                f"stored revision={current.revision}, "
+                f"expected={expected_revision}"
+            )
+        for field in _TASK_IMMUTABLE_FIELDS:
+            if getattr(candidate, field) != getattr(current, field):
+                raise EvolutionConflictError(
+                    f"immutable task field differs from stored record for "
+                    f"{candidate.evolution_id}: {field}"
+                )
+        updated_data = current.model_dump(mode="python")
+        for field in _TASK_MUTABLE_FIELDS:
+            updated_data[field] = getattr(candidate, field)
+        updated_data["revision"] = current.revision + 1
+        updated_data["updated_at"] = utc_now()
+        updated = EvolutionTask.model_validate(updated_data)
+        updated, payload = self._prepare_model(updated, EvolutionTask)
+        self._write_json_atomic(
+            self._task_path(candidate.evolution_id),
+            payload,
+        )
         return updated
 
     def write_episode(self, episode: EpisodeRecord) -> Path:
@@ -231,44 +341,163 @@ class EvolutionStore:
         expected_status: EpisodeStatus,
     ) -> EpisodeRecord:
         """Atomically advance a nonterminal episode from its expected status."""
+        task_dir = self._task_dir(episode.evolution_id)
+        with self._task_lock(task_dir):
+            return self._transition_episode_locked(episode, expected_status)
+
+    def _transition_episode_locked(
+        self,
+        episode: EpisodeRecord,
+        expected_status: EpisodeStatus,
+    ) -> EpisodeRecord:
         candidate, payload = self._prepare_model(episode, EpisodeRecord)
         if expected_status not in _EPISODE_TRANSITIONS:
             raise ValueError(f"unsupported expected episode status: {expected_status!r}")
-        task_dir = self._task_dir(candidate.evolution_id)
-        with self._task_lock(task_dir):
-            current = self.load_episode(candidate.evolution_id, candidate.version)
-            if current.status != expected_status:
+        current = self.load_episode(candidate.evolution_id, candidate.version)
+        if current.status != expected_status:
+            raise EvolutionConflictError(
+                f"stale episode transition for {candidate.evolution_id}/"
+                f"{candidate.version}: stored status={current.status}, "
+                f"expected={expected_status}"
+            )
+        if not _EPISODE_TRANSITIONS[current.status]:
+            raise EvolutionConflictError(
+                f"terminal episode is immutable: {candidate.evolution_id}/"
+                f"{candidate.version} status={current.status}"
+            )
+        if candidate.status not in _EPISODE_TRANSITIONS[current.status]:
+            raise EvolutionConflictError(
+                f"illegal episode transition for {candidate.evolution_id}/"
+                f"{candidate.version}: {current.status} -> {candidate.status}"
+            )
+        for field in _EPISODE_IMMUTABLE_FIELDS:
+            if getattr(candidate, field) != getattr(current, field):
                 raise EvolutionConflictError(
-                    f"stale episode transition for {candidate.evolution_id}/"
-                    f"{candidate.version}: stored status={current.status}, "
-                    f"expected={expected_status}"
+                    "immutable episode execution snapshot differs from stored "
+                    f"record for {candidate.evolution_id}/{candidate.version}: "
+                    f"{field}"
                 )
-            if not _EPISODE_TRANSITIONS[current.status]:
+        if current.status == "RESERVED" and candidate.status == "RUNNING":
+            if candidate.started_at is None:
                 raise EvolutionConflictError(
-                    f"terminal episode is immutable: {candidate.evolution_id}/"
-                    f"{candidate.version} status={current.status}"
+                    "RUNNING episode transition requires started_at provenance"
                 )
-            if candidate.status not in _EPISODE_TRANSITIONS[current.status]:
-                raise EvolutionConflictError(
-                    f"illegal episode transition for {candidate.evolution_id}/"
-                    f"{candidate.version}: {current.status} -> {candidate.status}"
-                )
-            for field in _EPISODE_IMMUTABLE_FIELDS:
+            for field in (
+                "completed_at",
+                "summary",
+                "artifact",
+                "error",
+            ):
                 if getattr(candidate, field) != getattr(current, field):
                     raise EvolutionConflictError(
-                        "immutable episode execution snapshot differs from stored "
-                        f"record for {candidate.evolution_id}/{candidate.version}: "
-                        f"{field}"
+                        f"RUNNING transition cannot set terminal field {field}"
                     )
-            self._write_json_atomic(
-                self._managed_path(
-                    candidate.evolution_id,
-                    "episodes",
-                    f"{candidate.version}.json",
-                ),
-                payload,
-            )
+        if current.status == "RESERVED" and candidate.status == "FAILED":
+            for field in _EPISODE_RUNNING_PROVENANCE_FIELDS:
+                if getattr(candidate, field) != getattr(current, field):
+                    raise EvolutionConflictError(
+                        "unstarted FAILED episode cannot add runtime provenance "
+                        f"field {field}"
+                    )
+        if current.status == "RUNNING":
+            for field in _EPISODE_RUNNING_PROVENANCE_FIELDS:
+                if getattr(candidate, field) != getattr(current, field):
+                    raise EvolutionConflictError(
+                        "running episode provenance differs from stored record for "
+                        f"{candidate.evolution_id}/{candidate.version}: {field}"
+                    )
+        self._write_json_atomic(
+            self._managed_path(
+                candidate.evolution_id,
+                "episodes",
+                f"{candidate.version}.json",
+            ),
+            payload,
+        )
         return candidate
+
+    def load_feedback(
+        self,
+        evolution_id: str,
+        feedback_id: str,
+    ) -> ExpertFeedbackRecord:
+        """Load one feedback record bound to its managed identity."""
+
+        self._validate_id(feedback_id)
+        path = self._managed_path(evolution_id, "feedback", f"{feedback_id}.json")
+        feedback = self._load_model(
+            path,
+            ExpertFeedbackRecord,
+            require_schema_version=True,
+        )
+        if feedback.evolution_id != evolution_id or feedback.feedback_id != feedback_id:
+            raise EvolutionCorruptRecordError(
+                path,
+                "feedback identity does not match its managed path",
+            )
+        return feedback
+
+    def list_feedback(self, evolution_id: str) -> list[ExpertFeedbackRecord]:
+        """Load every managed feedback record for duplicate-active checks."""
+
+        directory = self._managed_path(evolution_id, "feedback")
+        if not directory.is_dir():
+            return []
+        records: list[ExpertFeedbackRecord] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                self._validate_id(path.stem)
+            except (TypeError, ValueError):
+                continue
+            records.append(self.load_feedback(evolution_id, path.stem))
+        return records
+
+    def load_revision(self, evolution_id: str, revision_id: str) -> RevisionPlan:
+        """Load one revision plan bound to its managed identity."""
+
+        self._validate_id(revision_id)
+        path = self._managed_path(evolution_id, "revisions", f"{revision_id}.json")
+        revision = self._load_model(
+            path,
+            RevisionPlan,
+            require_schema_version=True,
+        )
+        if revision.evolution_id != evolution_id or revision.revision_id != revision_id:
+            raise EvolutionCorruptRecordError(
+                path,
+                "revision identity does not match its managed path",
+            )
+        return revision
+
+    def list_revisions(self, evolution_id: str) -> list[RevisionPlan]:
+        """Load every managed revision record for stable-operation checks."""
+
+        directory = self._managed_path(evolution_id, "revisions")
+        if not directory.is_dir():
+            return []
+        records: list[RevisionPlan] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                self._validate_id(path.stem)
+            except (TypeError, ValueError):
+                continue
+            records.append(self.load_revision(evolution_id, path.stem))
+        return records
+
+    def _write_record_locked(
+        self,
+        *,
+        evolution_id: str,
+        directory: str,
+        filename: str,
+        record: _ModelT,
+        model_type: type[_ModelT],
+    ) -> Path:
+        _, payload = self._prepare_model(record, model_type)
+        self._require_task(evolution_id)
+        path = self._managed_path(evolution_id, directory, filename)
+        self._write_immutable_json(path, payload)
+        return path
 
     def write_feedback(self, feedback: ExpertFeedbackRecord) -> Path:
         """Persist one immutable expert-feedback record."""

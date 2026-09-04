@@ -32,6 +32,12 @@ EvolutionStatus = Literal[
     "BUDGET_EXHAUSTED",
     "BLOCKED",
 ]
+EvolutionResumeStatus = Literal[
+    "CREATED",
+    "AWAITING_EXPERT_FEEDBACK",
+    "FEEDBACK_RECORDED",
+    "REVISION_READY",
+]
 EpisodeStatus = Literal["RESERVED", "RUNNING", "COMPLETED", "FAILED"]
 ExecutionMode = Literal["NORMAL", "CARRY_VERIFIED_EVIDENCE", "FRESH_EVALUATION"]
 StrategyArm = Literal[
@@ -356,6 +362,7 @@ class EvolutionTask(StrictModel):
     task_group_id: ManagedId = Field(frozen=True)
     input_sha256: Sha256 = Field(frozen=True)
     status: EvolutionStatus = "CREATED"
+    resume_status: EvolutionResumeStatus | None = None
     current_version: EpisodeVersion | None = None
     last_completed_version: EpisodeVersion | None = None
     accepted_version: EpisodeVersion | None = None
@@ -372,6 +379,15 @@ class EvolutionTask(StrictModel):
     @model_validator(mode="after")
     def isolate_target_snapshot(self) -> Self:
         object.__setattr__(self, "target", self.target.model_copy(deep=True))
+        return self
+
+    @model_validator(mode="after")
+    def validate_resume_checkpoint(self) -> Self:
+        checkpoint_states = {"STOPPED", "BLOCKED", "BUDGET_EXHAUSTED"}
+        if self.status in checkpoint_states and self.resume_status is None:
+            raise ValueError(f"{self.status} tasks require resume_status")
+        if self.status not in checkpoint_states and self.resume_status is not None:
+            raise ValueError("resume_status is valid only for a paused task")
         return self
 
 

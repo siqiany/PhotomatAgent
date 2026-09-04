@@ -461,8 +461,11 @@ def test_concurrent_saves_allow_exactly_one_revision_winner(tmp_path: Path) -> N
     barrier = Barrier(2)
 
     def save(status: str) -> EvolutionTask | Exception:
-        candidate = store.load_task("evo_test")
-        candidate.status = status  # type: ignore[assignment]
+        current = store.load_task("evo_test")
+        updates: dict[str, object] = {"status": status}
+        if status == "STOPPED":
+            updates["resume_status"] = "CREATED"
+        candidate = current.model_copy(update=updates)
         barrier.wait()
         try:
             return store.save_task(candidate, expected_revision=0)
@@ -685,7 +688,9 @@ def test_episode_load_and_legal_status_transitions_round_trip(tmp_path: Path) ->
     store.write_episode(reserved)
 
     running = store.transition_episode(
-        reserved.model_copy(update={"status": "RUNNING"}),
+        reserved.model_copy(
+            update={"status": "RUNNING", "started_at": "2026-09-04T08:00:00Z"}
+        ),
         expected_status="RESERVED",
     )
     completed = store.transition_episode(
@@ -710,7 +715,9 @@ def test_episode_transition_rejects_illegal_and_stale_statuses(tmp_path: Path) -
         )
 
     running = store.transition_episode(
-        reserved.model_copy(update={"status": "RUNNING"}),
+        reserved.model_copy(
+            update={"status": "RUNNING", "started_at": "2026-09-04T08:00:00Z"}
+        ),
         expected_status="RESERVED",
     )
     with pytest.raises(EvolutionConflictError, match="stored status=RUNNING"):
@@ -747,7 +754,9 @@ def test_terminal_episode_records_are_permanently_immutable(
     expected_status = "RESERVED"
     if terminal_status == "COMPLETED":
         source = store.transition_episode(
-            reserved.model_copy(update={"status": "RUNNING"}),
+            reserved.model_copy(
+                update={"status": "RUNNING", "started_at": "2026-09-04T08:00:00Z"}
+            ),
             expected_status="RESERVED",
         )
         expected_status = "RUNNING"
@@ -771,7 +780,9 @@ def test_concurrent_episode_terminal_transitions_allow_exactly_one_winner(
     reserved = make_episode()
     store.write_episode(reserved)
     running = store.transition_episode(
-        reserved.model_copy(update={"status": "RUNNING"}),
+        reserved.model_copy(
+            update={"status": "RUNNING", "started_at": "2026-09-04T08:00:00Z"}
+        ),
         expected_status="RESERVED",
     )
     barrier = Barrier(2)
@@ -793,3 +804,116 @@ def test_concurrent_episode_terminal_transitions_allow_exactly_one_winner(
     assert sum(isinstance(result, EpisodeRecord) for result in results) == 1
     assert sum(isinstance(result, EvolutionConflictError) for result in results) == 1
     assert store.load_episode("evo_test", "v001").status in {"COMPLETED", "FAILED"}
+
+
+def test_task_transaction_composes_record_and_manifest_without_reentrant_lock(
+    tmp_path: Path,
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    episode = make_episode()
+
+    with store.transaction("evo_test") as transaction:
+        task = transaction.load_task()
+        transaction.write_episode(episode)
+        saved = transaction.save_task(
+            task.model_copy(
+                update={
+                    "status": "RUNNING",
+                    "current_version": "v001",
+                    "episode_ids": [episode.episode_id],
+                }
+            ),
+            expected_revision=task.revision,
+        )
+
+    assert saved.revision == 1
+    assert store.load_episode("evo_test", "v001") == episode
+
+
+def test_task_transaction_cannot_be_reused_after_lock_release(tmp_path: Path) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+
+    with store.transaction("evo_test") as transaction:
+        assert transaction.load_task().evolution_id == "evo_test"
+
+    with pytest.raises(EvolutionLockError, match="no longer active"):
+        transaction.load_task()
+
+
+def test_running_provenance_cannot_change_during_terminal_transition(
+    tmp_path: Path,
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    reserved = make_episode()
+    store.write_episode(reserved)
+    running = store.transition_episode(
+        reserved.model_copy(
+            update={
+                "status": "RUNNING",
+                "runtime_session_id": "session_one",
+                "event_log_path": ".photomatagent/sessions/session_one/events.jsonl",
+                "started_at": "2026-09-04T08:00:00Z",
+            }
+        ),
+        expected_status="RESERVED",
+    )
+
+    for field, replacement in (
+        ("runtime_session_id", "session_two"),
+        ("event_log_path", "changed/events.jsonl"),
+        ("started_at", "2026-09-04T09:00:00Z"),
+    ):
+        with pytest.raises(EvolutionConflictError, match=field):
+            store.transition_episode(
+                running.model_copy(
+                    update={"status": "FAILED", field: replacement}
+                ),
+                expected_status="RUNNING",
+            )
+
+
+def test_episode_transition_enforces_status_specific_runtime_provenance(
+    tmp_path: Path,
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    reserved = make_episode()
+    store.write_episode(reserved)
+
+    with pytest.raises(EvolutionConflictError, match="started_at"):
+        store.transition_episode(
+            reserved.model_copy(update={"status": "RUNNING"}),
+            expected_status="RESERVED",
+        )
+    with pytest.raises(EvolutionConflictError, match="runtime_session_id"):
+        store.transition_episode(
+            reserved.model_copy(
+                update={
+                    "status": "FAILED",
+                    "runtime_session_id": "session_that_never_started",
+                }
+            ),
+            expected_status="RESERVED",
+        )
+
+
+def test_store_loads_feedback_and_revision_with_managed_identity(tmp_path: Path) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    feedback = make_feedback()
+    revision = RevisionPlan(
+        revision_id="rp_test",
+        evolution_id="evo_test",
+        source_version="v001",
+        feedback_id=feedback.feedback_id,
+    )
+    store.write_feedback(feedback)
+    store.write_revision(revision)
+
+    loaded_feedback = store.load_feedback("evo_test", feedback.feedback_id)
+    assert loaded_feedback.feedback_id == feedback.feedback_id
+    assert "super-secret-value" not in loaded_feedback.raw_input
+    assert store.load_revision("evo_test", revision.revision_id) == revision

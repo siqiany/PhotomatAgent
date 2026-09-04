@@ -515,6 +515,21 @@ def test_immutable_episode_snapshots_support_safe_deep_copy_and_target_use():
     assert clone.target_snapshot.metadata["nested"]["value"] == 1
 
 
+def test_paused_task_requires_a_strict_resume_checkpoint():
+    with pytest.raises(ValidationError, match="resume_status"):
+        _task(status="STOPPED")
+    with pytest.raises(ValidationError, match="resume_status"):
+        _task(status="STOPPED", resume_status="RUNNING")
+
+    stopped = _task(status="STOPPED", resume_status="FEEDBACK_RECORDED")
+    assert stopped.resume_status == "FEEDBACK_RECORDED"
+
+
+def test_active_task_cannot_retain_a_resume_checkpoint():
+    with pytest.raises(ValidationError, match="resume_status"):
+        _task(status="CREATED", resume_status="CREATED")
+
+
 def test_episode_lifecycle_fields_remain_mutable():
     episode = _episode()
     started = datetime(2026, 9, 4, 2, 0, tzinfo=UTC)
