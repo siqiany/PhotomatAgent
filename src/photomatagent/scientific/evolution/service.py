@@ -124,6 +124,77 @@ class EvolutionService:
     def get(self, evolution_id: str) -> EvolutionTask:
         return self.store.load_task(evolution_id)
 
+    def reconcile(self, evolution_id: str) -> MutationResult[EvolutionTask]:
+        """Repair a task manifest left behind a terminal episode write.
+
+        Episode transitions and task-manifest updates are separate atomic file
+        replacements.  If a process dies between them, the terminal episode is
+        authoritative, but the task can remain ``RUNNING``.  Reconciliation is
+        deliberately narrow: it only repairs that exact split state while the
+        task transaction lock is held.
+        """
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.status != "RUNNING":
+                return MutationResult(task)
+            if task.current_version is None:
+                raise InvalidEvolutionTransition(
+                    "RUNNING task has no current episode to reconcile"
+                )
+            episode = transaction.load_episode(task.current_version)
+            expected_episode_id = self._episode_id(
+                evolution_id,
+                task.current_version,
+            )
+            if (
+                episode.episode_id != expected_episode_id
+                or not task.episode_ids
+                or task.episode_ids[-1] != episode.episode_id
+            ):
+                raise EvolutionOperationConflict(
+                    "current episode identity does not match the task manifest"
+                )
+            if episode.status == "COMPLETED":
+                self.validate_transition(task.status, "AWAITING_EXPERT_FEEDBACK")
+                saved = transaction.save_task(
+                    task.model_copy(
+                        update={
+                            "status": "AWAITING_EXPERT_FEEDBACK",
+                            "resume_status": None,
+                            "last_completed_version": episode.version,
+                        }
+                    ),
+                    expected_revision=task.revision,
+                )
+                return MutationResult(
+                    saved,
+                    (
+                        EvolutionEpisodeCompleted(
+                            evolution_id=evolution_id,
+                            episode_version=episode.version,
+                        ),
+                    ),
+                )
+            if episode.status == "FAILED":
+                self.validate_transition(task.status, "BLOCKED")
+                checkpoint: EvolutionResumeStatus = (
+                    "CREATED"
+                    if task.last_completed_version is None
+                    else "REVISION_READY"
+                )
+                saved = transaction.save_task(
+                    task.model_copy(
+                        update={
+                            "status": "BLOCKED",
+                            "resume_status": checkpoint,
+                        }
+                    ),
+                    expected_revision=task.revision,
+                )
+                return MutationResult(saved)
+            return MutationResult(task)
+
     def create_task(
         self,
         *,

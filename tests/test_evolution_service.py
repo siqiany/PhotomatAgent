@@ -706,6 +706,121 @@ def test_failure_retry_reconciles_terminal_record_after_manifest_crash(
     assert service.get(task.evolution_id).status == "BLOCKED"
 
 
+def test_restart_reconciles_completed_split_once_and_feedback_can_continue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = make_service(tmp_path)
+    task = mutated(service.create_task(goal="goal", target=TargetSpec(goal="goal")))
+    episode = mutated(service.reserve_episode(task.evolution_id, mode="NORMAL"))
+    running = mutated(service.mark_episode_running(task.evolution_id, episode.version))
+    result = completed_result(service, running)
+
+    def crash_after_episode_write(candidate, expected_revision):  # type: ignore[no-untyped-def]
+        raise OSError("process died before task manifest write")
+
+    monkeypatch.setattr(service.store, "_save_task_locked", crash_after_episode_write)
+    with pytest.raises(OSError, match="process died"):
+        service.complete_episode(task.evolution_id, running.version, result=result)
+    assert service.store.load_episode(task.evolution_id, running.version).status == "COMPLETED"
+    assert service.get(task.evolution_id).status == "RUNNING"
+
+    restarted_store = EvolutionStore(Workspace(tmp_path))
+    restarted = EvolutionService(restarted_store)
+    repaired = restarted.reconcile(task.evolution_id)
+
+    assert repaired.entity.status == "AWAITING_EXPERT_FEEDBACK"
+    assert repaired.entity.last_completed_version == "v001"
+    assert [event.kind for event in repaired.events] == ["evolution_episode_completed"]
+    revision = repaired.entity.revision
+
+    repeated = restarted.reconcile(task.evolution_id)
+    assert repeated.entity.revision == revision
+    assert repeated.events == ()
+
+    completed = restarted_store.load_episode(task.evolution_id, "v001")
+    feedback = restarted.attach_feedback(
+        task.evolution_id,
+        "v001",
+        feedback_id="fb_after_restart",
+        draft=feedback_draft(),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+        raw_input="post-restart review",
+    )
+    assert feedback.entity.feedback_id == "fb_after_restart"
+    assert restarted.get(task.evolution_id).status == "FEEDBACK_RECORDED"
+
+
+def test_restart_reconciles_failed_split_preserving_last_good_then_reopens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, first = prepare_revision(service)
+    second = mutated(service.reserve_episode(
+        evolution_id,
+        mode="CARRY_VERIFIED_EVIDENCE",
+    ))
+    running = mutated(service.mark_episode_running(evolution_id, second.version))
+
+    def crash_after_episode_write(candidate, expected_revision):  # type: ignore[no-untyped-def]
+        raise OSError("process died before task manifest write")
+
+    monkeypatch.setattr(service.store, "_save_task_locked", crash_after_episode_write)
+    with pytest.raises(OSError, match="process died"):
+        service.fail_episode(evolution_id, running.version, "provider failed")
+    assert service.store.load_episode(evolution_id, running.version).status == "FAILED"
+    assert service.get(evolution_id).status == "RUNNING"
+
+    restarted = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    repaired = restarted.reconcile(evolution_id)
+
+    assert repaired.entity.status == "BLOCKED"
+    assert repaired.entity.resume_status == "REVISION_READY"
+    assert repaired.entity.last_completed_version == first.version == "v001"
+    revision = repaired.entity.revision
+    repeated = restarted.reconcile(evolution_id)
+    assert repeated.entity.revision == revision
+    assert repeated.events == ()
+
+    reopened = mutated(restarted.reopen(evolution_id))
+    assert reopened.status == "REVISION_READY"
+    retry = mutated(restarted.reserve_episode(
+        evolution_id,
+        mode="CARRY_VERIFIED_EVIDENCE",
+    ))
+    assert retry.status == "RESERVED"
+    assert retry.version == "v003"
+    assert retry.parent_version == "v001"
+
+
+def test_reconcile_rejects_terminal_episode_not_owned_by_task_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = make_service(tmp_path)
+    task = mutated(service.create_task(goal="goal", target=TargetSpec(goal="goal")))
+    episode = mutated(service.reserve_episode(task.evolution_id, mode="NORMAL"))
+    running = mutated(service.mark_episode_running(task.evolution_id, episode.version))
+    result = completed_result(service, running)
+
+    def crash_after_episode_write(candidate, expected_revision):  # type: ignore[no-untyped-def]
+        raise OSError("process died before task manifest write")
+
+    monkeypatch.setattr(service.store, "_save_task_locked", crash_after_episode_write)
+    with pytest.raises(OSError, match="process died"):
+        service.complete_episode(task.evolution_id, running.version, result=result)
+
+    restarted_store = EvolutionStore(Workspace(tmp_path))
+    stale = restarted_store.load_task(task.evolution_id)
+    restarted_store.save_task(
+        stale.model_copy(update={"episode_ids": []}),
+        expected_revision=stale.revision,
+    )
+    restarted = EvolutionService(restarted_store)
+
+    with pytest.raises(EvolutionOperationConflict, match="current episode identity"):
+        restarted.reconcile(task.evolution_id)
+    assert restarted.get(task.evolution_id).status == "RUNNING"
+
+
 def test_revision_retry_reconciles_matching_stable_id_after_manifest_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -530,6 +530,67 @@ async def test_failure_manifest_crash_is_reconciled_to_blocked(
 
 
 @pytest.mark.asyncio
+async def test_restarted_executor_reconciles_durable_split_before_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    task, episode = _reserved(service)
+    running = service.mark_episode_running(task.evolution_id, episode.version).entity
+    content = b"completed before process death"
+    relative = "user_output/evo_test/v001/result.md"
+    path = service.store.workspace.resolve(relative, must_exist=False)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+
+    def crash_after_episode_write(candidate, expected_revision):  # type: ignore[no-untyped-def]
+        raise OSError("process died before task manifest write")
+
+    monkeypatch.setattr(service.store, "_save_task_locked", crash_after_episode_write)
+    with pytest.raises(OSError, match="process died"):
+        service.complete_episode(
+            task.evolution_id,
+            episode.version,
+            result=running.model_copy(
+                update={
+                    "summary": ScientificLoopSummary(
+                        status="INCONCLUSIVE",
+                        rounds=1,
+                        candidate_count=0,
+                        best_candidate_id=None,
+                        best_score=0.0,
+                        final_evaluation=None,
+                    ),
+                    "artifact": ArtifactRef(
+                        path=relative,
+                        size_bytes=len(content),
+                        sha256=hashlib.sha256(content).hexdigest(),
+                    ),
+                }
+            ),
+        )
+
+    restarted_store = EvolutionStore(Workspace(tmp_path))
+    restarted_executor = ScientificEpisodeExecutor(restarted_store)
+    runtime = _runtime(
+        restarted_store.workspace,
+        FakeModelProvider([FakeResponse(text="must not execute")]),
+    )
+
+    with pytest.raises(ValueError, match="exact persisted RESERVED episode"):
+        await restarted_executor.execute(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+        )
+
+    repaired = restarted_store.load_task(task.evolution_id)
+    assert repaired.status == "AWAITING_EXPERT_FEEDBACK"
+    assert repaired.last_completed_version == "v001"
+
+
+@pytest.mark.asyncio
 async def test_executor_logs_every_yielded_event_once_without_runtime_logger_sink(
     tmp_path: Path,
 ) -> None:

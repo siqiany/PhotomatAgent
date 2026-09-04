@@ -79,6 +79,7 @@ class ScientificEpisodeExecutor:
         judge: ScientificJudge | None = None,
         on_event: EventSink | None = None,
     ) -> EpisodeExecutionResult:
+        self.service.reconcile(task.evolution_id)
         self._validate_execution(task=task, episode=episode, runtime=runtime)
         runtime_session_id = self._runtime_session_id(runtime)
         self._validate_unused_session(
