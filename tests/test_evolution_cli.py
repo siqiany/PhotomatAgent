@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import shlex
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 import photomatagent.cli.chat as chat_module
+import photomatagent.cli.evolve as evolve_module
+import photomatagent.cli.loop as loop_module
 from photomatagent.cli.app import app
+from photomatagent.errors import ProviderError
+from photomatagent.logging.event_logger import EventLogger
 from photomatagent.models.fake import FakeModelProvider, FakeResponse
+from photomatagent.models.types import ModelRequest, ModelStreamEvent
 from photomatagent.runtime.budget import BudgetState
+from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
 from photomatagent.scientific.evolution.models import ArtifactRef
@@ -83,6 +91,29 @@ def _runtime(workspace: Path, *, session_id: str = "session_cli_test") -> AgentR
         budget=BudgetState(max_iterations=10),
         session_id=session_id,
     )
+
+
+def _failed_initial_task(tmp_path: Path, *, evolution_id: str = "evo_retry_test"):
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    target = TargetSpec.model_validate_json(_target_json())
+    task = service.create_task(
+        goal=target.goal,
+        target=target,
+        evolution_id=evolution_id,
+    ).entity
+    reserved = service.reserve_episode(
+        task.evolution_id,
+        mode="NORMAL",
+        provider="fake",
+        model="fake",
+    ).entity
+    service.mark_episode_running(
+        task.evolution_id,
+        reserved.version,
+        runtime_session_id="session_failed_attempt",
+    )
+    service.fail_episode(task.evolution_id, reserved.version, "provider failed")
+    return service.get(task.evolution_id)
 
 
 def test_evolve_help_is_registered_and_labels_future_execution_commands(
@@ -243,7 +274,7 @@ def test_start_reserves_before_runtime_failure_and_leaves_recoverable_task(
     assert episode.status == "FAILED"
     assert episode.error == "RuntimeError: provider construction failed"
     assert task.evolution_id in result.stdout
-    assert f"photomatagent evolve reopen {task.evolution_id}" in result.stdout
+    assert f"photomatagent evolve start --resume {task.evolution_id}" in result.stdout
 
 
 def test_start_executes_first_episode_and_prints_resume_coordinates(
@@ -337,3 +368,337 @@ def test_start_accepts_workspace_contained_target_file(
     )
 
     assert result.exit_code == 0, result.stdout
+
+
+@pytest.mark.parametrize("interrupt_stage", ["runtime", "judge", "execution"])
+def test_start_interrupt_marks_episode_failed_and_preserves_exit_130(
+    interrupt_stage: str,
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupting_runtime(**kwargs):  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt("password=interrupt-secret")
+
+    def working_runtime(**kwargs):  # type: ignore[no-untyped-def]
+        return _runtime(tmp_path), None
+
+    monkeypatch.setattr(
+        chat_module,
+        "build_runtime",
+        interrupting_runtime if interrupt_stage == "runtime" else working_runtime,
+    )
+    if interrupt_stage == "judge":
+        monkeypatch.setattr(
+            loop_module,
+            "_build_judge",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                KeyboardInterrupt("password=interrupt-secret")
+            ),
+        )
+    if interrupt_stage == "execution":
+        async def interrupting_execution(**kwargs):  # type: ignore[no-untyped-def]
+            raise KeyboardInterrupt("password=interrupt-secret")
+
+        monkeypatch.setattr(
+            evolve_module,
+            "_execute_initial_episode",
+            interrupting_execution,
+        )
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "start",
+            "--target-json",
+            _target_json(),
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 130
+    store = EvolutionStore(Workspace(tmp_path))
+    task = store.list_tasks()[0]
+    episode = store.load_episode(task.evolution_id, "v001")
+    assert task.status == "BLOCKED"
+    assert task.resume_status == "CREATED"
+    assert episode.status == "FAILED"
+    assert "interrupt-secret" not in (episode.error or "")
+    assert "interrupt-secret" not in result.output
+    assert "[REDACTED]" in (episode.error or "")
+
+
+def test_execution_failure_redacts_terminal_store_log_and_delivered_events(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bearer_secret = "bearer-secret-value"
+    password_secret = "plain-password-value"
+    observed: list[RuntimeEvent] = []
+
+    class SecretFailingProvider:
+        provider = "broken"
+        model = "broken-model"
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            raise ProviderError(
+                "broken",
+                f"Authorization: Bearer {bearer_secret} password={password_secret}",
+            )
+            yield  # pragma: no cover
+
+    def build_failing_runtime(**kwargs):  # type: ignore[no-untyped-def]
+        logger = EventLogger(
+            tmp_path / ".photomatagent/sessions",
+            session_id="session_secret_failure",
+        )
+        scientific = ScientificState()
+        runtime = AgentRuntime(
+            model=SecretFailingProvider(),
+            tools=ToolRegistry(),
+            workspace=Workspace(tmp_path),
+            scientific_state=scientific,
+            permission_policy=AllowAllPolicy(),
+            budget=BudgetState(max_iterations=10),
+            event_sinks=[logger.log],
+            session_id=logger.session_id,
+        )
+        return runtime, logger
+
+    monkeypatch.setattr(chat_module, "build_runtime", build_failing_runtime)
+    monkeypatch.setattr(loop_module, "_render_event", lambda console, event: observed.append(event))
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "start",
+            "--target-json",
+            _target_json(),
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    store = EvolutionStore(Workspace(tmp_path))
+    task = store.list_tasks()[0]
+    episode = store.load_episode(task.evolution_id, "v001")
+    event_text = "\n".join(
+        str(getattr(event, "error", "")) for event in observed
+    )
+    persisted_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / ".photomatagent").rglob("*.json*")
+    )
+    for secret in (bearer_secret, password_secret):
+        assert secret not in result.output
+        assert secret not in (episode.error or "")
+        assert secret not in event_text
+        assert secret not in persisted_text
+    assert "[REDACTED]" in (episode.error or "")
+    assert "[REDACTED]" in event_text
+    assert "[REDACTED]" in persisted_text
+
+
+def test_history_redacts_error_from_preexisting_episode_record(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    secret = "legacy-password-value"
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    target = TargetSpec.model_validate_json(_target_json())
+    task = service.create_task(
+        goal=target.goal,
+        target=target,
+        evolution_id="evo_legacy_error",
+    ).entity
+    episode = service.reserve_episode(task.evolution_id, mode="NORMAL").entity
+    service.fail_episode(
+        task.evolution_id,
+        episode.version,
+        f"RuntimeError: password={secret}",
+    )
+
+    result = cli_runner.invoke(
+        app,
+        ["evolve", "history", task.evolution_id, "--workspace", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert secret not in result.output
+    assert "password=[REDACTED]" in result.output
+
+
+def test_start_resume_reopens_failed_initial_task_and_uses_fresh_runtime(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = _failed_initial_task(tmp_path)
+    runtime = _runtime(tmp_path, session_id="session_retry_attempt")
+    monkeypatch.setattr(chat_module, "build_runtime", lambda **kwargs: (runtime, None))
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "start",
+            "--resume",
+            original.evolution_id,
+            "--provider",
+            "fake",
+            "--max-rounds",
+            "1",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    store = EvolutionStore(Workspace(tmp_path))
+    task = store.load_task(original.evolution_id)
+    assert task.status == "AWAITING_EXPERT_FEEDBACK"
+    assert task.current_version == "v002"
+    assert task.last_completed_version == "v002"
+    assert store.load_episode(task.evolution_id, "v001").status == "FAILED"
+    retry = store.load_episode(task.evolution_id, "v002")
+    assert retry.status == "COMPLETED"
+    assert retry.runtime_session_id == "session_retry_attempt"
+    assert retry.runtime_session_id != "session_failed_attempt"
+    assert retry.target_snapshot.to_target_spec() == original.target
+    assert runtime.conversation_state.messages[0].content == original.goal
+
+
+def test_start_resume_executes_created_task_without_previous_attempt(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    target = TargetSpec.model_validate_json(_target_json())
+    created = service.create_task(
+        goal=target.goal,
+        target=target,
+        evolution_id="evo_created_retry",
+    ).entity
+    monkeypatch.setattr(chat_module, "build_runtime", lambda **kwargs: (_runtime(tmp_path), None))
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "start",
+            "--resume",
+            created.evolution_id,
+            "--provider",
+            "fake",
+            "--max-rounds",
+            "1",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    task = service.get(created.evolution_id)
+    assert task.current_version == "v001"
+    assert service.store.load_episode(created.evolution_id, "v001").status == "COMPLETED"
+
+
+def test_start_resume_is_mutually_exclusive_with_creation_arguments(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    task = _failed_initial_task(tmp_path)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "start",
+            "--resume",
+            task.evolution_id,
+            "--goal",
+            "different goal",
+            "--target-json",
+            _target_json(),
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+    assert EvolutionStore(Workspace(tmp_path)).load_task(task.evolution_id) == task
+
+
+@pytest.mark.parametrize(
+    ("status", "resume_status", "expected_action"),
+    [
+        ("CREATED", None, ["start", "--resume"]),
+        ("RUNNING", None, ["stop"]),
+        ("AWAITING_EXPERT_FEEDBACK", None, ["feedback"]),
+        ("FEEDBACK_RECORDED", None, ["compile"]),
+        ("REVISION_READY", None, ["iterate"]),
+        ("ACCEPTED", None, ["reopen"]),
+        ("STOPPED", "CREATED", ["reopen"]),
+        ("BUDGET_EXHAUSTED", "CREATED", ["reopen"]),
+        ("BLOCKED", "REVISION_READY", ["reopen"]),
+    ],
+)
+def test_every_status_has_workspace_qualified_non_self_loop_next_command(
+    status: str,
+    resume_status: str | None,
+    expected_action: list[str],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace with spaces"
+    workspace.mkdir()
+    service = EvolutionService(EvolutionStore(Workspace(workspace)))
+    target = TargetSpec.model_validate_json(_target_json())
+    task = service.create_task(
+        goal=target.goal,
+        target=target,
+        evolution_id="evo_mapping_test",
+    ).entity.model_copy(
+        update={"status": status, "resume_status": resume_status}
+    )
+
+    command = evolve_module._next_command(task, workspace)
+    arguments = shlex.split(command)
+
+    assert arguments[:2] == ["photomatagent", "evolve"]
+    assert all(part in arguments for part in expected_action)
+    assert arguments[-2:] == ["--workspace", str(workspace.resolve())]
+    assert arguments[2] != "status"
+
+
+def test_blocked_initial_retry_next_command_is_executable_start_resume(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace with spaces"
+    workspace.mkdir()
+    task = _failed_initial_task(workspace)
+
+    command = evolve_module._next_command(task, workspace)
+
+    assert shlex.split(command) == [
+        "photomatagent",
+        "evolve",
+        "start",
+        "--resume",
+        task.evolution_id,
+        "--workspace",
+        str(workspace.resolve()),
+    ]

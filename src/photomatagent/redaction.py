@@ -18,7 +18,7 @@ _DOTENV_SECRET_LINE = re.compile(
 )
 _INLINE_SECRET_ASSIGNMENT = re.compile(
     r'''(?ix)
-    (\b[A-Za-z_][A-Za-z0-9_]*(?:API[_-]?KEY|PASSWORD|SECRET|TOKEN)\b\s*[:=]\s*)
+    (\b(?:[A-Za-z_][A-Za-z0-9_]*)?(?:API[_-]?KEY|PASSWORD|SECRET|TOKEN)\b\s*[:=]\s*)
     (?:"[^"]*"|'[^']*'|[^\s,;]+)
     '''
 )

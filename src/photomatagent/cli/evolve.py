@@ -8,6 +8,7 @@ tool execution remains exclusively inside :class:`AgentRuntime`.
 from __future__ import annotations
 
 import asyncio
+import shlex
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Literal, cast
@@ -19,6 +20,8 @@ from rich.table import Table
 from photomatagent.errors import ToolExecutionError
 from photomatagent.config import LLMConfig
 from photomatagent.logging.event_logger import EventLogger, default_sessions_dir
+from photomatagent.redaction import redact_secrets, redact_text
+from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.scientific.evolution.executor import (
     EpisodeExecutionResult,
@@ -55,6 +58,11 @@ console = Console()
 
 @evolve_app.command("start")
 def evolve_start(
+    resume: str | None = typer.Option(
+        None,
+        "--resume",
+        help="Retry a persisted initial task from its stored goal and target.",
+    ),
     goal: str | None = typer.Option(None, "--goal", "-g"),
     target_json: str | None = typer.Option(
         None,
@@ -107,32 +115,68 @@ def evolve_start(
     if approval not in {"ask", "auto", "deny"}:
         console.print("[red]--approval must be ask | auto | deny[/]")
         raise typer.Exit(code=2)
+    if resume is not None and any(
+        value is not None and value is not False
+        for value in (goal, target_json, target_file, demo)
+    ):
+        console.print(
+            "[red]--resume is mutually exclusive with --goal, --target-json, "
+            "--target-file, and --demo[/]"
+        )
+        raise typer.Exit(code=2)
 
     try:
-        target = _resolve_target(
-            workspace=workspace,
-            goal=goal,
-            target_json=target_json,
-            target_file=target_file,
-            demo=demo,
-        )
-        config = _resolve_provider_config(workspace, provider, model)
-    except (OSError, ValueError) as exc:
-        console.print(f"[red]{exc}[/]")
-        raise typer.Exit(code=2) from None
+        boundary = Workspace(workspace)
+        store = EvolutionStore(boundary)
+        service = EvolutionService(store)
+        prior_mutations: list[MutationResult[object]] = []
+        if resume is None:
+            target = _resolve_target(
+                workspace=boundary.root,
+                goal=goal,
+                target_json=target_json,
+                target_file=target_file,
+                demo=demo,
+            )
+            config = _resolve_provider_config(boundary.root, provider, model)
+            created = service.create_task(goal=target.goal, target=target)
+            prior_mutations.append(created)
+            task = created.entity
+        else:
+            reconciled = service.reconcile(resume)
+            prior_mutations.append(reconciled)
+            task = reconciled.entity
+            if not task.target.constraints:
+                raise ValueError(
+                    "stored target must include at least one machine-verifiable constraint"
+                )
+            if task.status == "BLOCKED" and task.resume_status != "CREATED":
+                raise ValueError(
+                    "start --resume only retries an initial episode; use the "
+                    "task's displayed next command for revised work"
+                )
+            if task.status not in {"CREATED", "BLOCKED"}:
+                raise ValueError(
+                    f"start --resume requires CREATED or an initial BLOCKED task; "
+                    f"task is {task.status}"
+                )
+            config = _resolve_provider_config(boundary.root, provider, model)
+            if task.status == "BLOCKED":
+                reopened = service.reopen(task.evolution_id)
+                prior_mutations.append(reopened)
+                task = reopened.entity
 
-    boundary = Workspace(workspace)
-    store = EvolutionStore(boundary)
-    service = EvolutionService(store)
-    created = service.create_task(goal=target.goal, target=target)
-    task = created.entity
-    reserved = service.reserve_episode(
-        task.evolution_id,
-        mode="NORMAL",
-        provider=config.provider,
-        model=config.model,
-    )
-    episode = reserved.entity
+        reserved = service.reserve_episode(
+            task.evolution_id,
+            mode="NORMAL",
+            provider=config.provider,
+            model=config.model,
+        )
+        prior_mutations.append(reserved)
+        episode = reserved.entity
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]{redact_text(str(exc))}[/]")
+        raise typer.Exit(code=2) from None
 
     try:
         # Local imports avoid making the app/evolve/loop factory graph cyclic.
@@ -164,27 +208,35 @@ def evolve_start(
                     require_judge=require_judge,
                 ),
                 judge=judge,
-                prior_mutations=(created, reserved),
-                on_event=lambda event: _render_event(console, event),
+                prior_mutations=prior_mutations,
+                on_event=lambda event: _render_event(
+                    console,
+                    _redacted_event(event),
+                ),
             )
         )
-    except Exception as exc:
-        recovery_note = _fail_active_episode(
-            service,
-            task.evolution_id,
-            episode.version,
-            exc,
+    except KeyboardInterrupt as exc:
+        _report_start_failure(
+            service=service,
+            task=task,
+            episode=episode,
+            error=exc,
+            workspace=boundary.root,
         )
-        failed_task = service.get(task.evolution_id)
-        console.print(f"[red]evolution start failed: {_bounded_error(exc)}[/]")
-        if recovery_note is not None:
-            console.print(f"[red]failure reconciliation also failed: {recovery_note}[/]")
-        _render_task_details(failed_task)
+        raise typer.Exit(code=130) from None
+    except Exception as exc:
+        _report_start_failure(
+            service=service,
+            task=task,
+            episode=episode,
+            error=exc,
+            workspace=boundary.root,
+        )
         raise typer.Exit(code=1) from None
 
     _render_summary(console, execution.scientific_summary)
     completed_task = service.get(task.evolution_id)
-    _render_start_result(completed_task, execution)
+    _render_start_result(completed_task, execution, boundary.root)
     if logger is not None:
         console.print(f"[dim]events logged: {logger.events_path}[/]")
 
@@ -197,9 +249,10 @@ def evolve_list(
 ) -> None:
     """List persisted evolution tasks without constructing a model provider."""
 
-    tasks = EvolutionStore(Workspace(workspace)).list_tasks()
+    boundary = Workspace(workspace)
+    tasks = EvolutionStore(boundary).list_tasks()
     for task in tasks:
-        _render_task_details(task)
+        _render_task_details(task, boundary.root)
     if not tasks:
         console.print("[dim]No evolution tasks found.[/]")
 
@@ -213,8 +266,9 @@ def evolve_status(
 ) -> None:
     """Show the exact persisted state and next command for one task."""
 
-    task = _load_task(workspace, evolution_id)
-    _render_task_details(task)
+    boundary = Workspace(workspace)
+    task = _load_task(boundary.root, evolution_id)
+    _render_task_details(task, boundary.root)
 
 
 @evolve_app.command("history")
@@ -233,7 +287,7 @@ def evolve_history(
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="evolution_id") from exc
 
-    _render_task_details(task)
+    _render_task_details(task, boundary.root)
     table = Table(
         "Version",
         "Episode status",
@@ -251,7 +305,7 @@ def evolve_history(
             episode.parent_version or "—",
             episode.runtime_session_id or "—",
             episode.artifact.path if episode.artifact is not None else "—",
-            episode.error or "—",
+            redact_text(episode.error) if episode.error is not None else "—",
         )
     console.print(table)
     for index in range(1, len(task.episode_ids) + 1):
@@ -260,6 +314,11 @@ def evolve_history(
         if episode.artifact is not None:
             console.print(
                 f"Primary result [{episode.version}]: {episode.artifact.path}",
+                soft_wrap=True,
+            )
+        if episode.error is not None:
+            console.print(
+                f"Error [{episode.version}]: {redact_text(episode.error)}",
                 soft_wrap=True,
             )
 
@@ -340,20 +399,47 @@ def _fail_active_episode(
     service: EvolutionService,
     evolution_id: str,
     version: EpisodeVersion,
-    error: Exception,
+    safe_error: str,
 ) -> str | None:
     try:
         task = service.get(evolution_id)
         episode = service.store.load_episode(evolution_id, version)
         if task.status == "RUNNING" and episode.status in {"RESERVED", "RUNNING"}:
-            service.fail_episode(evolution_id, version, _bounded_error(error))
+            service.fail_episode(evolution_id, version, safe_error)
     except Exception as recovery_error:
         return _bounded_error(recovery_error)
     return None
 
 
 def _bounded_error(error: BaseException) -> str:
-    return f"{type(error).__name__}: {error}"[:1000]
+    return redact_text(f"{type(error).__name__}: {error}")[:1000]
+
+
+def _redacted_event(event: RuntimeEvent) -> RuntimeEvent:
+    payload = redact_secrets(event.model_dump(mode="python"))
+    return type(event).model_validate(payload)
+
+
+def _report_start_failure(
+    *,
+    service: EvolutionService,
+    task: EvolutionTask,
+    episode: EpisodeRecord,
+    error: BaseException,
+    workspace: Path,
+) -> None:
+    safe_error = _bounded_error(error)
+    recovery_note = _fail_active_episode(
+        service,
+        task.evolution_id,
+        episode.version,
+        safe_error,
+    )
+    failed_task = service.get(task.evolution_id)
+    console.print(f"[red]evolution start failed: {safe_error}[/]")
+    if recovery_note is not None:
+        console.print(f"[red]failure reconciliation also failed: {recovery_note}[/]")
+    _render_task_details(failed_task, workspace)
 
 
 def _load_task(workspace: Path, evolution_id: str) -> EvolutionTask:
@@ -366,6 +452,7 @@ def _load_task(workspace: Path, evolution_id: str) -> EvolutionTask:
 def _render_start_result(
     task: EvolutionTask,
     execution: EpisodeExecutionResult,
+    workspace: Path,
 ) -> None:
     table = Table("Field", "Value")
     table.add_row("Evolution ID", task.evolution_id)
@@ -375,10 +462,10 @@ def _render_start_result(
     table.add_row("Primary result", execution.artifact.path)
     console.print(table)
     console.print(f"Primary result: {execution.artifact.path}", soft_wrap=True)
-    _print_next_command(task)
+    _print_next_command(task, workspace)
 
 
-def _render_task_details(task: EvolutionTask) -> None:
+def _render_task_details(task: EvolutionTask, workspace: Path) -> None:
     table = Table("Field", "Value")
     table.add_row("Evolution ID", task.evolution_id)
     table.add_row("Status", task.status)
@@ -390,35 +477,39 @@ def _render_task_details(task: EvolutionTask) -> None:
         "Feedback / revisions",
         f"{len(task.feedback_ids)} / {len(task.revision_ids)}",
     )
-    table.add_row("Next command", _next_command(task))
+    table.add_row("Next command", _next_command(task, workspace))
     console.print(table)
-    _print_next_command(task)
+    _print_next_command(task, workspace)
 
 
-def _print_next_command(task: EvolutionTask) -> None:
-    command = _next_command(task)
+def _print_next_command(task: EvolutionTask, workspace: Path) -> None:
+    command = _next_command(task, workspace)
     console.print(f"Next command: [bold]{command}[/]", soft_wrap=True)
 
 
-def _next_action(task: EvolutionTask) -> str:
-    return {
-        "AWAITING_EXPERT_FEEDBACK": "feedback",
-        "FEEDBACK_RECORDED": "compile",
-        "REVISION_READY": "iterate",
-        "ACCEPTED": "reopen",
-        "STOPPED": "reopen",
-        "BLOCKED": "reopen",
-        "BUDGET_EXHAUSTED": "reopen",
-    }.get(task.status, "status")
-
-
-def _next_command(task: EvolutionTask) -> str:
-    prefix = f"photomatagent evolve {_next_action(task)} {task.evolution_id}"
+def _next_command(task: EvolutionTask, workspace: Path) -> str:
+    if task.status == "CREATED" or (
+        task.status == "BLOCKED" and task.resume_status == "CREATED"
+    ):
+        command = f"photomatagent evolve start --resume {task.evolution_id}"
+    else:
+        action = {
+            "RUNNING": "stop",
+            "AWAITING_EXPERT_FEEDBACK": "feedback",
+            "FEEDBACK_RECORDED": "compile",
+            "REVISION_READY": "iterate",
+            "ACCEPTED": "reopen",
+            "STOPPED": "reopen",
+            "BLOCKED": "reopen",
+            "BUDGET_EXHAUSTED": "reopen",
+        }[task.status]
+        command = f"photomatagent evolve {action} {task.evolution_id}"
     if task.status in {"AWAITING_EXPERT_FEEDBACK", "FEEDBACK_RECORDED"}:
         version = task.last_completed_version or task.current_version
         if version is not None:
-            return f"{prefix} --version {version}"
-    return prefix
+            command = f"{command} --version {version}"
+    resolved_workspace = Path(workspace).resolve()
+    return f"{command} --workspace {shlex.quote(str(resolved_workspace))}"
 
 
 __all__ = ["evolve_app"]

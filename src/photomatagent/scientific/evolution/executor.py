@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger
+from photomatagent.redaction import redact_text
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.scientific.evolution.artifacts import (
@@ -334,7 +335,7 @@ class ScientificEpisodeExecutor:
 
     @staticmethod
     def _bounded_error(exc: BaseException) -> str:
-        return f"{type(exc).__name__}: {exc}"[:1000]
+        return redact_text(f"{type(exc).__name__}: {exc}")[:1000]
 
     async def _reconcile_exception(
         self,
@@ -382,9 +383,12 @@ class ScientificEpisodeExecutor:
                 recovery_error = exc
                 continue
         if recovery_error is not None:
+            safe_recovery_error = redact_text(
+                f"{type(recovery_error).__name__}: {recovery_error}"
+            )
             error.add_note(
                 "episode terminal-state reconciliation also failed: "
-                f"{type(recovery_error).__name__}: {recovery_error}"
+                f"{safe_recovery_error}"
             )
 
 
