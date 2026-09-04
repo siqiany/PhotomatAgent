@@ -50,6 +50,7 @@ from photomatagent.scientific.evolution.store import (
     EvolutionTransaction,
 )
 from photomatagent.scientific.loop.target import TargetSpec
+from photomatagent.scientific.state import ScientificState
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _EntityT = TypeVar("_EntityT", covariant=True)
@@ -79,6 +80,17 @@ class MutationResult(Generic[_EntityT]):
 
     entity: _EntityT
     events: tuple[RuntimeEvent, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class IterationContext:
+    """Exact immutable checkpoint required to reserve a revised episode."""
+
+    task: EvolutionTask
+    source_episode: EpisodeRecord
+    revision: RevisionPlan
+    strategy: StrategyVersion
+    previous_scientific_state: ScientificState
 
 
 ALLOWED_TRANSITIONS: dict[EvolutionStatus, frozenset[EvolutionStatus]] = {
@@ -919,6 +931,65 @@ class EvolutionService:
         )
         return MutationResult(persisted, (event,))
 
+    def iteration_context(self, evolution_id: str) -> IterationContext:
+        """Load and validate the exact confirmed state used by ``iterate``."""
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.status != "REVISION_READY":
+                raise InvalidEvolutionTransition("iterate requires REVISION_READY")
+            if (
+                task.last_completed_version is None
+                or not task.feedback_ids
+                or not task.revision_ids
+                or not task.strategy_ids
+            ):
+                raise EvolutionOperationConflict(
+                    "REVISION_READY task is missing its exact iteration checkpoint"
+                )
+            source = transaction.load_episode(task.last_completed_version)
+            if source.status != "COMPLETED":
+                raise InvalidEvolutionTransition(
+                    "iterate requires a completed source episode"
+                )
+            self._verify_artifact(source.artifact)
+            if source.scientific_state_path is None:
+                raise InvalidEvolutionTransition(
+                    "source episode has no persisted scientific-state snapshot"
+                )
+            state_path = self.store.workspace.resolve(
+                source.scientific_state_path,
+                must_exist=True,
+            )
+            if not state_path.is_file():
+                raise InvalidEvolutionTransition(
+                    "source scientific-state snapshot is not a regular file"
+                )
+            revision = transaction.load_revision(task.revision_ids[-1])
+            strategy = transaction.load_strategy(task.strategy_ids[-1])
+            strategy_id, strategy_arm = self._reservation_strategy(transaction, task)
+            if (
+                revision.feedback_id != task.feedback_ids[-1]
+                or revision.has_blocking_ambiguity
+                or strategy.strategy_id != strategy_id
+                or strategy.arm != strategy_arm
+                or strategy.parameters.get("revision_id") != revision.revision_id
+            ):
+                raise EvolutionOperationConflict(
+                    "active revision and strategy do not match the exact checkpoint"
+                )
+            previous = self.store.load_scientific_state(
+                evolution_id,
+                source.version,
+            )
+            return IterationContext(
+                task=task,
+                source_episode=source,
+                revision=revision,
+                strategy=strategy,
+                previous_scientific_state=previous,
+            )
+
     def accept(
         self,
         evolution_id: str,
@@ -1400,5 +1471,6 @@ __all__ = [
     "EvolutionService",
     "EvolutionServiceError",
     "InvalidEvolutionTransition",
+    "IterationContext",
     "MutationResult",
 ]

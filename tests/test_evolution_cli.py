@@ -30,6 +30,7 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     RubricScores,
 )
+from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evolution.revision import build_revision_plan
 from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.store import EvolutionStore
@@ -105,8 +106,15 @@ def _completed_task(tmp_path: Path):  # type: ignore[no-untyped-def]
     return service.get(task.evolution_id)
 
 
-def _runtime(workspace: Path, *, session_id: str = "session_cli_test") -> AgentRuntime:
-    scientific = ScientificState()
+def _runtime(
+    workspace: Path,
+    *,
+    session_id: str = "session_cli_test",
+    scientific_state: ScientificState | None = None,
+) -> AgentRuntime:
+    scientific = (
+        scientific_state if scientific_state is not None else ScientificState()
+    )
     return AgentRuntime(
         model=FakeModelProvider([FakeResponse(text="final reviewable report")]),
         tools=ToolRegistry(),
@@ -116,6 +124,140 @@ def _runtime(workspace: Path, *, session_id: str = "session_cli_test") -> AgentR
         budget=BudgetState(max_iterations=10),
         session_id=session_id,
     )
+
+
+def _revision_ready_task(
+    tmp_path: Path,
+    *,
+    raw_feedback: str,
+):  # type: ignore[no-untyped-def]
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    target = TargetSpec.model_validate(
+        {
+            "goal": "design material",
+            "constraints": [
+                {
+                    "property": "band_gap",
+                    "operator": "le",
+                    "value": 0.1,
+                    "unit": "eV",
+                }
+            ],
+            "metadata": {"subject": "InAs"},
+        }
+    )
+    task = service.create_task(
+        goal=target.goal,
+        target=target,
+        evolution_id="evo_iterate_test",
+    ).entity
+    reserved = service.reserve_episode(task.evolution_id, mode="NORMAL").entity
+    running = service.mark_episode_running(
+        task.evolution_id,
+        reserved.version,
+        runtime_session_id="session_previous_episode",
+    ).entity
+    content = b"previous result\n"
+    relative = "user_output/evo_iterate_test/v001/result.md"
+    path = service.store.workspace.resolve(relative, must_exist=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    previous_state = ScientificState(
+        goal=target.goal,
+        hypotheses=["old model hypothesis"],
+        evidence=[
+            ScientificEvidence(
+                id="sev_previous_dft",
+                subject="InAs",
+                property="band_gap",
+                value=0.2,
+                unit="eV",
+                source="vasp/result.json",
+                source_type="dft_calculation",
+                method="VASP",
+                fidelity="dft",
+                provenance={"validated": True, "run_id": "run_old"},
+            )
+        ],
+    )
+    state_path = service.store.write_scientific_state(
+        task.evolution_id,
+        running.version,
+        previous_state,
+    )
+    completed = service.complete_episode(
+        task.evolution_id,
+        running.version,
+        result=running.model_copy(
+            update={
+                "scientific_state_path": service.store.workspace.relative(state_path),
+                "summary": ScientificLoopSummary(
+                    status="INCONCLUSIVE",
+                    rounds=1,
+                    candidate_count=0,
+                    best_candidate_id=None,
+                    best_score=0.0,
+                    final_evaluation=None,
+                ),
+                "artifact": ArtifactRef(
+                    path=relative,
+                    size_bytes=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                ),
+            }
+        ),
+    ).entity
+    feedback = service.attach_feedback(
+        task.evolution_id,
+        completed.version,
+        feedback_id="fb_iterate_test",
+        draft=ExpertFeedbackDraft(
+            scores=RubricScores(
+                scientific_correctness=5,
+                evidence_sufficiency=5,
+                novelty=5,
+                actionability=5,
+                overall=5,
+            )
+        ),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+        raw_input=raw_feedback,
+    ).entity
+    compilation = service.save_compilation(
+        task.evolution_id,
+        FeedbackCompilation(
+            compilation_id="comp_iterate_test",
+            evolution_id=task.evolution_id,
+            feedback_id=feedback.feedback_id,
+            episode_version=completed.version,
+            status="AVAILABLE",
+            items=(
+                FeedbackDelta(
+                    item_id="item_iterate_test",
+                    category="EVIDENCE_SUFFICIENCY",
+                    status="CORRECTION",
+                    severity="HIGH",
+                    responsible_module="evidence",
+                    problem="Band gap remains above the hard target",
+                    requested_actions=("Obtain stronger band-gap evidence",),
+                    acceptance_test="Hard band-gap constraint is re-evaluated",
+                    confidence=0.9,
+                    source_span=raw_feedback,
+                ),
+            ),
+            provider="fake",
+            model="fake",
+        ),
+    ).entity
+    plan = build_revision_plan(
+        feedback=feedback,
+        compilation=compilation,
+        target=completed.target_snapshot,
+        previous_summary=completed.summary,
+    ).model_copy(update={"confirmed": True})
+    strategy = FixedStrategySelector().select(service.get(task.evolution_id), plan)
+    service.confirm_revision(task.evolution_id, plan, strategy=strategy)
+    return service.get(task.evolution_id)
 
 
 def _failed_initial_task(tmp_path: Path, *, evolution_id: str = "evo_retry_test"):
@@ -1216,3 +1358,185 @@ def test_status_renders_bracketed_workspace_next_command_literally(
 
     assert result.exit_code == 0, result.output
     assert f"Next command: {expected}" in result.output
+
+
+def test_iterate_uses_fresh_runtime_with_only_carried_evidence(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_secret = "Authorization: Bearer feedback-prose-secret"
+    ready = _revision_ready_task(tmp_path, raw_feedback=raw_secret)
+    built: list[dict[str, object]] = []
+    runtimes: list[AgentRuntime] = []
+
+    def build_iteration_runtime(**kwargs):  # type: ignore[no-untyped-def]
+        built.append(kwargs)
+        inherited = kwargs["scientific_state"]
+        assert isinstance(inherited, ScientificState)
+        runtime = _runtime(
+            tmp_path,
+            session_id="session_new_iteration",
+            scientific_state=inherited,
+        )
+        runtimes.append(runtime)
+        return runtime, None
+
+    monkeypatch.setattr(chat_module, "build_runtime", build_iteration_runtime)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "iterate",
+            ready.evolution_id,
+            "--provider",
+            "fake",
+            "--approval",
+            "deny",
+            "--max-rounds",
+            "1",
+            "--no-log-events",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(built) == len(runtimes) == 1
+    assert built[0]["approval"] == "deny"
+    assert built[0]["scientific_state"] is runtimes[0].scientific_state
+    store = EvolutionStore(Workspace(tmp_path))
+    task = store.load_task(ready.evolution_id)
+    first = store.load_episode(ready.evolution_id, "v001")
+    second = store.load_episode(ready.evolution_id, "v002")
+    assert task.status == "AWAITING_EXPERT_FEEDBACK"
+    assert second.status == "COMPLETED"
+    assert second.parent_version == "v001"
+    assert second.execution_mode == "CARRY_VERIFIED_EVIDENCE"
+    assert second.runtime_session_id == "session_new_iteration"
+    assert second.runtime_session_id != first.runtime_session_id
+    inherited = store.load_scientific_state(ready.evolution_id, "v002")
+    assert [item.id for item in inherited.evidence] == ["sev_previous_dft"]
+    assert inherited.evidence[0].provenance["inherited_from_episode"] == "v001"
+    assert inherited.hypotheses == []
+    conversation = "\n".join(
+        message.model_dump_json()
+        for message in runtimes[0].conversation_state.messages
+    )
+    assert "old model hypothesis" not in conversation
+    assert "feedback-prose-secret" not in conversation
+    assert "feedback-prose-secret" not in result.output
+    assert second.summary is not None
+    assert second.summary.status != "SUCCESS"
+
+
+def test_iterate_rejects_unready_task_before_runtime_or_reservation(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _completed_task(tmp_path)
+    monkeypatch.setattr(
+        chat_module,
+        "build_runtime",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"unready iterate constructed runtime: {kwargs}")
+        ),
+    )
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "iterate",
+            task.evolution_id,
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "REVISION_READY" in result.output
+    stored = EvolutionStore(Workspace(tmp_path)).load_task(task.evolution_id)
+    assert stored.current_version == "v001"
+    assert len(stored.episode_ids) == 1
+
+
+def test_iterate_runtime_construction_failure_is_redacted_and_recoverable(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = _revision_ready_task(
+        tmp_path,
+        raw_feedback="feedback text",
+    )
+
+    def fail_runtime(**kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("password=iteration-secret")
+
+    monkeypatch.setattr(chat_module, "build_runtime", fail_runtime)
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "iterate",
+            ready.evolution_id,
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "iteration-secret" not in result.output
+    store = EvolutionStore(Workspace(tmp_path))
+    task = store.load_task(ready.evolution_id)
+    failed = store.load_episode(ready.evolution_id, "v002")
+    assert task.status == "BLOCKED"
+    assert task.resume_status == "REVISION_READY"
+    assert failed.status == "FAILED"
+    assert "iteration-secret" not in (failed.error or "")
+
+    service = EvolutionService(store)
+    reopened = service.reopen(ready.evolution_id).entity
+    assert reopened.status == "REVISION_READY"
+    monkeypatch.setattr(
+        chat_module,
+        "build_runtime",
+        lambda **kwargs: (
+            _runtime(
+                tmp_path,
+                session_id="session_iteration_retry",
+                scientific_state=kwargs["scientific_state"],
+            ),
+            None,
+        ),
+    )
+    retried = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "iterate",
+            ready.evolution_id,
+            "--provider",
+            "fake",
+            "--max-rounds",
+            "1",
+            "--no-log-events",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert retried.exit_code == 0, retried.output
+    recovered = store.load_task(ready.evolution_id)
+    retry_episode = store.load_episode(ready.evolution_id, "v003")
+    assert recovered.last_completed_version == "v003"
+    assert retry_episode.status == "COMPLETED"
+    assert retry_episode.parent_version == "v001"
+    assert retry_episode.runtime_session_id == "session_iteration_retry"

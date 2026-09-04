@@ -30,6 +30,9 @@ from photomatagent.scientific.evolution.executor import (
     EventSink,
     ScientificEpisodeExecutor,
 )
+from photomatagent.scientific.evolution.evidence import (
+    build_inherited_scientific_state,
+)
 from photomatagent.scientific.evolution.feedback import FeedbackCompiler
 from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
@@ -96,10 +99,7 @@ class FeedbackEntryCancelled(Exception):
     """Internal control signal for a feedback form cancelled without writes."""
 
 evolve_app = typer.Typer(
-    help=(
-        "Run persistent expert-feedback evolution tasks. "
-        "The iterate entry point is planned but not available yet."
-    ),
+    help="Run persistent expert-feedback evolution tasks.",
 )
 console = Console()
 
@@ -433,6 +433,126 @@ def evolve_feedback(
         f"{record.evolution_id} {record.episode_version}.[/]"
     )
     _render_task_details(service.get(evolution_id), boundary.root)
+
+
+@evolve_app.command("iterate")
+def evolve_iterate(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Override .env preference: fake | openai | anthropic",
+    ),
+    model: str | None = typer.Option(None, "--model"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+    approval: str = typer.Option("auto", "--approval", help="ask | auto | deny"),
+    max_rounds: int = typer.Option(6, "--max-rounds", min=1),
+    patience: int = typer.Option(3, "--patience", min=1),
+    min_confidence: float = typer.Option(
+        0.6, "--min-confidence", min=0.0, max=1.0
+    ),
+    judge_provider: str | None = typer.Option(None, "--judge-provider"),
+    judge_model: str | None = typer.Option(None, "--judge-model"),
+    judge_min_quality: float = typer.Option(
+        0.6, "--judge-min-quality", min=0.0, max=1.0
+    ),
+    require_judge: bool = typer.Option(False, "--require-judge"),
+    log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
+) -> None:
+    """Run the next episode from an exact confirmed revision checkpoint."""
+
+    if approval not in {"ask", "auto", "deny"}:
+        console.print("[red]--approval must be ask | auto | deny[/]")
+        raise typer.Exit(code=2)
+    try:
+        boundary = Workspace(workspace)
+        store = EvolutionStore(boundary)
+        service = EvolutionService(store)
+        context = service.iteration_context(evolution_id)
+        config = _resolve_provider_config(boundary.root, provider, model)
+        reserved = service.reserve_episode(
+            evolution_id,
+            mode="CARRY_VERIFIED_EVIDENCE",
+            provider=config.provider,
+            model=config.model,
+        )
+        episode = reserved.entity
+    except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        raise typer.Exit(code=2) from None
+
+    try:
+        from photomatagent.cli.chat import build_runtime
+        from photomatagent.cli.loop import _build_judge, _render_event, _render_summary
+
+        inherited, _decisions = build_inherited_scientific_state(
+            context.previous_scientific_state,
+            source_episode=context.source_episode.version,
+            invalidated_evidence_ids=context.revision.invalidated_evidence_ids,
+            subject=_target_subject(context.task.target),
+        )
+        runtime, logger = build_runtime(
+            provider=config.provider,
+            model=config.model,
+            workspace_root=boundary.root,
+            approval=cast(ApprovalMode, approval),
+            max_iterations=10000,
+            session_dir=boundary.root / default_sessions_dir(),
+            log_events=log_events,
+            scientific_state=inherited,
+        )
+        judge = _build_judge(judge_provider, judge_model, console)
+        execution = asyncio.run(
+            _execute_revised_episode(
+                store=store,
+                task=context.task,
+                episode=episode,
+                revision=context.revision,
+                runtime=runtime,
+                logger=logger,
+                config=ScientificLoopConfig(
+                    max_rounds=max_rounds,
+                    patience=patience,
+                    min_confidence=min_confidence,
+                    judge_min_quality=judge_min_quality,
+                    require_judge=require_judge,
+                ),
+                judge=judge,
+                prior_mutations=(reserved,),
+                on_event=lambda event: _render_event(
+                    console,
+                    _redacted_event(event),
+                ),
+            )
+        )
+    except KeyboardInterrupt as exc:
+        _report_start_failure(
+            service=service,
+            task=context.task,
+            episode=episode,
+            error=exc,
+            workspace=boundary.root,
+            operation="iteration",
+        )
+        raise typer.Exit(code=130) from None
+    except Exception as exc:
+        _report_start_failure(
+            service=service,
+            task=context.task,
+            episode=episode,
+            error=exc,
+            workspace=boundary.root,
+            operation="iteration",
+        )
+        raise typer.Exit(code=1) from None
+
+    _render_summary(console, _redacted_summary(execution.scientific_summary))
+    completed_task = service.get(evolution_id)
+    _render_start_result(completed_task, execution, boundary.root)
+    if logger is not None:
+        console.print(f"[dim]events logged: {logger.events_path}[/]")
 
 
 @evolve_app.command("cancel")
@@ -964,6 +1084,34 @@ async def _execute_initial_episode(
     )
 
 
+async def _execute_revised_episode(
+    *,
+    store: EvolutionStore,
+    task: EvolutionTask,
+    episode: EpisodeRecord,
+    revision: RevisionPlan,
+    runtime: AgentRuntime,
+    logger: EventLogger | None,
+    config: ScientificLoopConfig,
+    judge: ScientificJudge | None,
+    prior_mutations: Iterable[MutationResult[object]],
+    on_event: EventSink | None,
+) -> EpisodeExecutionResult:
+    if logger is not None:
+        for mutation in prior_mutations:
+            for event in mutation.events:
+                await logger.log(event)
+    return await ScientificEpisodeExecutor(store, event_logger=logger).execute(
+        task=task,
+        episode=episode,
+        runtime=runtime,
+        config=config,
+        revision=revision,
+        judge=judge,
+        on_event=on_event,
+    )
+
+
 def _resolve_target(
     *,
     workspace: Path,
@@ -994,6 +1142,17 @@ def _resolve_target(
             "target must include at least one machine-verifiable constraint"
         )
     return target
+
+
+def _target_subject(target: TargetSpec) -> str | None:
+    """Return an explicit task subject without guessing from free-form prose."""
+
+    for values in (target.metadata, target.operating_conditions):
+        for key in ("subject", "formula", "material", "candidate_id"):
+            value = values.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
 
 
 def _resolve_provider_config(
@@ -1047,6 +1206,7 @@ def _report_start_failure(
     episode: EpisodeRecord,
     error: BaseException,
     workspace: Path,
+    operation: str = "start",
 ) -> None:
     safe_error = _bounded_error(error)
     recovery_note = _fail_active_episode(
@@ -1056,7 +1216,7 @@ def _report_start_failure(
         safe_error,
     )
     failed_task = service.get(task.evolution_id)
-    console.print(f"[red]evolution start failed: {safe_error}[/]")
+    console.print(f"[red]evolution {operation} failed: {safe_error}[/]")
     if recovery_note is not None:
         console.print(f"[red]failure reconciliation also failed: {recovery_note}[/]")
     _render_task_details(failed_task, workspace)

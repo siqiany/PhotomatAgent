@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ from photomatagent.scientific.evolution.models import (
     EvolutionTask,
     RevisionPlan,
 )
+from photomatagent.scientific.evolution.revision import format_revision_instruction
 from photomatagent.scientific.evolution.service import (
     EvolutionService,
     MutationResult,
@@ -89,8 +89,8 @@ class ScientificEpisodeExecutor:
             version=episode.version,
         )
         event_log_path = self._event_log_path()
-        persisted_revision = self._persisted_revision(episode, revision)
-        instruction = self._instruction(task, persisted_revision)
+        persisted_revision = self._persisted_revision(task, episode, revision)
+        instruction = self._instruction(task, episode, persisted_revision)
         collector = EpisodeArtifactCollector()
         started_at = time.monotonic()
         runtime_logs_events = self._runtime_uses_event_logger(runtime)
@@ -241,6 +241,7 @@ class ScientificEpisodeExecutor:
 
     def _persisted_revision(
         self,
+        task: EvolutionTask,
         episode: EpisodeRecord,
         supplied: RevisionPlan | None,
     ) -> RevisionPlan | None:
@@ -262,6 +263,18 @@ class ScientificEpisodeExecutor:
             or persisted.feedback_id != episode.applied_feedback_id
         ):
             raise ValueError("persisted RevisionPlan does not match the reserved episode")
+        if episode.strategy_id is None:
+            raise ValueError("revised episode has no persisted strategy")
+        strategy = self.store.load_strategy(episode.evolution_id, episode.strategy_id)
+        from photomatagent.scientific.evolution.strategy import FixedStrategySelector
+
+        canonical = FixedStrategySelector().select(task, persisted)
+        if (
+            strategy != canonical
+            or strategy.arm != episode.strategy_arm
+            or strategy.parameters.get("revision_id") != persisted.revision_id
+        ):
+            raise ValueError("persisted strategy does not match the reserved episode")
         return persisted
 
     def _runtime_uses_event_logger(self, runtime: AgentRuntime) -> bool:
@@ -298,24 +311,15 @@ class ScientificEpisodeExecutor:
     def _instruction(
         self,
         task: EvolutionTask,
+        episode: EpisodeRecord,
         revision: RevisionPlan | None,
     ) -> str:
         if revision is None:
             return task.goal
-        payload = {
-            "contract_changes": revision.contract_changes,
-            "evidence_requirements": revision.evidence_requirements,
-            "output_schema_requirements": revision.output_schema_requirements,
-            "preserved_facts": revision.preserved_facts,
-            "preserved_evidence_ids": revision.preserved_evidence_ids,
-            "prohibited_repeats": revision.prohibited_repeats,
-            "invalidated_conclusions": revision.invalidated_conclusions,
-            "machine_acceptance_tests": revision.machine_acceptance_tests,
-            "human_acceptance_tests": revision.human_acceptance_tests,
-            "strategy_arm": revision.strategy_arm,
-            "strategy_reason": revision.strategy_reason,
-        }
-        revision_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        revision_text = format_revision_instruction(
+            revision,
+            strategy=episode.strategy_arm,
+        )
         return (
             f"{task.goal}\n\n"
             "--- Confirmed structured revision contract ---\n"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -361,6 +362,41 @@ async def test_invalid_revision_fails_before_episode_is_marked_running(
 
     assert service.store.load_episode("evo_test", "v001").status == "RESERVED"
 
+
+@pytest.mark.asyncio
+async def test_revised_executor_rejects_strategy_tampering_before_runtime(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    task, episode, revision = _reserved_revision(service)
+    assert episode.strategy_id is not None
+    strategy_path = service.store.workspace.resolve(
+        f".photomatagent/evolutions/{task.evolution_id}/strategies/"
+        f"{episode.strategy_id}.json",
+        must_exist=True,
+    )
+    payload = json.loads(strategy_path.read_text(encoding="utf-8"))
+    payload["arm"] = "DIVERSITY_FIRST"
+    strategy_path.write_text(json.dumps(payload), encoding="utf-8")
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="must not execute")]),
+        session_id="session_tampered_strategy",
+    )
+
+    with pytest.raises(ValueError, match="strategy"):
+        await ScientificEpisodeExecutor(service.store).execute(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+            revision=revision,
+        )
+
+    assert service.store.load_episode(task.evolution_id, episode.version).status == (
+        "RESERVED"
+    )
+    assert runtime.conversation_state.messages == []
 
 @pytest.mark.asyncio
 async def test_forged_revision_with_persisted_id_is_rejected_before_running(

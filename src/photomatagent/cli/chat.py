@@ -41,9 +41,12 @@ def build_runtime(
     session_dir: Path | str | None = None,
     session_id: str | None = None,
     log_events: bool = True,
+    scientific_state: ScientificState | None = None,
 ) -> tuple[AgentRuntime, EventLogger | None]:
     workspace = Workspace(workspace_root or Path.cwd())
-    scientific = ScientificState()
+    scientific = (
+        scientific_state if scientific_state is not None else ScientificState()
+    )
     registry = create_default_registry(scientific, workspace)
     model_provider = create_provider(provider, model)
     budget = BudgetState(max_iterations=max_iterations)

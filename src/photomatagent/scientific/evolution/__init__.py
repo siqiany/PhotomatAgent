@@ -6,6 +6,11 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from photomatagent.scientific.evolution.evidence import (
+        EvidenceCarryDecision,
+        build_inherited_scientific_state,
+        select_carry_forward_evidence,
+    )
     from photomatagent.scientific.evolution.models import (
         AcceptanceResult,
         AcceptanceStatus,
@@ -74,6 +79,7 @@ if TYPE_CHECKING:
         EvolutionService,
         EvolutionServiceError,
         InvalidEvolutionTransition,
+        IterationContext,
         MutationResult,
     )
     from photomatagent.scientific.evolution.store import (
@@ -152,7 +158,13 @@ _SERVICE_EXPORTS = (
     "EvolutionService",
     "EvolutionServiceError",
     "InvalidEvolutionTransition",
+    "IterationContext",
     "MutationResult",
+)
+_EVIDENCE_EXPORTS = (
+    "EvidenceCarryDecision",
+    "build_inherited_scientific_state",
+    "select_carry_forward_evidence",
 )
 _REVISION_EXPORTS = (
     "build_revision_plan",
@@ -171,6 +183,10 @@ _STORE_EXPORTS = (
 )
 
 _EXPORT_MODULE = {
+    **{
+        name: "photomatagent.scientific.evolution.evidence"
+        for name in _EVIDENCE_EXPORTS
+    },
     **{
         name: "photomatagent.scientific.evolution.models"
         for name in _MODEL_EXPORTS
@@ -198,6 +214,7 @@ _EXPORT_MODULE = {
 }
 
 __all__ = [
+    *_EVIDENCE_EXPORTS,
     *_MODEL_EXPORTS,
     *_RUBRIC_EXPORTS,
     *_SERVICE_EXPORTS,
