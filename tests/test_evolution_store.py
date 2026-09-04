@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
@@ -300,39 +302,37 @@ def test_store_rejects_unknown_fields_injected_by_model_copy(tmp_path: Path) -> 
     assert not (store.root / "evo_test/task.json").exists()
 
 
-def test_store_reports_lock_timeout_without_removing_another_owner_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_store_reports_lock_timeout_while_another_owner_holds_advisory_lock(
+    tmp_path: Path,
 ) -> None:
     store = EvolutionStore(Workspace(tmp_path))
     store.create_task(make_task())
-    lock_path = store.root / "evo_test/.lock"
-    lock_path.write_text("held by another process", encoding="utf-8")
-    monotonic_values = iter([10.0, 15.0])
-    monkeypatch.setattr(
-        "photomatagent.scientific.evolution.store.time.monotonic",
-        lambda: next(monotonic_values),
-    )
+    contender = EvolutionStore(Workspace(tmp_path))
+    contender.lock_timeout_seconds = 0.01
+    task_dir = store.root / "evo_test"
 
-    with pytest.raises(EvolutionLockError):
-        store.save_task(store.load_task("evo_test"), expected_revision=0)
+    with store._task_lock(task_dir):
+        with pytest.raises(EvolutionLockError):
+            contender.save_task(contender.load_task("evo_test"), expected_revision=0)
 
-    assert lock_path.read_text(encoding="utf-8") == "held by another process"
+    assert (task_dir / ".lock").is_file()
 
 
-def test_lock_release_preserves_a_replacement_owner(tmp_path: Path) -> None:
+def test_lock_release_keeps_one_persistent_lock_inode(tmp_path: Path) -> None:
     store = EvolutionStore(Workspace(tmp_path))
     store.create_task(make_task())
     task_dir = store.root / "evo_test"
     lock_path = task_dir / ".lock"
 
     with store._task_lock(task_dir):
-        lock_path.unlink()
-        lock_path.write_text("replacement-owner", encoding="utf-8")
+        first_inode = lock_path.stat().st_ino
+    with store._task_lock(task_dir):
+        second_inode = lock_path.stat().st_ino
 
-    assert lock_path.read_text(encoding="utf-8") == "replacement-owner"
+    assert first_inode == second_inode
 
 
-def test_replaced_lock_does_not_suppress_the_protected_operation_error(
+def test_lock_release_does_not_suppress_the_protected_operation_error(
     tmp_path: Path,
 ) -> None:
     store = EvolutionStore(Workspace(tmp_path))
@@ -342,14 +342,14 @@ def test_replaced_lock_does_not_suppress_the_protected_operation_error(
 
     with pytest.raises(RuntimeError, match="protected failure"):
         with store._task_lock(task_dir):
-            lock_path.unlink()
-            lock_path.write_text("replacement-owner", encoding="utf-8")
             raise RuntimeError("protected failure")
 
-    assert lock_path.read_text(encoding="utf-8") == "replacement-owner"
+    assert lock_path.is_file()
+    with store._task_lock(task_dir):
+        pass
 
 
-def test_lock_is_removed_when_a_locked_operation_raises(
+def test_lock_is_released_when_a_locked_operation_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = EvolutionStore(Workspace(tmp_path))
@@ -363,96 +363,65 @@ def test_lock_is_removed_when_a_locked_operation_raises(
     with pytest.raises(OSError, match="write failed"):
         store.save_task(store.load_task("evo_test"), expected_revision=0)
 
-    assert not (store.root / "evo_test/.lock").exists()
+    task_dir = store.root / "evo_test"
+    assert (task_dir / ".lock").is_file()
+    with store._task_lock(task_dir):
+        pass
 
 
-def test_lock_is_removed_when_owner_token_initialization_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_process_death_releases_lock_and_reservation_reconciles(
+    tmp_path: Path,
 ) -> None:
     store = EvolutionStore(Workspace(tmp_path))
     store.create_task(make_task())
+    child_program = """
+import time
+from pathlib import Path
+from photomatagent.scientific.evolution.models import EpisodeRecord
+from photomatagent.scientific.evolution.service import EvolutionService
+from photomatagent.scientific.evolution.store import EvolutionStore
+from photomatagent.scientific.loop import TargetSpec
+from photomatagent.workspace import Workspace
 
-    def fail_token_write(descriptor: int, data: bytes) -> int:
-        raise OSError("token write failed")
-
-    monkeypatch.setattr("photomatagent.scientific.evolution.store.os.write", fail_token_write)
-
-    with pytest.raises(OSError, match="token write failed"):
-        store.save_task(store.load_task("evo_test"), expected_revision=0)
-
-    assert not (store.root / "evo_test/.lock").exists()
-
-
-def test_lock_is_removed_and_descriptor_closed_when_fstat_raises(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = EvolutionStore(Workspace(tmp_path))
-    store.create_task(make_task())
-    opened_descriptor: int | None = None
-    original_open = os.open
-    original_fstat = os.fstat
-
-    def track_open(path: str | Path, flags: int, mode: int = 0o777) -> int:
-        nonlocal opened_descriptor
-        opened_descriptor = original_open(path, flags, mode)
-        return opened_descriptor
-
-    def fail_fstat(descriptor: int) -> os.stat_result:
-        raise OSError("fstat failed")
-
-    monkeypatch.setattr("photomatagent.scientific.evolution.store.os.open", track_open)
-    monkeypatch.setattr("photomatagent.scientific.evolution.store.os.fstat", fail_fstat)
-
-    with pytest.raises(OSError, match="fstat failed"):
-        store.save_task(store.load_task("evo_test"), expected_revision=0)
-
-    assert not (store.root / "evo_test/.lock").exists()
-    assert opened_descriptor is not None
-    with pytest.raises(OSError):
-        original_fstat(opened_descriptor)
-
-
-def test_lock_token_write_retries_short_writes_without_leaking_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = EvolutionStore(Workspace(tmp_path))
-    store.create_task(make_task())
-    original_write = os.write
-    write_sizes: list[int] = []
-
-    def short_first_write(descriptor: int, data: bytes) -> int:
-        write_sizes.append(len(data))
-        if len(write_sizes) == 1:
-            return original_write(descriptor, data[:3])
-        return original_write(descriptor, data)
-
-    monkeypatch.setattr(
-        "photomatagent.scientific.evolution.store.os.write", short_first_write
+store = EvolutionStore(Workspace(Path(__import__('sys').argv[1])))
+with store.transaction('evo_test') as transaction:
+    task = transaction.load_task()
+    version = 'v001'
+    transaction.write_episode(EpisodeRecord(
+        evolution_id=task.evolution_id,
+        episode_id=EvolutionService._episode_id(task.evolution_id, version),
+        version=version,
+        task_snapshot=task.model_dump(mode='json'),
+        target_snapshot=TargetSpec.model_validate(task.target),
+        execution_mode='NORMAL',
+    ))
+    print('READY', flush=True)
+    time.sleep(60)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_program, str(tmp_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        child.kill()
+        child.wait(timeout=5)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
 
-    saved = store.save_task(store.load_task("evo_test"), expected_revision=0)
+    store.lock_timeout_seconds = 0.2
+    from photomatagent.scientific.evolution.service import EvolutionService
 
-    assert saved.revision == 1
-    assert len(write_sizes) >= 2
-    assert write_sizes[1] == write_sizes[0] - 3
-    assert not (store.root / "evo_test/.lock").exists()
+    reconciled = EvolutionService(store).reserve_episode("evo_test", mode="NORMAL")
 
-
-def test_lock_token_write_fails_on_zero_progress_without_leaking_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = EvolutionStore(Workspace(tmp_path))
-    store.create_task(make_task())
-
-    monkeypatch.setattr(
-        "photomatagent.scientific.evolution.store.os.write",
-        lambda descriptor, data: 0,
-    )
-
-    with pytest.raises(OSError, match="no progress"):
-        store.save_task(store.load_task("evo_test"), expected_revision=0)
-
-    assert not (store.root / "evo_test/.lock").exists()
+    assert reconciled.entity.version == "v001"
+    assert reconciled.entity.status == "RESERVED"
+    assert store.load_task("evo_test").status == "RUNNING"
 
 
 def test_concurrent_saves_allow_exactly_one_revision_winner(tmp_path: Path) -> None:

@@ -642,6 +642,45 @@ def test_completion_retry_reconciles_terminal_record_after_manifest_crash(
     assert service.get(task.evolution_id).status == "AWAITING_EXPERT_FEEDBACK"
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("episode_id", "ep_forged"),
+        ("capability_fingerprint", "f" * 64),
+    ],
+)
+def test_completion_recovery_rejects_forged_frozen_episode_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: object,
+) -> None:
+    service = make_service(tmp_path)
+    task = mutated(service.create_task(goal="goal", target=TargetSpec(goal="goal")))
+    episode = mutated(service.reserve_episode(task.evolution_id, mode="NORMAL"))
+    running = mutated(service.mark_episode_running(task.evolution_id, episode.version))
+    result = completed_result(service, running)
+    original = service.store._save_task_locked
+    calls = 0
+
+    def fail_once(candidate, expected_revision):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("manifest crash")
+        return original(candidate, expected_revision)
+
+    monkeypatch.setattr(service.store, "_save_task_locked", fail_once)
+    with pytest.raises(OSError, match="manifest crash"):
+        service.complete_episode(task.evolution_id, running.version, result=result)
+
+    forged = result.model_copy(update={field: replacement})
+    with pytest.raises(EvolutionOperationConflict, match=field):
+        service.complete_episode(task.evolution_id, running.version, result=forged)
+
+    assert service.get(task.evolution_id).status == "RUNNING"
+
+
 def test_failure_retry_reconciles_terminal_record_after_manifest_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

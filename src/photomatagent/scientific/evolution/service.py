@@ -49,6 +49,23 @@ from photomatagent.scientific.loop import TargetSpec
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _EntityT = TypeVar("_EntityT", covariant=True)
+_EPISODE_COMPLETION_OUTPUT_FIELDS = frozenset(
+    {
+        "status",
+        "scientific_state_path",
+        "completed_at",
+        "summary",
+        "artifact",
+        "cost",
+        "acceptance_results",
+        "error",
+    }
+)
+_EPISODE_COMPLETION_IDENTITY_FIELDS = tuple(
+    field
+    for field in EpisodeRecord.model_fields
+    if field not in _EPISODE_COMPLETION_OUTPUT_FIELDS
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,22 +289,13 @@ class EvolutionService:
     ) -> MutationResult[EpisodeRecord]:
         with self.store.transaction(evolution_id) as transaction:
             task, episode = self._current_episode(transaction, version)
-            self._validate_result_identity(result, episode)
             artifact = self._verify_artifact(result.artifact)
+            completed = self._validated_completion(episode, result, artifact)
             if episode.status == "COMPLETED":
-                self._validate_completed_retry(episode, result, artifact)
                 saved_episode = episode
             elif episode.status == "RUNNING":
                 if task.status != "RUNNING":
                     raise InvalidEvolutionTransition("task must be RUNNING")
-                completed = result.model_copy(
-                    update={
-                        "status": "COMPLETED",
-                        "artifact": artifact,
-                        "completed_at": result.completed_at or utc_now(),
-                        "error": None,
-                    }
-                )
                 saved_episode = transaction.transition_episode(
                     completed,
                     expected_status="RUNNING",
@@ -629,35 +637,53 @@ class EvolutionService:
         return artifact
 
     @staticmethod
-    def _validate_result_identity(result: EpisodeRecord, episode: EpisodeRecord) -> None:
-        if result.evolution_id != episode.evolution_id or result.version != episode.version:
-            raise InvalidEvolutionTransition(
-                "episode result identity does not match the active episode"
-            )
-        for field in ("runtime_session_id", "event_log_path", "started_at"):
-            if getattr(result, field) != getattr(episode, field):
-                raise EvolutionOperationConflict(
-                    f"episode result changed running provenance field {field}"
-                )
-
-    @staticmethod
-    def _validate_completed_retry(
+    def _validated_completion(
         existing: EpisodeRecord,
         result: EpisodeRecord,
         artifact: ArtifactRef,
-    ) -> None:
-        fields = (
-            "scientific_state_path",
-            "summary",
-            "cost",
-            "acceptance_results",
+    ) -> EpisodeRecord:
+        """Normalize a completion and compare all recovery-authoritative fields."""
+
+        completed_at = result.completed_at
+        if completed_at is None:
+            completed_at = existing.completed_at or utc_now()
+        candidate_payload = cast(
+            dict[str, object],
+            redact_secrets(
+                result.model_copy(
+                    update={
+                        "status": "COMPLETED",
+                        "artifact": artifact,
+                        "completed_at": completed_at,
+                        "error": None,
+                    }
+                ).model_dump(mode="json")
+            ),
         )
-        if existing.artifact != artifact or any(
-            getattr(existing, field) != getattr(result, field) for field in fields
-        ):
+        existing_payload = existing.model_dump(mode="json")
+        for field in _EPISODE_COMPLETION_IDENTITY_FIELDS:
+            if candidate_payload[field] != existing_payload[field]:
+                raise EvolutionOperationConflict(
+                    f"episode completion changed authoritative field {field}"
+                )
+        candidate = EpisodeRecord.model_validate(candidate_payload)
+        if existing.status != "COMPLETED":
+            return candidate
+        candidate_payload = candidate.model_dump(mode="json")
+        differing = next(
+            (
+                field
+                for field in EpisodeRecord.model_fields
+                if existing_payload[field] != candidate_payload[field]
+            ),
+            None,
+        )
+        if differing is not None:
             raise EvolutionOperationConflict(
-                "completed episode content differs from retry result"
+                "completed episode retry differs from stored record at field "
+                f"{differing}"
             )
+        return candidate
 
     @staticmethod
     def _validate_reservation(

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import errno
+import importlib
 import json
 import os
 import re
 import tempfile
 import time
-import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, TypeVar
@@ -27,6 +28,12 @@ from photomatagent.scientific.evolution.models import (
 )
 from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
+
+_ADVISORY_LOCK_API: Any = None
+if os.name == "nt":
+    _ADVISORY_LOCK_API = importlib.import_module("msvcrt")
+elif os.name == "posix":
+    _ADVISORY_LOCK_API = importlib.import_module("fcntl")
 
 _STORE_PATH = ".photomatagent/evolutions"
 _EPISODE_VERSION = re.compile(r"^v[0-9]{3}$")
@@ -643,84 +650,85 @@ class EvolutionStore:
             self.workspace.relative(task_dir / ".lock"), must_exist=False
         )
         deadline = time.monotonic() + self.lock_timeout_seconds
-        descriptor: int | None = None
-        owner_token = uuid.uuid4().hex
-        while descriptor is None:
-            try:
-                descriptor = os.open(
-                    lock_path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
-            except FileExistsError as exc:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = False
+        try:
+            self._initialize_lock_file(descriptor)
+            while not acquired:
+                acquired = self._try_advisory_lock(descriptor)
+                if acquired:
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise EvolutionLockError(
                         f"timed out acquiring evolution task lock: {task_dir.name}"
-                    ) from exc
+                    )
                 time.sleep(min(self.lock_poll_seconds, remaining))
-        path_stat: os.stat_result | None = None
-        owner_stat: os.stat_result | None = None
-        initialized = False
-        try:
-            path_stat = lock_path.stat(follow_symlinks=False)
-            owner_stat = os.fstat(descriptor)
-            self._write_all(descriptor, owner_token.encode("ascii"))
-            os.fsync(descriptor)
-            initialized = True
             yield
         finally:
             try:
-                os.close(descriptor)
+                if acquired:
+                    self._release_advisory_lock(descriptor)
             finally:
-                ownership = owner_stat if owner_stat is not None else path_stat
-                if ownership is not None:
-                    self._release_owned_lock(
-                        lock_path,
-                        ownership,
-                        owner_token if initialized else None,
-                    )
+                os.close(descriptor)
 
     @staticmethod
-    def _write_all(descriptor: int, data: bytes) -> None:
-        remaining = memoryview(data)
-        while remaining:
-            written = os.write(descriptor, remaining)
-            if written <= 0:
-                raise OSError("lock owner token write made no progress")
-            remaining = remaining[written:]
+    def _initialize_lock_file(descriptor: int) -> None:
+        """Ensure the persistent lock inode has a byte for Windows locking."""
+
+        if os.fstat(descriptor).st_size == 0:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            written = os.write(descriptor, b"\0")
+            if written != 1:
+                raise OSError("evolution lock file initialization made no progress")
+            os.fsync(descriptor)
 
     @staticmethod
-    def _release_owned_lock(
-        lock_path: Path,
-        owner_stat: os.stat_result,
-        owner_token: str | None,
-    ) -> None:
-        try:
-            current_stat = lock_path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if (
-            current_stat.st_dev != owner_stat.st_dev
-            or current_stat.st_ino != owner_stat.st_ino
-        ):
-            return
-        if owner_token is not None:
+    def _try_advisory_lock(descriptor: int) -> bool:
+        if os.name == "nt":
+            os.lseek(descriptor, 0, os.SEEK_SET)
             try:
-                current_token = lock_path.read_text(encoding="ascii")
-            except (FileNotFoundError, OSError, UnicodeError):
-                return
-            if current_token != owner_token:
-                return
-        try:
-            verified_stat = lock_path.stat(follow_symlinks=False)
-            if (
-                verified_stat.st_dev == owner_stat.st_dev
-                and verified_stat.st_ino == owner_stat.st_ino
-            ):
-                lock_path.unlink()
-        except FileNotFoundError:
-            pass
+                _ADVISORY_LOCK_API.locking(
+                    descriptor,
+                    _ADVISORY_LOCK_API.LK_NBLCK,
+                    1,
+                )
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    return False
+                raise
+            return True
+        if os.name == "posix":
+            try:
+                _ADVISORY_LOCK_API.flock(
+                    descriptor,
+                    _ADVISORY_LOCK_API.LOCK_EX | _ADVISORY_LOCK_API.LOCK_NB,
+                )
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    return False
+                raise
+            return True
+        raise EvolutionLockError(
+            f"advisory evolution locking is unsupported on os.name={os.name!r}"
+        )
+
+    @staticmethod
+    def _release_advisory_lock(descriptor: int) -> None:
+        if os.name == "nt":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _ADVISORY_LOCK_API.locking(
+                descriptor,
+                _ADVISORY_LOCK_API.LK_UNLCK,
+                1,
+            )
+            return
+        if os.name == "posix":
+            _ADVISORY_LOCK_API.flock(descriptor, _ADVISORY_LOCK_API.LOCK_UN)
+            return
+        raise EvolutionLockError(
+            f"advisory evolution locking is unsupported on os.name={os.name!r}"
+        )
 
     def _write_immutable_json(self, path: Path, payload: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
