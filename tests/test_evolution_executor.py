@@ -30,8 +30,10 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     RubricScores,
 )
+from photomatagent.scientific.evolution.revision import build_revision_plan
 from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.store import EvolutionStore
+from photomatagent.scientific.evolution.strategy import FixedStrategySelector
 from photomatagent.scientific.loop import (
     ScientificLoopConfig,
     ScientificLoopSummary,
@@ -102,15 +104,7 @@ def _reserved_revision(service: EvolutionService):  # type: ignore[no-untyped-de
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
         raw_input="review",
     ).entity
-    plan = RevisionPlan(
-        revision_id="rp_test",
-        evolution_id=task.evolution_id,
-        source_version=first.version,
-        feedback_id=feedback.feedback_id,
-        contract_changes=["Use primary evidence"],
-        confirmed=True,
-    )
-    service.save_compilation(
+    compilation = service.save_compilation(
         task.evolution_id,
         FeedbackCompilation(
             compilation_id="comp_test",
@@ -121,8 +115,17 @@ def _reserved_revision(service: EvolutionService):  # type: ignore[no-untyped-de
             provider="fake",
             model="fake",
         ),
-    )
-    persisted_plan = service.confirm_revision(task.evolution_id, plan).entity
+    ).entity
+    plan = build_revision_plan(
+        feedback=feedback,
+        compilation=compilation,
+        target=completed.target_snapshot,
+        previous_summary=completed.summary,
+    ).model_copy(update={"confirmed": True})
+    strategy = FixedStrategySelector().select(service.get(task.evolution_id), plan)
+    persisted_plan = service.confirm_revision(
+        task.evolution_id, plan, strategy=strategy
+    ).entity
     second = service.reserve_episode(
         task.evolution_id,
         mode="CARRY_VERIFIED_EVIDENCE",

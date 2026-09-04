@@ -14,10 +14,12 @@ from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
     ExpertFeedbackDraft,
     FeedbackCompilation,
+    FeedbackDelta,
     RevisionPlan,
     RubricScores,
     StrategyVersion,
 )
+from photomatagent.scientific.evolution.revision import build_revision_plan
 from photomatagent.scientific.evolution.service import (
     ALLOWED_TRANSITIONS,
     ArtifactMismatchError,
@@ -30,6 +32,7 @@ from photomatagent.scientific.evolution.store import (
     EvolutionConflictError,
     EvolutionStore,
 )
+from photomatagent.scientific.evolution.strategy import FixedStrategySelector
 from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
 from photomatagent.workspace import Workspace
 
@@ -127,17 +130,11 @@ def prepare_revision(service: EvolutionService) -> tuple[str, EpisodeRecord]:
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
         raw_input='{"scores": "confirmed by expert"}',
     ))
-    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
-    mutated(service.confirm_revision(
-        evolution_id,
-        RevisionPlan(
-            revision_id="rp_test",
-            evolution_id=evolution_id,
-            source_version=completed.version,
-            feedback_id=feedback.feedback_id,
-            confirmed=True,
-        ),
-    ))
+    compilation = save_available_compilation(
+        service, evolution_id, feedback.feedback_id, completed.version
+    )
+    plan, strategy = canonical_confirmation(service, evolution_id, compilation)
+    mutated(service.confirm_revision(evolution_id, plan, strategy=strategy))
     return evolution_id, completed
 
 
@@ -161,6 +158,179 @@ def save_available_compilation(
     ).entity
 
 
+def canonical_confirmation(
+    service: EvolutionService,
+    evolution_id: str,
+    compilation: FeedbackCompilation,
+) -> tuple[RevisionPlan, StrategyVersion]:
+    task, episode, feedback = service.compilation_context(
+        evolution_id,
+        compilation.episode_version,
+    )
+    plan = build_revision_plan(
+        feedback=feedback,
+        compilation=compilation,
+        target=episode.target_snapshot,
+        previous_summary=episode.summary,
+    )
+    return (
+        plan.model_copy(update={"confirmed": True}),
+        FixedStrategySelector().select(task, plan),
+    )
+
+
+def compiled_revision_context(
+    service: EvolutionService,
+    *,
+    critical_without_contract: bool = False,
+) -> tuple[str, EpisodeRecord, FeedbackCompilation]:
+    evolution_id, completed = complete_first(service)
+    feedback = mutated(service.attach_feedback(
+        evolution_id,
+        completed.version,
+        feedback_id="fb_canonical_context",
+        draft=feedback_draft(),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+        raw_input="review",
+    ))
+    compilation = FeedbackCompilation(
+        compilation_id="comp_canonical_context",
+        evolution_id=evolution_id,
+        feedback_id=feedback.feedback_id,
+        episode_version=completed.version,
+        status="AVAILABLE",
+        items=(
+            FeedbackDelta(
+                item_id="item_001",
+                category="EVIDENCE_SUFFICIENCY",
+                status="CORRECTION",
+                severity="CRITICAL" if critical_without_contract else "HIGH",
+                responsible_module="retrieval",
+                problem="Evidence is insufficient",
+                requested_actions=(
+                    () if critical_without_contract else ("Read full text",)
+                ),
+                acceptance_test=(
+                    None if critical_without_contract else "Full-text evidence is bound"
+                ),
+                confidence=1.0,
+                source_span="source",
+            ),
+        ),
+        provider="fake",
+        model="fake",
+    )
+    return evolution_id, completed, service.save_compilation(
+        evolution_id,
+        compilation,
+    ).entity
+
+
+def test_confirm_revision_rebuilds_canonical_plan_before_any_write(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _completed, compilation = compiled_revision_context(service)
+    plan, strategy = canonical_confirmation(service, evolution_id, compilation)
+    forged = plan.model_copy(update={"contract_changes": ["forged change"]})
+
+    with pytest.raises(EvolutionOperationConflict, match="canonical"):
+        service.confirm_revision(evolution_id, forged, strategy=strategy)
+
+    assert service.get(evolution_id).status == "FEEDBACK_RECORDED"
+    assert service.store.list_revisions(evolution_id) == []
+    assert service.store.list_strategies(evolution_id) == []
+
+
+def test_confirm_revision_cannot_hide_canonical_critical_ambiguity(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _completed, compilation = compiled_revision_context(
+        service,
+        critical_without_contract=True,
+    )
+    canonical, strategy = canonical_confirmation(service, evolution_id, compilation)
+    assert canonical.has_blocking_ambiguity is True
+    forged = canonical.model_copy(
+        update={"has_blocking_ambiguity": False, "unresolved_ambiguities": []}
+    )
+
+    with pytest.raises(EvolutionOperationConflict, match="canonical"):
+        service.confirm_revision(evolution_id, forged, strategy=strategy)
+
+    assert service.get(evolution_id).status == "FEEDBACK_RECORDED"
+    assert service.store.list_revisions(evolution_id) == []
+    assert service.store.list_strategies(evolution_id) == []
+
+
+@pytest.mark.parametrize("forgery", ["strategy_id", "strategy_sha256", "parameters"])
+def test_confirm_revision_rejects_forged_strategy_before_any_write(
+    forgery: str,
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _completed, compilation = compiled_revision_context(service)
+    plan, canonical = canonical_confirmation(service, evolution_id, compilation)
+    updates = {
+        "strategy_id": {"strategy_id": "strategy_forged"},
+        "strategy_sha256": {"strategy_sha256": "f" * 64},
+        "parameters": {
+            "parameters": {
+                "selector": "fixed-v1",
+                "revision_id": plan.revision_id,
+                "forged": True,
+            }
+        },
+    }
+    forged = canonical.model_copy(update=updates[forgery])
+
+    with pytest.raises(EvolutionOperationConflict, match="canonical"):
+        service.confirm_revision(evolution_id, plan, strategy=forged)
+
+    assert service.get(evolution_id).status == "FEEDBACK_RECORDED"
+    assert service.store.list_revisions(evolution_id) == []
+    assert service.store.list_strategies(evolution_id) == []
+
+
+@pytest.mark.parametrize(
+    ("forged_field", "forged_value"),
+    [("strategy_id", "strategy_forged"), ("strategy_arm", "DIVERSITY_FIRST")],
+)
+def test_revised_reservation_binds_latest_confirmed_strategy_and_checks_retry(
+    forged_field: str,
+    forged_value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _completed, compilation = compiled_revision_context(service)
+    plan, strategy = canonical_confirmation(service, evolution_id, compilation)
+    service.confirm_revision(evolution_id, plan, strategy=strategy)
+
+    reserved = service.reserve_episode(
+        evolution_id,
+        mode="CARRY_VERIFIED_EVIDENCE",
+    ).entity
+    assert reserved.strategy_id == strategy.strategy_id
+    assert reserved.strategy_arm == strategy.arm
+
+    original_load = service.store.load_episode
+
+    def load_with_forged_strategy(selected_id, version):  # type: ignore[no-untyped-def]
+        episode = original_load(selected_id, version)
+        if version == reserved.version:
+            return episode.model_copy(update={forged_field: forged_value})
+        return episode
+
+    monkeypatch.setattr(service.store, "load_episode", load_with_forged_strategy)
+    with pytest.raises(EvolutionOperationConflict, match="reservation"):
+        service.reserve_episode(
+            evolution_id,
+            mode="CARRY_VERIFIED_EVIDENCE",
+        )
+
+
 def test_confirm_revision_atomically_persists_exact_plan_and_strategy(
     tmp_path: Path,
 ) -> None:
@@ -174,24 +344,10 @@ def test_confirm_revision_atomically_persists_exact_plan_and_strategy(
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
         raw_input="review",
     ))
-    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
-    plan = RevisionPlan(
-        revision_id="rp_atomic_revision",
-        evolution_id=evolution_id,
-        source_version=completed.version,
-        feedback_id=feedback.feedback_id,
-        strategy_arm="EVIDENCE_FIRST",
-        strategy_reason="fixed-v1: evidence",
-        confirmed=True,
+    compilation = save_available_compilation(
+        service, evolution_id, feedback.feedback_id, completed.version
     )
-    strategy = StrategyVersion(
-        strategy_id="strategy_atomic_revision",
-        evolution_id=evolution_id,
-        arm="EVIDENCE_FIRST",
-        reason="fixed-v1: evidence",
-        parameters={"selector": "fixed-v1", "revision_id": plan.revision_id},
-        strategy_sha256="c" * 64,
-    )
+    plan, strategy = canonical_confirmation(service, evolution_id, compilation)
 
     result = service.confirm_revision(evolution_id, plan, strategy=strategy)
     repeated = service.confirm_revision(evolution_id, plan, strategy=strategy)
@@ -217,24 +373,13 @@ def test_confirm_revision_rejects_strategy_mismatch_without_writing_either_recor
         draft=feedback_draft(),
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
     ))
-    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
-    plan = RevisionPlan(
-        revision_id="rp_strategy_mismatch",
-        evolution_id=evolution_id,
-        source_version=completed.version,
-        feedback_id=feedback.feedback_id,
-        strategy_arm="EVIDENCE_FIRST",
-        strategy_reason="fixed-v1: evidence",
-        confirmed=True,
+    compilation = save_available_compilation(
+        service, evolution_id, feedback.feedback_id, completed.version
     )
-    mismatch = StrategyVersion(
-        strategy_id="strategy_mismatch",
-        evolution_id=evolution_id,
-        arm="DIVERSITY_FIRST",
-        reason="wrong",
-    )
+    plan, strategy = canonical_confirmation(service, evolution_id, compilation)
+    mismatch = strategy.model_copy(update={"reason": "wrong"})
 
-    with pytest.raises(InvalidEvolutionTransition, match="strategy"):
+    with pytest.raises(EvolutionOperationConflict, match="strategy"):
         service.confirm_revision(evolution_id, plan, strategy=mismatch)
 
     task = service.get(evolution_id)
@@ -282,14 +427,10 @@ def test_confirm_revision_recovers_plan_write_before_strategy_write_crash(
         draft=feedback_draft(),
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
     ))
-    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
-    plan = RevisionPlan(
-        revision_id="rp_strategy_crash",
-        evolution_id=evolution_id,
-        source_version=completed.version,
-        feedback_id=feedback.feedback_id,
-        confirmed=True,
+    compilation = save_available_compilation(
+        service, evolution_id, feedback.feedback_id, completed.version
     )
+    plan, _strategy = canonical_confirmation(service, evolution_id, compilation)
     original = service.store._write_record_locked
     failed = False
 
@@ -454,18 +595,32 @@ def test_revision_with_blocking_ambiguity_cannot_become_ready(tmp_path: Path) ->
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
         raw_input="review",
     ))
-    plan = RevisionPlan(
-        revision_id="rp_ambiguous",
+    compilation = FeedbackCompilation(
+        compilation_id="comp_ambiguous",
         evolution_id=evolution_id,
-        source_version=completed.version,
         feedback_id=feedback.feedback_id,
-        confirmed=True,
-        unresolved_ambiguities=["Which measurement protocol applies?"],
-        has_blocking_ambiguity=True,
+        episode_version=completed.version,
+        status="AVAILABLE",
+        items=(
+            FeedbackDelta(
+                item_id="item_ambiguous",
+                category="OTHER",
+                status="CORRECTION",
+                severity="CRITICAL",
+                responsible_module="method",
+                problem="Which measurement protocol applies?",
+                confidence=1.0,
+                source_span="source",
+            ),
+        ),
+        provider="fake",
+        model="fake",
     )
+    service.save_compilation(evolution_id, compilation)
+    plan, strategy = canonical_confirmation(service, evolution_id, compilation)
 
     with pytest.raises(InvalidEvolutionTransition, match="ambiguity"):
-        service.confirm_revision(evolution_id, plan)
+        service.confirm_revision(evolution_id, plan, strategy=strategy)
 
     assert service.get(evolution_id).status == "FEEDBACK_RECORDED"
     assert service.get(evolution_id).revision_ids == []
@@ -592,22 +747,14 @@ def test_stop_and_reopen_restore_exact_checkpoint(
         ))
         task = service.get(evolution_id)
         if checkpoint == "REVISION_READY":
-            save_available_compilation(
+            compilation = save_available_compilation(
                 service,
                 evolution_id,
                 feedback.feedback_id,
                 completed.version,
             )
-            mutated(service.confirm_revision(
-                evolution_id,
-                RevisionPlan(
-                    revision_id="rp_checkpoint",
-                    evolution_id=evolution_id,
-                    source_version=completed.version,
-                    feedback_id=feedback.feedback_id,
-                    confirmed=True,
-                ),
-            ))
+            plan, strategy = canonical_confirmation(service, evolution_id, compilation)
+            mutated(service.confirm_revision(evolution_id, plan, strategy=strategy))
             task = service.get(evolution_id)
 
     stopped = mutated(service.stop(task.evolution_id))
@@ -1019,19 +1166,13 @@ def test_revision_retry_reconciles_matching_stable_id_after_manifest_crash(
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
         raw_input="review",
     ))
-    plan = RevisionPlan(
-        revision_id="rp_stable",
-        evolution_id=evolution_id,
-        source_version=completed.version,
-        feedback_id=feedback.feedback_id,
-        confirmed=True,
-    )
-    save_available_compilation(
+    compilation = save_available_compilation(
         service,
         evolution_id,
         feedback.feedback_id,
         completed.version,
     )
+    plan, strategy = canonical_confirmation(service, evolution_id, compilation)
     original = service.store._save_task_locked
     calls = 0
 
@@ -1044,16 +1185,17 @@ def test_revision_retry_reconciles_matching_stable_id_after_manifest_crash(
 
     monkeypatch.setattr(service.store, "_save_task_locked", fail_once)
     with pytest.raises(OSError, match="manifest crash"):
-        service.confirm_revision(evolution_id, plan)
+        service.confirm_revision(evolution_id, plan, strategy=strategy)
 
     with pytest.raises(EvolutionOperationConflict):
         service.confirm_revision(
             evolution_id,
             plan.model_copy(update={"revision_id": "rp_different"}),
+            strategy=strategy,
         )
-    retry = service.confirm_revision(evolution_id, plan)
-    assert retry.entity.revision_id == "rp_stable"
-    assert service.get(evolution_id).revision_ids == ["rp_stable"]
+    retry = service.confirm_revision(evolution_id, plan, strategy=strategy)
+    assert retry.entity.revision_id == plan.revision_id
+    assert service.get(evolution_id).revision_ids == [plan.revision_id]
 
 
 def test_mismatched_orphan_reservation_is_a_typed_conflict(

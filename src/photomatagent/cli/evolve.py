@@ -41,6 +41,7 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     RubricFlags,
     RubricScores,
+    StrategyVersion,
     new_feedback_id,
 )
 from photomatagent.scientific.evolution.revision import build_revision_plan
@@ -558,13 +559,18 @@ async def run_revision_confirmation_flow(
 ) -> RevisionPlan | None:
     """Build, preview, and explicitly confirm one deterministic revision plan."""
 
-    task, _episode, feedback = service.compilation_context(
+    task, episode, feedback = service.compilation_context(
         evolution_id,
         compilation.episode_version,
     )
-    plan = build_revision_plan(feedback=feedback, compilation=compilation)
+    plan = build_revision_plan(
+        feedback=feedback,
+        compilation=compilation,
+        target=episode.target_snapshot,
+        previous_summary=episode.summary,
+    )
     strategy = FixedStrategySelector().select(task, plan)
-    _render_revision_plan(console, plan)
+    _render_revision_plan(console, plan, strategy)
     if plan.has_blocking_ambiguity:
         raise EvolutionServiceError(
             "revision plan has blocking CRITICAL ambiguity; add an action or "
@@ -637,13 +643,20 @@ def _render_compilation(output: Console, compilation: FeedbackCompilation) -> No
         )
 
 
-def _render_revision_plan(output: Console, plan: RevisionPlan) -> None:
+def _render_revision_plan(
+    output: Console,
+    plan: RevisionPlan,
+    strategy: StrategyVersion,
+) -> None:
     summary = Table("Revision plan", "Value")
     summary.add_row("Revision ID", plan.revision_id)
     summary.add_row("Source episode", plan.source_version)
     summary.add_row("Feedback ID", plan.feedback_id)
-    summary.add_row("Strategy", plan.strategy_arm)
-    summary.add_row("Strategy reason", _bounded_plan_text(plan.strategy_reason))
+    summary.add_row("Strategy ID", strategy.strategy_id)
+    summary.add_row("Strategy", strategy.arm)
+    summary.add_row("Strategy reason", _bounded_plan_text(strategy.reason))
+    summary.add_row("Strategy SHA-256", strategy.strategy_sha256 or "—")
+    summary.add_row("Selector", str(strategy.parameters.get("selector", "—")))
     summary.add_row(
         "Blocking ambiguity",
         "yes" if plan.has_blocking_ambiguity else "no",
@@ -654,7 +667,10 @@ def _render_revision_plan(output: Console, plan: RevisionPlan) -> None:
         ("Evidence requirements", plan.evidence_requirements),
         ("Output schema requirements", plan.output_schema_requirements),
         ("Preserve", plan.preserved_facts),
+        ("Preserved evidence IDs", plan.preserved_evidence_ids),
         ("Prohibited repeats", plan.prohibited_repeats),
+        ("Invalidated conclusions", plan.invalidated_conclusions),
+        ("Invalidated evidence IDs", plan.invalidated_evidence_ids),
         ("Machine acceptance", plan.machine_acceptance_tests),
         ("Human acceptance", plan.human_acceptance_tests),
         ("Warnings", plan.warnings),

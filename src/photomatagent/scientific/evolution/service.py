@@ -38,6 +38,7 @@ from photomatagent.scientific.evolution.models import (
     FeedbackCompilation,
     RevisionPlan,
     Sha256,
+    StrategyArm,
     StrategyVersion,
     TargetSnapshot,
     new_evolution_id,
@@ -238,6 +239,10 @@ class EvolutionService:
             task = transaction.load_task()
             initial = task.last_completed_version is None
             required_status: EvolutionStatus = "CREATED" if initial else "REVISION_READY"
+            strategy_id, strategy_arm = self._reservation_strategy(
+                transaction,
+                task,
+            )
             if task.status == "RUNNING" and task.current_version is not None:
                 existing = transaction.load_episode(task.current_version)
                 self._validate_reservation(
@@ -249,6 +254,8 @@ class EvolutionService:
                     tool_surface_fingerprint,
                     capability_fingerprint,
                     data_source_fingerprints or {},
+                    strategy_id,
+                    strategy_arm,
                 )
                 return MutationResult(existing, self._reservation_events(existing, initial))
             if task.status != required_status:
@@ -272,6 +279,8 @@ class EvolutionService:
                 applied_feedback_id=(task.feedback_ids[-1] if task.feedback_ids else None),
                 revision_plan_id=(task.revision_ids[-1] if task.revision_ids else None),
                 execution_mode=mode,
+                strategy_id=strategy_id,
+                strategy_arm=strategy_arm,
                 task_snapshot=task.model_dump(mode="json"),
                 target_snapshot=TargetSnapshot.model_validate(task.target),
                 provider=provider,
@@ -295,6 +304,8 @@ class EvolutionService:
                     tool_surface_fingerprint,
                     capability_fingerprint,
                     data_source_fingerprints or {},
+                    strategy_id,
+                    strategy_arm,
                 )
                 persisted = existing
             updated = task.model_copy(
@@ -793,17 +804,38 @@ class EvolutionService:
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
             self._validate_revision(task, evolution_id, plan)
-            self._require_active_available_compilation(task, evolution_id, plan)
-            confirmed = plan.model_copy(
-                update={"confirmed_at": plan.confirmed_at or utc_now()}
+            episode, feedback, compilation = self._revision_context(
+                transaction,
+                task,
+                evolution_id,
             )
-            if strategy is None:
-                from photomatagent.scientific.evolution.strategy import (
-                    FixedStrategySelector,
-                )
+            from photomatagent.scientific.evolution.revision import (
+                build_revision_plan,
+            )
+            from photomatagent.scientific.evolution.strategy import (
+                FixedStrategySelector,
+            )
 
-                strategy = FixedStrategySelector().select(task, plan)
-            self._validate_strategy(evolution_id, confirmed, strategy)
+            canonical_plan = build_revision_plan(
+                feedback=feedback,
+                compilation=compilation,
+                target=episode.target_snapshot,
+                previous_summary=episode.summary,
+            )
+            self._require_canonical_plan(plan, canonical_plan)
+            if canonical_plan.has_blocking_ambiguity:
+                raise InvalidEvolutionTransition(
+                    "revision plan has an unresolved blocking ambiguity"
+                )
+            canonical_strategy = FixedStrategySelector().select(task, canonical_plan)
+            if strategy is not None and strategy != canonical_strategy:
+                raise EvolutionOperationConflict(
+                    "submitted strategy does not match canonical fixed strategy"
+                )
+            strategy = canonical_strategy
+            confirmed = canonical_plan.model_copy(
+                update={"confirmed": True, "confirmed_at": utc_now()}
+            )
             competing = next(
                 (
                     item
@@ -1080,6 +1112,8 @@ class EvolutionService:
         tool_surface_fingerprint: Sha256 | None,
         capability_fingerprint: Sha256 | None,
         data_source_fingerprints: dict[str, Sha256],
+        strategy_id: str | None,
+        strategy_arm: StrategyArm,
     ) -> None:
         expected_version = (
             task.current_version
@@ -1097,6 +1131,8 @@ class EvolutionService:
             or episode.tool_surface_fingerprint != tool_surface_fingerprint
             or episode.capability_fingerprint != capability_fingerprint
             or episode.data_source_fingerprints != data_source_fingerprints
+            or episode.strategy_id != strategy_id
+            or episode.strategy_arm != strategy_arm
             or episode.parent_version != task.last_completed_version
             or episode.applied_feedback_id
             != (task.feedback_ids[-1] if task.feedback_ids else None)
@@ -1192,10 +1228,6 @@ class EvolutionService:
             )
         if not plan.confirmed:
             raise InvalidEvolutionTransition("revision plan is not confirmed")
-        if plan.has_blocking_ambiguity:
-            raise InvalidEvolutionTransition(
-                "revision plan has an unresolved blocking ambiguity"
-            )
         if (
             plan.evolution_id != evolution_id
             or plan.source_version != task.last_completed_version
@@ -1206,45 +1238,96 @@ class EvolutionService:
                 "revision plan does not match active task version and feedback"
             )
 
-    def _require_active_available_compilation(
+    def _revision_context(
         self,
+        transaction: EvolutionTransaction,
         task: EvolutionTask,
         evolution_id: str,
-        plan: RevisionPlan,
-    ) -> FeedbackCompilation:
-        compilations = {
-            item.compilation_id: item
-            for item in self.store.list_compilations(evolution_id)
-        }
-        available = [
-            item
-            for compilation_id in task.compilation_ids
-            if (item := compilations.get(compilation_id)) is not None
-            and item.status == "AVAILABLE"
-            and item.feedback_id == plan.feedback_id
-            and item.episode_version == plan.source_version
+    ) -> tuple[EpisodeRecord, ExpertFeedbackRecord, FeedbackCompilation]:
+        if task.last_completed_version is None or not task.feedback_ids:
+            raise InvalidEvolutionTransition(
+                "revision confirmation requires a source episode and active feedback"
+            )
+        episode = transaction.load_episode(task.last_completed_version)
+        if episode.status != "COMPLETED":
+            raise InvalidEvolutionTransition(
+                "revision confirmation requires a completed source episode"
+            )
+        artifact = self._verify_artifact(episode.artifact)
+        feedback_records = [
+            transaction.load_feedback(feedback_id)
+            for feedback_id in task.feedback_ids
         ]
-        if len(available) != 1:
+        feedback = feedback_records[-1]
+        active_feedback = self._active_feedback(feedback_records, episode.version)
+        if active_feedback is None or active_feedback != feedback:
+            raise EvolutionOperationConflict(
+                "latest feedback is not the exact active source feedback"
+            )
+        if (
+            feedback.evolution_id != evolution_id
+            or feedback.episode_version != episode.version
+            or feedback.result_sha256 != artifact.sha256
+        ):
+            raise EvolutionOperationConflict(
+                "active feedback does not match the source episode"
+            )
+        available: list[FeedbackCompilation] = []
+        for compilation_id in task.compilation_ids:
+            compilation = transaction.load_compilation(compilation_id)
+            if compilation.status == "AVAILABLE":
+                available.append(compilation)
+        matching = [
+            item
+            for item in available
+            if item.feedback_id == feedback.feedback_id
+            and item.episode_version == episode.version
+        ]
+        if len(matching) != 1:
             raise InvalidEvolutionTransition(
                 "revision confirmation requires exactly one active AVAILABLE compilation"
             )
-        return available[0]
+        return episode, feedback, matching[0]
 
     @staticmethod
-    def _validate_strategy(
-        evolution_id: str,
-        plan: RevisionPlan,
-        strategy: StrategyVersion,
+    def _require_canonical_plan(
+        submitted: RevisionPlan,
+        canonical: RevisionPlan,
     ) -> None:
-        if (
-            strategy.evolution_id != evolution_id
-            or strategy.arm != plan.strategy_arm
-            or strategy.reason != plan.strategy_reason
-            or strategy.parameters.get("revision_id") != plan.revision_id
+        service_owned = {"confirmed", "confirmed_at"}
+        if submitted.model_dump(mode="json", exclude=service_owned) != canonical.model_dump(
+            mode="json",
+            exclude=service_owned,
         ):
-            raise InvalidEvolutionTransition(
-                "strategy snapshot does not match the confirmed revision plan"
+            raise EvolutionOperationConflict(
+                "submitted revision plan does not match canonical persisted inputs"
             )
+
+    @staticmethod
+    def _reservation_strategy(
+        transaction: EvolutionTransaction,
+        task: EvolutionTask,
+    ) -> tuple[str | None, StrategyArm]:
+        if task.last_completed_version is None:
+            return None, "STATIC"
+        if not task.revision_ids or not task.strategy_ids:
+            raise InvalidEvolutionTransition(
+                "revised reservation requires a confirmed revision and strategy"
+            )
+        revision = transaction.load_revision(task.revision_ids[-1])
+        strategy = transaction.load_strategy(task.strategy_ids[-1])
+        from photomatagent.scientific.evolution.strategy import FixedStrategySelector
+
+        canonical = FixedStrategySelector().select(task, revision)
+        if (
+            not revision.confirmed
+            or revision.source_version != task.last_completed_version
+            or strategy != canonical
+        ):
+            raise EvolutionOperationConflict(
+                "active revision and strategy do not match the task checkpoint"
+            )
+        return strategy.strategy_id, strategy.arm
 
     @staticmethod
     def _require_matching_revision(existing: RevisionPlan, candidate: RevisionPlan) -> None:

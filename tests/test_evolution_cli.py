@@ -30,8 +30,10 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     RubricScores,
 )
+from photomatagent.scientific.evolution.revision import build_revision_plan
 from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.store import EvolutionStore
+from photomatagent.scientific.evolution.strategy import FixedStrategySelector
 from photomatagent.scientific.loop import (
     JudgeIssue,
     JudgeReport,
@@ -291,6 +293,9 @@ def test_compile_previews_bounded_plan_and_requires_exact_confirmation(
 
     assert result.exit_code == 0, result.output
     assert "Revision plan" in result.output
+    assert "Strategy ID" in result.output
+    assert "Strategy SHA-256" in result.output
+    assert "Selector" in result.output
     assert "Strategy" in result.output
     assert "Keep verified evidence" in result.output
     assert "Do not repeat unsupported conclusion" in result.output
@@ -1092,7 +1097,7 @@ def test_cancel_preserves_last_good_revision(
         ),
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
     ).entity
-    service.save_compilation(
+    compilation = service.save_compilation(
         task.evolution_id,
         FeedbackCompilation(
             compilation_id="comp_cancel_test",
@@ -1103,16 +1108,18 @@ def test_cancel_preserves_last_good_revision(
             provider="fake",
             model="fake",
         ),
-    )
+    ).entity
+    plan = build_revision_plan(
+        feedback=feedback,
+        compilation=compilation,
+        target=completed.target_snapshot,
+        previous_summary=completed.summary,
+    ).model_copy(update={"confirmed": True})
+    strategy = FixedStrategySelector().select(service.get(task.evolution_id), plan)
     service.confirm_revision(
         task.evolution_id,
-        RevisionPlan(
-            revision_id="rp_cancel_test",
-            evolution_id=task.evolution_id,
-            source_version=completed.version,
-            feedback_id=feedback.feedback_id,
-            confirmed=True,
-        ),
+        plan,
+        strategy=strategy,
     )
     second = service.reserve_episode(
         task.evolution_id,

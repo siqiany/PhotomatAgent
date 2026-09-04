@@ -10,6 +10,13 @@ from photomatagent.scientific.evolution.revision import (
     build_revision_plan,
     format_revision_instruction,
 )
+from photomatagent.scientific.loop import (
+    ConstraintSpec,
+    EvaluationReport,
+    PropertyEvaluation,
+    ScientificLoopSummary,
+    TargetSpec,
+)
 
 
 def _feedback(*, raw_input: str = "RAW EXPERT PROSE 9f0b") -> ExpertFeedbackRecord:
@@ -253,3 +260,143 @@ def test_fixed_strategy_ignores_positive_signals_and_has_stable_tie_metadata() -
         feedback=_feedback(), compilation=_compilation(high, critical)
     ).strategy_reason
     assert reason.endswith("critical=1; high=1; first=item_004")
+
+
+def test_revision_plan_uses_frozen_target_and_known_previous_evidence_ids() -> None:
+    target = TargetSpec(
+        goal="Preserve the LWIR target",
+        constraints=[
+            ConstraintSpec(
+                property="band_gap",
+                operator="le",
+                value=0.2,
+                unit="eV",
+            )
+        ],
+    )
+    summary = ScientificLoopSummary(
+        status="INCONCLUSIVE",
+        rounds=1,
+        candidate_count=1,
+        best_candidate_id="cand_1",
+        best_score=0.2,
+        final_evaluation=EvaluationReport(
+            candidate_id="cand_1",
+            constraint_results=[
+                PropertyEvaluation(
+                    property="band_gap",
+                    result="PASS",
+                    evidence_ids=["sev_known"],
+                )
+            ],
+        ),
+    )
+    compilation = _compilation(
+        FeedbackDelta(
+            item_id="item_001",
+            category="TASK_DEFINITION",
+            status="CORRECTION",
+            severity="HIGH",
+            responsible_module="target_contract",
+            problem="Operating condition needs correction",
+            requested_actions=(
+                " Preserve evidence_id:sev_known   and update temperature ",
+                "Invalidate evidence_id:sev_known",
+            ),
+            acceptance_test="  Verify target band_gap contract  ",
+            preserve=(" Keep evidence_id:sev_known ",),
+            confidence=1.0,
+            source_span="source",
+        )
+    )
+
+    plan = build_revision_plan(
+        feedback=_feedback(),
+        compilation=compilation,
+        target=target,
+        previous_summary=summary,
+    )
+
+    assert plan.preserved_evidence_ids == ["sev_known"]
+    assert plan.invalidated_evidence_ids == ["sev_known"]
+    assert plan.contract_changes == [
+        "Preserve evidence_id:sev_known and update temperature",
+        "Invalidate evidence_id:sev_known",
+    ]
+    assert plan.machine_acceptance_tests == ["Verify target band_gap contract"]
+    assert plan.has_blocking_ambiguity is True
+    assert any(
+        "preserved and invalidated" in value
+        for value in plan.unresolved_ambiguities
+    )
+
+    other_target = target.model_copy(update={"goal": "Different immutable target"})
+    other = build_revision_plan(
+        feedback=_feedback(),
+        compilation=compilation,
+        target=other_target,
+        previous_summary=summary,
+    )
+    assert other.revision_id != plan.revision_id
+
+
+def test_unknown_explicit_evidence_reference_is_warned_and_never_added() -> None:
+    summary = ScientificLoopSummary(
+        status="INCONCLUSIVE",
+        rounds=1,
+        candidate_count=0,
+        best_candidate_id=None,
+        best_score=0.0,
+        final_evaluation=None,
+    )
+    plan = build_revision_plan(
+        feedback=_feedback(),
+        compilation=_compilation(
+            FeedbackDelta(
+                item_id="item_009",
+                category="EVIDENCE_SUFFICIENCY",
+                status="CORRECTION",
+                severity="HIGH",
+                responsible_module="retrieval",
+                problem="Invalidate evidence_id:sev_unknown",
+                requested_actions=("Invalidate evidence_id:sev_unknown",),
+                acceptance_test="Replacement evidence is present",
+                preserve=("Keep evidence_id:sev_unknown",),
+                confidence=1.0,
+                source_span="source",
+            )
+        ),
+        target=TargetSpec(goal="Target"),
+        previous_summary=summary,
+    )
+
+    assert plan.preserved_evidence_ids == []
+    assert plan.invalidated_evidence_ids == []
+    assert any("Unknown evidence ID sev_unknown" in value for value in plan.warnings)
+
+
+def test_whitespace_only_critical_positive_signal_is_blocking() -> None:
+    plan = build_revision_plan(
+        feedback=_feedback(),
+        compilation=_compilation(
+            FeedbackDelta(
+                item_id="item_010",
+                category="OTHER",
+                status="POSITIVE_SIGNAL",
+                severity="CRITICAL",
+                responsible_module="report",
+                problem="Preserve a claimed strength",
+                requested_actions=("   \n\t  ",),
+                acceptance_test="  ",
+                preserve=("  Keep   verified   section  ",),
+                confidence=1.0,
+                source_span="source",
+            )
+        ),
+    )
+
+    assert plan.preserved_facts == ["Keep verified section"]
+    assert plan.has_blocking_ambiguity is True
+    assert plan.unresolved_ambiguities == [
+        "CRITICAL item_010 needs a requested action or acceptance test"
+    ]

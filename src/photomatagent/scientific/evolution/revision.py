@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING
 
 from photomatagent.redaction import redact_text
 from photomatagent.scientific.evolution.models import (
@@ -13,7 +15,12 @@ from photomatagent.scientific.evolution.models import (
     FeedbackDelta,
     RevisionPlan,
     StrategyArm,
+    validate_managed_id,
 )
+from photomatagent.scientific.loop.target import TargetSpec
+
+if TYPE_CHECKING:
+    from photomatagent.scientific.loop.policy import ScientificLoopSummary
 
 _MAX_ITEM_TEXT = 500
 _MAX_PLAN_ITEMS = 100
@@ -31,12 +38,29 @@ _OUTPUT_MODULE_TERMS = ("output", "report", "schema", "deliverable", "render")
 _TARGET_MODULE_TERMS = ("target", "constraint", "contract", "task")
 _DIVERSITY_MODULE_TERMS = ("innovation", "novel", "divers", "candidate", "search")
 _UNCERTAINTY_TERMS = ("uncertain", "uncertainty", "ambig", "unknown")
+_EVIDENCE_REFERENCE = re.compile(
+    r"\bevidence(?:[_ -]?id)?\s*[:=]\s*([A-Za-z0-9_-]{1,200})\b",
+    re.IGNORECASE,
+)
+_INVALIDATION_TERMS = (
+    "invalidate",
+    "invalidated",
+    "remove",
+    "reject",
+    "discard",
+    "supersede",
+    "失效",
+    "作废",
+    "删除",
+)
 
 
 def build_revision_plan(
     *,
     feedback: ExpertFeedbackRecord,
     compilation: FeedbackCompilation,
+    target: TargetSpec | None = None,
+    previous_summary: ScientificLoopSummary | None = None,
 ) -> RevisionPlan:
     """Compile one AVAILABLE, identity-bound compilation into a safe plan.
 
@@ -54,12 +78,52 @@ def build_revision_plan(
     machine_tests: list[str] = []
     human_tests: list[str] = []
     ambiguities: list[str] = []
+    evidence_warnings: list[str] = []
+    preserved_evidence_ids: list[str] = []
+    invalidated_evidence_ids: list[str] = []
+    known_evidence_ids = _known_evidence_ids(previous_summary)
 
     for index, item in enumerate(compilation.items[:_MAX_PLAN_ITEMS], start=1):
         item_id = item.item_id or f"item_{index:03d}"
-        actions = [_bounded(value) for value in item.requested_actions]
-        preserve = [_bounded(value) for value in item.preserve]
+        actions = [
+            normalized
+            for value in item.requested_actions
+            if (normalized := _bounded(value))
+        ]
+        preserve = [
+            normalized
+            for value in item.preserve
+            if (normalized := _bounded(value))
+        ]
+        acceptance = _bounded(item.acceptance_test or "")
         module = item.responsible_module.lower()
+
+        if item.severity == "CRITICAL" and not actions and not acceptance:
+            ambiguities.append(
+                f"CRITICAL {item_id} needs a requested action or acceptance test"
+            )
+
+        preserve_refs = _evidence_references(preserve)
+        invalidation_refs = _invalidation_evidence_references(
+            [_bounded(item.problem), *actions]
+        )
+        for evidence_id, disposition in (
+            *((value, "preserve") for value in preserve_refs),
+            *((value, "invalidate") for value in invalidation_refs),
+        ):
+            if evidence_id not in known_evidence_ids:
+                evidence_warnings.append(
+                    f"Unknown evidence ID {evidence_id} referenced by {item_id}; not added"
+                )
+                if item.severity == "CRITICAL":
+                    ambiguities.append(
+                        f"CRITICAL {item_id} references unknown evidence ID {evidence_id}"
+                    )
+                continue
+            if disposition == "preserve":
+                preserved_evidence_ids.append(evidence_id)
+            else:
+                invalidated_evidence_ids.append(evidence_id)
 
         if item.status == "POSITIVE_SIGNAL":
             preserved_facts.extend(preserve or [_bounded(item.problem)])
@@ -78,8 +142,7 @@ def build_revision_plan(
                 if item.category == "SCIENTIFIC_CORRECTNESS":
                     invalidated_conclusions.append(_bounded(item.problem))
 
-            if item.acceptance_test:
-                acceptance = _bounded(item.acceptance_test)
+            if acceptance:
                 if item.status == "QUERY":
                     human_tests.append(f"QUERY {item_id}: {acceptance}")
                 else:
@@ -89,14 +152,13 @@ def build_revision_plan(
                     f"QUERY {item_id}: resolve uncertainty before treating it as fact"
                 )
 
-            if (
-                item.severity == "CRITICAL"
-                and not item.requested_actions
-                and not item.acceptance_test
-            ):
-                ambiguities.append(
-                    f"CRITICAL {item_id} needs a requested action or acceptance test"
-                )
+    conflicting_evidence = sorted(
+        set(preserved_evidence_ids) & set(invalidated_evidence_ids)
+    )
+    for evidence_id in conflicting_evidence:
+        ambiguities.append(
+            f"Evidence ID {evidence_id} cannot be both preserved and invalidated"
+        )
 
     arm, reason = _fixed_strategy_choice(compilation.items)
     identity_payload = {
@@ -109,6 +171,12 @@ def build_revision_plan(
             for item in compilation.items
         ],
         "warnings": list(compilation.warnings),
+        "target": target.model_dump(mode="json") if target is not None else None,
+        "previous_summary": (
+            previous_summary.model_dump(mode="json")
+            if previous_summary is not None
+            else None
+        ),
     }
     digest = hashlib.sha256(
         json.dumps(
@@ -127,13 +195,17 @@ def build_revision_plan(
         evidence_requirements=_dedupe(evidence_requirements),
         output_schema_requirements=_dedupe(output_schema_requirements),
         preserved_facts=_dedupe(preserved_facts),
+        preserved_evidence_ids=_dedupe(preserved_evidence_ids),
         prohibited_repeats=_dedupe(prohibited_repeats),
         invalidated_conclusions=_dedupe(invalidated_conclusions),
+        invalidated_evidence_ids=_dedupe(invalidated_evidence_ids),
         machine_acceptance_tests=_dedupe(machine_tests),
         human_acceptance_tests=_dedupe(human_tests),
         strategy_arm=arm,
         strategy_reason=reason,
-        warnings=_dedupe(_bounded(value) for value in compilation.warnings),
+        warnings=_dedupe(
+            [*(_bounded(value) for value in compilation.warnings), *evidence_warnings]
+        ),
         unresolved_ambiguities=_dedupe(ambiguities),
         has_blocking_ambiguity=bool(ambiguities),
         created_at=compilation.created_at,
@@ -272,7 +344,7 @@ def _fixed_strategy_choice(
 
 
 def _bounded(value: str) -> str:
-    safe = redact_text(value).strip()
+    safe = " ".join(redact_text(value).split())
     if len(safe) <= _MAX_ITEM_TEXT:
         return safe
     return safe[: _MAX_ITEM_TEXT - 1] + "…"
@@ -280,6 +352,45 @@ def _bounded(value: str) -> str:
 
 def _dedupe(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
+
+
+def _known_evidence_ids(
+    summary: ScientificLoopSummary | None,
+) -> frozenset[str]:
+    if summary is None:
+        return frozenset()
+    values: list[str] = []
+    evaluation = summary.final_evaluation
+    if evaluation is not None:
+        for result in evaluation.constraint_results:
+            values.extend(result.evidence_ids)
+        for violation in evaluation.violations:
+            values.extend(violation.evidence_ids)
+    for violation in summary.unresolved_violations:
+        values.extend(violation.evidence_ids)
+    valid: set[str] = set()
+    for value in values:
+        try:
+            valid.add(validate_managed_id(value))
+        except (TypeError, ValueError):
+            continue
+    return frozenset(sorted(valid))
+
+
+def _evidence_references(values: Iterable[str]) -> list[str]:
+    return _dedupe(
+        match.group(1)
+        for value in values
+        for match in _EVIDENCE_REFERENCE.finditer(value)
+    )
+
+
+def _invalidation_evidence_references(values: Iterable[str]) -> list[str]:
+    return _evidence_references(
+        value
+        for value in values
+        if any(term in value.lower() for term in _INVALIDATION_TERMS)
+    )
 
 
 __all__ = ["build_revision_plan", "format_revision_instruction"]
