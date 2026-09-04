@@ -35,6 +35,7 @@ from photomatagent.scientific.evolution.evidence import (
 )
 from photomatagent.scientific.evolution.feedback import FeedbackCompiler
 from photomatagent.scientific.evolution.models import (
+    ComparisonReport,
     EpisodeRecord,
     EpisodeVersion,
     EvolutionTask,
@@ -377,6 +378,69 @@ def evolve_history(
                 f"Error [{episode.version}]: {redact_text(episode.error)}",
                 soft_wrap=True,
             )
+
+
+@evolve_app.command("compare")
+def evolve_compare(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    left_version: str = typer.Argument(..., help="Earlier adjacent version"),
+    right_version: str = typer.Argument(..., help="Later adjacent version"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Persist and show a deterministic, redacted adjacent-episode comparison."""
+
+    try:
+        boundary = Workspace(workspace)
+        service = EvolutionService(EvolutionStore(boundary))
+        mutation = service.compare(
+            evolution_id,
+            cast(EpisodeVersion, left_version),
+            cast(EpisodeVersion, right_version),
+        )
+    except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        raise typer.Exit(code=2) from None
+    _render_comparison(console, mutation.entity)
+
+
+def _render_comparison(output: Console, report: ComparisonReport) -> None:
+    table = Table("Comparison", "Value")
+    table.add_row("Comparison ID", report.comparison_id)
+    table.add_row("Versions", f"{report.previous_version} → {report.current_version}")
+    table.add_row("Closure rate", _render_optional_rate(report.closure_rate))
+    table.add_row("Recurrence rate", _render_optional_rate(report.recurrence_rate))
+    table.add_row("New issue rate", _render_optional_rate(report.new_issue_rate))
+    table.add_row("Reward", "—" if report.reward is None else f"{report.reward:.3f}")
+    table.add_row("Components", ", ".join(report.components_used) or "—")
+    table.add_row(
+        "Artifact changed",
+        (
+            "—"
+            if report.artifact_diff is None
+            else str(report.artifact_diff.changed).lower()
+        ),
+    )
+    output.print(table)
+    if report.acceptance_results:
+        checks = Table("Acceptance ID", "Status", "Check")
+        for item in report.acceptance_results[:20]:
+            checks.add_row(
+                item.acceptance_id,
+                item.status,
+                _bounded_plan_text(item.detail),
+            )
+        output.print(checks)
+    if report.module_credit:
+        credits = Table("Module", "Credit")
+        for module, value in list(sorted(report.module_credit.items()))[:20]:
+            credits.add_row(_bounded_plan_text(module), f"{value:.3f}")
+        output.print(credits)
+
+
+def _render_optional_rate(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.3f}"
 
 
 @evolve_app.command("feedback")

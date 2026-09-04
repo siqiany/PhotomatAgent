@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import Generic, TypeVar, cast
 
 from photomatagent.runtime.events import (
+    EvolutionComparisonCompleted,
     EvolutionEpisodeCompleted,
     EvolutionEpisodeStarted,
     EvolutionIterationStarted,
     EvolutionTaskAccepted,
     EvolutionTaskCreated,
     EvolutionTaskStopped,
+    ExperienceStateChanged,
     ExpertFeedbackCompiled,
     ExpertFeedbackRecorded,
     RevisionPlanConfirmed,
@@ -24,9 +26,13 @@ from photomatagent.runtime.events import (
 )
 from photomatagent.errors import ToolExecutionError
 from photomatagent.redaction import redact_secrets
+from photomatagent.scientific.evolution.comparison import compare_episodes
 from photomatagent.scientific.evolution.events import bounded_summary
+from photomatagent.scientific.evolution.experience import create_experience
 from photomatagent.scientific.evolution.models import (
+    AcceptanceResult,
     ArtifactRef,
+    ComparisonReport,
     EpisodeRecord,
     EpisodeVersion,
     EvolutionResumeStatus,
@@ -150,6 +156,189 @@ class EvolutionService:
 
     def get(self, evolution_id: str) -> EvolutionTask:
         return self.store.load_task(evolution_id)
+
+    def compare(
+        self,
+        evolution_id: str,
+        previous_version: EpisodeVersion,
+        current_version: EpisodeVersion,
+    ) -> MutationResult[ComparisonReport]:
+        """Build and durably link one canonical adjacent-episode comparison.
+
+        Every input is reloaded under the task lock.  Primary artifacts are
+        hashed again, and declared scientific-state paths must name the
+        canonical immutable snapshots.  The operation writes immutable records
+        before atomically linking them into the task manifest, so a retry can
+        reconcile a crash at either boundary without creating a second
+        observation.
+        """
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            previous = transaction.load_episode(previous_version)
+            current = transaction.load_episode(current_version)
+            self._validate_comparison_episodes(task, previous, current)
+            self._verify_artifact(previous.artifact)
+            self._verify_artifact(current.artifact)
+            previous_state = self._comparison_state(previous)
+            current_state = self._comparison_state(current)
+            if current.revision_plan_id is None:
+                raise EvolutionOperationConflict(
+                    "revised episode does not name its applied revision plan"
+                )
+            if current.revision_plan_id not in task.revision_ids:
+                raise EvolutionOperationConflict(
+                    "applied revision plan is not linked by the task manifest"
+                )
+            plan = transaction.load_revision(current.revision_plan_id)
+            feedback_records = self.store.list_feedback(evolution_id)
+            previous_feedback = self._active_feedback(
+                feedback_records,
+                previous.version,
+            )
+            current_feedback = self._active_feedback(
+                feedback_records,
+                current.version,
+            )
+            if previous_feedback is None:
+                raise EvolutionOperationConflict(
+                    "adjacent comparison requires the feedback that produced "
+                    "the revision"
+                )
+            if previous_feedback.feedback_id not in task.feedback_ids:
+                raise EvolutionOperationConflict(
+                    "previous feedback is not linked by the task manifest"
+                )
+            self._require_feedback_artifact(previous_feedback, previous)
+            if current_feedback is not None:
+                if current_feedback.feedback_id not in task.feedback_ids:
+                    raise EvolutionOperationConflict(
+                        "current feedback is not linked by the task manifest"
+                    )
+                self._require_feedback_artifact(current_feedback, current)
+
+            previous_compilation = self._comparison_compilation(
+                task,
+                previous_feedback,
+            )
+            if previous_compilation is None:
+                raise EvolutionOperationConflict(
+                    "comparison source feedback has no canonical available compilation"
+                )
+            from photomatagent.scientific.evolution.revision import (
+                build_revision_plan,
+            )
+
+            canonical_plan = build_revision_plan(
+                feedback=previous_feedback,
+                compilation=previous_compilation,
+                target=previous.target_snapshot,
+                previous_summary=previous.summary,
+            ).model_copy(
+                update={
+                    "confirmed": True,
+                    "confirmed_at": plan.confirmed_at,
+                }
+            )
+            if plan != canonical_plan:
+                raise EvolutionOperationConflict(
+                    "comparison revision plan does not match canonical persisted inputs"
+                )
+            current_compilation = (
+                self._comparison_compilation(task, current_feedback)
+                if current_feedback is not None
+                else None
+            )
+            machine_results: dict[str, bool | str | AcceptanceResult] = {}
+            for result in current.acceptance_results:
+                machine_results[result.acceptance_id] = result
+                if result.detail:
+                    machine_results[result.detail] = result
+            report = compare_episodes(
+                previous=previous,
+                current=current,
+                previous_plan=plan,
+                previous_feedback=previous_feedback,
+                current_feedback=current_feedback,
+                previous_items=previous_compilation.items,
+                current_items=(
+                    current_compilation.items
+                    if current_compilation is not None
+                    else None
+                ),
+                machine_results=machine_results,
+                previous_state=previous_state,
+                current_state=current_state,
+            )
+            unsafe = self._unsafe_experience_observation(
+                previous_feedback,
+                current_feedback,
+                previous_compilation,
+                current_compilation,
+            )
+            experience = create_experience(
+                report,
+                task_group_id=task.task_group_id,
+                safety_or_fabrication_failure=unsafe,
+            )
+
+            try:
+                persisted_report = transaction.load_comparison(report.comparison_id)
+            except FileNotFoundError:
+                transaction.write_comparison(report)
+                persisted_report = transaction.load_comparison(report.comparison_id)
+            else:
+                if persisted_report != report:
+                    raise EvolutionOperationConflict(
+                        "comparison ID names different canonical content"
+                    )
+            try:
+                persisted_experience = transaction.load_experience(
+                    experience.experience_id
+                )
+            except FileNotFoundError:
+                transaction.write_experience(experience)
+                persisted_experience = transaction.load_experience(
+                    experience.experience_id
+                )
+            else:
+                if persisted_experience != experience:
+                    raise EvolutionOperationConflict(
+                        "experience ID names different canonical content"
+                    )
+
+            comparison_ids = self._append_once(
+                task.comparison_ids,
+                persisted_report.comparison_id,
+            )
+            experience_ids = self._append_once(
+                task.experience_ids,
+                persisted_experience.experience_id,
+            )
+            if (
+                comparison_ids != task.comparison_ids
+                or experience_ids != task.experience_ids
+            ):
+                transaction.save_task(
+                    task.model_copy(
+                        update={
+                            "comparison_ids": comparison_ids,
+                            "experience_ids": experience_ids,
+                        }
+                    ),
+                    expected_revision=task.revision,
+                )
+
+        return MutationResult(
+            persisted_report,
+            (
+                EvolutionComparisonCompleted(
+                    evolution_id=evolution_id,
+                    episode_version=current.version,
+                ),
+                ExperienceStateChanged(evolution_id=evolution_id),
+            ),
+        )
 
     def reconcile(self, evolution_id: str) -> MutationResult[EvolutionTask]:
         """Repair a task manifest left behind a terminal episode write.
@@ -1213,6 +1402,153 @@ class EvolutionService:
                 f"episode version {version} is not current version {task.current_version}"
             )
         return task, transaction.load_episode(version)
+
+    def _validate_comparison_episodes(
+        self,
+        task: EvolutionTask,
+        previous: EpisodeRecord,
+        current: EpisodeRecord,
+    ) -> None:
+        """Reject forged or stale records before computing scientific deltas."""
+
+        if (
+            previous.evolution_id != task.evolution_id
+            or current.evolution_id != task.evolution_id
+        ):
+            raise EvolutionOperationConflict(
+                "comparison episodes do not belong to the requested task"
+            )
+        previous_index = int(previous.version[1:])
+        current_index = int(current.version[1:])
+        if current.parent_version != previous.version:
+            raise InvalidEvolutionTransition(
+                "compare requires adjacent parent/child episodes"
+            )
+        if previous.status != "COMPLETED" or current.status != "COMPLETED":
+            raise InvalidEvolutionTransition(
+                "compare requires two completed episodes"
+            )
+        for episode, index in ((previous, previous_index), (current, current_index)):
+            if index < 1 or index > len(task.episode_ids):
+                raise EvolutionOperationConflict(
+                    f"episode {episode.version} is not linked by the task manifest"
+                )
+            expected_id = self._episode_id(task.evolution_id, episode.version)
+            if (
+                task.episode_ids[index - 1] != expected_id
+                or episode.episode_id != expected_id
+            ):
+                raise EvolutionOperationConflict(
+                    f"episode {episode.version} identity is not canonical"
+                )
+            snapshot = episode.task_snapshot
+            expected_snapshot = {
+                "evolution_id": task.evolution_id,
+                "goal": task.goal,
+                "target": task.target.model_dump(mode="json"),
+                "task_group_id": task.task_group_id,
+                "input_sha256": task.input_sha256,
+            }
+            for field, expected in expected_snapshot.items():
+                if snapshot.get(field) != expected:
+                    raise EvolutionOperationConflict(
+                        f"episode {episode.version} has noncanonical task "
+                        f"snapshot field {field}"
+                    )
+            if episode.target_snapshot != TargetSnapshot.model_validate(task.target):
+                raise EvolutionOperationConflict(
+                    f"episode {episode.version} target snapshot is not canonical"
+                )
+            artifact = episode.artifact
+            canonical_artifact = (
+                f"user_output/{task.evolution_id}/{episode.version}/result.md"
+            )
+            if artifact is None or artifact.path != canonical_artifact:
+                raise ArtifactMismatchError(
+                    f"episode {episode.version} does not name its canonical "
+                    "primary result"
+                )
+
+    def _comparison_state(self, episode: EpisodeRecord) -> ScientificState | None:
+        if episode.scientific_state_path is None:
+            return None
+        expected = (
+            f".photomatagent/evolutions/{episode.evolution_id}/episodes/"
+            f"{episode.version}.scientific.json"
+        )
+        if episode.scientific_state_path != expected:
+            raise EvolutionOperationConflict(
+                f"episode {episode.version} scientific-state path is not canonical"
+            )
+        try:
+            path = self.store.workspace.resolve(expected, must_exist=True)
+        except (OSError, ValueError, ToolExecutionError) as exc:
+            raise EvolutionOperationConflict(
+                f"episode {episode.version} scientific-state snapshot is unavailable"
+            ) from exc
+        if not path.is_file():
+            raise EvolutionOperationConflict(
+                f"episode {episode.version} scientific-state snapshot is not a file"
+            )
+        return self.store.load_scientific_state(
+            episode.evolution_id,
+            episode.version,
+        )
+
+    def _comparison_compilation(
+        self,
+        task: EvolutionTask,
+        feedback: ExpertFeedbackRecord,
+    ) -> FeedbackCompilation | None:
+        matches = [
+            item
+            for item in self.store.list_compilations(task.evolution_id)
+            if item.compilation_id in task.compilation_ids
+            and item.feedback_id == feedback.feedback_id
+            and item.episode_version == feedback.episode_version
+            and item.status == "AVAILABLE"
+        ]
+        if len(matches) > 1:
+            raise EvolutionOperationConflict(
+                f"feedback {feedback.feedback_id} has multiple available compilations"
+            )
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _require_feedback_artifact(
+        feedback: ExpertFeedbackRecord,
+        episode: EpisodeRecord,
+    ) -> None:
+        if (
+            episode.artifact is None
+            or feedback.result_sha256 != episode.artifact.sha256
+        ):
+            raise ArtifactMismatchError(
+                f"feedback {feedback.feedback_id} is not bound to its episode artifact"
+            )
+
+    @staticmethod
+    def _unsafe_experience_observation(
+        previous_feedback: ExpertFeedbackRecord,
+        current_feedback: ExpertFeedbackRecord | None,
+        previous_compilation: FeedbackCompilation | None,
+        current_compilation: FeedbackCompilation | None,
+    ) -> bool:
+        feedback_records = [previous_feedback]
+        if current_feedback is not None:
+            feedback_records.append(current_feedback)
+        if any(item.flags.fabricated_source for item in feedback_records):
+            return True
+        compilations = [
+            item
+            for item in (previous_compilation, current_compilation)
+            if item is not None
+        ]
+        return any(
+            delta.category == "SAFETY" and delta.status != "POSITIVE_SIGNAL"
+            for compilation in compilations
+            for delta in compilation.items
+        )
 
     @staticmethod
     def _require_episode_owner(

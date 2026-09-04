@@ -17,6 +17,7 @@ from pydantic import BaseModel, ValidationError
 
 from photomatagent.redaction import redact_secrets
 from photomatagent.scientific.evolution.models import (
+    ComparisonReport,
     EpisodeRecord,
     EpisodeStatus,
     EvolutionTask,
@@ -27,6 +28,7 @@ from photomatagent.scientific.evolution.models import (
     utc_now,
     validate_managed_id,
 )
+from photomatagent.scientific.evolution.experience import ExperienceRecord
 from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
 
@@ -247,6 +249,42 @@ class EvolutionTransaction:
             filename=f"{strategy.strategy_id}.json",
             record=strategy,
             model_type=StrategyVersion,
+        )
+
+    def load_comparison(self, comparison_id: str) -> ComparisonReport:
+        self._require_active()
+        return self.store.load_comparison(self.evolution_id, comparison_id)
+
+    def write_comparison(self, comparison: ComparisonReport) -> Path:
+        self._require_active()
+        if comparison.evolution_id != self.evolution_id:
+            raise EvolutionConflictError(
+                "comparison belongs to a different transaction"
+            )
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="comparisons",
+            filename=f"{comparison.comparison_id}.json",
+            record=comparison,
+            model_type=ComparisonReport,
+        )
+
+    def load_experience(self, experience_id: str) -> ExperienceRecord:
+        self._require_active()
+        return self.store.load_experience(self.evolution_id, experience_id)
+
+    def write_experience(self, experience: ExperienceRecord) -> Path:
+        self._require_active()
+        if experience.evolution_id != self.evolution_id:
+            raise EvolutionConflictError(
+                "experience belongs to a different transaction"
+            )
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="experience",
+            filename=f"{experience.experience_id}.json",
+            record=experience,
+            model_type=ExperienceRecord,
         )
 
 
@@ -602,6 +640,125 @@ class EvolutionStore:
             except (TypeError, ValueError):
                 continue
             records.append(self.load_strategy(evolution_id, path.stem))
+        return records
+
+    def write_comparison(self, comparison: ComparisonReport) -> Path:
+        """Persist one immutable adjacent-episode comparison snapshot."""
+
+        self._validate_id(comparison.comparison_id)
+        return self._write_record(
+            evolution_id=comparison.evolution_id,
+            directory="comparisons",
+            filename=f"{comparison.comparison_id}.json",
+            record=comparison,
+            model_type=ComparisonReport,
+        )
+
+    def load_comparison(
+        self,
+        evolution_id: str,
+        comparison_id: str,
+    ) -> ComparisonReport:
+        """Load one comparison bound to its managed task and filename."""
+
+        self._validate_id(comparison_id)
+        path = self._managed_path(
+            evolution_id,
+            "comparisons",
+            f"{comparison_id}.json",
+        )
+        comparison = self._load_model(
+            path,
+            ComparisonReport,
+            require_schema_version=True,
+        )
+        if (
+            comparison.evolution_id != evolution_id
+            or comparison.comparison_id != comparison_id
+        ):
+            raise EvolutionCorruptRecordError(
+                path,
+                "comparison identity does not match its managed path",
+            )
+        return comparison
+
+    def list_comparisons(self, evolution_id: str) -> list[ComparisonReport]:
+        """Load every immutable comparison for one evolution task."""
+
+        return self._list_managed_records(
+            evolution_id,
+            "comparisons",
+            self.load_comparison,
+        )
+
+    def write_experience(
+        self,
+        experience: ExperienceRecord,
+    ) -> Path:
+        """Persist one immutable experience maturity snapshot."""
+
+        self._validate_id(experience.experience_id)
+        return self._write_record(
+            evolution_id=experience.evolution_id,
+            directory="experience",
+            filename=f"{experience.experience_id}.json",
+            record=experience,
+            model_type=ExperienceRecord,
+        )
+
+    def load_experience(
+        self,
+        evolution_id: str,
+        experience_id: str,
+    ) -> ExperienceRecord:
+        """Load one experience bound to its immutable managed filename."""
+
+        self._validate_id(experience_id)
+        path = self._managed_path(
+            evolution_id,
+            "experience",
+            f"{experience_id}.json",
+        )
+        experience = self._load_model(
+            path,
+            ExperienceRecord,
+            require_schema_version=True,
+        )
+        if (
+            experience.evolution_id != evolution_id
+            or experience.experience_id != experience_id
+        ):
+            raise EvolutionCorruptRecordError(
+                path,
+                "experience identity does not match its managed path",
+            )
+        return experience
+
+    def list_experiences(self, evolution_id: str) -> list[ExperienceRecord]:
+        """Load every immutable experience snapshot for one task."""
+
+        return self._list_managed_records(
+            evolution_id,
+            "experience",
+            self.load_experience,
+        )
+
+    def _list_managed_records(
+        self,
+        evolution_id: str,
+        directory_name: str,
+        loader: Any,
+    ) -> list[Any]:
+        directory = self._managed_path(evolution_id, directory_name)
+        if not directory.is_dir():
+            return []
+        records: list[Any] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                self._validate_id(path.stem)
+            except (TypeError, ValueError):
+                continue
+            records.append(loader(evolution_id, path.stem))
         return records
 
     def _write_record_locked(
