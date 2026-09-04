@@ -16,6 +16,7 @@ from typing import Literal, cast
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from photomatagent.errors import ToolExecutionError
 from photomatagent.config import LLMConfig
@@ -34,6 +35,7 @@ from photomatagent.scientific.evolution.models import (
     EvolutionTask,
 )
 from photomatagent.scientific.evolution.service import (
+    EvolutionServiceError,
     EvolutionService,
     MutationResult,
 )
@@ -41,6 +43,7 @@ from photomatagent.scientific.evolution.store import EvolutionStore
 from photomatagent.scientific.loop import (
     ScientificJudge,
     ScientificLoopConfig,
+    ScientificLoopSummary,
     TargetSpec,
 )
 from photomatagent.workspace import Workspace
@@ -234,7 +237,7 @@ def evolve_start(
         )
         raise typer.Exit(code=1) from None
 
-    _render_summary(console, execution.scientific_summary)
+    _render_summary(console, _redacted_summary(execution.scientific_summary))
     completed_task = service.get(task.evolution_id)
     _render_start_result(completed_task, execution, boundary.root)
     if logger is not None:
@@ -321,6 +324,27 @@ def evolve_history(
                 f"Error [{episode.version}]: {redact_text(episode.error)}",
                 soft_wrap=True,
             )
+
+
+@evolve_app.command("cancel")
+def evolve_cancel(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Cancel the current active episode or reconcile its terminal state."""
+
+    boundary = Workspace(workspace)
+    service = EvolutionService(EvolutionStore(boundary))
+    try:
+        cancelled = service.cancel(evolution_id)
+    except (FileNotFoundError, ValueError, EvolutionServiceError) as exc:
+        raise typer.BadParameter(
+            redact_text(str(exc)),
+            param_hint="evolution_id",
+        ) from exc
+    _render_task_details(cancelled.entity, boundary.root)
 
 
 async def _execute_initial_episode(
@@ -420,6 +444,11 @@ def _redacted_event(event: RuntimeEvent) -> RuntimeEvent:
     return type(event).model_validate(payload)
 
 
+def _redacted_summary(summary: ScientificLoopSummary) -> ScientificLoopSummary:
+    payload = redact_secrets(summary.model_dump(mode="python"))
+    return ScientificLoopSummary.model_validate(payload)
+
+
 def _report_start_failure(
     *,
     service: EvolutionService,
@@ -477,14 +506,16 @@ def _render_task_details(task: EvolutionTask, workspace: Path) -> None:
         "Feedback / revisions",
         f"{len(task.feedback_ids)} / {len(task.revision_ids)}",
     )
-    table.add_row("Next command", _next_command(task, workspace))
+    table.add_row("Next command", Text(_next_command(task, workspace)))
     console.print(table)
     _print_next_command(task, workspace)
 
 
 def _print_next_command(task: EvolutionTask, workspace: Path) -> None:
     command = _next_command(task, workspace)
-    console.print(f"Next command: [bold]{command}[/]", soft_wrap=True)
+    line = Text("Next command: ")
+    line.append(command, style="bold")
+    console.print(line, soft_wrap=True)
 
 
 def _next_command(task: EvolutionTask, workspace: Path) -> str:
@@ -494,7 +525,7 @@ def _next_command(task: EvolutionTask, workspace: Path) -> str:
         command = f"photomatagent evolve start --resume {task.evolution_id}"
     else:
         action = {
-            "RUNNING": "stop",
+            "RUNNING": "cancel",
             "AWAITING_EXPERT_FEEDBACK": "feedback",
             "FEEDBACK_RECORDED": "compile",
             "REVISION_READY": "iterate",

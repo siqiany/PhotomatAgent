@@ -66,6 +66,7 @@ _EPISODE_COMPLETION_IDENTITY_FIELDS = tuple(
     for field in EpisodeRecord.model_fields
     if field not in _EPISODE_COMPLETION_OUTPUT_FIELDS
 )
+_USER_CANCELLATION_ERROR = "Cancelled by user via evolution CLI."
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +437,96 @@ class EvolutionService:
                     "failed episode cannot reconcile with task state"
                 )
         return MutationResult(saved_episode)
+
+    def cancel(self, evolution_id: str) -> MutationResult[EvolutionTask]:
+        """Safely reconcile or cancel the task's active episode.
+
+        The episode transition precedes the task-manifest update, matching the
+        existing crash-recovery protocol. Repeating cancellation after either
+        terminal state is therefore a harmless read of the reconciled task.
+        """
+
+        events: tuple[RuntimeEvent, ...] = ()
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.current_version is None:
+                raise InvalidEvolutionTransition(
+                    "cancellation requires a current episode"
+                )
+            episode = transaction.load_episode(task.current_version)
+            expected_episode_id = self._episode_id(
+                evolution_id,
+                task.current_version,
+            )
+            if (
+                episode.episode_id != expected_episode_id
+                or not task.episode_ids
+                or task.episode_ids[-1] != episode.episode_id
+            ):
+                raise EvolutionOperationConflict(
+                    "current episode identity does not match the task manifest"
+                )
+
+            if task.status != "RUNNING":
+                if (
+                    (task.status == "BLOCKED" and episode.status == "FAILED")
+                    or (
+                        task.status == "AWAITING_EXPERT_FEEDBACK"
+                        and episode.status == "COMPLETED"
+                    )
+                ):
+                    return MutationResult(task)
+                raise InvalidEvolutionTransition(
+                    f"cancel requires a RUNNING task; task is {task.status}"
+                )
+
+            if episode.status == "COMPLETED":
+                self.validate_transition(task.status, "AWAITING_EXPERT_FEEDBACK")
+                updated = task.model_copy(
+                    update={
+                        "status": "AWAITING_EXPERT_FEEDBACK",
+                        "resume_status": None,
+                        "last_completed_version": episode.version,
+                    }
+                )
+                events = (
+                    EvolutionEpisodeCompleted(
+                        evolution_id=evolution_id,
+                        episode_version=episode.version,
+                    ),
+                )
+            else:
+                if episode.status in {"RESERVED", "RUNNING"}:
+                    failed = episode.model_copy(
+                        update={
+                            "status": "FAILED",
+                            "completed_at": utc_now(),
+                            "error": _USER_CANCELLATION_ERROR,
+                        }
+                    )
+                    transaction.transition_episode(
+                        failed,
+                        expected_status=episode.status,
+                    )
+                elif episode.status != "FAILED":
+                    raise InvalidEvolutionTransition(
+                        f"cannot cancel episode in {episode.status} state"
+                    )
+                self.validate_transition(task.status, "BLOCKED")
+                checkpoint: EvolutionResumeStatus = (
+                    "CREATED"
+                    if task.last_completed_version is None
+                    else "REVISION_READY"
+                )
+                updated = task.model_copy(
+                    update={"status": "BLOCKED", "resume_status": checkpoint}
+                )
+
+            saved = transaction.save_task(
+                updated,
+                expected_revision=task.revision,
+            )
+        return MutationResult(saved, events)
 
     def attach_feedback(
         self,

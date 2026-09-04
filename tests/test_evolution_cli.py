@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import shlex
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,10 +21,20 @@ from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
-from photomatagent.scientific.evolution.models import ArtifactRef
+from photomatagent.scientific.evolution.models import (
+    ArtifactRef,
+    ExpertFeedbackDraft,
+    RevisionPlan,
+    RubricScores,
+)
 from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.store import EvolutionStore
-from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
+from photomatagent.scientific.loop import (
+    JudgeIssue,
+    JudgeReport,
+    ScientificLoopSummary,
+    TargetSpec,
+)
 from photomatagent.scientific.state import ScientificState
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.workspace import Workspace
@@ -647,7 +658,7 @@ def test_start_resume_is_mutually_exclusive_with_creation_arguments(
     ("status", "resume_status", "expected_action"),
     [
         ("CREATED", None, ["start", "--resume"]),
-        ("RUNNING", None, ["stop"]),
+        ("RUNNING", None, ["cancel"]),
         ("AWAITING_EXPERT_FEEDBACK", None, ["feedback"]),
         ("FEEDBACK_RECORDED", None, ["compile"]),
         ("REVISION_READY", None, ["iterate"]),
@@ -702,3 +713,242 @@ def test_blocked_initial_retry_next_command_is_executable_start_resume(
         "--workspace",
         str(workspace.resolve()),
     ]
+
+
+def test_start_redacts_every_judge_summary_string_before_rendering(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets = {
+        "error": "judge-error-secret",
+        "issue": "judge-issue-secret",
+        "recommendation": "judge-recommendation-secret",
+        "rationale": "judge-rationale-secret",
+    }
+    original_execute = evolve_module._execute_initial_episode
+    original_render = loop_module._render_summary
+    rendered: list[ScientificLoopSummary] = []
+
+    async def execute_with_secret_summary(**kwargs):  # type: ignore[no-untyped-def]
+        result = await original_execute(**kwargs)
+        report = JudgeReport(
+            status="AVAILABLE",
+            scientific_quality=0.5,
+            issues=[
+                JudgeIssue(
+                    severity="HIGH",
+                    description=f"password={secrets['issue']}",
+                )
+            ],
+            recommendations=[
+                f"Authorization: Bearer {secrets['recommendation']}"
+            ],
+            rationale=f"api_key={secrets['rationale']}",
+            error=f"password={secrets['error']}",
+        )
+        return replace(
+            result,
+            scientific_summary=result.scientific_summary.model_copy(
+                update={"judge_report": report}
+            ),
+        )
+
+    def capture_render(console, summary):  # type: ignore[no-untyped-def]
+        rendered.append(summary)
+        original_render(console, summary)
+
+    monkeypatch.setattr(chat_module, "build_runtime", lambda **kwargs: (_runtime(tmp_path), None))
+    monkeypatch.setattr(evolve_module, "_execute_initial_episode", execute_with_secret_summary)
+    monkeypatch.setattr(loop_module, "_render_summary", capture_render)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "start",
+            "--target-json",
+            _target_json(),
+            "--provider",
+            "fake",
+            "--max-rounds",
+            "1",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(rendered) == 1
+    redacted_json = rendered[0].model_dump_json()
+    for secret in secrets.values():
+        assert secret not in result.output
+        assert secret not in redacted_json
+    assert "[REDACTED]" in redacted_json
+
+
+@pytest.mark.parametrize("episode_status", ["RESERVED", "RUNNING"])
+def test_cancel_fails_active_episode_and_is_idempotent(
+    episode_status: str,
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    target = TargetSpec.model_validate_json(_target_json())
+    task = service.create_task(goal=target.goal, target=target).entity
+    episode = service.reserve_episode(task.evolution_id, mode="NORMAL").entity
+    if episode_status == "RUNNING":
+        service.mark_episode_running(
+            task.evolution_id,
+            episode.version,
+            runtime_session_id="session_to_cancel",
+        )
+
+    arguments = [
+        "evolve",
+        "cancel",
+        task.evolution_id,
+        "--workspace",
+        str(tmp_path),
+    ]
+    first = cli_runner.invoke(app, arguments)
+    second = cli_runner.invoke(app, arguments)
+
+    assert first.exit_code == second.exit_code == 0
+    cancelled = service.get(task.evolution_id)
+    failed = service.store.load_episode(task.evolution_id, episode.version)
+    assert cancelled.status == "BLOCKED"
+    assert cancelled.resume_status == "CREATED"
+    assert cancelled.last_completed_version is None
+    assert failed.status == "FAILED"
+    assert failed.error == "Cancelled by user via evolution CLI."
+    assert "BLOCKED" in second.output
+
+
+def test_cancel_preserves_last_good_revision(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    task = _completed_task(tmp_path)
+    completed = service.store.load_episode(task.evolution_id, "v001")
+    feedback = service.attach_feedback(
+        task.evolution_id,
+        completed.version,
+        feedback_id="fb_cancel_test",
+        draft=ExpertFeedbackDraft(
+            scores=RubricScores(
+                scientific_correctness=3,
+                evidence_sufficiency=3,
+                novelty=3,
+                actionability=3,
+                overall=3,
+            )
+        ),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+    ).entity
+    service.confirm_revision(
+        task.evolution_id,
+        RevisionPlan(
+            revision_id="rp_cancel_test",
+            evolution_id=task.evolution_id,
+            source_version=completed.version,
+            feedback_id=feedback.feedback_id,
+            confirmed=True,
+        ),
+    )
+    second = service.reserve_episode(
+        task.evolution_id,
+        mode="CARRY_VERIFIED_EVIDENCE",
+    ).entity
+    service.mark_episode_running(task.evolution_id, second.version)
+
+    result = cli_runner.invoke(
+        app,
+        ["evolve", "cancel", task.evolution_id, "--workspace", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    cancelled = service.get(task.evolution_id)
+    assert cancelled.status == "BLOCKED"
+    assert cancelled.resume_status == "REVISION_READY"
+    assert cancelled.current_version == "v002"
+    assert cancelled.last_completed_version == "v001"
+    assert service.store.load_episode(task.evolution_id, "v001").status == "COMPLETED"
+    assert service.store.load_episode(task.evolution_id, "v002").status == "FAILED"
+
+
+def test_cancel_reconciles_completed_episode_manifest_split(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    target = TargetSpec.model_validate_json(_target_json())
+    task = service.create_task(goal=target.goal, target=target).entity
+    reserved = service.reserve_episode(task.evolution_id, mode="NORMAL").entity
+    running = service.mark_episode_running(task.evolution_id, reserved.version).entity
+    relative = f"user_output/{task.evolution_id}/v001/result.md"
+    artifact_path = service.store.workspace.resolve(relative, must_exist=False)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    content = b"completed result"
+    artifact_path.write_bytes(content)
+    completed = running.model_copy(
+        update={
+            "summary": ScientificLoopSummary(
+                status="INCONCLUSIVE",
+                rounds=1,
+                candidate_count=0,
+                best_candidate_id=None,
+                best_score=0.0,
+                final_evaluation=None,
+            ),
+            "artifact": ArtifactRef(
+                path=relative,
+                size_bytes=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+            ),
+        }
+    )
+
+    original_save = service.store._save_task_locked
+    monkeypatch.setattr(
+        service.store,
+        "_save_task_locked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("manifest split")),
+    )
+    with pytest.raises(OSError, match="manifest split"):
+        service.complete_episode(task.evolution_id, running.version, result=completed)
+    monkeypatch.setattr(service.store, "_save_task_locked", original_save)
+
+    result = cli_runner.invoke(
+        app,
+        ["evolve", "cancel", task.evolution_id, "--workspace", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    reconciled = service.get(task.evolution_id)
+    assert reconciled.status == "AWAITING_EXPERT_FEEDBACK"
+    assert reconciled.last_completed_version == "v001"
+    assert service.store.load_episode(task.evolution_id, "v001").status == "COMPLETED"
+
+
+def test_status_renders_bracketed_workspace_next_command_literally(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace [bold] with spaces"
+    workspace.mkdir()
+    task = _completed_task(workspace)
+    expected = (
+        f"photomatagent evolve feedback {task.evolution_id} --version v001 "
+        f"--workspace {shlex.quote(str(workspace.resolve()))}"
+    )
+
+    result = cli_runner.invoke(
+        app,
+        ["evolve", "status", task.evolution_id, "--workspace", str(workspace)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Next command: {expected}" in result.output
