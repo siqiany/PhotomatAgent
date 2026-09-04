@@ -383,6 +383,78 @@ def test_lock_is_removed_when_owner_token_initialization_raises(
     assert not (store.root / "evo_test/.lock").exists()
 
 
+def test_lock_is_removed_and_descriptor_closed_when_fstat_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    opened_descriptor: int | None = None
+    original_open = os.open
+    original_fstat = os.fstat
+
+    def track_open(path: str | Path, flags: int, mode: int = 0o777) -> int:
+        nonlocal opened_descriptor
+        opened_descriptor = original_open(path, flags, mode)
+        return opened_descriptor
+
+    def fail_fstat(descriptor: int) -> os.stat_result:
+        raise OSError("fstat failed")
+
+    monkeypatch.setattr("photomatagent.scientific.evolution.store.os.open", track_open)
+    monkeypatch.setattr("photomatagent.scientific.evolution.store.os.fstat", fail_fstat)
+
+    with pytest.raises(OSError, match="fstat failed"):
+        store.save_task(store.load_task("evo_test"), expected_revision=0)
+
+    assert not (store.root / "evo_test/.lock").exists()
+    assert opened_descriptor is not None
+    with pytest.raises(OSError):
+        original_fstat(opened_descriptor)
+
+
+def test_lock_token_write_retries_short_writes_without_leaking_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    original_write = os.write
+    write_sizes: list[int] = []
+
+    def short_first_write(descriptor: int, data: bytes) -> int:
+        write_sizes.append(len(data))
+        if len(write_sizes) == 1:
+            return original_write(descriptor, data[:3])
+        return original_write(descriptor, data)
+
+    monkeypatch.setattr(
+        "photomatagent.scientific.evolution.store.os.write", short_first_write
+    )
+
+    saved = store.save_task(store.load_task("evo_test"), expected_revision=0)
+
+    assert saved.revision == 1
+    assert len(write_sizes) >= 2
+    assert write_sizes[1] == write_sizes[0] - 3
+    assert not (store.root / "evo_test/.lock").exists()
+
+
+def test_lock_token_write_fails_on_zero_progress_without_leaking_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+
+    monkeypatch.setattr(
+        "photomatagent.scientific.evolution.store.os.write",
+        lambda descriptor, data: 0,
+    )
+
+    with pytest.raises(OSError, match="no progress"):
+        store.save_task(store.load_task("evo_test"), expected_revision=0)
+
+    assert not (store.root / "evo_test/.lock").exists()
+
+
 def test_concurrent_saves_allow_exactly_one_revision_winner(tmp_path: Path) -> None:
     store = EvolutionStore(Workspace(tmp_path))
     store.create_task(make_task())
@@ -522,6 +594,22 @@ def test_load_task_reports_malformed_and_unsupported_records_with_context(
     assert "schema_version=2" in str(unsupported.value)
 
 
+def test_load_task_rejects_record_whose_identity_differs_from_directory(
+    tmp_path: Path,
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    task_path = store.root / "evo_requested/task.json"
+    task_path.parent.mkdir()
+    task_path.write_text(make_task("evo_stored").model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(EvolutionCorruptRecordError) as caught:
+        store.load_task("evo_requested")
+
+    assert caught.value.path == task_path
+    assert "requested='evo_requested'" in str(caught.value)
+    assert "stored='evo_stored'" in str(caught.value)
+
+
 def test_load_scientific_state_reports_corrupt_json_with_path(tmp_path: Path) -> None:
     store = EvolutionStore(Workspace(tmp_path))
     store.create_task(make_task())
@@ -548,6 +636,21 @@ def test_list_tasks_surfaces_first_corrupt_task_in_sorted_order(tmp_path: Path) 
         store.list_tasks()
 
     assert caught.value.path == earlier
+
+
+def test_list_tasks_deterministically_surfaces_mismatched_task_identity(
+    tmp_path: Path,
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    mismatch = store.root / "evo_a/task.json"
+    mismatch.parent.mkdir()
+    mismatch.write_text(make_task("evo_other").model_dump_json(), encoding="utf-8")
+    store.create_task(make_task("evo_b"))
+
+    with pytest.raises(EvolutionCorruptRecordError) as caught:
+        store.list_tasks()
+
+    assert caught.value.path == mismatch
 
 
 def test_list_tasks_is_sorted_and_ignores_non_task_entries(tmp_path: Path) -> None:

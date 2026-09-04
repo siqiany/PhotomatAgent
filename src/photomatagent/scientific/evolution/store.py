@@ -115,7 +115,14 @@ class EvolutionStore:
     def load_task(self, evolution_id: str) -> EvolutionTask:
         """Load and validate the authoritative task record."""
         path = self._task_path(evolution_id)
-        return self._load_model(path, EvolutionTask, require_schema_version=True)
+        task = self._load_model(path, EvolutionTask, require_schema_version=True)
+        if task.evolution_id != evolution_id:
+            raise EvolutionCorruptRecordError(
+                path,
+                "task identity does not match its managed directory: "
+                f"requested={evolution_id!r}, stored={task.evolution_id!r}",
+            )
+        return task
 
     def save_task(
         self, task: EvolutionTask, expected_revision: int
@@ -333,10 +340,13 @@ class EvolutionStore:
                         f"timed out acquiring evolution task lock: {task_dir.name}"
                     ) from exc
                 time.sleep(min(self.lock_poll_seconds, remaining))
-        owner_stat = os.fstat(descriptor)
+        path_stat: os.stat_result | None = None
+        owner_stat: os.stat_result | None = None
         initialized = False
         try:
-            os.write(descriptor, owner_token.encode("ascii"))
+            path_stat = lock_path.stat(follow_symlinks=False)
+            owner_stat = os.fstat(descriptor)
+            self._write_all(descriptor, owner_token.encode("ascii"))
             os.fsync(descriptor)
             initialized = True
             yield
@@ -344,11 +354,22 @@ class EvolutionStore:
             try:
                 os.close(descriptor)
             finally:
-                self._release_owned_lock(
-                    lock_path,
-                    owner_stat,
-                    owner_token if initialized else None,
-                )
+                ownership = owner_stat if owner_stat is not None else path_stat
+                if ownership is not None:
+                    self._release_owned_lock(
+                        lock_path,
+                        ownership,
+                        owner_token if initialized else None,
+                    )
+
+    @staticmethod
+    def _write_all(descriptor: int, data: bytes) -> None:
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("lock owner token write made no progress")
+            remaining = remaining[written:]
 
     @staticmethod
     def _release_owned_lock(
