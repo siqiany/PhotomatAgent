@@ -365,11 +365,38 @@ def scientific_approve(
         ApprovalReceiptStore,
     )
 
-    store = ApprovalReceiptStore(workspace)
-    pending = store.load_pending(decision_id)
-    if pending is None:
+    boundary = Workspace(workspace)
+    stores = [ApprovalReceiptStore(boundary.root)]
+    evolution_approvals = boundary.resolve(
+        ".photomatagent/evolution-approvals",
+        must_exist=False,
+    )
+    if evolution_approvals.is_dir():
+        for database in sorted(evolution_approvals.rglob("approvals.sqlite3")):
+            resolved = database.resolve()
+            if (
+                not boundary.contains(resolved)
+                or resolved.parent.name != "vasp"
+                or resolved.parent.parent.name != ".photomatagent"
+            ):
+                continue
+            stores.append(ApprovalReceiptStore(resolved.parents[2]))
+    matches = [
+        (candidate, candidate.load_pending(decision_id))
+        for candidate in stores
+    ]
+    matches = [(candidate, pending) for candidate, pending in matches if pending]
+    if not matches:
         console.print(f"[red]unknown pending decision: {decision_id}[/]")
         raise typer.Exit(code=1)
+    if len(matches) > 1:
+        console.print(
+            f"[red]pending decision is ambiguous across approval scopes: "
+            f"{decision_id}[/]"
+        )
+        raise typer.Exit(code=1)
+    store, pending = matches[0]
+    assert pending is not None
 
     console.print(f"workflow_id: {pending.workflow_id}")
     console.print(f"approval kind: {pending.kind.value}")

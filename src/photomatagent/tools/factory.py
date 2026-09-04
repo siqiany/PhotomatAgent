@@ -35,6 +35,7 @@ def create_default_registry(
     *,
     skill_loader: SkillLoader | None = None,
     surface_config: ToolSurfaceConfig | None = None,
+    application_approval_root: Path | str | None = None,
 ) -> ToolRegistry:
     boundary = workspace if isinstance(workspace, Workspace) else Workspace(workspace or Path.cwd())
     registry = ToolRegistry()
@@ -53,7 +54,13 @@ def create_default_registry(
         ]
     )
     scientific_config = ScientificConfig.from_environment(workspace=boundary.root)
-    registry.register_all(build_scientific_tools(scientific_config, boundary))
+    registry.register_all(
+        build_scientific_tools(
+            scientific_config,
+            boundary,
+            vasp_approval_root=application_approval_root,
+        )
+    )
     config = surface_config or ToolSurfaceConfig()
     catalog = ToolCatalog(registry)
     registry.register_all(

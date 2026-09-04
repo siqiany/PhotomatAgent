@@ -93,6 +93,16 @@ class IterationContext:
     previous_scientific_state: ScientificState
 
 
+@dataclass(frozen=True, slots=True)
+class IterationClaim:
+    """One atomically verified and owner-bound revised episode claim."""
+
+    context: IterationContext
+    episode: EpisodeRecord
+    owner_token: str
+    events: tuple[RuntimeEvent, ...] = ()
+
+
 ALLOWED_TRANSITIONS: dict[EvolutionStatus, frozenset[EvolutionStatus]] = {
     "CREATED": frozenset({"RUNNING", "STOPPED"}),
     "RUNNING": frozenset(
@@ -246,106 +256,138 @@ class EvolutionService:
         tool_surface_fingerprint: Sha256 | None = None,
         capability_fingerprint: Sha256 | None = None,
         data_source_fingerprints: dict[str, Sha256] | None = None,
+        owner_token: str | None = None,
     ) -> MutationResult[EpisodeRecord]:
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
-            initial = task.last_completed_version is None
-            required_status: EvolutionStatus = "CREATED" if initial else "REVISION_READY"
-            strategy_id, strategy_arm = self._reservation_strategy(
+            return self._reserve_episode_locked(
                 transaction,
                 task,
-            )
-            if task.status == "RUNNING" and task.current_version is not None:
-                existing = transaction.load_episode(task.current_version)
-                self._validate_reservation(
-                    existing,
-                    task,
-                    mode,
-                    provider,
-                    model,
-                    tool_surface_fingerprint,
-                    capability_fingerprint,
-                    data_source_fingerprints or {},
-                    strategy_id,
-                    strategy_arm,
-                )
-                return MutationResult(existing, self._reservation_events(existing, initial))
-            if task.status != required_status:
-                raise InvalidEvolutionTransition(
-                    f"cannot reserve an episode while task is {task.status}; "
-                    f"required {required_status}"
-                )
-            if initial and mode != "NORMAL":
-                raise InvalidEvolutionTransition("an initial or retry episode must use NORMAL")
-            if not initial and mode == "NORMAL":
-                raise InvalidEvolutionTransition(
-                    "a revised episode requires an explicit evidence/evaluation mode"
-                )
-            self.validate_transition(task.status, "RUNNING")
-            version = self._next_version(task.current_version)
-            episode = EpisodeRecord(
-                evolution_id=evolution_id,
-                episode_id=self._episode_id(evolution_id, version),
-                version=version,
-                parent_version=task.last_completed_version,
-                applied_feedback_id=(task.feedback_ids[-1] if task.feedback_ids else None),
-                revision_plan_id=(task.revision_ids[-1] if task.revision_ids else None),
-                execution_mode=mode,
-                strategy_id=strategy_id,
-                strategy_arm=strategy_arm,
-                task_snapshot=task.model_dump(mode="json"),
-                target_snapshot=TargetSnapshot.model_validate(task.target),
+                mode=mode,
                 provider=provider,
                 model=model,
                 tool_surface_fingerprint=tool_surface_fingerprint,
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
+                owner_token=owner_token,
             )
-            try:
-                existing = transaction.load_episode(version)
-            except FileNotFoundError:
-                transaction.write_episode(episode)
-                persisted = episode
-            else:
-                self._validate_reservation(
-                    existing,
-                    task,
-                    mode,
-                    provider,
-                    model,
-                    tool_surface_fingerprint,
-                    capability_fingerprint,
-                    data_source_fingerprints or {},
-                    strategy_id,
-                    strategy_arm,
-                )
-                persisted = existing
-            updated = task.model_copy(
-                update={
-                    "status": "RUNNING",
-                    "resume_status": None,
-                    "current_version": version,
-                    "episode_ids": self._append_once(
-                        task.episode_ids, persisted.episode_id
-                    ),
-                }
+
+    def _reserve_episode_locked(
+        self,
+        transaction: EvolutionTransaction,
+        task: EvolutionTask,
+        *,
+        mode: ExecutionMode,
+        provider: str | None,
+        model: str | None,
+        tool_surface_fingerprint: Sha256 | None,
+        capability_fingerprint: Sha256 | None,
+        data_source_fingerprints: dict[str, Sha256],
+        owner_token: str | None,
+    ) -> MutationResult[EpisodeRecord]:
+        evolution_id = task.evolution_id
+        initial = task.last_completed_version is None
+        required_status: EvolutionStatus = "CREATED" if initial else "REVISION_READY"
+        strategy_id, strategy_arm = self._reservation_strategy(
+            transaction,
+            task,
+        )
+        if task.status == "RUNNING" and task.current_version is not None:
+            existing = transaction.load_episode(task.current_version)
+            self._validate_reservation(
+                existing,
+                task,
+                mode,
+                provider,
+                model,
+                tool_surface_fingerprint,
+                capability_fingerprint,
+                data_source_fingerprints,
+                strategy_id,
+                strategy_arm,
+                owner_token,
             )
-            transaction.save_task(updated, expected_revision=task.revision)
-            return MutationResult(
-                persisted,
-                self._reservation_events(persisted, initial),
+            return MutationResult(existing, self._reservation_events(existing, initial))
+        if task.status != required_status:
+            raise InvalidEvolutionTransition(
+                f"cannot reserve an episode while task is {task.status}; "
+                f"required {required_status}"
             )
+        if initial and mode != "NORMAL":
+            raise InvalidEvolutionTransition("an initial or retry episode must use NORMAL")
+        if not initial and mode == "NORMAL":
+            raise InvalidEvolutionTransition(
+                "a revised episode requires an explicit evidence/evaluation mode"
+            )
+        self.validate_transition(task.status, "RUNNING")
+        version = self._next_version(task.current_version)
+        episode = EpisodeRecord(
+            evolution_id=evolution_id,
+            episode_id=self._episode_id(evolution_id, version),
+            version=version,
+            parent_version=task.last_completed_version,
+            applied_feedback_id=(task.feedback_ids[-1] if task.feedback_ids else None),
+            revision_plan_id=(task.revision_ids[-1] if task.revision_ids else None),
+            owner_token=owner_token,
+            execution_mode=mode,
+            strategy_id=strategy_id,
+            strategy_arm=strategy_arm,
+            task_snapshot=task.model_dump(mode="json"),
+            target_snapshot=TargetSnapshot.model_validate(task.target),
+            provider=provider,
+            model=model,
+            tool_surface_fingerprint=tool_surface_fingerprint,
+            capability_fingerprint=capability_fingerprint,
+            data_source_fingerprints=data_source_fingerprints,
+        )
+        try:
+            existing = transaction.load_episode(version)
+        except FileNotFoundError:
+            transaction.write_episode(episode)
+            persisted = episode
+        else:
+            self._validate_reservation(
+                existing,
+                task,
+                mode,
+                provider,
+                model,
+                tool_surface_fingerprint,
+                capability_fingerprint,
+                data_source_fingerprints,
+                strategy_id,
+                strategy_arm,
+                owner_token,
+            )
+            persisted = existing
+        updated = task.model_copy(
+            update={
+                "status": "RUNNING",
+                "resume_status": None,
+                "current_version": version,
+                "episode_ids": self._append_once(
+                    task.episode_ids, persisted.episode_id
+                ),
+            }
+        )
+        transaction.save_task(updated, expected_revision=task.revision)
+        return MutationResult(
+            persisted,
+            self._reservation_events(persisted, initial),
+        )
 
     def mark_episode_running(
         self,
         evolution_id: str,
         version: EpisodeVersion,
         *,
+        owner_token: str | None = None,
         runtime_session_id: str | None = None,
         event_log_path: str | None = None,
     ) -> MutationResult[EpisodeRecord]:
         with self.store.transaction(evolution_id) as transaction:
             task, episode = self._current_episode(transaction, version)
+            self._require_episode_owner(episode, owner_token)
             if task.status != "RUNNING":
                 raise InvalidEvolutionTransition("task must be RUNNING")
             if episode.status == "RUNNING":
@@ -384,9 +426,11 @@ class EvolutionService:
         version: EpisodeVersion,
         *,
         result: EpisodeRecord,
+        owner_token: str | None = None,
     ) -> MutationResult[EpisodeRecord]:
         with self.store.transaction(evolution_id) as transaction:
             task, episode = self._current_episode(transaction, version)
+            self._require_episode_owner(episode, owner_token)
             artifact = self._verify_artifact(result.artifact)
             completed = self._validated_completion(episode, result, artifact)
             if episode.status == "COMPLETED":
@@ -428,9 +472,12 @@ class EvolutionService:
         evolution_id: str,
         version: EpisodeVersion,
         error: str,
+        *,
+        owner_token: str | None = None,
     ) -> MutationResult[EpisodeRecord]:
         with self.store.transaction(evolution_id) as transaction:
             task, episode = self._current_episode(transaction, version)
+            self._require_episode_owner(episode, owner_token)
             if episode.status == "FAILED":
                 if episode.error != error:
                     raise EvolutionOperationConflict("failed episode error differs from retry")
@@ -464,7 +511,12 @@ class EvolutionService:
                 )
         return MutationResult(saved_episode)
 
-    def cancel(self, evolution_id: str) -> MutationResult[EvolutionTask]:
+    def cancel(
+        self,
+        evolution_id: str,
+        *,
+        owner_token: str | None = None,
+    ) -> MutationResult[EvolutionTask]:
         """Safely reconcile or cancel the task's active episode.
 
         The episode transition precedes the task-manifest update, matching the
@@ -480,6 +532,7 @@ class EvolutionService:
                     "cancellation requires a current episode"
                 )
             episode = transaction.load_episode(task.current_version)
+            self._require_episode_owner(episode, owner_token)
             expected_episode_id = self._episode_id(
                 evolution_id,
                 task.current_version,
@@ -936,59 +989,120 @@ class EvolutionService:
 
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
-            if task.status != "REVISION_READY":
-                raise InvalidEvolutionTransition("iterate requires REVISION_READY")
-            if (
-                task.last_completed_version is None
-                or not task.feedback_ids
-                or not task.revision_ids
-                or not task.strategy_ids
-            ):
-                raise EvolutionOperationConflict(
-                    "REVISION_READY task is missing its exact iteration checkpoint"
-                )
-            source = transaction.load_episode(task.last_completed_version)
-            if source.status != "COMPLETED":
-                raise InvalidEvolutionTransition(
-                    "iterate requires a completed source episode"
-                )
-            self._verify_artifact(source.artifact)
-            if source.scientific_state_path is None:
-                raise InvalidEvolutionTransition(
-                    "source episode has no persisted scientific-state snapshot"
-                )
-            state_path = self.store.workspace.resolve(
-                source.scientific_state_path,
-                must_exist=True,
+            return self._iteration_context_locked(transaction, task)
+
+    def claim_iteration(
+        self,
+        evolution_id: str,
+        *,
+        owner_token: str,
+        mode: ExecutionMode,
+        provider: str | None = None,
+        model: str | None = None,
+        tool_surface_fingerprint: Sha256 | None = None,
+        capability_fingerprint: Sha256 | None = None,
+        data_source_fingerprints: dict[str, Sha256] | None = None,
+    ) -> IterationClaim:
+        """Atomically verify the exact revision checkpoint and claim its episode."""
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            checkpoint_task = task
+            if task.status == "RUNNING" and task.current_version is not None:
+                existing = transaction.load_episode(task.current_version)
+                if existing.owner_token != owner_token:
+                    raise EvolutionOperationConflict(
+                        "active episode is owned by another iteration invocation"
+                    )
+                checkpoint_task = EvolutionTask.model_validate(existing.task_snapshot)
+            context = self._iteration_context_locked(transaction, checkpoint_task)
+            reserved = self._reserve_episode_locked(
+                transaction,
+                task,
+                mode=mode,
+                provider=provider,
+                model=model,
+                tool_surface_fingerprint=tool_surface_fingerprint,
+                capability_fingerprint=capability_fingerprint,
+                data_source_fingerprints=data_source_fingerprints or {},
+                owner_token=owner_token,
             )
-            if not state_path.is_file():
-                raise InvalidEvolutionTransition(
-                    "source scientific-state snapshot is not a regular file"
-                )
-            revision = transaction.load_revision(task.revision_ids[-1])
-            strategy = transaction.load_strategy(task.strategy_ids[-1])
-            strategy_id, strategy_arm = self._reservation_strategy(transaction, task)
-            if (
-                revision.feedback_id != task.feedback_ids[-1]
-                or revision.has_blocking_ambiguity
-                or strategy.strategy_id != strategy_id
-                or strategy.arm != strategy_arm
-                or strategy.parameters.get("revision_id") != revision.revision_id
-            ):
-                raise EvolutionOperationConflict(
-                    "active revision and strategy do not match the exact checkpoint"
-                )
-            previous = self.store.load_scientific_state(
-                evolution_id,
-                source.version,
+            return IterationClaim(
+                context=context,
+                episode=reserved.entity,
+                owner_token=owner_token,
+                events=reserved.events,
             )
-            return IterationContext(
-                task=task,
-                source_episode=source,
-                revision=revision,
-                strategy=strategy,
-                previous_scientific_state=previous,
+
+    def _iteration_context_locked(
+        self,
+        transaction: EvolutionTransaction,
+        task: EvolutionTask,
+    ) -> IterationContext:
+        evolution_id = task.evolution_id
+        if task.status != "REVISION_READY":
+            raise InvalidEvolutionTransition("iterate requires REVISION_READY")
+        if (
+            task.last_completed_version is None
+            or not task.feedback_ids
+            or not task.revision_ids
+            or not task.strategy_ids
+        ):
+            raise EvolutionOperationConflict(
+                "REVISION_READY task is missing its exact iteration checkpoint"
             )
+        source, feedback, compilation = self._revision_context(
+            transaction, task, evolution_id
+        )
+        from photomatagent.scientific.evolution.revision import build_revision_plan
+        from photomatagent.scientific.evolution.strategy import FixedStrategySelector
+
+        revision = transaction.load_revision(task.revision_ids[-1])
+        canonical_plan = build_revision_plan(
+            feedback=feedback,
+            compilation=compilation,
+            target=task.target,
+            previous_summary=source.summary,
+        ).model_copy(
+            update={
+                "confirmed": True,
+                "confirmed_at": revision.confirmed_at,
+            }
+        )
+        if revision != canonical_plan:
+            raise EvolutionOperationConflict(
+                "persisted revision plan does not match canonical persisted inputs"
+            )
+        canonical_strategy = FixedStrategySelector().select(task, canonical_plan)
+        strategy = transaction.load_strategy(task.strategy_ids[-1])
+        if strategy != canonical_strategy:
+            raise EvolutionOperationConflict(
+                "persisted strategy does not match canonical persisted inputs"
+            )
+        if revision.has_blocking_ambiguity:
+            raise EvolutionOperationConflict(
+                "active revision has a blocking ambiguity"
+            )
+        if source.scientific_state_path is None:
+            raise InvalidEvolutionTransition(
+                "source episode has no persisted scientific-state snapshot"
+            )
+        state_path = self.store.workspace.resolve(
+            source.scientific_state_path,
+            must_exist=True,
+        )
+        if not state_path.is_file():
+            raise InvalidEvolutionTransition(
+                "source scientific-state snapshot is not a regular file"
+            )
+        previous = self.store.load_scientific_state(evolution_id, source.version)
+        return IterationContext(
+            task=task,
+            source_episode=source,
+            revision=revision,
+            strategy=strategy,
+            previous_scientific_state=previous,
+        )
 
     def accept(
         self,
@@ -1100,6 +1214,16 @@ class EvolutionService:
             )
         return task, transaction.load_episode(version)
 
+    @staticmethod
+    def _require_episode_owner(
+        episode: EpisodeRecord,
+        owner_token: str | None,
+    ) -> None:
+        if episode.owner_token is not None and episode.owner_token != owner_token:
+            raise EvolutionOperationConflict(
+                "episode transition owner token does not match the active invocation"
+            )
+
     def _verify_artifact(self, artifact: ArtifactRef | None) -> ArtifactRef:
         if artifact is None:
             raise ArtifactMismatchError("a completed episode requires an artifact")
@@ -1185,6 +1309,7 @@ class EvolutionService:
         data_source_fingerprints: dict[str, Sha256],
         strategy_id: str | None,
         strategy_arm: StrategyArm,
+        owner_token: str | None,
     ) -> None:
         expected_version = (
             task.current_version
@@ -1204,6 +1329,7 @@ class EvolutionService:
             or episode.data_source_fingerprints != data_source_fingerprints
             or episode.strategy_id != strategy_id
             or episode.strategy_arm != strategy_arm
+            or episode.owner_token != owner_token
             or episode.parent_version != task.last_completed_version
             or episode.applied_feedback_id
             != (task.feedback_ids[-1] if task.feedback_ids else None)

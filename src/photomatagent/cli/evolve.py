@@ -45,6 +45,7 @@ from photomatagent.scientific.evolution.models import (
     RubricFlags,
     RubricScores,
     StrategyVersion,
+    new_episode_owner_token,
     new_feedback_id,
 )
 from photomatagent.scientific.evolution.revision import build_revision_plan
@@ -214,11 +215,13 @@ def evolve_start(
                 prior_mutations.append(reopened)
                 task = reopened.entity
 
+        owner_token = new_episode_owner_token()
         reserved = service.reserve_episode(
             task.evolution_id,
             mode="NORMAL",
             provider=config.provider,
             model=config.model,
+            owner_token=owner_token,
         )
         prior_mutations.append(reserved)
         episode = reserved.entity
@@ -236,6 +239,8 @@ def evolve_start(
             model=config.model,
             workspace_root=boundary.root,
             approval=cast(ApprovalMode, approval),
+            fresh_approval=True,
+            application_approval_root=_episode_approval_root(episode),
             max_iterations=10000,
             session_dir=boundary.root / default_sessions_dir(),
             log_events=log_events,
@@ -261,6 +266,7 @@ def evolve_start(
                     console,
                     _redacted_event(event),
                 ),
+                owner_token=owner_token,
             )
         )
     except KeyboardInterrupt as exc:
@@ -270,6 +276,7 @@ def evolve_start(
             episode=episode,
             error=exc,
             workspace=boundary.root,
+            owner_token=owner_token,
         )
         raise typer.Exit(code=130) from None
     except Exception as exc:
@@ -279,6 +286,7 @@ def evolve_start(
             episode=episode,
             error=exc,
             workspace=boundary.root,
+            owner_token=owner_token,
         )
         raise typer.Exit(code=1) from None
 
@@ -470,15 +478,18 @@ def evolve_iterate(
         boundary = Workspace(workspace)
         store = EvolutionStore(boundary)
         service = EvolutionService(store)
-        context = service.iteration_context(evolution_id)
         config = _resolve_provider_config(boundary.root, provider, model)
-        reserved = service.reserve_episode(
+        owner_token = new_episode_owner_token()
+        claim = service.claim_iteration(
             evolution_id,
+            owner_token=owner_token,
             mode="CARRY_VERIFIED_EVIDENCE",
             provider=config.provider,
             model=config.model,
         )
-        episode = reserved.entity
+        context = claim.context
+        episode = claim.episode
+        reserved = MutationResult(episode, claim.events)
     except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
         raise typer.Exit(code=2) from None
@@ -498,6 +509,8 @@ def evolve_iterate(
             model=config.model,
             workspace_root=boundary.root,
             approval=cast(ApprovalMode, approval),
+            fresh_approval=True,
+            application_approval_root=_episode_approval_root(episode),
             max_iterations=10000,
             session_dir=boundary.root / default_sessions_dir(),
             log_events=log_events,
@@ -525,6 +538,7 @@ def evolve_iterate(
                     console,
                     _redacted_event(event),
                 ),
+                owner_token=owner_token,
             )
         )
     except KeyboardInterrupt as exc:
@@ -535,6 +549,7 @@ def evolve_iterate(
             error=exc,
             workspace=boundary.root,
             operation="iteration",
+            owner_token=owner_token,
         )
         raise typer.Exit(code=130) from None
     except Exception as exc:
@@ -545,6 +560,7 @@ def evolve_iterate(
             error=exc,
             workspace=boundary.root,
             operation="iteration",
+            owner_token=owner_token,
         )
         raise typer.Exit(code=1) from None
 
@@ -567,7 +583,13 @@ def evolve_cancel(
     boundary = Workspace(workspace)
     service = EvolutionService(EvolutionStore(boundary))
     try:
-        cancelled = service.cancel(evolution_id)
+        task = service.get(evolution_id)
+        owner_token = (
+            service.store.load_episode(evolution_id, task.current_version).owner_token
+            if task.current_version is not None
+            else None
+        )
+        cancelled = service.cancel(evolution_id, owner_token=owner_token)
     except (FileNotFoundError, ValueError, EvolutionServiceError) as exc:
         raise typer.BadParameter(
             redact_text(str(exc)),
@@ -1069,6 +1091,7 @@ async def _execute_initial_episode(
     judge: ScientificJudge | None,
     prior_mutations: Iterable[MutationResult[object]],
     on_event: EventSink | None,
+    owner_token: str | None = None,
 ) -> EpisodeExecutionResult:
     if logger is not None:
         for mutation in prior_mutations:
@@ -1081,6 +1104,7 @@ async def _execute_initial_episode(
         config=config,
         judge=judge,
         on_event=on_event,
+        owner_token=owner_token,
     )
 
 
@@ -1096,6 +1120,7 @@ async def _execute_revised_episode(
     judge: ScientificJudge | None,
     prior_mutations: Iterable[MutationResult[object]],
     on_event: EventSink | None,
+    owner_token: str | None = None,
 ) -> EpisodeExecutionResult:
     if logger is not None:
         for mutation in prior_mutations:
@@ -1109,6 +1134,7 @@ async def _execute_revised_episode(
         revision=revision,
         judge=judge,
         on_event=on_event,
+        owner_token=owner_token,
     )
 
 
@@ -1155,6 +1181,15 @@ def _target_subject(target: TargetSpec) -> str | None:
     return None
 
 
+def _episode_approval_root(episode: EpisodeRecord) -> str:
+    """Return the managed, workspace-relative application approval namespace."""
+
+    return (
+        ".photomatagent/evolution-approvals/"
+        f"{episode.evolution_id}/{episode.version}_{episode.episode_id}"
+    )
+
+
 def _resolve_provider_config(
     workspace: Path,
     provider: str | None,
@@ -1174,12 +1209,18 @@ def _fail_active_episode(
     evolution_id: str,
     version: EpisodeVersion,
     safe_error: str,
+    owner_token: str | None = None,
 ) -> str | None:
     try:
         task = service.get(evolution_id)
         episode = service.store.load_episode(evolution_id, version)
         if task.status == "RUNNING" and episode.status in {"RESERVED", "RUNNING"}:
-            service.fail_episode(evolution_id, version, safe_error)
+            service.fail_episode(
+                evolution_id,
+                version,
+                safe_error,
+                owner_token=owner_token,
+            )
     except Exception as recovery_error:
         return _bounded_error(recovery_error)
     return None
@@ -1207,6 +1248,7 @@ def _report_start_failure(
     error: BaseException,
     workspace: Path,
     operation: str = "start",
+    owner_token: str | None = None,
 ) -> None:
     safe_error = _bounded_error(error)
     recovery_note = _fail_active_episode(
@@ -1214,6 +1256,7 @@ def _report_start_failure(
         task.evolution_id,
         episode.version,
         safe_error,
+        owner_token,
     )
     failed_task = service.get(task.evolution_id)
     console.print(f"[red]evolution {operation} failed: {safe_error}[/]")

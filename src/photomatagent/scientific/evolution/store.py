@@ -67,6 +67,7 @@ _EPISODE_IMMUTABLE_FIELDS = (
     "parent_version",
     "applied_feedback_id",
     "revision_plan_id",
+    "owner_token",
     "execution_mode",
     "strategy_id",
     "strategy_arm",

@@ -80,6 +80,23 @@ def test_forged_receipt_id_is_rejected(tmp_path):
         raise AssertionError("unknown decision id must raise KeyError")
 
 
+def test_episode_scoped_store_does_not_carry_prior_receipt(tmp_path):
+    manifest = make_manifest()
+    pending = make_pending(
+        scientific_fingerprint=manifest.scientific_fingerprint,
+        execution_fingerprint=manifest.execution_fingerprint,
+    )
+    prior = ApprovalReceiptStore(tmp_path / "episode-v001")
+    prior.record_pending(pending)
+    assert prior.approve(pending.decision_id, approved_by="user") is not None
+
+    fresh = ApprovalReceiptStore(tmp_path / "episode-v002")
+    assert fresh.load_pending(pending.decision_id) is None
+    assert fresh.valid_receipt(pending, manifest) is None
+    fresh.record_pending(pending)
+    assert fresh.approve(pending.decision_id, approved_by="user") is not None
+
+
 def test_receipt_from_another_workflow_is_rejected(tmp_path):
     store = ApprovalReceiptStore(tmp_path)
     manifest = make_manifest()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
+import json
 from pathlib import Path
 from threading import Barrier
 
@@ -34,6 +35,7 @@ from photomatagent.scientific.evolution.store import (
 )
 from photomatagent.scientific.evolution.strategy import FixedStrategySelector
 from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
+from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
 
 
@@ -112,10 +114,16 @@ def complete_first(service: EvolutionService) -> tuple[str, EpisodeRecord]:
     assert isinstance(task, object)
     episode = mutated(service.reserve_episode(task.evolution_id, mode="NORMAL"))
     running = mutated(service.mark_episode_running(task.evolution_id, episode.version))
+    state_path = service.store.write_scientific_state(
+        task.evolution_id, running.version, ScientificState()
+    )
+    result = completed_result(service, running).model_copy(
+        update={"scientific_state_path": service.store.workspace.relative(state_path)}
+    )
     completed = mutated(service.complete_episode(
         task.evolution_id,
         running.version,
-        result=completed_result(service, running),
+        result=result,
     ))
     return task.evolution_id, completed
 
@@ -723,6 +731,101 @@ def test_concurrent_stop_and_reserve_are_serialized_as_one_logical_mutation(
 
     assert sum(not isinstance(result, Exception) for result in results) == 1
     assert sum(isinstance(result, InvalidEvolutionTransition) for result in results) == 1
+
+
+def test_iteration_claim_rebuilds_canonical_plan_before_episode_write(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _completed = prepare_revision(service)
+    task = service.get(evolution_id)
+    revision_path = service.store.workspace.resolve(
+        f".photomatagent/evolutions/{evolution_id}/revisions/"
+        f"{task.revision_ids[-1]}.json",
+        must_exist=True,
+    )
+    payload = json.loads(revision_path.read_text(encoding="utf-8"))
+    payload["contract_changes"] = ["tampered persisted instruction"]
+    revision_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(EvolutionOperationConflict, match="canonical"):
+        service.claim_iteration(
+            evolution_id,
+            owner_token="owner_first",
+            mode="CARRY_VERIFIED_EVIDENCE",
+        )
+
+    assert service.get(evolution_id).status == "REVISION_READY"
+    stored = service.get(evolution_id)
+    assert len(stored.episode_ids) == 1
+    assert stored.current_version == "v001"
+    assert not service.store.workspace.resolve(
+        f".photomatagent/evolutions/{evolution_id}/episodes/v002.json",
+        must_exist=False,
+    ).exists()
+
+
+def test_concurrent_iteration_claim_has_one_distinct_owner_winner(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _completed = prepare_revision(service)
+    barrier = Barrier(2)
+
+    def claim(owner_token: str) -> object:
+        barrier.wait()
+        try:
+            return service.claim_iteration(
+                evolution_id,
+                owner_token=owner_token,
+                mode="CARRY_VERIFIED_EVIDENCE",
+            )
+        except Exception as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(claim, ["owner_a", "owner_b"]))
+
+    winners = [result for result in results if not isinstance(result, Exception)]
+    losers = [result for result in results if isinstance(result, Exception)]
+    assert len(winners) == len(losers) == 1
+    assert isinstance(losers[0], EvolutionOperationConflict)
+    winner = winners[0]
+    assert winner.episode.owner_token in {"owner_a", "owner_b"}  # type: ignore[union-attr]
+    assert winner.owner_token == winner.episode.owner_token  # type: ignore[union-attr]
+    stored = service.get(evolution_id)
+    episodes = [
+        service.store.load_episode(evolution_id, version)
+        for version in ("v001", "v002")
+    ]
+    assert stored.episode_ids == [item.episode_id for item in episodes]
+    assert [item.version for item in episodes] == ["v001", "v002"]
+    assert episodes[-1].owner_token == winner.owner_token  # type: ignore[union-attr]
+
+
+def test_non_owner_cannot_transition_claimed_episode(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _completed = prepare_revision(service)
+    claim = service.claim_iteration(
+        evolution_id,
+        owner_token="owner_winner",
+        mode="CARRY_VERIFIED_EVIDENCE",
+    )
+
+    with pytest.raises(EvolutionOperationConflict, match="owner"):
+        service.fail_episode(
+            evolution_id,
+            claim.episode.version,
+            "stale invocation failed",
+            owner_token="owner_loser",
+        )
+    with pytest.raises(EvolutionOperationConflict, match="owner"):
+        service.cancel(evolution_id, owner_token="owner_loser")
+
+    assert service.get(evolution_id).status == "RUNNING"
+    assert service.store.load_episode(evolution_id, claim.episode.version).status == (
+        "RESERVED"
+    )
 
 
 @pytest.mark.parametrize(

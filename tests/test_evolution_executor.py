@@ -398,6 +398,39 @@ async def test_revised_executor_rejects_strategy_tampering_before_runtime(
     )
     assert runtime.conversation_state.messages == []
 
+
+@pytest.mark.asyncio
+async def test_executor_cannot_fail_an_episode_owned_by_another_invocation(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    task = service.create_task(
+        goal="goal",
+        target=TargetSpec(goal="goal"),
+        evolution_id="evo_owned_executor",
+    ).entity
+    episode = service.reserve_episode(
+        task.evolution_id,
+        mode="NORMAL",
+        owner_token="owner_winner",
+    ).entity
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="must not execute")]),
+    )
+
+    with pytest.raises(ValueError, match="owner token"):
+        await ScientificEpisodeExecutor(service.store).execute(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+            owner_token="owner_loser",
+        )
+
+    persisted = service.store.load_episode(task.evolution_id, episode.version)
+    assert persisted.status == "RESERVED"
+
 @pytest.mark.asyncio
 async def test_forged_revision_with_persisted_id_is_rejected_before_running(
     tmp_path: Path,

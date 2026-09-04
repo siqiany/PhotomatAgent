@@ -76,6 +76,28 @@ def test_capability_pack_assembles_one_shared_service_for_all_workflow_kinds(
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in first_tools)
 
 
+def test_capability_pack_uses_episode_scoped_approval_root(tmp_path) -> None:
+    first_root = tmp_path / ".photomatagent/evolutions/evo_test/v002-ep_first"
+    second_root = tmp_path / ".photomatagent/evolutions/evo_test/v003-ep_second"
+
+    first = VaspCapabilityPack(
+        application=None,
+        workspace=tmp_path,
+        approval_root=first_root,
+    ).unified_graph
+    second = VaspCapabilityPack(
+        application=None,
+        workspace=tmp_path,
+        approval_root=second_root,
+    ).unified_graph
+
+    assert first.repository.workspace.root == tmp_path.resolve()
+    assert second.repository.workspace.root == tmp_path.resolve()
+    assert first.approvals.db_path != second.approvals.db_path
+    assert first.approvals.db_path.is_relative_to(first_root.resolve())
+    assert second.approvals.db_path.is_relative_to(second_root.resolve())
+
+
 def test_capability_pack_has_no_legacy_alternative_pack_constructors(tmp_path) -> None:
     pack = VaspCapabilityPack(application=None, workspace=tmp_path)
 

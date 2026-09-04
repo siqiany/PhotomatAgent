@@ -42,12 +42,23 @@ def build_runtime(
     session_id: str | None = None,
     log_events: bool = True,
     scientific_state: ScientificState | None = None,
+    fresh_approval: bool = False,
+    application_approval_root: Path | str | None = None,
 ) -> tuple[AgentRuntime, EventLogger | None]:
     workspace = Workspace(workspace_root or Path.cwd())
     scientific = (
         scientific_state if scientific_state is not None else ScientificState()
     )
-    registry = create_default_registry(scientific, workspace)
+    resolved_approval_root = (
+        workspace.resolve(str(application_approval_root), must_exist=False)
+        if application_approval_root is not None
+        else None
+    )
+    registry = create_default_registry(
+        scientific,
+        workspace,
+        application_approval_root=resolved_approval_root,
+    )
     model_provider = create_provider(provider, model)
     budget = BudgetState(max_iterations=max_iterations)
 
@@ -71,7 +82,8 @@ def build_runtime(
         sinks.append(logger.log)
 
     policy = SwitchablePermissionPolicy(
-        policy, settings=ApprovalSettings(workspace.root)
+        policy,
+        settings=None if fresh_approval else ApprovalSettings(workspace.root),
     )
     runtime = AgentRuntime(
         model=model_provider,

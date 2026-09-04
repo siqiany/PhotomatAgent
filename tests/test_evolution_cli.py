@@ -717,17 +717,22 @@ def test_start_executes_first_episode_and_prints_resume_coordinates(
     )
 
     assert result.exit_code == 0, result.stdout
-    assert calls == [
-        {
-                "provider": "fake",
-                "model": "fake",
-                "workspace_root": tmp_path,
-            "approval": "deny",
-            "max_iterations": 10000,
-            "session_dir": tmp_path / ".photomatagent/sessions",
-            "log_events": False,
-        }
-    ]
+    assert len(calls) == 1
+    call = calls[0]
+    assert call == {
+        "provider": "fake",
+        "model": "fake",
+        "workspace_root": tmp_path,
+        "approval": "deny",
+        "fresh_approval": True,
+        "application_approval_root": call["application_approval_root"],
+        "max_iterations": 10000,
+        "session_dir": tmp_path / ".photomatagent/sessions",
+        "log_events": False,
+    }
+    assert str(call["application_approval_root"]).startswith(
+        ".photomatagent/evolution-approvals/"
+    )
     store = EvolutionStore(Workspace(tmp_path))
     task = store.list_tasks()[0]
     episode = store.load_episode(task.evolution_id, "v001")
@@ -1405,6 +1410,13 @@ def test_iterate_uses_fresh_runtime_with_only_carried_evidence(
     assert result.exit_code == 0, result.output
     assert len(built) == len(runtimes) == 1
     assert built[0]["approval"] == "deny"
+    assert built[0]["fresh_approval"] is True
+    reserved = EvolutionStore(Workspace(tmp_path)).load_episode(
+        ready.evolution_id, "v002"
+    )
+    assert str(built[0]["application_approval_root"]).endswith(
+        f"v002_{reserved.episode_id}"
+    )
     assert built[0]["scientific_state"] is runtimes[0].scientific_state
     store = EvolutionStore(Workspace(tmp_path))
     task = store.load_task(ready.evolution_id)
@@ -1414,6 +1426,7 @@ def test_iterate_uses_fresh_runtime_with_only_carried_evidence(
     assert second.status == "COMPLETED"
     assert second.parent_version == "v001"
     assert second.execution_mode == "CARRY_VERIFIED_EVIDENCE"
+    assert second.owner_token is not None
     assert second.runtime_session_id == "session_new_iteration"
     assert second.runtime_session_id != first.runtime_session_id
     inherited = store.load_scientific_state(ready.evolution_id, "v002")

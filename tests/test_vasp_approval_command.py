@@ -110,6 +110,25 @@ def test_approval_records_local_user_session_source(tmp_path):
     assert row["approved_by"].startswith("local:")
 
 
+def test_approval_discovers_fresh_evolution_episode_namespace(tmp_path):
+    episode_root = (
+        tmp_path
+        / ".photomatagent/evolution-approvals/evo_test/v002_ep_test"
+    )
+    seed_pending(episode_root)
+
+    result = CliRunner().invoke(
+        app,
+        ["scientific", "approve", "dec-1", "--workspace", str(tmp_path)],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "已批准" in result.output
+    assert receipt_count(episode_root) == 1
+    assert receipt_count(tmp_path) == 0
+
+
 def test_approve_always_does_not_approve_pending_scientific_decisions(tmp_path):
     seed_pending(tmp_path)
     workspace = Workspace(tmp_path)

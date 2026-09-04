@@ -60,7 +60,10 @@ class UnifiedVaspGraph:
 
 
 def build_unified_vasp_graph(
-    *, application: VaspApplication | None, workspace: Workspace | Path | str
+    *,
+    application: VaspApplication | None,
+    workspace: Workspace | Path | str,
+    approval_root: Path | str | None = None,
 ) -> UnifiedVaspGraph:
     """Build the single graph shared by one pack or MCP server owner.
 
@@ -73,7 +76,7 @@ def build_unified_vasp_graph(
         else Workspace(Path(workspace))
     )
     repository = ManifestRepository(resolved_workspace)
-    approvals = ApprovalReceiptStore(resolved_workspace.root)
+    approvals = ApprovalReceiptStore(approval_root or resolved_workspace.root)
     resources = ResourceAuthorizationService(
         approvals, policy=application.policy if application is not None else None
     )

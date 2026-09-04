@@ -13,6 +13,8 @@ from photomatagent.workspace import Workspace
 def build_scientific_tools(
     config: ScientificConfig | None = None,
     workspace: Workspace | None = None,
+    *,
+    vasp_approval_root: Path | str | None = None,
 ) -> list[Tool]:
     """Instantiate every capability pack and collect their tools.
 
@@ -65,7 +67,7 @@ def build_scientific_tools(
         photodetector_pack(),
         interface_pack(),
         kp_pack(effective_workspace),
-        vasp_pack(effective_workspace),
+        vasp_pack(effective_workspace, approval_root=vasp_approval_root),
         namd_pack(effective_workspace),
         magus_pack(effective_workspace),
         generation_pack(effective_config),

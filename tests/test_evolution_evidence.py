@@ -6,6 +6,12 @@ import pytest
 
 import photomatagent.tools.factory as tools_factory
 from photomatagent.cli.chat import build_runtime
+from photomatagent.errors import ToolExecutionError
+from photomatagent.runtime.permissions import (
+    ApprovalSettings,
+    PermissionDecision,
+    SwitchablePermissionPolicy,
+)
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.evolution.evidence import (
@@ -120,7 +126,11 @@ def test_build_runtime_binds_one_exact_inherited_scientific_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inherited = ScientificState(goal="same task")
-    monkeypatch.setattr(tools_factory, "build_scientific_tools", lambda *args: [])
+    monkeypatch.setattr(
+        tools_factory,
+        "build_scientific_tools",
+        lambda *args, **kwargs: [],
+    )
 
     runtime, _ = build_runtime(
         provider="fake",
@@ -134,6 +144,83 @@ def test_build_runtime_binds_one_exact_inherited_scientific_state(
     inspect_tool = runtime._tools.get("scientific_state_inspect")
     assert isinstance(inspect_tool, ScientificStateInspectTool)
     assert inspect_tool._state is inherited
+
+
+@pytest.mark.asyncio
+async def test_fresh_approval_runtime_ignores_workspace_always_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = ApprovalSettings(tmp_path)
+    settings.set_always_allow(True)
+    assembly: list[dict[str, object]] = []
+
+    def build_tools(*args, **kwargs):  # type: ignore[no-untyped-def]
+        assembly.append(kwargs)
+        return []
+
+    monkeypatch.setattr(tools_factory, "build_scientific_tools", build_tools)
+
+    runtime, _ = build_runtime(
+        provider="fake",
+        workspace_root=tmp_path,
+        approval="deny",
+        fresh_approval=True,
+        application_approval_root=(
+            ".photomatagent/evolution-approvals/evo_test/v002_ep_test"
+        ),
+        log_events=False,
+    )
+
+    assert (await runtime.permission_policy.check("bash", {})).decision is (
+        PermissionDecision.DENY
+    )
+    assert isinstance(runtime.permission_policy, SwitchablePermissionPolicy)
+    runtime.permission_policy.allow_always()
+    assert (await runtime.permission_policy.check("bash", {})).decision is (
+        PermissionDecision.ALLOW
+    )
+    next_runtime, _ = build_runtime(
+        provider="fake",
+        workspace_root=tmp_path,
+        approval="deny",
+        fresh_approval=True,
+        application_approval_root=(
+            ".photomatagent/evolution-approvals/evo_test/v003_ep_next"
+        ),
+        log_events=False,
+    )
+    assert (await next_runtime.permission_policy.check("bash", {})).decision is (
+        PermissionDecision.DENY
+    )
+    assert assembly == [
+        {
+            "vasp_approval_root": (
+                tmp_path
+                / ".photomatagent/evolution-approvals/evo_test/v002_ep_test"
+            ).resolve()
+        },
+        {
+            "vasp_approval_root": (
+                tmp_path
+                / ".photomatagent/evolution-approvals/evo_test/v003_ep_next"
+            ).resolve()
+        },
+    ]
+
+
+def test_build_runtime_rejects_approval_root_escape(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ToolExecutionError):
+        build_runtime(
+            provider="fake",
+            workspace_root=tmp_path,
+            approval="deny",
+            fresh_approval=True,
+            application_approval_root="../outside",
+            log_events=False,
+        )
 
 
 def test_evidence_carry_contract_is_exported_from_evolution_package() -> None:

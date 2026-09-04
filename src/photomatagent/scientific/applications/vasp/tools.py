@@ -528,7 +528,11 @@ class VaspCapabilityPack(CapabilityPack):
     backend_name = "SCNet (SSH + Slurm)"
 
     def __init__(
-        self, application: VaspApplication | None = None, workspace: Any = None
+        self,
+        application: VaspApplication | None = None,
+        workspace: Any = None,
+        *,
+        approval_root: Any = None,
     ) -> None:
         self.application = application or default_vasp_application()
         from photomatagent.workspace import Workspace
@@ -538,6 +542,11 @@ class VaspCapabilityPack(CapabilityPack):
                 workspace or Path.cwd()
             )
         ).expanduser().resolve()
+        self.approval_root = (
+            Path(approval_root).expanduser().resolve()
+            if approval_root is not None
+            else None
+        )
         self._unified_capability_pack: Any = None
         self._unified_graph: Any = None
 
@@ -572,7 +581,9 @@ class VaspCapabilityPack(CapabilityPack):
         )
 
         self._unified_graph = build_unified_vasp_graph(
-            application=self.application, workspace=self.workspace
+            application=self.application,
+            workspace=self.workspace,
+            approval_root=self.approval_root,
         )
         self._unified_capability_pack = self._unified_graph.tool_pack
         return self._unified_capability_pack
@@ -584,5 +595,10 @@ class VaspCapabilityPack(CapabilityPack):
         assert self._unified_graph is not None
         return self._unified_graph
 
-def vasp_pack(workspace: Any = None) -> VaspCapabilityPack:
-    return VaspCapabilityPack(workspace=workspace)
+
+def vasp_pack(
+    workspace: Any = None,
+    *,
+    approval_root: Any = None,
+) -> VaspCapabilityPack:
+    return VaspCapabilityPack(workspace=workspace, approval_root=approval_root)

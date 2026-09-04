@@ -53,6 +53,7 @@ if TYPE_CHECKING:
         UtcDatetime,
         new_compilation_id,
         new_episode_id,
+        new_episode_owner_token,
         new_evolution_id,
         new_feedback_id,
         new_revision_id,
@@ -80,6 +81,7 @@ if TYPE_CHECKING:
         EvolutionServiceError,
         InvalidEvolutionTransition,
         IterationContext,
+        IterationClaim,
         MutationResult,
     )
     from photomatagent.scientific.evolution.store import (
@@ -135,6 +137,7 @@ _MODEL_EXPORTS = (
     "TargetSnapshot",
     "UtcDatetime",
     "new_episode_id",
+    "new_episode_owner_token",
     "new_compilation_id",
     "new_evolution_id",
     "new_feedback_id",
@@ -159,6 +162,7 @@ _SERVICE_EXPORTS = (
     "EvolutionServiceError",
     "InvalidEvolutionTransition",
     "IterationContext",
+    "IterationClaim",
     "MutationResult",
 )
 _EVIDENCE_EXPORTS = (

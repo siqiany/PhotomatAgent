@@ -79,9 +79,15 @@ class ScientificEpisodeExecutor:
         revision: RevisionPlan | None = None,
         judge: ScientificJudge | None = None,
         on_event: EventSink | None = None,
+        owner_token: str | None = None,
     ) -> EpisodeExecutionResult:
         self.service.reconcile(task.evolution_id)
-        self._validate_execution(task=task, episode=episode, runtime=runtime)
+        self._validate_execution(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            owner_token=owner_token,
+        )
         runtime_session_id = self._runtime_session_id(runtime)
         self._validate_unused_session(
             runtime_session_id,
@@ -98,6 +104,7 @@ class ScientificEpisodeExecutor:
             running_result = self.service.mark_episode_running(
                 task.evolution_id,
                 episode.version,
+                owner_token=owner_token,
                 runtime_session_id=runtime_session_id,
                 event_log_path=event_log_path,
             )
@@ -146,6 +153,7 @@ class ScientificEpisodeExecutor:
                 task.evolution_id,
                 episode.version,
                 result=completion,
+                owner_token=owner_token,
             )
             await self._publish(completed_result, on_event)
         except BaseException as exc:
@@ -154,6 +162,7 @@ class ScientificEpisodeExecutor:
                 episode=episode,
                 error=exc,
                 on_event=on_event,
+                owner_token=owner_token,
             )
             raise
         completed = completed_result.entity
@@ -172,6 +181,7 @@ class ScientificEpisodeExecutor:
         task: EvolutionTask,
         episode: EpisodeRecord,
         runtime: AgentRuntime,
+        owner_token: str | None,
     ) -> None:
         if runtime.workspace.root != self.store.workspace.root:
             raise ValueError("runtime and evolution store must use the same workspace")
@@ -187,6 +197,11 @@ class ScientificEpisodeExecutor:
             raise ValueError("episode is not the task's current reserved version")
         if stored_episode != episode or stored_episode.status != "RESERVED":
             raise ValueError("executor requires the exact persisted RESERVED episode")
+        if (
+            stored_episode.owner_token is not None
+            and stored_episode.owner_token != owner_token
+        ):
+            raise ValueError("executor owner token does not match the reserved episode")
         if task.goal != stored_task.goal or task.target != stored_task.target:
             raise ValueError("task does not match the persisted immutable task snapshot")
 
@@ -348,6 +363,7 @@ class ScientificEpisodeExecutor:
         episode: EpisodeRecord,
         error: BaseException,
         on_event: EventSink | None,
+        owner_token: str | None,
     ) -> None:
         recovery_error: BaseException | None = None
         for _ in range(2):
@@ -363,6 +379,7 @@ class ScientificEpisodeExecutor:
                             task.evolution_id,
                             episode.version,
                             result=persisted,
+                            owner_token=owner_token,
                         )
                         await self._publish(reconciled, on_event)
                     return
@@ -372,6 +389,7 @@ class ScientificEpisodeExecutor:
                             task.evolution_id,
                             episode.version,
                             persisted.error or self._bounded_error(error),
+                            owner_token=owner_token,
                         )
                         await self._publish(reconciled, on_event)
                     return
@@ -380,6 +398,7 @@ class ScientificEpisodeExecutor:
                         task.evolution_id,
                         episode.version,
                         self._bounded_error(error),
+                        owner_token=owner_token,
                     )
                     await self._publish(failed, on_event)
                     return

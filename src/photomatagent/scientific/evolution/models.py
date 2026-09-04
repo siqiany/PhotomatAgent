@@ -315,6 +315,12 @@ def new_strategy_id() -> str:
     return f"strategy_{secrets.token_hex(5)}"
 
 
+def new_episode_owner_token() -> str:
+    """Return an unguessable, persistence-safe execution ownership token."""
+
+    return f"owner_{secrets.token_hex(16)}"
+
+
 class StrictModel(BaseModel):
     """Base contract for JSON records owned by the evolution subsystem."""
 
@@ -508,6 +514,7 @@ class EpisodeRecord(StrictModel):
     parent_version: EpisodeVersion | None = Field(default=None, frozen=True)
     applied_feedback_id: ManagedId | None = Field(default=None, frozen=True)
     revision_plan_id: ManagedId | None = Field(default=None, frozen=True)
+    owner_token: ManagedId | None = Field(default=None, frozen=True)
     runtime_session_id: ManagedId | None = None
     event_log_path: str | None = None
     execution_mode: ExecutionMode = Field(default="NORMAL", frozen=True)

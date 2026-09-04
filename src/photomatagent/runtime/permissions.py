@@ -167,7 +167,11 @@ class SwitchablePermissionPolicy(PermissionPolicy):
 
     def allow_always(self) -> None:
         if self._settings is None:
-            raise RuntimeError("persistent approval settings are unavailable")
+            # A fresh execution scope deliberately has no durable settings.
+            # Treat an explicit "always" choice as allow-all only for this
+            # runtime instance so it cannot authorize a later episode.
+            self._session_allow_all = True
+            return
         self._settings.set_always_allow(True)
         self._session_allow_all = False
 
