@@ -15,16 +15,88 @@ from pydantic import (
     Field,
     JsonValue,
     StringConstraints,
-    field_validator,
     model_validator,
 )
+from pydantic_core import core_schema
 
 from photomatagent.scientific.loop.target import ConstraintSpec, TargetSpec
 
 if TYPE_CHECKING:
     from photomatagent.scientific.loop.policy import ScientificLoopSummary
 else:
-    ScientificLoopSummary = Any
+    class _LazyScientificLoopSummary:
+        """Import the concrete loop summary only when it is validated or schematized."""
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls,
+            source_type: Any,
+            handler: Any,
+        ) -> core_schema.CoreSchema:
+            del source_type, handler
+            return core_schema.no_info_plain_validator_function(
+                _validate_scientific_loop_summary,
+                serialization=core_schema.plain_serializer_function_ser_schema(
+                    _serialize_scientific_loop_summary,
+                ),
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls,
+            schema: core_schema.CoreSchema,
+            handler: Any,
+        ) -> dict[str, Any]:
+            del schema
+            from photomatagent.scientific.loop.policy import (
+                ScientificLoopSummary as ConcreteScientificLoopSummary,
+            )
+
+            concrete = ConcreteScientificLoopSummary.model_json_schema(
+                mode=handler.mode,
+            )
+            return _inline_json_schema_refs(concrete)
+
+    ScientificLoopSummary = _LazyScientificLoopSummary
+
+
+def _validate_scientific_loop_summary(value: Any) -> Any:
+    from photomatagent.scientific.loop.policy import ScientificLoopSummary
+
+    return ScientificLoopSummary.model_validate(value)
+
+
+def _serialize_scientific_loop_summary(value: Any) -> Any:
+    return value.model_dump(mode="python")
+
+
+def _inline_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Inline one self-contained model schema for a lazy Pydantic adapter."""
+
+    definitions = schema.get("$defs", {})
+
+    def resolve(value: Any) -> Any:
+        if isinstance(value, list):
+            return [resolve(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        reference = value.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            name = reference.removeprefix("#/$defs/")
+            target = definitions.get(name)
+            if not isinstance(target, dict):
+                raise ValueError(f"unresolved JSON schema reference: {reference}")
+            return resolve(target)
+        return {
+            key: resolve(item)
+            for key, item in value.items()
+            if key != "$defs"
+        }
+
+    resolved = resolve(schema)
+    if not isinstance(resolved, dict):  # pragma: no cover - Pydantic invariant
+        raise TypeError("model JSON schema must be an object")
+    return resolved
 
 EvolutionStatus = Literal[
     "CREATED",
@@ -80,7 +152,12 @@ _MANAGED_ID_PATTERN = r"^[A-Za-z0-9_-]+$"
 _MANAGED_ID_RE = re.compile(_MANAGED_ID_PATTERN)
 ManagedId = Annotated[
     str,
-    StringConstraints(strict=True, min_length=1, pattern=_MANAGED_ID_PATTERN),
+    StringConstraints(
+        strict=True,
+        min_length=1,
+        max_length=200,
+        pattern=_MANAGED_ID_PATTERN,
+    ),
 ]
 EpisodeVersion = Annotated[
     str,
@@ -458,14 +535,6 @@ class EpisodeRecord(StrictModel):
     error: str | None = None
     created_at: UtcDatetime = Field(default_factory=utc_now)
 
-    @field_validator("summary", mode="before")
-    @classmethod
-    def validate_summary(cls, value: Any) -> Any:
-        if value is None:
-            return None
-        from photomatagent.scientific.loop.policy import ScientificLoopSummary
-
-        return ScientificLoopSummary.model_validate(value)
 
 class FeedbackDelta(StrictModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)

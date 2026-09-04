@@ -19,8 +19,13 @@ from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
     EvolutionTask,
     ExpertFeedbackRecord,
+    FeedbackCategory,
     FeedbackCompilation,
     FeedbackDelta,
+    FeedbackItemStatus,
+    FeedbackModule,
+    FeedbackSeverity,
+    FeedbackText,
     OptionalFeedbackText,
     new_compilation_id,
 )
@@ -46,6 +51,7 @@ Rules:
 - Do not invent facts, evidence, actions, or acceptance criteria.
 - Keep source_span as a faithful excerpt from the expert feedback.
 - POSITIVE_SIGNAL means content to preserve, not proof that a constraint passed.
+- Do not provide item_id. Item identifiers are assigned by the host.
 - Return strict JSON only, with no markdown or prose outside the JSON object.
 - category must be one of TASK_DEFINITION, SCIENTIFIC_CORRECTNESS,
   EVIDENCE_SUFFICIENCY, NOVELTY, DELIVERABLE_COMPLETENESS, ACTIONABILITY,
@@ -71,13 +77,36 @@ The exact output schema is:
 """
 
 
+class _CompilerDelta(BaseModel):
+    """Strict provider-owned fields; host identity is deliberately absent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: FeedbackCategory
+    status: FeedbackItemStatus
+    severity: FeedbackSeverity
+    responsible_module: FeedbackModule
+    problem: FeedbackText
+    requested_actions: tuple[FeedbackText, ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
+    acceptance_test: OptionalFeedbackText | None = None
+    preserve: tuple[FeedbackText, ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
+    confidence: float = Field(ge=0.0, le=1.0)
+    source_span: FeedbackText
+
+
 class _CompilerPayload(BaseModel):
     """The model-owned subset of a compilation; provenance is host-owned."""
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["AVAILABLE"]
-    items: tuple[FeedbackDelta, ...] = Field(default_factory=tuple, max_length=100)
+    items: tuple[_CompilerDelta, ...] = Field(default_factory=tuple, max_length=100)
     warnings: tuple[OptionalFeedbackText, ...] = Field(
         default_factory=tuple,
         max_length=100,
@@ -191,7 +220,13 @@ class FeedbackCompiler:
         return FeedbackCompilation(
             **identity,
             status="AVAILABLE",
-            items=payload.items,
+            items=tuple(
+                FeedbackDelta(
+                    item_id=f"item_{index:03d}",
+                    **item.model_dump(mode="python"),
+                )
+                for index, item in enumerate(payload.items, start=1)
+            ),
             warnings=payload.warnings,
         )
 

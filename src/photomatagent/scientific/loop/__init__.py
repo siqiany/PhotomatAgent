@@ -3,7 +3,57 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from photomatagent.scientific.loop.candidate import (
+        CandidateState,
+        candidate_fingerprint,
+        extract_candidate_from_state,
+    )
+    from photomatagent.scientific.loop.controller import (
+        ScientificLoopConfig,
+        ScientificLoopController,
+        format_loop_state_snapshot,
+    )
+    from photomatagent.scientific.loop.evaluation import (
+        EvaluationReport,
+        PropertyEvaluation,
+        ScientificEvaluator,
+        fidelity_rank,
+    )
+    from photomatagent.scientific.loop.feedback import (
+        FeedbackSignal,
+        RecommendedAction,
+        build_feedback,
+        format_feedback_for_model,
+    )
+    from photomatagent.scientific.loop.judge import (
+        JudgeIssue,
+        JudgeReport,
+        ScientificJudge,
+    )
+    from photomatagent.scientific.loop.policy import (
+        ScientificLoopDecision,
+        ScientificLoopPolicy,
+        ScientificLoopState,
+        ScientificLoopSummary,
+    )
+    from photomatagent.scientific.loop.scoring import compute_score, score_breakdown
+    from photomatagent.scientific.loop.stagnation import (
+        StagnationDetector,
+        gap_signature,
+        violation_signature,
+    )
+    from photomatagent.scientific.loop.target import (
+        ConstraintCheck,
+        ConstraintOutcome,
+        ConstraintSpec,
+        ConstraintViolation,
+        TargetSpec,
+        canonical_lwir_detector_target,
+        evaluate_constraint,
+    )
 
 _EXPORT_MODULE = {
     "CandidateState": "candidate",

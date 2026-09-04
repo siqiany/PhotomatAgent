@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 import subprocess
@@ -33,6 +34,7 @@ from photomatagent.scientific.evolution.service import (
 )
 from photomatagent.scientific.evolution.store import EvolutionStore
 from photomatagent.scientific.loop import TargetSpec
+from photomatagent.scientific.loop.policy import ScientificLoopSummary
 from photomatagent.workspace import Workspace
 
 
@@ -60,6 +62,59 @@ def test_clean_feedback_import_does_not_load_runtime_or_scientific_execution_gra
     )
 
     assert json.loads(completed.stdout) == []
+
+
+def test_public_facade_imports_retain_concrete_mypy_types() -> None:
+    fixture = Path(__file__).parent / "typing" / "evolution_public_imports.py"
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "mypy", "--no-incremental", str(fixture)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "MYPYPATH": str(Path(__file__).parents[1] / "src")},
+    )
+
+    assert (
+        "photomatagent.scientific.evolution.models.EpisodeRecord"
+        in completed.stdout
+    )
+    assert (
+        "photomatagent.scientific.loop.policy.ScientificLoopSummary | None"
+        in completed.stdout
+    )
+    assert "Revealed type is \"Any\"" not in completed.stdout
+
+
+def test_episode_summary_has_concrete_schema_and_round_trips_to_loop_summary() -> None:
+    task, episode, _feedback = _context()
+    summary_payload = {
+        "status": "INCONCLUSIVE",
+        "rounds": 2,
+        "candidate_count": 1,
+        "best_candidate_id": "candidate_1",
+        "best_score": 0.25,
+        "final_evaluation": None,
+        "unresolved_evidence_gaps": ["band_gap"],
+    }
+
+    restored = EpisodeRecord.model_validate(
+        {
+            **episode.model_dump(mode="python"),
+            "summary": summary_payload,
+            "task_snapshot": task.model_dump(mode="json"),
+        }
+    )
+    round_tripped = EpisodeRecord.model_validate_json(restored.model_dump_json())
+    summary_schema = EpisodeRecord.model_json_schema()["properties"]["summary"]
+    concrete_schema = next(
+        branch for branch in summary_schema["anyOf"] if branch.get("type") == "object"
+    )
+
+    assert isinstance(restored.summary, ScientificLoopSummary)
+    assert isinstance(round_tripped.summary, ScientificLoopSummary)
+    assert round_tripped.summary == restored.summary
+    assert set(summary_payload) <= set(concrete_schema["properties"])
 
 
 def _available_response(*, status: str = "QUERY", source_span: str = "正文信息呢？") -> str:
@@ -152,6 +207,55 @@ async def test_compiler_has_no_tools_preserves_query_and_bounds_result_text() ->
     payload = json.loads(request.messages[1].content)
     assert len(payload["result_text"]) == 12_000
     assert payload["result_text_truncated"] is True
+    assert result.items[0].item_id == "item_001"
+
+
+@pytest.mark.asyncio
+async def test_provider_cannot_supply_feedback_item_ids() -> None:
+    task, episode, feedback = _context()
+    payload = json.loads(_available_response())
+    payload["items"][0]["item_id"] = "provider_chosen"
+
+    result = await FeedbackCompiler(
+        FakeModelProvider([FakeResponse(text=json.dumps(payload))])
+    ).compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text="report text",
+    )
+
+    assert result.status == "UNAVAILABLE"
+    assert result.items == ()
+    assert "JSON/schema" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_host_generated_feedback_item_ids_are_deterministic_and_bounded() -> None:
+    task, episode, feedback = _context()
+    payload = json.loads(_available_response())
+    payload["items"].append({**payload["items"][0], "problem": "second"})
+
+    first = await FeedbackCompiler(
+        FakeModelProvider([FakeResponse(text=json.dumps(payload))])
+    ).compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text="report text",
+    )
+    second = await FeedbackCompiler(
+        FakeModelProvider([FakeResponse(text=json.dumps(payload))])
+    ).compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text="report text",
+    )
+
+    assert [item.item_id for item in first.items] == ["item_001", "item_002"]
+    assert [item.item_id for item in second.items] == ["item_001", "item_002"]
+    assert all(len(item.item_id or "") <= 200 for item in first.items)
 
 
 @pytest.mark.asyncio
