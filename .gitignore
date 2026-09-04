@@ -25,3 +25,5 @@ drylab_vasp/
 reports/
 user_input/
 .coverage
+.worktrees/
+.superpowers/
