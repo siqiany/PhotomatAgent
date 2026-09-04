@@ -8,6 +8,7 @@ from photomatagent.scientific.evolution.models import (
     RubricFlags,
     RubricScores,
     StrictModel,
+    derive_hard_cap_suggestion,
 )
 
 RUBRIC_VERSION = "expert-review-v1"
@@ -71,26 +72,7 @@ def assess_hard_caps(
 ) -> HardCapAssessment:
     """Suggest deterministic caps while retaining the expert's original scores."""
 
-    suggested = scores.model_copy(deep=True)
-    reasons: list[str] = []
-
-    if flags.fabricated_source:
-        suggested.evidence_sufficiency = min(suggested.evidence_sufficiency, 1)
-        suggested.overall = min(suggested.overall, 1)
-        reasons.append("存在伪造来源：证据充分性和总体等级最高 1 分")
-    if flags.conclusion_changing_error:
-        suggested.scientific_correctness = min(suggested.scientific_correctness, 2)
-        suggested.overall = min(suggested.overall, 2)
-        reasons.append("存在会改变结论的科学错误：科学正确性和总体等级最高 2 分")
-    if flags.abstract_only_core_evidence:
-        suggested.evidence_sufficiency = min(suggested.evidence_sufficiency, 2)
-        reasons.append("核心结论只有摘要支持：证据充分性最高 2 分")
-    if flags.unsupported_novelty:
-        suggested.novelty = min(suggested.novelty, 2)
-        reasons.append("创新性没有定义、基线或证据：创新性最高 2 分")
-    if flags.process_parameters_only:
-        suggested.actionability = min(suggested.actionability, 2)
-        reasons.append("工艺只有路线名称和少数参数：可执行性最高 2 分")
+    suggested, reasons = derive_hard_cap_suggestion(scores, flags)
 
     return HardCapAssessment(
         original_scores=scores.model_copy(deep=True),
