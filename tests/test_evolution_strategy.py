@@ -61,4 +61,3 @@ def test_fixed_selector_rejects_cross_task_plan() -> None:
         assert "same evolution task" in str(exc)
     else:  # pragma: no cover - explicit assertion without pytest dependency
         raise AssertionError("cross-task plan was accepted")
-
