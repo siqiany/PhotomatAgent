@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter
 
 
 def _now() -> datetime:
@@ -416,8 +416,6 @@ EvolutionScoreDimension = Literal[
 
 class EvolutionRuntimeEvent(RuntimeEvent):
     """Base envelope for events emitted by one scientific evolution task."""
-
-    model_config = ConfigDict(extra="forbid")
 
     evolution_id: EvolutionEventId
 

@@ -9,10 +9,23 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from photomatagent.runtime.events import RuntimeEvent, parse_event
+from photomatagent.runtime.events import (
+    EVOLUTION_SUMMARY_MAX_CHARS,
+    EvolutionRuntimeEvent,
+    RuntimeEvent,
+    parse_event,
+)
 from photomatagent.redaction import redact_secrets
 
 Redactor = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def _bound_evolution_summaries(payload: dict[str, Any]) -> dict[str, Any]:
+    bounded = dict(payload)
+    for key, value in bounded.items():
+        if isinstance(value, str) and (key == "summary" or key.endswith("_summary")):
+            bounded[key] = value[:EVOLUTION_SUMMARY_MAX_CHARS]
+    return bounded
 
 
 def _session_id() -> str:
@@ -42,6 +55,8 @@ class EventLogger:
 
     async def log(self, event: RuntimeEvent) -> None:
         payload = self._redactor(event.model_dump(mode="json"))
+        if isinstance(event, EvolutionRuntimeEvent):
+            payload = _bound_evolution_summaries(payload)
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 

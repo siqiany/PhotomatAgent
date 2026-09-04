@@ -119,15 +119,25 @@ def test_expert_feedback_event_round_trips_without_raw_feedback_fields() -> None
 
     assert parsed.kind == "expert_feedback_recorded"
     assert not hasattr(parsed, "raw_comments")
-    with pytest.raises(ValidationError):
-        ExpertFeedbackRecorded(
-            evolution_id="evo_test",
-            episode_version="v001",
-            feedback_id="fb_test",
-            result_sha256="a" * 64,
-            scores={"overall": 3},
-            raw_comments="must not enter event payloads",  # type: ignore[call-arg]
-        )
+
+
+def test_evolution_events_ignore_unknown_fields_without_serializing_them() -> None:
+    event = ExpertFeedbackRecorded(
+        evolution_id="evo_test",
+        episode_version="v001",
+        feedback_id="fb_test",
+        result_sha256="a" * 64,
+        scores={"overall": 3},
+        raw_comments="must not enter event payloads",  # type: ignore[call-arg]
+    )
+    payload = event.model_dump(mode="json")
+    payload["future_additive_field"] = "ignored"
+
+    parsed = parse_event(payload)
+    serialized = parsed.model_dump(mode="json")
+
+    assert "raw_comments" not in serialized
+    assert "future_additive_field" not in serialized
 
 
 def test_evolution_event_payload_fields_are_bounded() -> None:

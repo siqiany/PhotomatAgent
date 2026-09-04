@@ -44,6 +44,40 @@ async def test_evolution_event_is_redacted_in_jsonl(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_redacted_evolution_summary_is_finally_bounded_in_jsonl(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("EXPERT_SECRET", "SECR")
+    logger = EventLogger(tmp_path, session_id="evolution-boundary")
+    await logger.log(
+        EvolutionTaskCreated(
+            evolution_id="evo_test",
+            goal_summary="x" * 220 + "SECR" + "y" * 16,
+        )
+    )
+
+    payload = json.loads(logger.events_path.read_text(encoding="utf-8"))
+    restored = logger.read_events()[0]
+
+    assert payload["goal_summary"] == "x" * 220 + "[REDACTED]" + "y" * 10
+    assert len(payload["goal_summary"]) == 240
+    assert restored.goal_summary == payload["goal_summary"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_jsonl_does_not_bound_unrelated_event_text(tmp_path):
+    logger = EventLogger(tmp_path, session_id="non-evolution-boundary")
+    error = "x" * 241
+    await logger.log(
+        ProviderFailed(iteration=1, provider="fake", model="fake", error=error)
+    )
+
+    restored = logger.read_events()[0]
+
+    assert restored.error == error  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_api_key_is_redacted(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-super-secret-value")
     logger = EventLogger(tmp_path)
