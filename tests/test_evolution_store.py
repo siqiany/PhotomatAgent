@@ -676,3 +676,120 @@ def test_create_task_requires_initial_revision_and_is_immutable(tmp_path: Path) 
         store.create_task(task)
     with pytest.raises(ValueError, match="revision 0"):
         store.create_task(make_task("evo_nonzero").model_copy(update={"revision": 2}))
+
+
+def test_episode_load_and_legal_status_transitions_round_trip(tmp_path: Path) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    reserved = make_episode()
+    store.write_episode(reserved)
+
+    running = store.transition_episode(
+        reserved.model_copy(update={"status": "RUNNING"}),
+        expected_status="RESERVED",
+    )
+    completed = store.transition_episode(
+        running.model_copy(update={"status": "COMPLETED"}),
+        expected_status="RUNNING",
+    )
+
+    assert store.load_episode("evo_test", "v001") == completed
+    assert completed.status == "COMPLETED"
+
+
+def test_episode_transition_rejects_illegal_and_stale_statuses(tmp_path: Path) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    reserved = make_episode()
+    store.write_episode(reserved)
+
+    with pytest.raises(EvolutionConflictError, match="illegal episode transition"):
+        store.transition_episode(
+            reserved.model_copy(update={"status": "COMPLETED"}),
+            expected_status="RESERVED",
+        )
+
+    running = store.transition_episode(
+        reserved.model_copy(update={"status": "RUNNING"}),
+        expected_status="RESERVED",
+    )
+    with pytest.raises(EvolutionConflictError, match="stored status=RUNNING"):
+        store.transition_episode(
+            running.model_copy(update={"status": "FAILED"}),
+            expected_status="RESERVED",
+        )
+
+
+def test_episode_transition_rejects_execution_snapshot_mutation(tmp_path: Path) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    reserved = make_episode()
+    store.write_episode(reserved)
+    forged = reserved.model_copy(
+        update={"status": "RUNNING", "execution_mode": "FRESH_EVALUATION"}
+    )
+
+    with pytest.raises(EvolutionConflictError, match="execution_mode"):
+        store.transition_episode(forged, expected_status="RESERVED")
+
+    assert store.load_episode("evo_test", "v001") == reserved
+
+
+@pytest.mark.parametrize("terminal_status", ["COMPLETED", "FAILED"])
+def test_terminal_episode_records_are_permanently_immutable(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    reserved = make_episode()
+    store.write_episode(reserved)
+    source = reserved
+    expected_status = "RESERVED"
+    if terminal_status == "COMPLETED":
+        source = store.transition_episode(
+            reserved.model_copy(update={"status": "RUNNING"}),
+            expected_status="RESERVED",
+        )
+        expected_status = "RUNNING"
+    terminal = store.transition_episode(
+        source.model_copy(update={"status": terminal_status}),  # type: ignore[arg-type]
+        expected_status=expected_status,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(EvolutionConflictError, match="terminal"):
+        store.transition_episode(
+            terminal.model_copy(update={"error": "changed"}),
+            expected_status=terminal_status,  # type: ignore[arg-type]
+        )
+
+
+def test_concurrent_episode_terminal_transitions_allow_exactly_one_winner(
+    tmp_path: Path,
+) -> None:
+    store = EvolutionStore(Workspace(tmp_path))
+    store.create_task(make_task())
+    reserved = make_episode()
+    store.write_episode(reserved)
+    running = store.transition_episode(
+        reserved.model_copy(update={"status": "RUNNING"}),
+        expected_status="RESERVED",
+    )
+    barrier = Barrier(2)
+
+    def finish(status: str) -> EpisodeRecord | Exception:
+        candidate = running.model_copy(update={"status": status})
+        barrier.wait()
+        try:
+            return store.transition_episode(  # type: ignore[arg-type]
+                candidate,
+                expected_status="RUNNING",
+            )
+        except Exception as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(finish, ["COMPLETED", "FAILED"]))
+
+    assert sum(isinstance(result, EpisodeRecord) for result in results) == 1
+    assert sum(isinstance(result, EvolutionConflictError) for result in results) == 1
+    assert store.load_episode("evo_test", "v001").status in {"COMPLETED", "FAILED"}

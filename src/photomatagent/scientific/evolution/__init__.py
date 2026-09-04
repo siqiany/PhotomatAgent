@@ -54,6 +54,13 @@ from photomatagent.scientific.evolution.rubric import (
     assess_hard_caps,
     expert_utility,
 )
+from photomatagent.scientific.evolution.service import (
+    ALLOWED_TRANSITIONS,
+    ArtifactMismatchError,
+    EvolutionService,
+    EvolutionServiceError,
+    InvalidEvolutionTransition,
+)
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
     EvolutionConflictError,
@@ -65,10 +72,12 @@ from photomatagent.scientific.evolution.store import (
 )
 
 __all__ = [
+    "ALLOWED_TRANSITIONS",
     "AcceptanceResult",
     "AcceptanceStatus",
     "ArtifactDiff",
     "ArtifactRef",
+    "ArtifactMismatchError",
     "ComparisonReport",
     "CompilationStatus",
     "ConstraintChangeSummary",
@@ -79,6 +88,8 @@ __all__ = [
     "EpisodeVersion",
     "EvidenceChangeSummary",
     "EvolutionStatus",
+    "EvolutionService",
+    "EvolutionServiceError",
     "EvolutionAlreadyExistsError",
     "EvolutionConflictError",
     "EvolutionCorruptRecordError",
@@ -97,6 +108,7 @@ __all__ = [
     "FeedbackSeverity",
     "FidelityChangeSummary",
     "HardCapAssessment",
+    "InvalidEvolutionTransition",
     "ManagedId",
     "RUBRIC_ANCHORS",
     "RUBRIC_DIMENSIONS",

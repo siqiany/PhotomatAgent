@@ -17,6 +17,7 @@ from pydantic import BaseModel, ValidationError
 from photomatagent.redaction import redact_secrets
 from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
+    EpisodeStatus,
     EvolutionTask,
     ExpertFeedbackRecord,
     RevisionPlan,
@@ -50,6 +51,31 @@ _TASK_IMMUTABLE_FIELDS = (
     "input_sha256",
     "created_at",
 )
+_EPISODE_IMMUTABLE_FIELDS = (
+    "evolution_id",
+    "episode_id",
+    "version",
+    "parent_version",
+    "applied_feedback_id",
+    "revision_plan_id",
+    "execution_mode",
+    "strategy_id",
+    "strategy_arm",
+    "task_snapshot",
+    "target_snapshot",
+    "provider",
+    "model",
+    "tool_surface_fingerprint",
+    "capability_fingerprint",
+    "data_source_fingerprints",
+    "created_at",
+)
+_EPISODE_TRANSITIONS: dict[EpisodeStatus, frozenset[EpisodeStatus]] = {
+    "RESERVED": frozenset({"RUNNING", "FAILED"}),
+    "RUNNING": frozenset({"COMPLETED", "FAILED"}),
+    "COMPLETED": frozenset(),
+    "FAILED": frozenset(),
+}
 
 
 class EvolutionStoreError(RuntimeError):
@@ -179,6 +205,70 @@ class EvolutionStore:
             record=episode,
             model_type=EpisodeRecord,
         )
+
+    def load_episode(self, evolution_id: str, version: str) -> EpisodeRecord:
+        """Load one validated episode and bind it to its managed path identity."""
+        self._validate_episode_version(version)
+        path = self._managed_path(evolution_id, "episodes", f"{version}.json")
+        episode = self._load_model(
+            path,
+            EpisodeRecord,
+            require_schema_version=True,
+        )
+        if episode.evolution_id != evolution_id or episode.version != version:
+            raise EvolutionCorruptRecordError(
+                path,
+                "episode identity does not match its managed path: "
+                f"requested={evolution_id!r}/{version!r}, "
+                f"stored={episode.evolution_id!r}/{episode.version!r}",
+            )
+        return episode
+
+    def transition_episode(
+        self,
+        episode: EpisodeRecord,
+        *,
+        expected_status: EpisodeStatus,
+    ) -> EpisodeRecord:
+        """Atomically advance a nonterminal episode from its expected status."""
+        candidate, payload = self._prepare_model(episode, EpisodeRecord)
+        if expected_status not in _EPISODE_TRANSITIONS:
+            raise ValueError(f"unsupported expected episode status: {expected_status!r}")
+        task_dir = self._task_dir(candidate.evolution_id)
+        with self._task_lock(task_dir):
+            current = self.load_episode(candidate.evolution_id, candidate.version)
+            if current.status != expected_status:
+                raise EvolutionConflictError(
+                    f"stale episode transition for {candidate.evolution_id}/"
+                    f"{candidate.version}: stored status={current.status}, "
+                    f"expected={expected_status}"
+                )
+            if not _EPISODE_TRANSITIONS[current.status]:
+                raise EvolutionConflictError(
+                    f"terminal episode is immutable: {candidate.evolution_id}/"
+                    f"{candidate.version} status={current.status}"
+                )
+            if candidate.status not in _EPISODE_TRANSITIONS[current.status]:
+                raise EvolutionConflictError(
+                    f"illegal episode transition for {candidate.evolution_id}/"
+                    f"{candidate.version}: {current.status} -> {candidate.status}"
+                )
+            for field in _EPISODE_IMMUTABLE_FIELDS:
+                if getattr(candidate, field) != getattr(current, field):
+                    raise EvolutionConflictError(
+                        "immutable episode execution snapshot differs from stored "
+                        f"record for {candidate.evolution_id}/{candidate.version}: "
+                        f"{field}"
+                    )
+            self._write_json_atomic(
+                self._managed_path(
+                    candidate.evolution_id,
+                    "episodes",
+                    f"{candidate.version}.json",
+                ),
+                payload,
+            )
+        return candidate
 
     def write_feedback(self, feedback: ExpertFeedbackRecord) -> Path:
         """Persist one immutable expert-feedback record."""
