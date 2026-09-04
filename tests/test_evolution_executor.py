@@ -26,6 +26,7 @@ from photomatagent.scientific.evolution.artifacts import (
 from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     ExpertFeedbackDraft,
+    FeedbackCompilation,
     RevisionPlan,
     RubricScores,
 )
@@ -108,6 +109,18 @@ def _reserved_revision(service: EvolutionService):  # type: ignore[no-untyped-de
         feedback_id=feedback.feedback_id,
         contract_changes=["Use primary evidence"],
         confirmed=True,
+    )
+    service.save_compilation(
+        task.evolution_id,
+        FeedbackCompilation(
+            compilation_id="comp_test",
+            evolution_id=task.evolution_id,
+            feedback_id=feedback.feedback_id,
+            episode_version=first.version,
+            status="AVAILABLE",
+            provider="fake",
+            model="fake",
+        ),
     )
     persisted_plan = service.confirm_revision(task.evolution_id, plan).entity
     second = service.reserve_episode(

@@ -232,6 +232,22 @@ class EvolutionTransaction:
             model_type=RevisionPlan,
         )
 
+    def load_strategy(self, strategy_id: str) -> StrategyVersion:
+        self._require_active()
+        return self.store.load_strategy(self.evolution_id, strategy_id)
+
+    def write_strategy(self, strategy: StrategyVersion) -> Path:
+        self._require_active()
+        if strategy.evolution_id != self.evolution_id:
+            raise EvolutionConflictError("strategy belongs to a different transaction")
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="strategies",
+            filename=f"{strategy.strategy_id}.json",
+            record=strategy,
+            model_type=StrategyVersion,
+        )
+
 
 class EvolutionStore:
     """Persist evolution tasks and immutable records inside one workspace."""
@@ -553,6 +569,38 @@ class EvolutionStore:
             except (TypeError, ValueError):
                 continue
             records.append(self.load_revision(evolution_id, path.stem))
+        return records
+
+    def load_strategy(self, evolution_id: str, strategy_id: str) -> StrategyVersion:
+        """Load one strategy snapshot bound to its managed identity."""
+
+        self._validate_id(strategy_id)
+        path = self._managed_path(evolution_id, "strategies", f"{strategy_id}.json")
+        strategy = self._load_model(
+            path,
+            StrategyVersion,
+            require_schema_version=True,
+        )
+        if strategy.evolution_id != evolution_id or strategy.strategy_id != strategy_id:
+            raise EvolutionCorruptRecordError(
+                path,
+                "strategy identity does not match its managed path",
+            )
+        return strategy
+
+    def list_strategies(self, evolution_id: str) -> list[StrategyVersion]:
+        """Load every immutable strategy snapshot for stable-operation checks."""
+
+        directory = self._managed_path(evolution_id, "strategies")
+        if not directory.is_dir():
+            return []
+        records: list[StrategyVersion] = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                self._validate_id(path.stem)
+            except (TypeError, ValueError):
+                continue
+            records.append(self.load_strategy(evolution_id, path.stem))
         return records
 
     def _write_record_locked(

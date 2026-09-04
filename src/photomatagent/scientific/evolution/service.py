@@ -38,6 +38,7 @@ from photomatagent.scientific.evolution.models import (
     FeedbackCompilation,
     RevisionPlan,
     Sha256,
+    StrategyVersion,
     TargetSnapshot,
     new_evolution_id,
     utc_now,
@@ -786,13 +787,23 @@ class EvolutionService:
         self,
         evolution_id: str,
         plan: RevisionPlan,
+        *,
+        strategy: StrategyVersion | None = None,
     ) -> MutationResult[RevisionPlan]:
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
             self._validate_revision(task, evolution_id, plan)
+            self._require_active_available_compilation(task, evolution_id, plan)
             confirmed = plan.model_copy(
                 update={"confirmed_at": plan.confirmed_at or utc_now()}
             )
+            if strategy is None:
+                from photomatagent.scientific.evolution.strategy import (
+                    FixedStrategySelector,
+                )
+
+                strategy = FixedStrategySelector().select(task, plan)
+            self._validate_strategy(evolution_id, confirmed, strategy)
             competing = next(
                 (
                     item
@@ -808,14 +819,46 @@ class EvolutionService:
                     "active feedback already has a different durable revision "
                     f"{competing.revision_id}"
                 )
+            competing_strategy = next(
+                (
+                    item
+                    for item in self.store.list_strategies(evolution_id)
+                    if item.parameters.get("revision_id") == plan.revision_id
+                    and item.strategy_id != strategy.strategy_id
+                ),
+                None,
+            )
+            if competing_strategy is not None:
+                raise EvolutionOperationConflict(
+                    "revision already has a different durable strategy "
+                    f"{competing_strategy.strategy_id}"
+                )
+
             try:
-                existing = transaction.load_revision(plan.revision_id)
+                existing_revision = transaction.load_revision(plan.revision_id)
             except FileNotFoundError:
+                existing_revision = None
+            else:
+                assert existing_revision is not None
+                self._require_matching_revision(existing_revision, confirmed)
+            try:
+                existing_strategy = transaction.load_strategy(strategy.strategy_id)
+            except FileNotFoundError:
+                existing_strategy = None
+            else:
+                assert existing_strategy is not None
+                self._require_matching_strategy(existing_strategy, strategy)
+
+            if existing_revision is None:
                 transaction.write_revision(confirmed)
                 persisted = confirmed
             else:
-                self._require_matching_revision(existing, confirmed)
-                persisted = existing
+                persisted = existing_revision
+            if existing_strategy is None:
+                transaction.write_strategy(strategy)
+                persisted_strategy = strategy
+            else:
+                persisted_strategy = existing_strategy
             if task.status == "FEEDBACK_RECORDED":
                 self.validate_transition(task.status, "REVISION_READY")
                 updated = task.model_copy(
@@ -824,12 +867,16 @@ class EvolutionService:
                         "revision_ids": self._append_once(
                             task.revision_ids, persisted.revision_id
                         ),
+                        "strategy_ids": self._append_once(
+                            task.strategy_ids, persisted_strategy.strategy_id
+                        ),
                     }
                 )
                 transaction.save_task(updated, expected_revision=task.revision)
             elif not (
                 task.status == "REVISION_READY"
                 and persisted.revision_id in task.revision_ids
+                and persisted_strategy.strategy_id in task.strategy_ids
             ):
                 raise InvalidEvolutionTransition(
                     "revision cannot reconcile with current task state"
@@ -1159,6 +1206,46 @@ class EvolutionService:
                 "revision plan does not match active task version and feedback"
             )
 
+    def _require_active_available_compilation(
+        self,
+        task: EvolutionTask,
+        evolution_id: str,
+        plan: RevisionPlan,
+    ) -> FeedbackCompilation:
+        compilations = {
+            item.compilation_id: item
+            for item in self.store.list_compilations(evolution_id)
+        }
+        available = [
+            item
+            for compilation_id in task.compilation_ids
+            if (item := compilations.get(compilation_id)) is not None
+            and item.status == "AVAILABLE"
+            and item.feedback_id == plan.feedback_id
+            and item.episode_version == plan.source_version
+        ]
+        if len(available) != 1:
+            raise InvalidEvolutionTransition(
+                "revision confirmation requires exactly one active AVAILABLE compilation"
+            )
+        return available[0]
+
+    @staticmethod
+    def _validate_strategy(
+        evolution_id: str,
+        plan: RevisionPlan,
+        strategy: StrategyVersion,
+    ) -> None:
+        if (
+            strategy.evolution_id != evolution_id
+            or strategy.arm != plan.strategy_arm
+            or strategy.reason != plan.strategy_reason
+            or strategy.parameters.get("revision_id") != plan.revision_id
+        ):
+            raise InvalidEvolutionTransition(
+                "strategy snapshot does not match the confirmed revision plan"
+            )
+
     @staticmethod
     def _require_matching_revision(existing: RevisionPlan, candidate: RevisionPlan) -> None:
         ignored = {"confirmed_at", "created_at"}
@@ -1169,6 +1256,16 @@ class EvolutionService:
         if existing_payload != candidate_payload:
             raise EvolutionOperationConflict(
                 f"revision ID {candidate.revision_id} names different content"
+            )
+
+    @staticmethod
+    def _require_matching_strategy(
+        existing: StrategyVersion,
+        candidate: StrategyVersion,
+    ) -> None:
+        if existing != candidate:
+            raise EvolutionOperationConflict(
+                f"strategy ID {candidate.strategy_id} names different content"
             )
 
     @staticmethod

@@ -13,8 +13,10 @@ from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     EpisodeRecord,
     ExpertFeedbackDraft,
+    FeedbackCompilation,
     RevisionPlan,
     RubricScores,
+    StrategyVersion,
 )
 from photomatagent.scientific.evolution.service import (
     ALLOWED_TRANSITIONS,
@@ -125,6 +127,7 @@ def prepare_revision(service: EvolutionService) -> tuple[str, EpisodeRecord]:
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
         raw_input='{"scores": "confirmed by expert"}',
     ))
+    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
     mutated(service.confirm_revision(
         evolution_id,
         RevisionPlan(
@@ -136,6 +139,182 @@ def prepare_revision(service: EvolutionService) -> tuple[str, EpisodeRecord]:
         ),
     ))
     return evolution_id, completed
+
+
+def save_available_compilation(
+    service: EvolutionService,
+    evolution_id: str,
+    feedback_id: str,
+    version: str,
+) -> FeedbackCompilation:
+    return service.save_compilation(
+        evolution_id,
+        FeedbackCompilation(
+            compilation_id=f"comp_{feedback_id}",
+            evolution_id=evolution_id,
+            feedback_id=feedback_id,
+            episode_version=version,
+            status="AVAILABLE",
+            provider="fake",
+            model="fake",
+        ),
+    ).entity
+
+
+def test_confirm_revision_atomically_persists_exact_plan_and_strategy(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, completed = complete_first(service)
+    feedback = mutated(service.attach_feedback(
+        evolution_id,
+        completed.version,
+        feedback_id="fb_atomic_revision",
+        draft=feedback_draft(),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+        raw_input="review",
+    ))
+    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
+    plan = RevisionPlan(
+        revision_id="rp_atomic_revision",
+        evolution_id=evolution_id,
+        source_version=completed.version,
+        feedback_id=feedback.feedback_id,
+        strategy_arm="EVIDENCE_FIRST",
+        strategy_reason="fixed-v1: evidence",
+        confirmed=True,
+    )
+    strategy = StrategyVersion(
+        strategy_id="strategy_atomic_revision",
+        evolution_id=evolution_id,
+        arm="EVIDENCE_FIRST",
+        reason="fixed-v1: evidence",
+        parameters={"selector": "fixed-v1", "revision_id": plan.revision_id},
+        strategy_sha256="c" * 64,
+    )
+
+    result = service.confirm_revision(evolution_id, plan, strategy=strategy)
+    repeated = service.confirm_revision(evolution_id, plan, strategy=strategy)
+
+    assert result.entity == repeated.entity
+    task = service.get(evolution_id)
+    assert task.status == "REVISION_READY"
+    assert task.revision_ids == [plan.revision_id]
+    assert task.strategy_ids == [strategy.strategy_id]
+    assert service.store.load_revision(evolution_id, plan.revision_id) == result.entity
+    assert service.store.load_strategy(evolution_id, strategy.strategy_id) == strategy
+
+
+def test_confirm_revision_rejects_strategy_mismatch_without_writing_either_record(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, completed = complete_first(service)
+    feedback = mutated(service.attach_feedback(
+        evolution_id,
+        completed.version,
+        feedback_id="fb_strategy_mismatch",
+        draft=feedback_draft(),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+    ))
+    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
+    plan = RevisionPlan(
+        revision_id="rp_strategy_mismatch",
+        evolution_id=evolution_id,
+        source_version=completed.version,
+        feedback_id=feedback.feedback_id,
+        strategy_arm="EVIDENCE_FIRST",
+        strategy_reason="fixed-v1: evidence",
+        confirmed=True,
+    )
+    mismatch = StrategyVersion(
+        strategy_id="strategy_mismatch",
+        evolution_id=evolution_id,
+        arm="DIVERSITY_FIRST",
+        reason="wrong",
+    )
+
+    with pytest.raises(InvalidEvolutionTransition, match="strategy"):
+        service.confirm_revision(evolution_id, plan, strategy=mismatch)
+
+    task = service.get(evolution_id)
+    assert task.status == "FEEDBACK_RECORDED"
+    assert task.revision_ids == []
+    assert task.strategy_ids == []
+    assert service.store.list_revisions(evolution_id) == []
+    assert service.store.list_strategies(evolution_id) == []
+
+
+def test_confirm_revision_requires_available_active_compilation(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    evolution_id, completed = complete_first(service)
+    feedback = mutated(service.attach_feedback(
+        evolution_id,
+        completed.version,
+        feedback_id="fb_without_compilation",
+        draft=feedback_draft(),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+    ))
+    plan = RevisionPlan(
+        revision_id="rp_without_compilation",
+        evolution_id=evolution_id,
+        source_version=completed.version,
+        feedback_id=feedback.feedback_id,
+        confirmed=True,
+    )
+
+    with pytest.raises(InvalidEvolutionTransition, match="AVAILABLE compilation"):
+        service.confirm_revision(evolution_id, plan)
+
+    assert service.get(evolution_id).status == "FEEDBACK_RECORDED"
+
+
+def test_confirm_revision_recovers_plan_write_before_strategy_write_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, completed = complete_first(service)
+    feedback = mutated(service.attach_feedback(
+        evolution_id,
+        completed.version,
+        feedback_id="fb_strategy_crash",
+        draft=feedback_draft(),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+    ))
+    save_available_compilation(service, evolution_id, feedback.feedback_id, completed.version)
+    plan = RevisionPlan(
+        revision_id="rp_strategy_crash",
+        evolution_id=evolution_id,
+        source_version=completed.version,
+        feedback_id=feedback.feedback_id,
+        confirmed=True,
+    )
+    original = service.store._write_record_locked
+    failed = False
+
+    def fail_first_strategy_write(**kwargs):  # type: ignore[no-untyped-def]
+        nonlocal failed
+        if kwargs["directory"] == "strategies" and not failed:
+            failed = True
+            raise OSError("strategy write interrupted")
+        return original(**kwargs)
+
+    monkeypatch.setattr(service.store, "_write_record_locked", fail_first_strategy_write)
+
+    with pytest.raises(OSError, match="strategy write interrupted"):
+        service.confirm_revision(evolution_id, plan)
+    assert len(service.store.list_revisions(evolution_id)) == 1
+    assert service.store.list_strategies(evolution_id) == []
+    assert service.get(evolution_id).status == "FEEDBACK_RECORDED"
+
+    recovered = service.confirm_revision(evolution_id, plan)
+
+    task = service.get(evolution_id)
+    assert recovered.entity.revision_id == plan.revision_id
+    assert task.status == "REVISION_READY"
+    assert task.revision_ids == [plan.revision_id]
+    assert len(task.strategy_ids) == 1
 
 
 def test_lifecycle_requires_feedback_before_next_episode(tmp_path: Path) -> None:
@@ -413,6 +592,12 @@ def test_stop_and_reopen_restore_exact_checkpoint(
         ))
         task = service.get(evolution_id)
         if checkpoint == "REVISION_READY":
+            save_available_compilation(
+                service,
+                evolution_id,
+                feedback.feedback_id,
+                completed.version,
+            )
             mutated(service.confirm_revision(
                 evolution_id,
                 RevisionPlan(
@@ -840,6 +1025,12 @@ def test_revision_retry_reconciles_matching_stable_id_after_manifest_crash(
         source_version=completed.version,
         feedback_id=feedback.feedback_id,
         confirmed=True,
+    )
+    save_available_compilation(
+        service,
+        evolution_id,
+        feedback.feedback_id,
+        completed.version,
     )
     original = service.store._save_task_locked
     calls = 0

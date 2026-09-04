@@ -63,6 +63,10 @@ if TYPE_CHECKING:
         assess_hard_caps,
         expert_utility,
     )
+    from photomatagent.scientific.evolution.revision import (
+        build_revision_plan,
+        format_revision_instruction,
+    )
     from photomatagent.scientific.evolution.service import (
         ALLOWED_TRANSITIONS,
         ArtifactMismatchError,
@@ -82,6 +86,7 @@ if TYPE_CHECKING:
         EvolutionTransaction,
         EvolutionUnsupportedSchemaError,
     )
+    from photomatagent.scientific.evolution.strategy import FixedStrategySelector
 
 _MODEL_EXPORTS = (
     "AcceptanceResult",
@@ -149,6 +154,11 @@ _SERVICE_EXPORTS = (
     "InvalidEvolutionTransition",
     "MutationResult",
 )
+_REVISION_EXPORTS = (
+    "build_revision_plan",
+    "format_revision_instruction",
+)
+_STRATEGY_EXPORTS = ("FixedStrategySelector",)
 _STORE_EXPORTS = (
     "EvolutionAlreadyExistsError",
     "EvolutionConflictError",
@@ -174,6 +184,14 @@ _EXPORT_MODULE = {
         for name in _SERVICE_EXPORTS
     },
     **{
+        name: "photomatagent.scientific.evolution.revision"
+        for name in _REVISION_EXPORTS
+    },
+    **{
+        name: "photomatagent.scientific.evolution.strategy"
+        for name in _STRATEGY_EXPORTS
+    },
+    **{
         name: "photomatagent.scientific.evolution.store"
         for name in _STORE_EXPORTS
     },
@@ -183,6 +201,8 @@ __all__ = [
     *_MODEL_EXPORTS,
     *_RUBRIC_EXPORTS,
     *_SERVICE_EXPORTS,
+    *_REVISION_EXPORTS,
+    *_STRATEGY_EXPORTS,
     *_STORE_EXPORTS,
 ]
 

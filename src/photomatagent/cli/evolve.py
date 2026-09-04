@@ -38,10 +38,12 @@ from photomatagent.scientific.evolution.models import (
     ExpertFeedbackDraft,
     ExpertFeedbackRecord,
     FeedbackCompilation,
+    RevisionPlan,
     RubricFlags,
     RubricScores,
     new_feedback_id,
 )
+from photomatagent.scientific.evolution.revision import build_revision_plan
 from photomatagent.scientific.evolution.rubric import (
     RUBRIC_ANCHORS,
     RUBRIC_DIMENSIONS,
@@ -53,6 +55,7 @@ from photomatagent.scientific.evolution.service import (
     EvolutionService,
     MutationResult,
 )
+from photomatagent.scientific.evolution.strategy import FixedStrategySelector
 from photomatagent.scientific.evolution.store import EvolutionStore
 from photomatagent.scientific.loop import (
     ScientificJudge,
@@ -80,6 +83,8 @@ _FLAG_PROMPTS = (
 _MAX_RENDERED_COMPILATION_ITEMS = 20
 _MAX_RENDERED_COMPILATION_WARNINGS = 20
 _MAX_RENDERED_COMPILATION_TEXT = 500
+_MAX_RENDERED_PLAN_ITEMS = 20
+_MAX_RENDERED_PLAN_TEXT = 500
 
 
 class PromptSessionLike(Protocol):
@@ -488,9 +493,28 @@ def evolve_compile(
         raise typer.Exit(code=2) from None
 
     _render_compilation(console, compilation)
-    _render_task_details(service.get(evolution_id), boundary.root)
     if compilation.status == "UNAVAILABLE":
+        _render_task_details(service.get(evolution_id), boundary.root)
         raise typer.Exit(code=1)
+    try:
+        confirmed = asyncio.run(
+            run_revision_confirmation_flow(
+                session=make_prompt_session(),
+                console=console,
+                service=service,
+                evolution_id=evolution_id,
+                compilation=compilation,
+            )
+        )
+    except (ValueError, EvolutionServiceError) as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        _render_task_details(service.get(evolution_id), boundary.root)
+        raise typer.Exit(code=2) from None
+    if confirmed is None:
+        console.print("[dim]Revision plan rejected; no plan or strategy was written.[/]")
+    else:
+        console.print(f"[green]Confirmed revision plan {confirmed.revision_id}.[/]")
+    _render_task_details(service.get(evolution_id), boundary.root)
 
 
 async def run_compilation_flow(
@@ -520,6 +544,51 @@ async def run_compilation_flow(
         result_text=result_text,
     )
     mutation = service.save_compilation(evolution_id, compilation)
+    await service.publish(mutation)
+    return mutation.entity
+
+
+async def run_revision_confirmation_flow(
+    *,
+    session: PromptSessionLike,
+    console: Console,
+    service: EvolutionService,
+    evolution_id: str,
+    compilation: FeedbackCompilation,
+) -> RevisionPlan | None:
+    """Build, preview, and explicitly confirm one deterministic revision plan."""
+
+    task, _episode, feedback = service.compilation_context(
+        evolution_id,
+        compilation.episode_version,
+    )
+    plan = build_revision_plan(feedback=feedback, compilation=compilation)
+    strategy = FixedStrategySelector().select(task, plan)
+    _render_revision_plan(console, plan)
+    if plan.has_blocking_ambiguity:
+        raise EvolutionServiceError(
+            "revision plan has blocking CRITICAL ambiguity; add an action or "
+            "acceptance test before confirmation"
+        )
+    try:
+        confirmation = await _prompt_value(
+            session,
+            _expert_prompt(
+                evolution_id,
+                plan.source_version,
+                "confirm revision plan with exact input 'y'",
+            ),
+        )
+    except FeedbackEntryCancelled:
+        return None
+    if confirmation.strip().lower() != "y":
+        return None
+    confirmed = plan.model_copy(update={"confirmed": True})
+    mutation = service.confirm_revision(
+        evolution_id,
+        confirmed,
+        strategy=strategy,
+    )
     await service.publish(mutation)
     return mutation.entity
 
@@ -566,6 +635,49 @@ def _render_compilation(output: Console, compilation: FeedbackCompilation) -> No
         output.print(
             Text(f"… {omitted_warnings} additional warnings omitted", style="dim")
         )
+
+
+def _render_revision_plan(output: Console, plan: RevisionPlan) -> None:
+    summary = Table("Revision plan", "Value")
+    summary.add_row("Revision ID", plan.revision_id)
+    summary.add_row("Source episode", plan.source_version)
+    summary.add_row("Feedback ID", plan.feedback_id)
+    summary.add_row("Strategy", plan.strategy_arm)
+    summary.add_row("Strategy reason", _bounded_plan_text(plan.strategy_reason))
+    summary.add_row(
+        "Blocking ambiguity",
+        "yes" if plan.has_blocking_ambiguity else "no",
+    )
+    output.print(summary)
+    sections = (
+        ("Contract changes", plan.contract_changes),
+        ("Evidence requirements", plan.evidence_requirements),
+        ("Output schema requirements", plan.output_schema_requirements),
+        ("Preserve", plan.preserved_facts),
+        ("Prohibited repeats", plan.prohibited_repeats),
+        ("Machine acceptance", plan.machine_acceptance_tests),
+        ("Human acceptance", plan.human_acceptance_tests),
+        ("Warnings", plan.warnings),
+        ("Unresolved ambiguities", plan.unresolved_ambiguities),
+    )
+    for heading, values in sections:
+        if not values:
+            continue
+        output.print(Text(f"{heading}:", style="bold"))
+        rendered = values[:_MAX_RENDERED_PLAN_ITEMS]
+        for value in rendered:
+            output.print(Text(f"- {_bounded_plan_text(value)}"), soft_wrap=True)
+        omitted = len(values) - len(rendered)
+        if omitted:
+            output.print(Text(f"… {omitted} additional items omitted", style="dim"))
+    output.print("[bold]Only exact input 'y' confirms this revision plan.[/]")
+
+
+def _bounded_plan_text(value: str) -> str:
+    safe = redact_text(value)
+    if len(safe) <= _MAX_RENDERED_PLAN_TEXT:
+        return safe
+    return safe[: _MAX_RENDERED_PLAN_TEXT - 1] + "…"
 
 
 def _bounded_compilation_text(value: str) -> str:
@@ -1013,4 +1125,5 @@ __all__ = [
     "load_feedback_file",
     "run_compilation_flow",
     "run_feedback_flow",
+    "run_revision_confirmation_flow",
 ]

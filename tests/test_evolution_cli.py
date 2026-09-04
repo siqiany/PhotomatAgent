@@ -25,6 +25,8 @@ from photomatagent.runtime.permissions import AllowAllPolicy
 from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     ExpertFeedbackDraft,
+    FeedbackCompilation,
+    FeedbackDelta,
     RevisionPlan,
     RubricScores,
 )
@@ -205,6 +207,99 @@ def test_feedback_file_import_is_confirmed_without_constructing_runtime(
         task.evolution_id, stored.feedback_ids[0]
     )
     assert "cli-secret" not in feedback.raw_input
+
+
+@pytest.mark.parametrize(
+    ("confirmation", "expected_status", "expected_revision_count"),
+    [("y", "REVISION_READY", 1), ("yes", "FEEDBACK_RECORDED", 0)],
+)
+def test_compile_previews_bounded_plan_and_requires_exact_confirmation(
+    confirmation: str,
+    expected_status: str,
+    expected_revision_count: int,
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _completed_task(tmp_path)
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    episode = service.store.load_episode(task.evolution_id, "v001")
+    service.attach_feedback(
+        task.evolution_id,
+        episode.version,
+        feedback_id="fb_compile_preview",
+        draft=ExpertFeedbackDraft(
+            scores=RubricScores(
+                scientific_correctness=2,
+                evidence_sufficiency=3,
+                novelty=3,
+                actionability=3,
+                overall=3,
+            )
+        ),
+        result_sha256=episode.artifact.sha256,  # type: ignore[union-attr]
+        raw_input="Authorization: Bearer never-render-this-secret",
+    )
+
+    class Compiler:
+        async def compile(self, **kwargs):  # type: ignore[no-untyped-def]
+            feedback = kwargs["feedback"]
+            return FeedbackCompilation(
+                compilation_id="comp_compile_preview",
+                evolution_id=task.evolution_id,
+                feedback_id=feedback.feedback_id,
+                episode_version=episode.version,
+                status="AVAILABLE",
+                items=(
+                    FeedbackDelta(
+                        item_id="item_001",
+                        category="SCIENTIFIC_CORRECTNESS",
+                        status="CORRECTION",
+                        severity="HIGH",
+                        responsible_module="scientific_checker",
+                        problem="Do not repeat unsupported conclusion",
+                        requested_actions=("Re-evaluate the conclusion",),
+                        acceptance_test="Conclusion passes deterministic check",
+                        preserve=("Keep verified evidence",),
+                        confidence=0.9,
+                        source_span="never-render-this-secret",
+                    ),
+                ),
+                provider="fake",
+                model="fake",
+            )
+
+    monkeypatch.setattr(evolve_module, "_build_feedback_compiler", lambda config: Compiler())
+    monkeypatch.setattr(
+        evolve_module,
+        "make_prompt_session",
+        lambda: _ScriptedPrompt(confirmation),
+    )
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "compile",
+            task.evolution_id,
+            "--provider",
+            "fake",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Revision plan" in result.output
+    assert "Strategy" in result.output
+    assert "Keep verified evidence" in result.output
+    assert "Do not repeat unsupported conclusion" in result.output
+    assert "Conclusion passes deterministic check" in result.output
+    assert "never-render-this-secret" not in result.output
+    stored = service.get(task.evolution_id)
+    assert stored.status == expected_status
+    assert len(stored.revision_ids) == expected_revision_count
+    assert len(stored.strategy_ids) == expected_revision_count
 
 
 def test_feedback_requires_exact_y_and_rejects_files_outside_workspace(
@@ -997,6 +1092,18 @@ def test_cancel_preserves_last_good_revision(
         ),
         result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
     ).entity
+    service.save_compilation(
+        task.evolution_id,
+        FeedbackCompilation(
+            compilation_id="comp_cancel_test",
+            evolution_id=task.evolution_id,
+            feedback_id=feedback.feedback_id,
+            episode_version=completed.version,
+            status="AVAILABLE",
+            provider="fake",
+            model="fake",
+        ),
+    )
     service.confirm_revision(
         task.evolution_id,
         RevisionPlan(
