@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
+from pydantic import ValidationError
+from rich.console import Console
 from typer.testing import CliRunner
 
 import photomatagent.cli.evolve as evolve_module
+import photomatagent.scientific.evolution.feedback as feedback_module
 from photomatagent.cli.app import app
 from photomatagent.models.fake import FakeModelProvider, FakeResponse
 from photomatagent.models.types import ModelRequest, ModelStreamEvent, SystemMessage, UserMessage
@@ -28,6 +34,32 @@ from photomatagent.scientific.evolution.service import (
 from photomatagent.scientific.evolution.store import EvolutionStore
 from photomatagent.scientific.loop import TargetSpec
 from photomatagent.workspace import Workspace
+
+
+def test_clean_feedback_import_does_not_load_runtime_or_scientific_execution_graph() -> None:
+    forbidden = [
+        "photomatagent.scientific.loop.judge",
+        "photomatagent.runtime.loop",
+        "photomatagent.runtime.state",
+        "photomatagent.scientific.state",
+        "photomatagent.tools.registry",
+        "photomatagent.scientific.capabilities.registry",
+    ]
+    script = (
+        "import json, sys\n"
+        "import photomatagent.scientific.evolution.feedback\n"
+        f"names = {forbidden!r}\n"
+        "print(json.dumps([name for name in names if name in sys.modules]))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == []
 
 
 def _available_response(*, status: str = "QUERY", source_span: str = "正文信息呢？") -> str:
@@ -175,7 +207,7 @@ async def test_empty_or_schema_invalid_output_degrades_to_unavailable(
 
     assert result.status == "UNAVAILABLE"
     assert expected_error in (result.error or "")
-    assert result.items == []
+    assert result.items == ()
 
 
 @pytest.mark.asyncio
@@ -197,6 +229,151 @@ async def test_compiler_redacts_secret_bearing_structured_output() -> None:
     assert result.status == "AVAILABLE"
     assert "structured-output-secret" not in result.model_dump_json()
     assert "[REDACTED]" in result.items[0].source_span
+
+
+@pytest.mark.asyncio
+async def test_compilation_is_deeply_immutable_and_json_round_trips() -> None:
+    task, episode, feedback = _context()
+    result = await FeedbackCompiler(
+        FakeModelProvider([FakeResponse(text=_available_response())])
+    ).compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text="report text",
+    )
+
+    with pytest.raises(ValidationError):
+        result.items[0].problem = "rewritten"
+    with pytest.raises(TypeError):
+        result.items[0].requested_actions[0] = "rewritten"
+    with pytest.raises(TypeError):
+        result.items[0] = result.items[0]
+    with pytest.raises(ValidationError):
+        result.items = ()
+    with pytest.raises(ValidationError):
+        result.warnings = ("rewritten",)
+
+    restored = type(result).model_validate_json(result.model_dump_json())
+    assert restored == result
+    assert isinstance(restored.items, tuple)
+    assert isinstance(restored.items[0].requested_actions, tuple)
+    assert isinstance(restored.items[0].preserve, tuple)
+    assert isinstance(restored.warnings, tuple)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("responsible_module", "x" * 4_001),
+        ("problem", "x" * 4_001),
+        ("requested_actions", ["x" * 4_001]),
+        ("acceptance_test", "x" * 4_001),
+        ("preserve", ["x" * 4_001]),
+        ("source_span", "x" * 4_001),
+    ],
+)
+async def test_every_model_controlled_item_string_is_bounded(
+    field: str,
+    value: object,
+) -> None:
+    task, episode, feedback = _context()
+    payload = json.loads(_available_response())
+    payload["items"][0][field] = value
+
+    result = await FeedbackCompiler(
+        FakeModelProvider([FakeResponse(text=json.dumps(payload))])
+    ).compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text="report text",
+    )
+
+    assert result.status == "UNAVAILABLE"
+    assert "JSON/schema" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_model_controlled_warning_strings_are_bounded() -> None:
+    task, episode, feedback = _context()
+    payload = json.loads(_available_response())
+    payload["warnings"] = ["x" * 4_001]
+
+    result = await FeedbackCompiler(
+        FakeModelProvider([FakeResponse(text=json.dumps(payload))])
+    ).compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text="report text",
+    )
+
+    assert result.status == "UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_raw_provider_response_is_rejected_before_json_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task, episode, feedback = _context()
+    response = _available_response() + (" " * 64_000)
+    monkeypatch.setattr(
+        feedback_module,
+        "_extract_json_object",
+        lambda text: (_ for _ in ()).throw(
+            AssertionError(f"oversized response was parsed: {len(text)}")
+        ),
+    )
+
+    result = await FeedbackCompiler(
+        FakeModelProvider([FakeResponse(text=response)])
+    ).compile(
+        task=task,
+        episode=episode,
+        feedback=feedback,
+        result_text="report text",
+    )
+
+    assert result.status == "UNAVAILABLE"
+    assert "response exceeded" in (result.error or "")
+
+
+def test_cli_compilation_rendering_is_bounded() -> None:
+    task, episode, feedback = _context()
+    item = json.loads(_available_response())["items"][0]
+    item["problem"] = "x" * 4_000
+    payload = {
+        "compilation_id": "comp_render",
+        "evolution_id": task.evolution_id,
+        "feedback_id": feedback.feedback_id,
+        "episode_version": episode.version,
+        "status": "AVAILABLE",
+        "items": [
+            {**item, "problem": f"item-{index}-" + ("x" * 3_980)}
+            for index in range(100)
+        ],
+        "warnings": [f"warning-{index}-" + ("x" * 3_900) for index in range(100)],
+        "provider": "fake",
+        "model": "fake",
+    }
+    compilation = evolve_module.FeedbackCompilation.model_validate(payload)
+    output = Console(
+        file=io.StringIO(),
+        record=True,
+        force_terminal=False,
+        width=200,
+    )
+
+    evolve_module._render_compilation(output, compilation)
+    rendered = output.export_text()
+
+    assert len(rendered) < 30_000
+    assert "item-0" in rendered
+    assert "item-99" not in rendered
+    assert "warning-0" in rendered
+    assert "warning-99" not in rendered
 
 
 @pytest.mark.asyncio

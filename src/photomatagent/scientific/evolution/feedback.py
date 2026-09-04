@@ -21,10 +21,12 @@ from photomatagent.scientific.evolution.models import (
     ExpertFeedbackRecord,
     FeedbackCompilation,
     FeedbackDelta,
+    OptionalFeedbackText,
     new_compilation_id,
 )
 
 MAX_RESULT_TEXT_CHARS = 12_000
+MAX_COMPILER_RESPONSE_CHARS = 64_000
 _MAX_PROVENANCE_CHARS = 200
 _MAX_ERROR_CHARS = 1_000
 
@@ -75,8 +77,11 @@ class _CompilerPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["AVAILABLE"]
-    items: list[FeedbackDelta] = Field(default_factory=list, max_length=100)
-    warnings: list[str] = Field(default_factory=list, max_length=100)
+    items: tuple[FeedbackDelta, ...] = Field(default_factory=tuple, max_length=100)
+    warnings: tuple[OptionalFeedbackText, ...] = Field(
+        default_factory=tuple,
+        max_length=100,
+    )
 
 
 class FeedbackCompiler:
@@ -161,6 +166,15 @@ class FeedbackCompiler:
                 status="UNAVAILABLE",
                 error="feedback compiler returned no completed text",
             )
+        if len(text) > MAX_COMPILER_RESPONSE_CHARS:
+            return FeedbackCompilation(
+                **identity,
+                status="UNAVAILABLE",
+                error=(
+                    "feedback compiler response exceeded the "
+                    f"{MAX_COMPILER_RESPONSE_CHARS}-character limit"
+                ),
+            )
         try:
             raw_payload = json.loads(_extract_json_object(text))
             safe_payload = redact_secrets(raw_payload)
@@ -244,6 +258,7 @@ def _extract_json_object(text: str) -> str:
 
 __all__ = [
     "FEEDBACK_COMPILER_SYSTEM_PROMPT",
+    "MAX_COMPILER_RESPONSE_CHARS",
     "MAX_RESULT_TEXT_CHARS",
     "FeedbackCompiler",
 ]

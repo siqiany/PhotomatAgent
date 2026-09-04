@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import secrets
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal, Never, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Never, Self
 
 from pydantic import (
     AfterValidator,
@@ -15,11 +15,16 @@ from pydantic import (
     Field,
     JsonValue,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 
-from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
-from photomatagent.scientific.loop.target import ConstraintSpec
+from photomatagent.scientific.loop.target import ConstraintSpec, TargetSpec
+
+if TYPE_CHECKING:
+    from photomatagent.scientific.loop.policy import ScientificLoopSummary
+else:
+    ScientificLoopSummary = Any
 
 EvolutionStatus = Literal[
     "CREATED",
@@ -86,6 +91,18 @@ Sha256 = Annotated[
     StringConstraints(strict=True, pattern=r"^[0-9a-fA-F]{64}$"),
 ]
 RubricScore = Annotated[int, Field(strict=True, ge=1, le=5)]
+FeedbackModule = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1, max_length=200),
+]
+FeedbackText = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1, max_length=4_000),
+]
+OptionalFeedbackText = Annotated[
+    str,
+    StringConstraints(strict=True, max_length=4_000),
+]
 
 
 def _normalize_utc(value: datetime) -> datetime:
@@ -441,18 +458,35 @@ class EpisodeRecord(StrictModel):
     error: str | None = None
     created_at: UtcDatetime = Field(default_factory=utc_now)
 
+    @field_validator("summary", mode="before")
+    @classmethod
+    def validate_summary(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        from photomatagent.scientific.loop.policy import ScientificLoopSummary
+
+        return ScientificLoopSummary.model_validate(value)
+
 class FeedbackDelta(StrictModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)
+
     item_id: ManagedId | None = None
     category: FeedbackCategory
     status: FeedbackItemStatus
     severity: FeedbackSeverity
-    responsible_module: str = Field(min_length=1, max_length=200)
-    problem: str = Field(min_length=1, max_length=4_000)
-    requested_actions: list[str] = Field(default_factory=list, max_length=20)
-    acceptance_test: str | None = Field(default=None, max_length=4_000)
-    preserve: list[str] = Field(default_factory=list, max_length=20)
+    responsible_module: FeedbackModule
+    problem: FeedbackText
+    requested_actions: tuple[FeedbackText, ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
+    acceptance_test: OptionalFeedbackText | None = None
+    preserve: tuple[FeedbackText, ...] = Field(
+        default_factory=tuple,
+        max_length=20,
+    )
     confidence: float = Field(ge=0.0, le=1.0)
-    source_span: str = Field(min_length=1, max_length=4_000)
+    source_span: FeedbackText
 
 
 class FeedbackCompilation(StrictModel):
@@ -464,8 +498,11 @@ class FeedbackCompilation(StrictModel):
     feedback_id: ManagedId | None = None
     episode_version: EpisodeVersion | None = None
     status: CompilationStatus = "PENDING"
-    items: list[FeedbackDelta] = Field(default_factory=list, max_length=100)
-    warnings: list[str] = Field(default_factory=list, max_length=100)
+    items: tuple[FeedbackDelta, ...] = Field(default_factory=tuple, max_length=100)
+    warnings: tuple[OptionalFeedbackText, ...] = Field(
+        default_factory=tuple,
+        max_length=100,
+    )
     provider: str | None = Field(default=None, max_length=200)
     model: str | None = Field(default=None, max_length=200)
     error: str | None = Field(default=None, max_length=1_000)

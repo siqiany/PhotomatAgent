@@ -47,7 +47,7 @@ from photomatagent.scientific.evolution.store import (
     EvolutionStore,
     EvolutionTransaction,
 )
-from photomatagent.scientific.loop import TargetSpec
+from photomatagent.scientific.loop.target import TargetSpec
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _EntityT = TypeVar("_EntityT", covariant=True)

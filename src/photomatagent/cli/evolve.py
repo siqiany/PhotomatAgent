@@ -77,6 +77,9 @@ _FLAG_PROMPTS = (
     ("unsupported_novelty", "创新性缺少定义、基线或证据"),
     ("process_parameters_only", "工艺只有路线名称和少数参数"),
 )
+_MAX_RENDERED_COMPILATION_ITEMS = 20
+_MAX_RENDERED_COMPILATION_WARNINGS = 20
+_MAX_RENDERED_COMPILATION_TEXT = 500
 
 
 class PromptSessionLike(Protocol):
@@ -537,14 +540,39 @@ def _render_compilation(output: Console, compilation: FeedbackCompilation) -> No
     if compilation.error:
         table.add_row("Error", redact_text(compilation.error))
     output.print(table)
-    for item in compilation.items:
+    rendered_items = compilation.items[:_MAX_RENDERED_COMPILATION_ITEMS]
+    for item in rendered_items:
         output.print(
-            f"[{item.severity}] {item.status} {item.category}: "
-            f"{redact_text(item.problem)}",
+            Text(
+                f"[{item.severity}] {item.status} {item.category}: "
+                f"{_bounded_compilation_text(item.problem)}"
+            ),
             soft_wrap=True,
         )
-    for warning in compilation.warnings:
-        output.print(f"[yellow]Warning: {redact_text(warning)}[/]", soft_wrap=True)
+    omitted_items = len(compilation.items) - len(rendered_items)
+    if omitted_items:
+        output.print(Text(f"… {omitted_items} additional items omitted", style="dim"))
+    rendered_warnings = compilation.warnings[:_MAX_RENDERED_COMPILATION_WARNINGS]
+    for warning in rendered_warnings:
+        output.print(
+            Text(
+                f"Warning: {_bounded_compilation_text(warning)}",
+                style="yellow",
+            ),
+            soft_wrap=True,
+        )
+    omitted_warnings = len(compilation.warnings) - len(rendered_warnings)
+    if omitted_warnings:
+        output.print(
+            Text(f"… {omitted_warnings} additional warnings omitted", style="dim")
+        )
+
+
+def _bounded_compilation_text(value: str) -> str:
+    safe = redact_text(value)
+    if len(safe) <= _MAX_RENDERED_COMPILATION_TEXT:
+        return safe
+    return safe[: _MAX_RENDERED_COMPILATION_TEXT - 1] + "…"
 
 
 def load_feedback_file(path: Path) -> ExpertFeedbackDraft:
