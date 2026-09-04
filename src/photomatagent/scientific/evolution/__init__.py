@@ -54,6 +54,13 @@ from photomatagent.scientific.evolution.rubric import (
     assess_hard_caps,
     expert_utility,
 )
+from photomatagent.scientific.evolution.store import (
+    EvolutionAlreadyExistsError,
+    EvolutionConflictError,
+    EvolutionLockError,
+    EvolutionStore,
+    EvolutionStoreError,
+)
 
 __all__ = [
     "AcceptanceResult",
@@ -70,6 +77,11 @@ __all__ = [
     "EpisodeVersion",
     "EvidenceChangeSummary",
     "EvolutionStatus",
+    "EvolutionAlreadyExistsError",
+    "EvolutionConflictError",
+    "EvolutionLockError",
+    "EvolutionStore",
+    "EvolutionStoreError",
     "EvolutionTask",
     "ExecutionMode",
     "ExperienceMaturity",
