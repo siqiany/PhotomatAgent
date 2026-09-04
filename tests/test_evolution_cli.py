@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import shlex
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from pathlib import Path
@@ -43,6 +44,15 @@ from photomatagent.workspace import Workspace
 @pytest.fixture
 def cli_runner() -> CliRunner:
     return CliRunner()
+
+
+class _ScriptedPrompt:
+    def __init__(self, *answers: str) -> None:
+        self.answers = deque(answers)
+
+    async def prompt_async(self, message: str) -> str:
+        del message
+        return self.answers.popleft()
 
 
 def _target_json() -> str:
@@ -127,7 +137,7 @@ def _failed_initial_task(tmp_path: Path, *, evolution_id: str = "evo_retry_test"
     return service.get(task.evolution_id)
 
 
-def test_evolve_help_is_registered_and_labels_future_execution_commands(
+def test_evolve_help_registers_feedback_and_labels_future_execution_commands(
     cli_runner: CliRunner,
 ) -> None:
     result = cli_runner.invoke(app, ["evolve", "--help"])
@@ -139,11 +149,151 @@ def test_evolve_help_is_registered_and_labels_future_execution_commands(
     assert "history" in result.stdout
     assert "feedback" in result.stdout
     assert "iterate" in result.stdout
-    assert "planned" in result.stdout.lower()
+    feedback_help = cli_runner.invoke(app, ["evolve", "feedback", "--help"])
+    assert feedback_help.exit_code == 0
+    assert "--file" in feedback_help.output
+    assert "--version" in feedback_help.output
 
-    unavailable = cli_runner.invoke(app, ["evolve", "feedback", "evo_cli_test"])
-    assert unavailable.exit_code != 0
-    assert "No such command" in unavailable.output
+
+def test_feedback_file_import_is_confirmed_without_constructing_runtime(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _completed_task(tmp_path)
+    review = tmp_path / "review.json"
+    review.write_text(
+        '{"scores":{"scientific_correctness":4,"evidence_sufficiency":3,'
+        '"novelty":2,"actionability":3,"overall":3},'
+        '"comments":"Authorization: Bearer cli-secret"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        evolve_module,
+        "make_prompt_session",
+        lambda: _ScriptedPrompt("y"),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "build_runtime",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError(f"feedback constructed runtime: {kwargs}")
+        ),
+    )
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "feedback",
+            task.evolution_id,
+            "--version",
+            "v001",
+            "--file",
+            str(review),
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    stored = EvolutionService(EvolutionStore(Workspace(tmp_path))).get(task.evolution_id)
+    assert stored.status == "FEEDBACK_RECORDED"
+    assert len(stored.feedback_ids) == 1
+    assert "cli-secret" not in result.output
+    feedback = EvolutionStore(Workspace(tmp_path)).load_feedback(
+        task.evolution_id, stored.feedback_ids[0]
+    )
+    assert "cli-secret" not in feedback.raw_input
+
+
+def test_feedback_requires_exact_y_and_rejects_files_outside_workspace(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _completed_task(workspace)
+    outside = tmp_path / "outside-review.json"
+    outside.write_text(
+        '{"scores":{"scientific_correctness":3,"evidence_sufficiency":3,'
+        '"novelty":3,"actionability":3,"overall":3}}',
+        encoding="utf-8",
+    )
+
+    rejected = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "feedback",
+            task.evolution_id,
+            "--file",
+            str(outside),
+            "--workspace",
+            str(workspace),
+        ],
+    )
+    assert rejected.exit_code == 2
+    assert "outside workspace" in rejected.output
+
+    inside = workspace / "review.json"
+    inside.write_text(outside.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(
+        evolve_module,
+        "make_prompt_session",
+        lambda: _ScriptedPrompt("yes"),
+    )
+    unconfirmed = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "feedback",
+            task.evolution_id,
+            "--file",
+            str(inside),
+            "--workspace",
+            str(workspace),
+        ],
+    )
+
+    assert unconfirmed.exit_code == 0, unconfirmed.output
+    service = EvolutionService(EvolutionStore(Workspace(workspace)))
+    assert service.get(task.evolution_id).feedback_ids == []
+    assert service.store.list_feedback(task.evolution_id) == []
+
+
+def test_invalid_feedback_import_does_not_echo_rejected_secret_values(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    task = _completed_task(tmp_path)
+    review = tmp_path / "invalid-review.json"
+    review.write_text(
+        '{"scores":{"scientific_correctness":3,"evidence_sufficiency":3,'
+        '"novelty":3,"actionability":3,"overall":3},'
+        '"password":"raw-feedback-secret"}',
+        encoding="utf-8",
+    )
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "feedback",
+            task.evolution_id,
+            "--file",
+            str(review),
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "raw-feedback-secret" not in result.output
+    assert "strict ExpertFeedbackDraft" in result.output
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    assert service.get(task.evolution_id).feedback_ids == []
 
 
 def test_start_requires_machine_verifiable_target_without_persisting_task(

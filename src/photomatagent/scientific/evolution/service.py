@@ -541,6 +541,13 @@ class EvolutionService:
     ) -> MutationResult[ExpertFeedbackRecord]:
         with self.store.transaction(evolution_id) as transaction:
             task, episode = self._current_episode(transaction, version)
+            if task.status not in {
+                "AWAITING_EXPERT_FEEDBACK",
+                "FEEDBACK_RECORDED",
+            }:
+                raise InvalidEvolutionTransition(
+                    "feedback requires AWAITING_EXPERT_FEEDBACK"
+                )
             if episode.status != "COMPLETED":
                 raise InvalidEvolutionTransition("feedback requires a completed episode")
             artifact = self._verify_artifact(episode.artifact)
@@ -571,8 +578,12 @@ class EvolutionService:
                 self._require_matching_feedback(existing, feedback)
                 persisted = existing
             else:
+                if task.status == "FEEDBACK_RECORDED":
+                    raise InvalidEvolutionTransition(
+                        "recorded feedback retry requires its existing immutable record"
+                    )
                 transaction.write_feedback(feedback)
-                persisted = feedback
+                persisted = transaction.load_feedback(feedback.feedback_id)
             if task.status == "AWAITING_EXPERT_FEEDBACK":
                 self.validate_transition(task.status, "FEEDBACK_RECORDED")
                 updated = task.model_copy(

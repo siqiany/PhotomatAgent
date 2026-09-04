@@ -11,15 +11,16 @@ import asyncio
 import shlex
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 
 import typer
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from photomatagent.errors import ToolExecutionError
+from photomatagent.cli.prompt import make_prompt_session
 from photomatagent.config import LLMConfig
+from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger, default_sessions_dir
 from photomatagent.redaction import redact_secrets, redact_text
 from photomatagent.runtime.events import RuntimeEvent
@@ -33,6 +34,17 @@ from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
     EpisodeVersion,
     EvolutionTask,
+    ExpertFeedbackDraft,
+    ExpertFeedbackRecord,
+    RubricFlags,
+    RubricScores,
+    new_feedback_id,
+)
+from photomatagent.scientific.evolution.rubric import (
+    RUBRIC_ANCHORS,
+    RUBRIC_DIMENSIONS,
+    RUBRIC_VERSION,
+    assess_hard_caps,
 )
 from photomatagent.scientific.evolution.service import (
     EvolutionServiceError,
@@ -49,11 +61,33 @@ from photomatagent.scientific.loop import (
 from photomatagent.workspace import Workspace
 
 ApprovalMode = Literal["ask", "auto", "deny"]
+_RUBRIC_FIELDS = (
+    "scientific_correctness",
+    "evidence_sufficiency",
+    "novelty",
+    "actionability",
+    "overall",
+)
+_FLAG_PROMPTS = (
+    ("fabricated_source", "存在伪造来源"),
+    ("conclusion_changing_error", "存在会改变结论的科学错误"),
+    ("abstract_only_core_evidence", "核心结论只有摘要支持"),
+    ("unsupported_novelty", "创新性缺少定义、基线或证据"),
+    ("process_parameters_only", "工艺只有路线名称和少数参数"),
+)
+
+
+class PromptSessionLike(Protocol):
+    async def prompt_async(self, message: str) -> str: ...
+
+
+class FeedbackEntryCancelled(Exception):
+    """Internal control signal for a feedback form cancelled without writes."""
 
 evolve_app = typer.Typer(
     help=(
         "Run persistent expert-feedback evolution tasks. "
-        "Planned entry points: feedback and iterate (not available yet)."
+        "The iterate and compilation entry points are planned but not available yet."
     ),
 )
 console = Console()
@@ -326,6 +360,70 @@ def evolve_history(
             )
 
 
+@evolve_app.command("feedback")
+def evolve_feedback(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    version: str | None = typer.Option(
+        None,
+        "--version",
+        help="Completed episode version; defaults to the latest completed version.",
+    ),
+    feedback_file: Path | None = typer.Option(
+        None,
+        "--file",
+        help="Workspace-contained strict ExpertFeedbackDraft JSON file.",
+    ),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Record one confirmed expert review without constructing a runtime."""
+
+    try:
+        boundary = Workspace(workspace)
+        service = EvolutionService(EvolutionStore(boundary))
+        task = service.get(evolution_id)
+        selected_version = version or task.last_completed_version
+        if selected_version is None:
+            raise ValueError("task has no completed episode available for feedback")
+        draft: ExpertFeedbackDraft | None = None
+        raw_input: str | None = None
+        if feedback_file is not None:
+            resolved = boundary.resolve(str(feedback_file), must_exist=True)
+            if not resolved.is_file():
+                raise ValueError("--file must name a regular file")
+            raw_input = resolved.read_text(encoding="utf-8")
+            try:
+                draft = load_feedback_file(resolved)
+            except ValueError as exc:
+                raise ValueError(
+                    "invalid --file: expected strict ExpertFeedbackDraft JSON"
+                ) from exc
+        record = asyncio.run(
+            run_feedback_flow(
+                session=make_prompt_session(),
+                console=console,
+                service=service,
+                evolution_id=evolution_id,
+                version=cast(EpisodeVersion, selected_version),
+                draft=draft,
+                raw_input=raw_input,
+            )
+        )
+    except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
+        console.print(f"[red]{redact_text(str(exc))}[/]")
+        raise typer.Exit(code=2) from None
+
+    if record is None:
+        console.print("[dim]Expert feedback cancelled; no data was written.[/]")
+        return
+    console.print(
+        f"[green]Recorded feedback {record.feedback_id} for "
+        f"{record.evolution_id} {record.episode_version}.[/]"
+    )
+    _render_task_details(service.get(evolution_id), boundary.root)
+
+
 @evolve_app.command("cancel")
 def evolve_cancel(
     evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
@@ -345,6 +443,241 @@ def evolve_cancel(
             param_hint="evolution_id",
         ) from exc
     _render_task_details(cancelled.entity, boundary.root)
+
+
+def load_feedback_file(path: Path) -> ExpertFeedbackDraft:
+    """Load a JSON file through the strict draft schema.
+
+    CLI callers must pass a path already resolved by their ``Workspace``
+    boundary. Keeping schema parsing separate makes import behavior reusable
+    without weakening the command's path containment check.
+    """
+
+    return ExpertFeedbackDraft.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+async def collect_expert_feedback(
+    *,
+    session: PromptSessionLike,
+    console: Console,
+    evolution_id: str,
+    version: EpisodeVersion,
+) -> ExpertFeedbackDraft:
+    """Collect one complete ``expert-review-v1`` draft without persisting it."""
+
+    console.print(
+        f"[bold cyan]EXPERT FEEDBACK — {RUBRIC_VERSION} — "
+        f"{evolution_id} — {version}[/]"
+    )
+    console.print("[dim]输入 /cancel 可随时取消；评论输入 /submit 后结束。[/]")
+    scores: dict[str, int] = {}
+    for field in _RUBRIC_FIELDS:
+        label = RUBRIC_DIMENSIONS[field]
+        console.print(f"[bold]{label}[/]")
+        for number, anchor in enumerate(RUBRIC_ANCHORS[field], start=1):
+            console.print(f"  {number}: {anchor}")
+        scores[field] = await _prompt_score(
+            session,
+            console,
+            _expert_prompt(evolution_id, version, field),
+        )
+
+    flags: dict[str, bool] = {}
+    for field, label in _FLAG_PROMPTS:
+        flags[field] = await _prompt_boolean(
+            session,
+            console,
+            _expert_prompt(evolution_id, version, f"{field} [y/N] ({label})"),
+        )
+    fatal_issue = await _prompt_boolean(
+        session,
+        console,
+        _expert_prompt(evolution_id, version, "fatal_issue [y/N] (存在致命问题)"),
+    )
+    comments = await _prompt_multiline(
+        session,
+        _expert_prompt(evolution_id, version, "comments"),
+    )
+    return ExpertFeedbackDraft(
+        scores=RubricScores.model_validate(scores),
+        flags=RubricFlags.model_validate(flags),
+        fatal_issue=fatal_issue,
+        comments=comments,
+    )
+
+
+async def run_feedback_flow(
+    *,
+    session: PromptSessionLike,
+    console: Console,
+    service: EvolutionService,
+    evolution_id: str,
+    version: EpisodeVersion,
+    draft: ExpertFeedbackDraft | None = None,
+    raw_input: str | None = None,
+) -> ExpertFeedbackRecord | None:
+    """Collect/import, summarize, confirm, and atomically attach one review."""
+
+    try:
+        task = service.get(evolution_id)
+        episode = service.store.load_episode(evolution_id, version)
+        if episode.artifact is None:
+            raise ValueError("selected episode has no primary result artifact")
+        selected = draft or await collect_expert_feedback(
+            session=session,
+            console=console,
+            evolution_id=evolution_id,
+            version=version,
+        )
+        assessment = assess_hard_caps(selected.scores, selected.flags)
+        override_reason: str | None = None
+        exceeds_cap = any(
+            getattr(selected.scores, field) > getattr(assessment.suggested_scores, field)
+            for field in _RUBRIC_FIELDS
+        )
+        if exceeds_cap:
+            console.print("[yellow]Deterministic hard-cap suggestion:[/]")
+            for reason in assessment.reasons:
+                console.print(f"  - {reason}")
+            override_reason = await _prompt_nonempty(
+                session,
+                console,
+                _expert_prompt(evolution_id, version, "hard_cap_override_reason"),
+            )
+
+        _render_feedback_confirmation(
+            console,
+            task=task,
+            version=version,
+            result_sha256=episode.artifact.sha256,
+            draft=selected,
+        )
+        confirmation = await _prompt_value(
+            session,
+            _expert_prompt(evolution_id, version, "confirm exact input 'y'"),
+        )
+        if confirmation.strip().lower() != "y":
+            return None
+
+        feedback_id = _feedback_id_for_retry(service, evolution_id, version)
+        mutation = service.attach_feedback(
+            evolution_id,
+            version,
+            feedback_id=feedback_id,
+            draft=selected,
+            result_sha256=episode.artifact.sha256,
+            raw_input=raw_input or selected.model_dump_json(),
+            hard_cap_override_reason=override_reason,
+        )
+        await service.publish(mutation)
+        return mutation.entity
+    except FeedbackEntryCancelled:
+        return None
+
+
+def _expert_prompt(evolution_id: str, version: str, field: str) -> str:
+    return f"[EXPERT FEEDBACK | {evolution_id} | {version}] {field}> "
+
+
+async def _prompt_value(session: PromptSessionLike, prompt: str) -> str:
+    try:
+        value = await session.prompt_async(prompt)
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise FeedbackEntryCancelled from exc
+    if value.strip().lower() == "/cancel":
+        raise FeedbackEntryCancelled
+    return value
+
+
+async def _prompt_score(
+    session: PromptSessionLike,
+    console: Console,
+    prompt: str,
+) -> int:
+    while True:
+        value = (await _prompt_value(session, prompt)).strip()
+        if value in {"1", "2", "3", "4", "5"}:
+            return int(value)
+        console.print("[red]请输入 1–5 的整数。[/]")
+
+
+async def _prompt_boolean(
+    session: PromptSessionLike,
+    console: Console,
+    prompt: str,
+) -> bool:
+    while True:
+        value = (await _prompt_value(session, prompt)).strip().lower()
+        if value in {"", "n", "no"}:
+            return False
+        if value in {"y", "yes"}:
+            return True
+        console.print("[red]请输入 y 或 n（默认 n）。[/]")
+
+
+async def _prompt_multiline(session: PromptSessionLike, prompt: str) -> str:
+    lines: list[str] = []
+    while True:
+        value = await _prompt_value(session, prompt)
+        if value.strip().lower() == "/submit":
+            return "\n".join(lines)
+        lines.append(value)
+
+
+async def _prompt_nonempty(
+    session: PromptSessionLike,
+    console: Console,
+    prompt: str,
+) -> str:
+    while True:
+        value = (await _prompt_value(session, prompt)).strip()
+        if value:
+            return value
+        console.print("[red]覆盖确定性封顶时必须填写专家理由。[/]")
+
+
+def _render_feedback_confirmation(
+    output: Console,
+    *,
+    task: EvolutionTask,
+    version: EpisodeVersion,
+    result_sha256: str,
+    draft: ExpertFeedbackDraft,
+) -> None:
+    table = Table("Feedback confirmation", "Value")
+    table.add_row("Evolution task", task.evolution_id)
+    table.add_row("Episode", version)
+    table.add_row("Result SHA-256", result_sha256)
+    for field in _RUBRIC_FIELDS:
+        table.add_row(RUBRIC_DIMENSIONS[field], str(getattr(draft.scores, field)))
+    active_flags = [label for field, label in _FLAG_PROMPTS if getattr(draft.flags, field)]
+    table.add_row("Flags", ", ".join(active_flags) if active_flags else "none")
+    table.add_row("Fatal issue", "yes" if draft.fatal_issue else "no")
+    table.add_row("Comments length", str(len(draft.comments)))
+    output.print(table)
+    output.print(f"Result SHA-256: {result_sha256}", soft_wrap=True)
+    output.print("[bold]Only exact input 'y' records this feedback.[/]")
+
+
+def _feedback_id_for_retry(
+    service: EvolutionService,
+    evolution_id: str,
+    version: EpisodeVersion,
+) -> str:
+    records = service.store.list_feedback(evolution_id)
+    superseded = {
+        record.supersedes_feedback_id
+        for record in records
+        if record.supersedes_feedback_id is not None
+    }
+    active = [
+        record
+        for record in records
+        if record.episode_version == version and record.feedback_id not in superseded
+    ]
+    if len(active) > 1:
+        raise ValueError(f"episode {version} has multiple active feedback records")
+    return active[0].feedback_id if active else new_feedback_id()
 
 
 async def _execute_initial_episode(
@@ -543,4 +876,10 @@ def _next_command(task: EvolutionTask, workspace: Path) -> str:
     return f"{command} --workspace {shlex.quote(str(resolved_workspace))}"
 
 
-__all__ = ["evolve_app"]
+__all__ = [
+    "FeedbackEntryCancelled",
+    "collect_expert_feedback",
+    "evolve_app",
+    "load_feedback_file",
+    "run_feedback_flow",
+]
