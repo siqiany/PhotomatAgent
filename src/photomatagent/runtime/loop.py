@@ -180,6 +180,12 @@ class AgentRuntime:
     def workspace(self) -> Workspace:
         return self._workspace
 
+    @property
+    def session_id(self) -> str:
+        """Stable read-only identity used to attribute one runtime session."""
+
+        return self._session_id
+
     def restore_session(self, snapshot: SessionSnapshot) -> None:
         """Reload a saved session snapshot and continue on top of it.
 

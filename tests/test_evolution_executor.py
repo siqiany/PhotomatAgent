@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -8,7 +9,12 @@ import pytest
 from photomatagent.errors import ProviderError
 from photomatagent.logging.event_logger import EventLogger
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
-from photomatagent.models.types import ModelRequest, ModelStreamEvent, ModelUsage
+from photomatagent.models.types import (
+    AssistantMessage,
+    ModelRequest,
+    ModelStreamEvent,
+    ModelUsage,
+)
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
@@ -17,10 +23,19 @@ from photomatagent.scientific.evolution.executor import ScientificEpisodeExecuto
 from photomatagent.scientific.evolution.artifacts import (
     EpisodeResultAlreadyExistsError,
 )
-from photomatagent.scientific.evolution.models import RevisionPlan
+from photomatagent.scientific.evolution.models import (
+    ArtifactRef,
+    ExpertFeedbackDraft,
+    RevisionPlan,
+    RubricScores,
+)
 from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.store import EvolutionStore
-from photomatagent.scientific.loop import ScientificLoopConfig, TargetSpec
+from photomatagent.scientific.loop import (
+    ScientificLoopConfig,
+    ScientificLoopSummary,
+    TargetSpec,
+)
 from photomatagent.scientific.state import ScientificState
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.write import WriteTool
@@ -39,6 +54,67 @@ def _reserved(service: EvolutionService):  # type: ignore[no-untyped-def]
     ).entity
     episode = service.reserve_episode(task.evolution_id, mode="NORMAL").entity
     return task, episode
+
+
+def _reserved_revision(service: EvolutionService):  # type: ignore[no-untyped-def]
+    task, first = _reserved(service)
+    running = service.mark_episode_running(task.evolution_id, first.version).entity
+    content = b"first result"
+    relative = "user_output/evo_test/v001/result.md"
+    path = service.store.workspace.resolve(relative, must_exist=False)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    completed = service.complete_episode(
+        task.evolution_id,
+        first.version,
+        result=running.model_copy(
+            update={
+                "summary": ScientificLoopSummary(
+                    status="INCONCLUSIVE",
+                    rounds=1,
+                    candidate_count=0,
+                    best_candidate_id=None,
+                    best_score=0.0,
+                    final_evaluation=None,
+                ),
+                "artifact": ArtifactRef(
+                    path=relative,
+                    size_bytes=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                ),
+            }
+        ),
+    ).entity
+    feedback = service.attach_feedback(
+        task.evolution_id,
+        first.version,
+        feedback_id="fb_test",
+        draft=ExpertFeedbackDraft(
+            scores=RubricScores(
+                scientific_correctness=3,
+                evidence_sufficiency=3,
+                novelty=3,
+                actionability=3,
+                overall=3,
+            )
+        ),
+        result_sha256=completed.artifact.sha256,  # type: ignore[union-attr]
+        raw_input="review",
+    ).entity
+    plan = RevisionPlan(
+        revision_id="rp_test",
+        evolution_id=task.evolution_id,
+        source_version=first.version,
+        feedback_id=feedback.feedback_id,
+        contract_changes=["Use primary evidence"],
+        confirmed=True,
+    )
+    persisted_plan = service.confirm_revision(task.evolution_id, plan).entity
+    second = service.reserve_episode(
+        task.evolution_id,
+        mode="CARRY_VERIFIED_EVIDENCE",
+    ).entity
+    return service.get(task.evolution_id), second, persisted_plan
 
 
 def _runtime(
@@ -61,6 +137,18 @@ def _runtime(
         event_sinks=event_sinks,
         session_id=session_id,
     )
+
+
+def test_agent_runtime_exposes_read_only_session_id(tmp_path: Path) -> None:
+    runtime = _runtime(
+        Workspace(tmp_path),
+        FakeModelProvider([FakeResponse(text="unused")]),
+        session_id="session_public",
+    )
+
+    assert runtime.session_id == "session_public"
+    with pytest.raises(AttributeError):
+        runtime.session_id = "changed"  # type: ignore[misc]
 
 
 @pytest.mark.asyncio
@@ -119,7 +207,9 @@ async def test_executor_runs_write_only_through_agent_runtime_and_completes_epis
     assert "tool_completed" in [event.kind for event in observed]
     assert "evolution_episode_started" in [event.kind for event in observed]
     assert "evolution_episode_completed" in [event.kind for event in observed]
-    assert "scientific_loop_completed" in [event.kind for event in logger.read_events()]
+    logged_kinds = [event.kind for event in logger.read_events()]
+    assert logged_kinds.count("tool_completed") == 1
+    assert logged_kinds.count("scientific_loop_completed") == 1
 
 
 @pytest.mark.asyncio
@@ -257,6 +347,101 @@ async def test_invalid_revision_fails_before_episode_is_marked_running(
 
 
 @pytest.mark.asyncio
+async def test_forged_revision_with_persisted_id_is_rejected_before_running(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    task, episode, persisted = _reserved_revision(service)
+    forged = persisted.model_copy(update={"contract_changes": ["Forged instruction"]})
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="unused")]),
+    )
+
+    with pytest.raises(ValueError, match="persisted RevisionPlan"):
+        await ScientificEpisodeExecutor(service.store).execute(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+            revision=forged,
+        )
+
+    assert service.store.load_episode("evo_test", "v002").status == "RESERVED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dirty", ["conversation", "budget"])
+async def test_executor_rejects_reused_runtime_before_episode_attribution(
+    tmp_path: Path,
+    dirty: str,
+) -> None:
+    service = _service(tmp_path)
+    task, episode = _reserved(service)
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="new result")]),
+    )
+    if dirty == "conversation":
+        runtime.conversation_state.add(AssistantMessage(text="old answer"))
+    else:
+        runtime.budget.record_iteration()
+
+    with pytest.raises(ValueError, match="fresh"):
+        await ScientificEpisodeExecutor(service.store).execute(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+        )
+
+    assert service.store.load_episode("evo_test", "v001").status == "RESERVED"
+    assert not (
+        service.store.workspace.root / "user_output/evo_test/v001/result.md"
+    ).exists()
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_session_used_by_another_episode(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    first_task = service.create_task(
+        goal="first",
+        target=TargetSpec(goal="first"),
+        evolution_id="evo_first",
+    ).entity
+    first = service.reserve_episode(first_task.evolution_id, mode="NORMAL").entity
+    service.mark_episode_running(
+        first_task.evolution_id,
+        first.version,
+        runtime_session_id="session_shared",
+    )
+    service.fail_episode(first_task.evolution_id, first.version, "finished failure")
+    second_task = service.create_task(
+        goal="second",
+        target=TargetSpec(goal="second"),
+        evolution_id="evo_second",
+    ).entity
+    second = service.reserve_episode(second_task.evolution_id, mode="NORMAL").entity
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="unused")]),
+        session_id="session_shared",
+    )
+
+    with pytest.raises(ValueError, match="already attributed"):
+        await ScientificEpisodeExecutor(service.store).execute(
+            task=second_task,
+            episode=second,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+        )
+
+    assert service.store.load_episode("evo_second", "v001").status == "RESERVED"
+
+
+@pytest.mark.asyncio
 async def test_callback_failure_after_durable_completion_does_not_mark_failed(
     tmp_path: Path,
 ) -> None:
@@ -312,4 +497,118 @@ async def test_completion_manifest_crash_does_not_reclassify_durable_completion(
         )
 
     assert service.store.load_episode("evo_test", "v001").status == "COMPLETED"
-    assert service.get("evo_test").status == "RUNNING"
+    assert service.get("evo_test").status == "AWAITING_EXPERT_FEEDBACK"
+
+
+@pytest.mark.asyncio
+async def test_failure_manifest_crash_is_reconciled_to_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    task, episode = _reserved(service)
+    runtime = _runtime(service.store.workspace, FailingProvider())
+    executor = ScientificEpisodeExecutor(service.store)
+    original = service.store._save_task_locked
+
+    def fail_manifest_once(candidate, expected_revision):  # type: ignore[no-untyped-def]
+        monkeypatch.setattr(service.store, "_save_task_locked", original)
+        raise OSError("failure manifest crash")
+
+    monkeypatch.setattr(service.store, "_save_task_locked", fail_manifest_once)
+
+    with pytest.raises(ProviderError, match="boom"):
+        await executor.execute(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+        )
+
+    assert service.store.load_episode("evo_test", "v001").status == "FAILED"
+    assert service.get("evo_test").status == "BLOCKED"
+
+
+@pytest.mark.asyncio
+async def test_executor_logs_every_yielded_event_once_without_runtime_logger_sink(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    task, episode = _reserved(service)
+    logger = EventLogger(
+        tmp_path / ".photomatagent/sessions", session_id="session_test"
+    )
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider(
+            [
+                scripted_tool_call(
+                    "write",
+                    {
+                        "path": "user_output/evo_test/v001/result.md",
+                        "content": "result",
+                    },
+                    tool_call_id="call_result",
+                ),
+                FakeResponse(text="done"),
+            ]
+        ),
+    )
+
+    await ScientificEpisodeExecutor(service.store, event_logger=logger).execute(
+        task=task,
+        episode=episode,
+        runtime=runtime,
+        config=ScientificLoopConfig(max_rounds=1),
+    )
+
+    kinds = [event.kind for event in logger.read_events()]
+    for expected in (
+        "scientific_loop_started",
+        "loop_started",
+        "model_request_started",
+        "tool_call_completed",
+        "tool_started",
+        "tool_completed",
+        "loop_completed",
+        "scientific_loop_completed",
+    ):
+        assert expected in kinds
+    assert kinds.count("tool_call_completed") == 1
+    assert kinds.count("tool_completed") == 1
+    assert kinds.count("scientific_loop_started") == 1
+    assert kinds.count("scientific_loop_completed") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via_symlink", [False, True])
+async def test_outside_event_logger_is_rejected_before_running(
+    tmp_path: Path,
+    via_symlink: bool,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    service = _service(workspace_root)
+    task, episode = _reserved(service)
+    if via_symlink:
+        sessions = workspace_root / ".photomatagent/sessions"
+        sessions.symlink_to(outside, target_is_directory=True)
+        logger = EventLogger(sessions, session_id="session_test")
+    else:
+        logger = EventLogger(outside, session_id="session_test")
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="unused")]),
+    )
+
+    with pytest.raises(ValueError, match="event log"):
+        await ScientificEpisodeExecutor(service.store, event_logger=logger).execute(
+            task=task,
+            episode=episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+        )
+
+    assert service.store.load_episode("evo_test", "v001").status == "RESERVED"

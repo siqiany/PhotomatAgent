@@ -8,6 +8,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
@@ -79,33 +80,41 @@ class ScientificEpisodeExecutor:
         on_event: EventSink | None = None,
     ) -> EpisodeExecutionResult:
         self._validate_execution(task=task, episode=episode, runtime=runtime)
-        instruction = self._instruction(task, episode, revision)
         runtime_session_id = self._runtime_session_id(runtime)
+        self._validate_unused_session(
+            runtime_session_id,
+            evolution_id=task.evolution_id,
+            version=episode.version,
+        )
         event_log_path = self._event_log_path()
+        persisted_revision = self._persisted_revision(episode, revision)
+        instruction = self._instruction(task, persisted_revision)
         collector = EpisodeArtifactCollector()
         started_at = time.monotonic()
-        running_result = self.service.mark_episode_running(
-            task.evolution_id,
-            episode.version,
-            runtime_session_id=runtime_session_id,
-            event_log_path=event_log_path,
-        )
-        running = running_result.entity
-
-        controller = ScientificLoopController(
-            target=episode.target_snapshot.to_target_spec(),
-            runtime=runtime,
-            config=config,
-            judge=judge,
-            event_sinks=(
-                [self.event_logger.log] if self.event_logger is not None else []
-            ),
-            session_id=runtime_session_id,
-        )
+        runtime_logs_events = self._runtime_uses_event_logger(runtime)
         try:
+            running_result = self.service.mark_episode_running(
+                task.evolution_id,
+                episode.version,
+                runtime_session_id=runtime_session_id,
+                event_log_path=event_log_path,
+            )
+            running = running_result.entity
+            controller = ScientificLoopController(
+                target=episode.target_snapshot.to_target_spec(),
+                runtime=runtime,
+                config=config,
+                judge=judge,
+                event_sinks=[],
+                session_id=runtime_session_id,
+            )
             await self._publish(running_result, on_event)
             async for event in controller.run(goal=instruction):
                 collector.observe(event)
+                if self.event_logger is not None and (
+                    not runtime_logs_events or event.run_id == controller.run_id
+                ):
+                    await self.event_logger.log(event)
                 await self._deliver(on_event, event)
             if controller.summary is None:
                 raise RuntimeError("scientific loop ended without a summary")
@@ -136,26 +145,15 @@ class ScientificEpisodeExecutor:
                 episode.version,
                 result=completion,
             )
+            await self._publish(completed_result, on_event)
         except BaseException as exc:
-            try:
-                persisted = self.store.load_episode(
-                    task.evolution_id,
-                    episode.version,
-                )
-                if persisted.status in {"RESERVED", "RUNNING"}:
-                    failure = self.service.fail_episode(
-                        task.evolution_id,
-                        episode.version,
-                        self._bounded_error(exc),
-                    )
-                    await self._publish(failure, on_event)
-            except BaseException as recovery_error:
-                exc.add_note(
-                    "episode failure reconciliation also failed: "
-                    f"{type(recovery_error).__name__}: {recovery_error}"
-                )
+            await self._reconcile_exception(
+                task=task,
+                episode=episode,
+                error=exc,
+                on_event=on_event,
+            )
             raise
-        await self._publish(completed_result, on_event)
         completed = completed_result.entity
         return EpisodeExecutionResult(
             episode=completed,
@@ -175,6 +173,10 @@ class ScientificEpisodeExecutor:
     ) -> None:
         if runtime.workspace.root != self.store.workspace.root:
             raise ValueError("runtime and evolution store must use the same workspace")
+        if runtime.conversation_state.messages:
+            raise ValueError("evolution episodes require a fresh runtime conversation")
+        if any(value != 0 for value in runtime.budget.snapshot().values()):
+            raise ValueError("evolution episodes require a fresh runtime budget")
         if task.evolution_id != episode.evolution_id:
             raise ValueError("task and episode belong to different evolution tasks")
         stored_task = self.store.load_task(task.evolution_id)
@@ -187,12 +189,8 @@ class ScientificEpisodeExecutor:
             raise ValueError("task does not match the persisted immutable task snapshot")
 
     def _runtime_session_id(self, runtime: AgentRuntime) -> str:
-        public = getattr(runtime, "session_id", None)
-        private = getattr(runtime, "_session_id", None)
-        runtime_id = public or private
+        runtime_id = runtime.session_id
         logger_id = self.event_logger.session_id if self.event_logger is not None else None
-        if runtime_id is None:
-            runtime_id = logger_id
         if not isinstance(runtime_id, str) or not runtime_id:
             raise ValueError("runtime session ID is unavailable")
         if logger_id is not None and logger_id != runtime_id:
@@ -202,10 +200,80 @@ class ScientificEpisodeExecutor:
     def _event_log_path(self) -> str | None:
         if self.event_logger is None:
             return None
-        path = self.event_logger.events_path.resolve()
-        if self.store.workspace.contains(path):
-            return self.store.workspace.relative(path)
-        return str(path)
+        try:
+            path = self.store.workspace.resolve(
+                str(self.event_logger.events_path),
+                must_exist=True,
+            )
+        except (OSError, ValueError, ToolExecutionError) as exc:
+            raise ValueError("event log path must resolve inside the workspace") from exc
+        if not path.is_file():
+            raise ValueError("event log path must be a regular workspace file")
+        return self.store.workspace.relative(path)
+
+    def _validate_unused_session(
+        self,
+        session_id: str,
+        *,
+        evolution_id: str,
+        version: str,
+    ) -> None:
+        for existing_task in self.store.list_tasks():
+            if existing_task.current_version is None:
+                continue
+            latest = int(existing_task.current_version[1:])
+            for number in range(1, latest + 1):
+                existing_version = f"v{number:03d}"
+                existing = self.store.load_episode(
+                    existing_task.evolution_id,
+                    existing_version,
+                )
+                if (
+                    existing.runtime_session_id == session_id
+                    and (existing.evolution_id, existing.version)
+                    != (evolution_id, version)
+                ):
+                    raise ValueError(
+                        "runtime session is already attributed to another episode"
+                    )
+
+    def _persisted_revision(
+        self,
+        episode: EpisodeRecord,
+        supplied: RevisionPlan | None,
+    ) -> RevisionPlan | None:
+        if episode.revision_plan_id is None:
+            if supplied is not None:
+                raise ValueError("initial episode must not receive a revision")
+            return None
+        persisted = self.store.load_revision(
+            episode.evolution_id,
+            episode.revision_plan_id,
+        )
+        if supplied is None or supplied != persisted:
+            raise ValueError("supplied revision does not equal the persisted RevisionPlan")
+        if (
+            not persisted.confirmed
+            or persisted.has_blocking_ambiguity
+            or persisted.evolution_id != episode.evolution_id
+            or persisted.source_version != episode.parent_version
+            or persisted.feedback_id != episode.applied_feedback_id
+        ):
+            raise ValueError("persisted RevisionPlan does not match the reserved episode")
+        return persisted
+
+    def _runtime_uses_event_logger(self, runtime: AgentRuntime) -> bool:
+        if self.event_logger is None:
+            return False
+        expected_path = self.event_logger.events_path.resolve()
+        for sink in runtime._event_sinks:
+            owner = getattr(sink, "__self__", None)
+            if (
+                isinstance(owner, EventLogger)
+                and owner.events_path.resolve() == expected_path
+            ):
+                return True
+        return False
 
     async def _publish(
         self,
@@ -225,24 +293,13 @@ class ScientificEpisodeExecutor:
         if inspect.isawaitable(pending):
             await pending
 
-    @staticmethod
     def _instruction(
+        self,
         task: EvolutionTask,
-        episode: EpisodeRecord,
         revision: RevisionPlan | None,
     ) -> str:
         if revision is None:
-            if episode.revision_plan_id is not None:
-                raise ValueError("reserved revised episode requires its RevisionPlan")
             return task.goal
-        if (
-            not revision.confirmed
-            or revision.has_blocking_ambiguity
-            or revision.evolution_id != task.evolution_id
-            or revision.revision_id != episode.revision_plan_id
-            or revision.source_version != episode.parent_version
-        ):
-            raise ValueError("revision does not match the reserved episode")
         payload = {
             "contract_changes": revision.contract_changes,
             "evidence_requirements": revision.evidence_requirements,
@@ -277,6 +334,57 @@ class ScientificEpisodeExecutor:
     @staticmethod
     def _bounded_error(exc: BaseException) -> str:
         return f"{type(exc).__name__}: {exc}"[:1000]
+
+    async def _reconcile_exception(
+        self,
+        *,
+        task: EvolutionTask,
+        episode: EpisodeRecord,
+        error: BaseException,
+        on_event: EventSink | None,
+    ) -> None:
+        recovery_error: BaseException | None = None
+        for _ in range(2):
+            try:
+                persisted = self.store.load_episode(
+                    task.evolution_id,
+                    episode.version,
+                )
+                persisted_task = self.store.load_task(task.evolution_id)
+                if persisted.status == "COMPLETED":
+                    if persisted_task.status == "RUNNING":
+                        reconciled = self.service.complete_episode(
+                            task.evolution_id,
+                            episode.version,
+                            result=persisted,
+                        )
+                        await self._publish(reconciled, on_event)
+                    return
+                if persisted.status == "FAILED":
+                    if persisted_task.status == "RUNNING":
+                        reconciled = self.service.fail_episode(
+                            task.evolution_id,
+                            episode.version,
+                            persisted.error or self._bounded_error(error),
+                        )
+                        await self._publish(reconciled, on_event)
+                    return
+                if persisted.status in {"RESERVED", "RUNNING"}:
+                    failed = self.service.fail_episode(
+                        task.evolution_id,
+                        episode.version,
+                        self._bounded_error(error),
+                    )
+                    await self._publish(failed, on_event)
+                    return
+            except BaseException as exc:
+                recovery_error = exc
+                continue
+        if recovery_error is not None:
+            error.add_note(
+                "episode terminal-state reconciliation also failed: "
+                f"{type(recovery_error).__name__}: {recovery_error}"
+            )
 
 
 __all__ = [
