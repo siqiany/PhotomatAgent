@@ -7,6 +7,7 @@ import pytest
 from photomatagent.logging.event_logger import EventLogger
 from photomatagent.logging.session_stats import read_session_stats
 from photomatagent.runtime.events import (
+    EvolutionTaskCreated,
     LoopCompleted,
     LoopIterationStarted,
     LoopStarted,
@@ -32,6 +33,14 @@ async def test_events_roundtrip_via_jsonl(tmp_path):
     restored = logger.read_events()
     assert [event.kind for event in restored] == ["loop_started", "loop_completed"]
     assert restored[0].session_id == logger.session_id
+
+
+@pytest.mark.asyncio
+async def test_evolution_event_is_redacted_in_jsonl(tmp_path):
+    logger = EventLogger(tmp_path, session_id="evolution")
+    await logger.log(EvolutionTaskCreated(evolution_id="evo_test", goal_summary="safe"))
+
+    assert logger.read_events()[0].kind == "evolution_task_created"
 
 
 @pytest.mark.asyncio

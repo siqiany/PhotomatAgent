@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 
 def _now() -> datetime:
@@ -396,6 +396,91 @@ class ScientificLoopStalled(RuntimeEvent):
     no_progress_rounds: int = 0
 
 
+EvolutionEventId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+]
+EvolutionEpisodeVersion = Annotated[str, Field(pattern=r"^v\d{3}$")]
+EvolutionSha256 = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{64}$")]
+EVOLUTION_SUMMARY_MAX_CHARS = 240
+EvolutionSummary = Annotated[str, Field(max_length=EVOLUTION_SUMMARY_MAX_CHARS)]
+EvolutionScore = Annotated[int, Field(strict=True, ge=1, le=5)]
+EvolutionScoreDimension = Literal[
+    "scientific_correctness",
+    "evidence_sufficiency",
+    "novelty",
+    "actionability",
+    "overall",
+]
+
+
+class EvolutionRuntimeEvent(RuntimeEvent):
+    """Base envelope for events emitted by one scientific evolution task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evolution_id: EvolutionEventId
+
+
+class EvolutionEpisodeEvent(EvolutionRuntimeEvent):
+    """Base envelope for evolution events tied to one episode version."""
+
+    episode_version: EvolutionEpisodeVersion
+
+
+class EvolutionTaskCreated(EvolutionRuntimeEvent):
+    kind: Literal["evolution_task_created"] = "evolution_task_created"
+    goal_summary: EvolutionSummary = ""
+
+
+class EvolutionEpisodeStarted(EvolutionEpisodeEvent):
+    kind: Literal["evolution_episode_started"] = "evolution_episode_started"
+
+
+class EvolutionEpisodeCompleted(EvolutionEpisodeEvent):
+    kind: Literal["evolution_episode_completed"] = "evolution_episode_completed"
+
+
+class ExpertFeedbackRecorded(EvolutionEpisodeEvent):
+    kind: Literal["expert_feedback_recorded"] = "expert_feedback_recorded"
+    feedback_id: EvolutionEventId
+    result_sha256: EvolutionSha256
+    scores: dict[EvolutionScoreDimension, EvolutionScore] = Field(
+        default_factory=dict,
+        max_length=5,
+    )
+
+
+class ExpertFeedbackCompiled(EvolutionEpisodeEvent):
+    kind: Literal["expert_feedback_compiled"] = "expert_feedback_compiled"
+
+
+class RevisionPlanConfirmed(EvolutionEpisodeEvent):
+    kind: Literal["revision_plan_confirmed"] = "revision_plan_confirmed"
+
+
+class EvolutionIterationStarted(EvolutionEpisodeEvent):
+    kind: Literal["evolution_iteration_started"] = "evolution_iteration_started"
+
+
+class EvolutionComparisonCompleted(EvolutionEpisodeEvent):
+    kind: Literal["evolution_comparison_completed"] = (
+        "evolution_comparison_completed"
+    )
+
+
+class ExperienceStateChanged(EvolutionRuntimeEvent):
+    kind: Literal["experience_state_changed"] = "experience_state_changed"
+
+
+class EvolutionTaskAccepted(EvolutionEpisodeEvent):
+    kind: Literal["evolution_task_accepted"] = "evolution_task_accepted"
+
+
+class EvolutionTaskStopped(EvolutionRuntimeEvent):
+    kind: Literal["evolution_task_stopped"] = "evolution_task_stopped"
+
+
 AnyRuntimeEvent = Annotated[
     Union[
         LoopStarted,
@@ -433,6 +518,17 @@ AnyRuntimeEvent = Annotated[
         ScientificLoopDecisionMade,
         ScientificLoopCompleted,
         ScientificLoopStalled,
+        EvolutionTaskCreated,
+        EvolutionEpisodeStarted,
+        EvolutionEpisodeCompleted,
+        ExpertFeedbackRecorded,
+        ExpertFeedbackCompiled,
+        RevisionPlanConfirmed,
+        EvolutionIterationStarted,
+        EvolutionComparisonCompleted,
+        ExperienceStateChanged,
+        EvolutionTaskAccepted,
+        EvolutionTaskStopped,
     ],
     Field(discriminator="kind"),
 ]
