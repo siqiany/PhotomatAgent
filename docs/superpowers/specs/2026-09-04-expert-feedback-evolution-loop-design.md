@@ -109,6 +109,7 @@ photomatagent evolve start [--goal ...] (--target-json ... | --target-file ...) 
 photomatagent evolve list
 photomatagent evolve status <evolution-id>
 photomatagent evolve feedback <evolution-id> [--version v001] [--file review.json]
+photomatagent evolve compile <evolution-id> [--version v001]
 photomatagent evolve iterate <evolution-id> [运行参数]
 photomatagent evolve history <evolution-id>
 photomatagent evolve compare <evolution-id> <left-version> <right-version>
@@ -151,6 +152,10 @@ TargetSpec，与现有 scientific loop 保持一致。
 5. 通过正常权限路径运行下一 Episode；
 6. 保存新结果和相邻版本比较。
 
+如果原始反馈已经保存，但 Compiler 因 provider、JSON 或 schema 错误而失败，使用
+`evolve compile` 重试同一条不可变反馈。该命令不得创建第二份 active review，也不得
+运行科学工具；编译成功后仍需经过 RevisionPlan 预览和用户确认。
+
 ### 5.4 `evaluate --fresh`
 
 该命令用于受控论文评估。它加载冻结的原始任务和指定的通用策略版本，但排除：
@@ -170,6 +175,7 @@ TargetSpec，与现有 scientific loop 保持一致。
 /evolve list
 /evolve status <id>
 /evolve feedback <id> [--version ...]
+/evolve compile <id> [--version ...]
 /evolve iterate <id>
 /evolve history <id>
 ```
