@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta, timezone
+import json
 import re
 
 from pydantic import ValidationError
@@ -31,7 +32,7 @@ from photomatagent.scientific.evolution.models import (
     validate_managed_id,
 )
 from photomatagent.scientific.evolution.rubric import assess_hard_caps, expert_utility
-from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
+from photomatagent.scientific.loop import ConstraintSpec, ScientificLoopSummary, TargetSpec
 
 
 def _scores(value: int = 5) -> RubricScores:
@@ -425,6 +426,93 @@ def test_episode_defensively_copies_nested_context_and_fingerprint_mapping():
     assert episode.task_snapshot["nested"]["value"] == 1
     assert episode.target_snapshot.metadata["nested"]["value"] == 1
     assert episode.data_source_fingerprints == {"catalog": "e" * 64}
+
+
+def test_episode_snapshot_values_reject_direct_nested_mutation():
+    episode = _episode(
+        task_snapshot={"nested": {"value": 1}, "items": ["a"]},
+    )
+
+    with pytest.raises(TypeError):
+        episode.task_snapshot["nested"]["value"] = 2
+    with pytest.raises(TypeError):
+        episode.task_snapshot["items"].append("b")
+    with pytest.raises(ValidationError):
+        episode.target_snapshot.goal = "changed"
+    with pytest.raises(TypeError):
+        episode.target_snapshot.metadata["nested"]["value"] = 2
+    with pytest.raises(TypeError):
+        episode.data_source_fingerprints["catalog"] = "f" * 64
+
+
+def test_target_snapshot_is_recursive_across_constraints_and_conditions():
+    target = TargetSpec(
+        goal="goal",
+        constraints=[
+            ConstraintSpec(property="phase", operator="eq", value={"allowed": ["A"]})
+        ],
+        objectives=["stability"],
+        operating_conditions={"temperature": {"kelvin": 77}},
+    )
+    episode = _episode(target_snapshot=target)
+
+    with pytest.raises(TypeError):
+        episode.target_snapshot.constraints.append(
+            ConstraintSpec(property="other", operator="eq", value=1)
+        )
+    with pytest.raises(ValidationError):
+        episode.target_snapshot.constraints[0].property = "changed"
+    with pytest.raises(TypeError):
+        episode.target_snapshot.constraints[0].value["allowed"].append("B")
+    with pytest.raises(TypeError):
+        episode.target_snapshot.objectives.append("changed")
+    with pytest.raises(TypeError):
+        episode.target_snapshot.operating_conditions["temperature"]["kelvin"] = 300
+
+
+def test_immutable_episode_snapshots_round_trip_as_clean_json():
+    episode = _episode(
+        task_snapshot={"nested": {"value": 1}, "items": ["a"]},
+    )
+
+    serialized = episode.model_dump_json()
+    payload = json.loads(serialized)
+    assert payload["task_snapshot"] == {
+        "nested": {"value": 1},
+        "items": ["a"],
+    }
+    assert payload["target_snapshot"]["goal"] == "goal"
+    assert payload["data_source_fingerprints"] == {"catalog": "e" * 64}
+
+    restored = EpisodeRecord.model_validate_json(serialized)
+    assert restored == episode
+    with pytest.raises(TypeError):
+        restored.task_snapshot["nested"]["value"] = 2
+    with pytest.raises(TypeError):
+        restored.target_snapshot.metadata["nested"]["value"] = 2
+    with pytest.raises(TypeError):
+        restored.data_source_fingerprints["catalog"] = "f" * 64
+
+
+def test_episode_task_snapshot_rejects_non_json_values_before_persistence():
+    with pytest.raises(ValidationError):
+        _episode(task_snapshot={"not_json": object()})
+
+
+def test_immutable_episode_snapshots_support_safe_deep_copy_and_target_use():
+    episode = _episode(
+        task_snapshot={"nested": {"value": 1}, "items": ["a"]},
+    )
+
+    clone = episode.model_copy(deep=True)
+    assert clone == episode
+    assert isinstance(clone.target_snapshot, TargetSpec)
+
+    mutable_target = clone.target_snapshot.to_target_spec()
+    mutable_target.goal = "changed"
+    mutable_target.metadata["nested"]["value"] = 2
+    assert clone.target_snapshot.goal == "goal"
+    assert clone.target_snapshot.metadata["nested"]["value"] == 1
 
 
 def test_episode_lifecycle_fields_remain_mutable():

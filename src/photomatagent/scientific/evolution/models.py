@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import re
 import secrets
-from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Never, Self
 
 from pydantic import (
     AfterValidator,
@@ -14,11 +13,13 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     StringConstraints,
     model_validator,
 )
 
 from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
+from photomatagent.scientific.loop.target import ConstraintSpec
 
 EvolutionStatus = Literal[
     "CREATED",
@@ -78,6 +79,93 @@ def _normalize_utc(value: datetime) -> datetime:
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(_normalize_utc)]
 
 
+class FrozenJsonDict(dict[str, Any]):
+    """A JSON-object-compatible dict that rejects every in-place mutation."""
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> Never:
+        raise TypeError("snapshot JSON values are immutable")
+
+    __setitem__ = _immutable  # type: ignore[assignment]
+    __delitem__ = _immutable  # type: ignore[assignment]
+    clear = _immutable  # type: ignore[assignment]
+    pop = _immutable  # type: ignore[assignment]
+    popitem = _immutable  # type: ignore[assignment]
+    setdefault = _immutable  # type: ignore[assignment]
+    update = _immutable  # type: ignore[assignment]
+    __ior__ = _immutable  # type: ignore[assignment]
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        memo[id(self)] = self
+        return self
+
+
+class FrozenJsonList(list[Any]):
+    """A JSON-array-compatible list that rejects every in-place mutation."""
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> Never:
+        raise TypeError("snapshot JSON values are immutable")
+
+    __setitem__ = _immutable  # type: ignore[assignment]
+    __delitem__ = _immutable  # type: ignore[assignment]
+    append = _immutable  # type: ignore[assignment]
+    clear = _immutable  # type: ignore[assignment]
+    extend = _immutable  # type: ignore[assignment]
+    insert = _immutable  # type: ignore[assignment]
+    pop = _immutable  # type: ignore[assignment]
+    remove = _immutable  # type: ignore[assignment]
+    reverse = _immutable  # type: ignore[assignment]
+    sort = _immutable  # type: ignore[assignment]
+    __iadd__ = _immutable  # type: ignore[assignment]
+    __imul__ = _immutable  # type: ignore[assignment]
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        memo[id(self)] = self
+        return self
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="python")
+    if isinstance(value, dict):
+        return FrozenJsonDict({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return FrozenJsonList(_freeze_json(item) for item in value)
+    return value
+
+
+def _freeze_json_dict(value: dict[str, Any]) -> dict[str, Any]:
+    frozen = _freeze_json(value)
+    if not isinstance(frozen, FrozenJsonDict):  # defensive type narrowing
+        raise TypeError("snapshot must be a JSON object")
+    return frozen
+
+
+FrozenJsonObject = Annotated[
+    dict[str, JsonValue],
+    AfterValidator(_freeze_json_dict),
+]
+
+
+def _target_snapshot_input(value: Any) -> Any:
+    if isinstance(value, TargetSpec):
+        return value.model_dump(mode="python")
+    return value
+
+
+def _constraint_snapshot_input(value: Any) -> Any:
+    if isinstance(value, ConstraintSpec):
+        return value.model_dump(mode="python")
+    return value
+
+
 def utc_now() -> datetime:
     """Return the single canonical timestamp form used by evolution records."""
 
@@ -117,6 +205,58 @@ class StrictModel(BaseModel):
     """Base contract for JSON records owned by the evolution subsystem."""
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+class TargetConstraintSnapshot(ConstraintSpec):
+    """Immutable form of one TargetSpec constraint."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    value: JsonValue = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_constraint_spec(cls, value: Any) -> Any:
+        return _constraint_snapshot_input(value)
+
+    @model_validator(mode="after")
+    def freeze_constraint_value(self) -> Self:
+        object.__setattr__(self, "value", _freeze_json(self.value))
+        return self
+
+
+class TargetSnapshot(TargetSpec):
+    """A TargetSpec-compatible, recursively immutable execution snapshot."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operating_conditions: FrozenJsonObject = Field(default_factory=dict)
+    metadata: FrozenJsonObject = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_target_spec(cls, value: Any) -> Any:
+        return _target_snapshot_input(value)
+
+    @model_validator(mode="after")
+    def freeze_target_values(self) -> Self:
+        constraints = FrozenJsonList(
+            TargetConstraintSnapshot.model_validate(item) for item in self.constraints
+        )
+        object.__setattr__(self, "constraints", constraints)
+        object.__setattr__(self, "objectives", FrozenJsonList(self.objectives))
+        object.__setattr__(
+            self,
+            "operating_conditions",
+            _freeze_json_dict(self.operating_conditions),
+        )
+        object.__setattr__(self, "metadata", _freeze_json_dict(self.metadata))
+        return self
+
+    def to_target_spec(self) -> TargetSpec:
+        """Return a detached mutable TargetSpec for APIs that need one."""
+
+        return TargetSpec.model_validate(self.model_dump(mode="python"))
 
 
 class RubricScores(StrictModel):
@@ -250,14 +390,16 @@ class EpisodeRecord(StrictModel):
     strategy_id: ManagedId | None = Field(default=None, frozen=True)
     strategy_arm: StrategyArm = Field(default="STATIC", frozen=True)
     scientific_state_path: str | None = None
-    task_snapshot: dict[str, Any] = Field(frozen=True)
-    target_snapshot: TargetSpec = Field(frozen=True)
+    task_snapshot: FrozenJsonObject = Field(frozen=True)
+    target_snapshot: TargetSnapshot = Field(frozen=True)
     provider: str | None = Field(default=None, frozen=True)
     model: str | None = Field(default=None, frozen=True)
     tool_surface_fingerprint: Sha256 | None = Field(default=None, frozen=True)
     capability_fingerprint: Sha256 | None = Field(default=None, frozen=True)
-    data_source_fingerprints: dict[str, Sha256] = Field(
-        default_factory=dict,
+    data_source_fingerprints: Annotated[
+        dict[str, Sha256], AfterValidator(_freeze_json_dict)
+    ] = Field(
+        default_factory=FrozenJsonDict,
         frozen=True,
     )
     started_at: UtcDatetime | None = None
@@ -268,20 +410,6 @@ class EpisodeRecord(StrictModel):
     acceptance_results: list[AcceptanceResult] = Field(default_factory=list)
     error: str | None = None
     created_at: UtcDatetime = Field(default_factory=utc_now)
-
-    @model_validator(mode="after")
-    def isolate_input_snapshots(self) -> Self:
-        object.__setattr__(self, "task_snapshot", deepcopy(self.task_snapshot))
-        object.__setattr__(
-            self, "target_snapshot", self.target_snapshot.model_copy(deep=True)
-        )
-        object.__setattr__(
-            self,
-            "data_source_fingerprints",
-            deepcopy(self.data_source_fingerprints),
-        )
-        return self
-
 
 class FeedbackDelta(StrictModel):
     item_id: ManagedId | None = None
