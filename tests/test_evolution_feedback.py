@@ -660,3 +660,10 @@ def test_evolve_compile_retries_same_feedback_without_constructing_runtime(
     assert stored.feedback_ids == [feedback.feedback_id]
     assert len(stored.compilation_ids) == 2
     assert [item.status for item in compilations] == ["UNAVAILABLE", "AVAILABLE"]
+    service.store.flush_event_outbox(task.evolution_id)
+    compiled_events = [
+        envelope["event"]
+        for _source, envelope in service.store.read_event_journal(task.evolution_id)
+        if envelope["event"]["kind"] == "expert_feedback_compiled"
+    ]
+    assert [event["compilation_id"] for event in compiled_events] == stored.compilation_ids

@@ -460,10 +460,12 @@ class ExpertFeedbackRecorded(EvolutionEpisodeEvent):
 
 class ExpertFeedbackCompiled(EvolutionEpisodeEvent):
     kind: Literal["expert_feedback_compiled"] = "expert_feedback_compiled"
+    compilation_id: EvolutionEventId | None = None
 
 
 class RevisionPlanConfirmed(EvolutionEpisodeEvent):
     kind: Literal["revision_plan_confirmed"] = "revision_plan_confirmed"
+    revision_id: EvolutionEventId | None = None
 
 
 class EvolutionIterationStarted(EvolutionEpisodeEvent):
@@ -474,10 +476,12 @@ class EvolutionComparisonCompleted(EvolutionEpisodeEvent):
     kind: Literal["evolution_comparison_completed"] = (
         "evolution_comparison_completed"
     )
+    comparison_id: EvolutionEventId | None = None
 
 
 class ExperienceStateChanged(EvolutionRuntimeEvent):
     kind: Literal["experience_state_changed"] = "experience_state_changed"
+    experience_id: EvolutionEventId | None = None
 
 
 class EvolutionTaskAccepted(EvolutionEpisodeEvent):

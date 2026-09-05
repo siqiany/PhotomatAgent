@@ -49,6 +49,7 @@ from photomatagent.scientific.evolution.models import (
     validate_managed_id,
 )
 from photomatagent.scientific.evolution.experience import ExperienceRecord
+from photomatagent.scientific.evolution.events import bounded_summary
 from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
 
@@ -493,7 +494,9 @@ class EvolutionStore:
             evolution_id=task.evolution_id,
             goal_summary=task.goal[:240],
         )
-        task.event_outbox = [created_event.model_dump(mode="json")]
+        task.event_outbox = [
+            {"sequence": 1, **created_event.model_dump(mode="json")}
+        ]
         validated, payload = self._prepare_model(task, EvolutionTask)
         if validated.revision != 0:
             raise ValueError("new evolution tasks must start at revision 0")
@@ -529,68 +532,36 @@ class EvolutionStore:
             return
         task_dir = self._task_dir(evolution_id)
         with self._task_lock(task_dir):
-            path = self._managed_path(evolution_id, "events.jsonl")
-            existing_ids: set[str] = set()
-            if path.exists():
-                if path.is_symlink() or not path.is_file():
-                    raise EvolutionCorruptRecordError(path, "event journal is not a regular file")
-                for line_number, line in enumerate(path.read_bytes().splitlines(), start=1):
-                    try:
-                        envelope = json.loads(line)
-                        existing_ids.add(str(envelope["event_id"]))
-                    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                        raise EvolutionCorruptRecordError(
-                            path, f"invalid event journal line {line_number}: {exc}"
-                        ) from exc
-            additions: list[bytes] = []
+            durable = self._sequenced_outbox_entries(evolution_id)
+            self._append_sequenced_events_locked(evolution_id, durable)
+            journal = self.read_event_journal(evolution_id)
+            existing = {
+                self._event_payload_identity(
+                    envelope["event"],
+                    ignore_transient=idempotency_scope is not None,
+                )
+                for _source, envelope in journal
+            }
+            next_sequence = max(
+                [
+                    *(entry[0] for entry in durable),
+                    *(int(envelope["sequence"]) for _source, envelope in journal),
+                    0,
+                ]
+            ) + 1
+            sequenced: list[tuple[int, dict[str, Any]]] = []
             for event in pending:
                 payload = event.model_dump(mode="json")
-                source = json.dumps(
-                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-                identity_payload = dict(payload)
-                if idempotency_scope is not None:
-                    identity_payload.pop("timestamp", None)
-                    identity_payload.pop("session_id", None)
-                    identity_payload.pop("run_id", None)
-                identity = json.dumps(
-                    {"scope": idempotency_scope, "event": identity_payload},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                event_id = hashlib.sha256(identity).hexdigest()
-                if event_id in existing_ids:
-                    continue
-                envelope = {"event_id": event_id, "event": payload}
-                additions.append(
-                    json.dumps(
-                        envelope,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                    + b"\n"
+                identity = self._event_payload_identity(
+                    payload,
+                    ignore_transient=idempotency_scope is not None,
                 )
-                existing_ids.add(event_id)
-            if not additions:
-                return
-            path.parent.mkdir(parents=True, exist_ok=True)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-            flags |= int(getattr(os, "O_NOFOLLOW", 0))
-            descriptor = os.open(path, flags, 0o600)
-            try:
-                with os.fdopen(descriptor, "ab", closefd=True) as stream:
-                    for addition in additions:
-                        stream.write(addition)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            except Exception:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-                raise
+                if identity in existing:
+                    continue
+                sequenced.append((next_sequence, payload))
+                existing.add(identity)
+                next_sequence += 1
+            self._append_sequenced_events_locked(evolution_id, sequenced)
 
     def read_event_journal(self, evolution_id: str) -> list[tuple[bytes, dict[str, Any]]]:
         """Return exact source lines and decoded journal envelopes."""
@@ -608,6 +579,9 @@ class EvolutionStore:
                 decoded = json.loads(raw)
                 if not isinstance(decoded, dict) or not isinstance(decoded.get("event"), dict):
                     raise TypeError("journal envelope must contain an event object")
+                decoded.setdefault("sequence", line_number)
+                if not isinstance(decoded["sequence"], int) or decoded["sequence"] < 1:
+                    raise TypeError("journal envelope sequence must be a positive integer")
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise EvolutionCorruptRecordError(
                     path, f"invalid event journal line {line_number}: {exc}"
@@ -618,22 +592,185 @@ class EvolutionStore:
     def flush_event_outbox(self, evolution_id: str) -> None:
         """Idempotently materialize every durable event intent into the journal."""
 
-        task = self.load_task(evolution_id)
-        payloads = list(task.event_outbox)
-        for index in range(1, len(task.episode_ids) + 1):
-            payloads.extend(self.load_episode(evolution_id, f"v{index:03d}").event_outbox)
-        for index in range(1, len(task.evaluation_episode_ids) + 1):
-            payloads.extend(
-                self.load_evaluation_episode(
-                    evolution_id, f"v{index:03d}"
-                ).event_outbox
+        task_dir = self._task_dir(evolution_id)
+        with self._task_lock(task_dir):
+            self._append_sequenced_events_locked(
+                evolution_id,
+                self._sequenced_outbox_entries(evolution_id),
             )
-        events = [parse_event(payload) for payload in payloads]
-        self.append_events(
-            evolution_id,
-            events,
-            idempotency_scope="durable-outbox",
+
+    def _all_outbox_entries(
+        self,
+        evolution_id: str,
+    ) -> list[tuple[str, int, dict[str, Any]]]:
+        task = self.load_task(evolution_id)
+        located = [
+            ("task", index, entry)
+            for index, entry in enumerate(task.event_outbox)
+        ]
+        for index in range(1, len(task.episode_ids) + 1):
+            episode = self.load_episode(evolution_id, f"v{index:03d}")
+            located.extend(
+                (f"main:{episode.version}", item_index, entry)
+                for item_index, entry in enumerate(episode.event_outbox)
+            )
+        for index in range(1, len(task.evaluation_episode_ids) + 1):
+            episode = self.load_evaluation_episode(evolution_id, f"v{index:03d}")
+            located.extend(
+                (f"evaluation:{episode.version}", item_index, entry)
+                for item_index, entry in enumerate(episode.event_outbox)
+            )
+        return located
+
+    @staticmethod
+    def _outbox_payload(entry: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in entry.items() if key != "sequence"}
+
+    def _sequenced_outbox_entries(
+        self,
+        evolution_id: str,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        located = self._all_outbox_entries(evolution_id)
+        sequenced: list[tuple[int, dict[str, Any]]] = []
+        legacy: list[tuple[str, int, dict[str, Any]]] = []
+        used: set[int] = set()
+        for source, index, entry in located:
+            sequence = entry.get("sequence")
+            payload = self._outbox_payload(entry)
+            parse_event(payload)
+            if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0:
+                if sequence in used:
+                    raise EvolutionConflictError(
+                        f"duplicate evolution event sequence {sequence}"
+                    )
+                used.add(sequence)
+                sequenced.append((sequence, payload))
+            else:
+                legacy.append((source, index, payload))
+        legacy.sort(
+            key=lambda item: (
+                str(item[2].get("timestamp", "")),
+                item[0],
+                item[1],
+            )
         )
+        next_sequence = 1
+        for _source, _index, payload in legacy:
+            while next_sequence in used:
+                next_sequence += 1
+            used.add(next_sequence)
+            sequenced.append((next_sequence, payload))
+            next_sequence += 1
+        return sorted(sequenced, key=lambda item: item[0])
+
+    def _next_outbox_sequence(self, evolution_id: str) -> int:
+        outbox = self._sequenced_outbox_entries(evolution_id)
+        journal = self.read_event_journal(evolution_id)
+        return max(
+            [
+                *(sequence for sequence, _payload in outbox),
+                *(int(envelope["sequence"]) for _source, envelope in journal),
+                0,
+            ]
+        ) + 1
+
+    @staticmethod
+    def _event_payload_identity(
+        payload: dict[str, Any],
+        *,
+        ignore_transient: bool,
+    ) -> str:
+        stable = dict(payload)
+        if ignore_transient:
+            stable.pop("timestamp", None)
+            stable.pop("session_id", None)
+            stable.pop("run_id", None)
+        return hashlib.sha256(
+            json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _append_sequenced_events_locked(
+        self,
+        evolution_id: str,
+        entries: list[tuple[int, dict[str, Any]]],
+    ) -> None:
+        if not entries:
+            return
+        path = self._managed_path(evolution_id, "events.jsonl")
+        existing_ids: set[str] = set()
+        legacy_identities: set[str] = set()
+        if path.exists():
+            if path.is_symlink() or not path.is_file():
+                raise EvolutionCorruptRecordError(
+                    path, "event journal is not a regular file"
+                )
+            for line_number, line in enumerate(path.read_bytes().splitlines(), start=1):
+                try:
+                    envelope = json.loads(line)
+                    payload = envelope["event"]
+                    existing_ids.add(str(envelope["event_id"]))
+                    if "sequence" not in envelope:
+                        legacy_identities.add(
+                            self._event_payload_identity(
+                                payload,
+                                ignore_transient=True,
+                            )
+                        )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise EvolutionCorruptRecordError(
+                        path, f"invalid event journal line {line_number}: {exc}"
+                    ) from exc
+        additions: list[bytes] = []
+        for sequence, payload in sorted(entries, key=lambda item: item[0]):
+            stable = dict(payload)
+            stable.pop("timestamp", None)
+            stable.pop("session_id", None)
+            stable.pop("run_id", None)
+            identity = json.dumps(
+                {"sequence": sequence, "event": stable},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            event_id = hashlib.sha256(identity).hexdigest()
+            if event_id in existing_ids or self._event_payload_identity(
+                payload,
+                ignore_transient=True,
+            ) in legacy_identities:
+                continue
+            envelope = {
+                "sequence": sequence,
+                "event_id": event_id,
+                "event": payload,
+            }
+            additions.append(
+                json.dumps(
+                    envelope,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            existing_ids.add(event_id)
+        if not additions:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "ab", closefd=True) as stream:
+                for addition in additions:
+                    stream.write(addition)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def event_scope(record: object) -> str:
@@ -700,6 +837,7 @@ class EvolutionStore:
             updated_data[field] = getattr(candidate, field)
         transition_events = self._task_transition_events(current, candidate)
         updated_data["event_outbox"] = self._merge_outbox(
+            candidate.evolution_id,
             current.event_outbox,
             transition_events,
         )
@@ -713,27 +851,30 @@ class EvolutionStore:
         )
         return updated
 
-    @staticmethod
     def _merge_outbox(
+        self,
+        evolution_id: str,
         existing: list[dict[str, Any]],
         events: list[RuntimeEvent],
     ) -> list[dict[str, Any]]:
         merged = list(existing)
         identities = {
-            EvolutionStore._outbox_identity(item)
+            self._outbox_identity(item)
             for item in merged
         }
+        next_sequence = self._next_outbox_sequence(evolution_id)
         for event in events:
             payload = event.model_dump(mode="json")
-            identity = EvolutionStore._outbox_identity(payload)
+            identity = self._outbox_identity(payload)
             if identity not in identities:
-                merged.append(payload)
+                merged.append({"sequence": next_sequence, **payload})
                 identities.add(identity)
+                next_sequence += 1
         return merged
 
     @staticmethod
     def _outbox_identity(payload: dict[str, Any]) -> str:
-        stable = dict(payload)
+        stable = EvolutionStore._outbox_payload(payload)
         stable.pop("timestamp", None)
         stable.pop("session_id", None)
         stable.pop("run_id", None)
@@ -759,7 +900,6 @@ class EvolutionStore:
             kwargs = self._episode_event_kwargs(episode)
             if current.current_version is not None:
                 events.append(EvolutionIterationStarted(**kwargs))
-            events.append(EvolutionEpisodeStarted(**kwargs))
         if (
             candidate.current_evaluation_version != current.current_evaluation_version
             and candidate.current_evaluation_version
@@ -768,7 +908,7 @@ class EvolutionStore:
                 evolution_id, candidate.current_evaluation_version
             )
             kwargs = self._episode_event_kwargs(episode)
-            events.extend([EvolutionIterationStarted(**kwargs), EvolutionEpisodeStarted(**kwargs)])
+            events.append(EvolutionIterationStarted(**kwargs))
         for feedback_id in candidate.feedback_ids[len(current.feedback_ids):]:
             feedback = self.load_feedback(evolution_id, feedback_id)
             episode = self.load_episode(evolution_id, feedback.episode_version)
@@ -791,17 +931,37 @@ class EvolutionStore:
             if compilation.episode_version is None:
                 raise EvolutionConflictError("linked compilation has no episode version")
             episode = self.load_episode(evolution_id, compilation.episode_version)
-            events.append(ExpertFeedbackCompiled(**self._episode_event_kwargs(episode)))
+            events.append(
+                ExpertFeedbackCompiled(
+                    **self._episode_event_kwargs(episode),
+                    compilation_id=compilation.compilation_id,
+                )
+            )
         for revision_id in candidate.revision_ids[len(current.revision_ids):]:
             revision = self.load_revision(evolution_id, revision_id)
             episode = self.load_episode(evolution_id, revision.source_version)
-            events.append(RevisionPlanConfirmed(**self._episode_event_kwargs(episode)))
+            events.append(
+                RevisionPlanConfirmed(
+                    **self._episode_event_kwargs(episode),
+                    revision_id=revision.revision_id,
+                )
+            )
         for comparison_id in candidate.comparison_ids[len(current.comparison_ids):]:
             comparison = self.load_comparison(evolution_id, comparison_id)
             episode = self.load_episode(evolution_id, comparison.current_version)
-            events.append(EvolutionComparisonCompleted(**self._episode_event_kwargs(episode)))
-        if len(candidate.experience_ids) > len(current.experience_ids):
-            events.append(ExperienceStateChanged(evolution_id=evolution_id))
+            events.append(
+                EvolutionComparisonCompleted(
+                    **self._episode_event_kwargs(episode),
+                    comparison_id=comparison.comparison_id,
+                )
+            )
+        for experience_id in candidate.experience_ids[len(current.experience_ids):]:
+            events.append(
+                ExperienceStateChanged(
+                    evolution_id=evolution_id,
+                    experience_id=experience_id,
+                )
+            )
         if candidate.status == "ACCEPTED" and current.status != "ACCEPTED":
             if candidate.accepted_version is None:
                 raise EvolutionConflictError("accepted task has no accepted version")
@@ -896,7 +1056,21 @@ class EvolutionStore:
         if expected_status not in _EPISODE_TRANSITIONS:
             raise ValueError(f"unsupported expected episode status: {expected_status!r}")
         current = self.load_evaluation_episode(episode.evolution_id, episode.version)
+        owner_recovery = (
+            current.status == "RUNNING"
+            and episode.status == "FAILED"
+            and current.owner_token is not None
+            and episode.owner_token == current.owner_token
+            and episode.previous_owner_sha256
+            == hashlib.sha256(current.owner_token.encode("utf-8")).hexdigest()
+            and episode.owner_reclaimed_at is not None
+        )
         for field in _EPISODE_IMMUTABLE_FIELDS:
+            if owner_recovery and field in {
+                "previous_owner_sha256",
+                "owner_reclaimed_at",
+            }:
+                continue
             if getattr(episode, field) != getattr(current, field):
                 raise EvolutionConflictError(
                     f"immutable evaluation field differs: {field}"
@@ -904,6 +1078,7 @@ class EvolutionStore:
         episode = episode.model_copy(
             update={
                 "event_outbox": self._merge_outbox(
+                    current.evolution_id,
                     current.event_outbox,
                     self._episode_transition_events(current, episode),
                 )
@@ -979,6 +1154,7 @@ class EvolutionStore:
         episode = episode.model_copy(
             update={
                 "event_outbox": self._merge_outbox(
+                    current.evolution_id,
                     current.event_outbox,
                     self._episode_transition_events(current, episode),
                 )
@@ -1063,7 +1239,7 @@ class EvolutionStore:
             return [
                 EvolutionEpisodeFailed(
                     **kwargs,
-                    error_summary=(candidate.error or "")[:500],
+                    error_summary=bounded_summary(candidate.error or ""),
                 )
             ]
         return []

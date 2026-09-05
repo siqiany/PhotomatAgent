@@ -14,6 +14,8 @@ from pydantic import ValidationError
 
 from photomatagent.models.fake import FakeModelProvider, FakeResponse
 from photomatagent.runtime.budget import BudgetState
+from photomatagent.runtime.context import ContextBuilder
+from photomatagent.runtime.events import EVOLUTION_SUMMARY_MAX_CHARS
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import (
     AllowAllPolicy,
@@ -46,6 +48,7 @@ from photomatagent.scientific.evolution.store import (
 from photomatagent.scientific.loop import ScientificLoopConfig, ScientificLoopSummary
 from photomatagent.scientific.loop.target import TargetSpec
 from photomatagent.scientific.state import ScientificState
+from photomatagent.skills.loader import SkillLoader
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.factory import create_default_registry
 from photomatagent.tools.read import ReadTool
@@ -542,6 +545,125 @@ def test_fresh_executor_rejects_renamed_read_tool_and_policy_spoof(
         )
 
 
+@pytest.mark.asyncio
+async def test_fresh_executor_rejects_reused_compaction_before_running(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_context_spoof",
+    )
+    isolated = Workspace(service.validate_evaluation_workspace(claim.episode))
+    state = ScientificState()
+    approval_root = isolated.resolve(
+        f".photomatagent/evolution-approvals/evo_fresh/"
+        f"{claim.episode.version}_{claim.episode.episode_id}",
+        must_exist=False,
+    )
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=create_default_registry(state, isolated, evaluation_isolation=True),
+        workspace=isolated,
+        scientific_state=state,
+        permission_policy=SwitchablePermissionPolicy(DenyAllPolicy(), settings=None),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+    runtime.context_engine.restore(
+        compaction_state={
+            "goal": "prior task",
+            "key_findings": ["secret prior finding"],
+            "progress": ["prior summary"],
+        },
+        compacted_message_count=3,
+        compaction_count=1,
+    )
+
+    with pytest.raises(ValueError, match="blank context snapshot"):
+        await ScientificEpisodeExecutor(service.store).execute(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            config=ScientificLoopConfig(max_rounds=1),
+            owner_token=claim.owner_token,
+        )
+    assert service.store.load_evaluation_episode("evo_fresh", "v001").status == "RESERVED"
+
+
+def test_fresh_executor_rejects_context_builder_bound_to_prior_skills(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_context_builder_spoof",
+    )
+    isolated = Workspace(service.validate_evaluation_workspace(claim.episode))
+    state = ScientificState()
+    approval_root = isolated.resolve(
+        f".photomatagent/evolution-approvals/evo_fresh/"
+        f"{claim.episode.version}_{claim.episode.episode_id}",
+        must_exist=False,
+    )
+    prior_skills = tmp_path / "prior-skills"
+    prior_skills.mkdir()
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=create_default_registry(state, isolated, evaluation_isolation=True),
+        workspace=isolated,
+        scientific_state=state,
+        context_builder=ContextBuilder(SkillLoader(prior_skills)),
+        permission_policy=SwitchablePermissionPolicy(DenyAllPolicy(), settings=None),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+
+    with pytest.raises(ValueError, match="context skill binding"):
+        ScientificEpisodeExecutor(service.store)._validate_execution(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            owner_token=claim.owner_token,
+        )
+
+
+def test_fresh_executor_rejects_cached_context_builder_state(tmp_path: Path) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_cached_context",
+    )
+    isolated = Workspace(service.validate_evaluation_workspace(claim.episode))
+    state = ScientificState()
+    approval_root = isolated.resolve(
+        f".photomatagent/evolution-approvals/evo_fresh/"
+        f"{claim.episode.version}_{claim.episode.episode_id}",
+        must_exist=False,
+    )
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=create_default_registry(state, isolated, evaluation_isolation=True),
+        workspace=isolated,
+        scientific_state=state,
+        permission_policy=SwitchablePermissionPolicy(DenyAllPolicy(), settings=None),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+    runtime._context_builder.skill_loader.cached_task_context = "prior summary"  # type: ignore[attr-defined]
+
+    with pytest.raises(ValueError, match="context skill binding"):
+        ScientificEpisodeExecutor(service.store)._validate_execution(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            owner_token=claim.owner_token,
+        )
+
+
 def test_fresh_claim_rejects_symlinked_evaluation_workspace(tmp_path: Path) -> None:
     service, strategy = _fresh_ready_service(tmp_path)
     episode_id = service._evaluation_episode_id("evo_fresh", "v001")
@@ -674,6 +796,84 @@ def test_dead_process_releases_lease_and_reserved_owner_is_replaced(
     ).hexdigest()
 
 
+def test_dead_running_owner_is_failed_before_new_fresh_version(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    script = (
+        "import time\n"
+        "from photomatagent.workspace import Workspace\n"
+        "from photomatagent.scientific.evolution.service import EvolutionService\n"
+        "from photomatagent.scientific.evolution.store import EvolutionStore\n"
+        f"service=EvolutionService(EvolutionStore(Workspace({str(tmp_path)!r})))\n"
+        "with service.store.evaluation_lease('evo_fresh') as lease:\n"
+        " claim=service.claim_fresh_evaluation('evo_fresh', "
+        "strategy_id='strategy_baseline', owner_token='owner_running_dead', "
+        "lease=lease, reclaim_reserved_owner=True)\n"
+        " service.mark_evaluation_running('evo_fresh', claim.episode.version, "
+        "owner_token=claim.owner_token, runtime_session_id='session_dead')\n"
+        " print(claim.episode.version, flush=True)\n"
+        " time.sleep(60)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        first_line = process.stdout.readline().strip()
+        if first_line != "v001":
+            assert process.stderr is not None
+            pytest.fail(process.stderr.read())
+        with pytest.raises(EvolutionLockError, match="leased"):
+            with service.store.evaluation_lease("evo_fresh"):
+                pass
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+    recovery_script = (
+        "from photomatagent.workspace import Workspace\n"
+        "from photomatagent.scientific.evolution.service import EvolutionService\n"
+        "from photomatagent.scientific.evolution.store import EvolutionStore\n"
+        f"service=EvolutionService(EvolutionStore(Workspace({str(tmp_path)!r})))\n"
+        "with service.store.evaluation_lease('evo_fresh') as lease:\n"
+        " claim=service.claim_fresh_evaluation('evo_fresh', "
+        f"strategy_id={strategy.strategy_id!r}, owner_token='owner_running_recovered', "
+        "lease=lease, reclaim_reserved_owner=True)\n"
+        " print(claim.episode.version, flush=True)\n"
+    )
+    recovery = subprocess.run(
+        [sys.executable, "-c", recovery_script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert recovery.returncode == 0, recovery.stderr
+    assert recovery.stdout.strip() == "v002"
+
+    abandoned = service.store.load_evaluation_episode("evo_fresh", "v001")
+    recovered = service.store.load_evaluation_episode("evo_fresh", "v002")
+    assert abandoned.status == "FAILED"
+    assert abandoned.previous_owner_sha256 == hashlib.sha256(
+        b"owner_running_dead"
+    ).hexdigest()
+    assert abandoned.owner_reclaimed_at is not None
+    assert abandoned.error is not None
+    assert len(abandoned.error) <= EVOLUTION_SUMMARY_MAX_CHARS
+    assert recovered.version == "v002"
+    assert recovered.owner_token == "owner_running_recovered"
+    assert service.get("evo_fresh").evaluation_episode_ids == [
+        abandoned.episode_id,
+        recovered.episode_id,
+    ]
+
+
 def test_fresh_claim_rejects_unregistered_lease_object(tmp_path: Path) -> None:
     service, strategy = _fresh_ready_service(tmp_path)
     fake = EvaluationLease(
@@ -691,6 +891,79 @@ def test_fresh_claim_rejects_unregistered_lease_object(tmp_path: Path) -> None:
         )
 
 
+def test_long_fresh_failure_always_persists_bounded_event_summary(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_long_error",
+    )
+
+    failed = service.fail_evaluation(
+        "evo_fresh",
+        claim.episode.version,
+        "x" * 1_000,
+        owner_token=claim.owner_token,
+    )
+
+    assert failed.entity.status == "FAILED"
+    summaries = [
+        item["error_summary"]
+        for item in failed.entity.event_outbox
+        if item.get("kind") == "evolution_episode_failed"
+    ]
+    assert len(summaries) == 1
+    assert len(summaries[0]) == EVOLUTION_SUMMARY_MAX_CHARS
+    assert len(ScientificEpisodeExecutor._bounded_error(RuntimeError("y" * 1_000))) <= (
+        EVOLUTION_SUMMARY_MAX_CHARS
+    )
+
+
+def test_durable_journal_sequences_runtime_transitions_before_accept(
+    tmp_path: Path,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    completed = _complete_initial(service, "evo_ordered_events")
+    service.accept("evo_ordered_events", completed.version)
+    service.store.flush_event_outbox("evo_ordered_events")
+
+    journal = service.store.read_event_journal("evo_ordered_events")
+    sequences = [envelope["sequence"] for _source, envelope in journal]
+    kinds = [envelope["event"]["kind"] for _source, envelope in journal]
+    assert sequences == sorted(sequences)
+    assert len(sequences) == len(set(sequences))
+    assert kinds.count("evolution_episode_started") == 1
+    assert kinds.index("evolution_episode_started") < kinds.index(
+        "evolution_episode_completed"
+    ) < kinds.index("evolution_task_accepted")
+
+
+def test_legacy_unsequenced_outbox_migrates_before_new_event(
+    tmp_path: Path,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    completed = _complete_initial(service, "evo_legacy_outbox")
+    task_path = service.store.root / "evo_legacy_outbox/task.json"
+    episode_path = service.store.root / "evo_legacy_outbox/episodes/v001.json"
+    for path in (task_path, episode_path):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["event_outbox"] = [
+            {key: value for key, value in entry.items() if key != "sequence"}
+            for entry in payload["event_outbox"]
+        ]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    service.accept("evo_legacy_outbox", completed.version)
+    service.store.flush_event_outbox("evo_legacy_outbox")
+
+    journal = service.store.read_event_journal("evo_legacy_outbox")
+    sequences = [envelope["sequence"] for _source, envelope in journal]
+    assert sequences == list(range(1, len(sequences) + 1))
+    assert journal[-1][1]["event"]["kind"] == "evolution_task_accepted"
+
+
 def test_event_journal_is_idempotent_and_export_hashes_exact_source(
     tmp_path: Path,
 ) -> None:
@@ -699,14 +972,19 @@ def test_event_journal_is_idempotent_and_export_hashes_exact_source(
     service.store.append_events("evo_fresh", (event,))
     service.store.append_events("evo_fresh", (event,))
     journal = service.store.read_event_journal("evo_fresh")
-    assert len(journal) == 1
+    stopped = [
+        item for item in journal if item[1]["event"]["kind"] == "evolution_task_stopped"
+    ]
+    assert len(stopped) == 1
 
     export = service.export_evolution(
         "evo_fresh", output="user_output/journal-export.json", include_content=True
     )
     payload = json.loads(export.read_text(encoding="utf-8"))
-    exported = payload["events"][0]
-    assert exported["source_sha256"] == hashlib.sha256(journal[0][0]).hexdigest()
+    exported = next(
+        item for item in payload["events"] if item["kind"] == "evolution_task_stopped"
+    )
+    assert exported["source_sha256"] == hashlib.sha256(stopped[0][0]).hexdigest()
     assert exported["payload"]["kind"] == "evolution_task_stopped"
 
 
@@ -722,17 +1000,17 @@ def test_export_recovers_durable_event_intent_after_journal_crash(
         for item in accepted.event_outbox
     )
 
-    original = service.store.append_events
+    original = service.store._append_sequenced_events_locked
     monkeypatch.setattr(
         service.store,
-        "append_events",
+        "_append_sequenced_events_locked",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("journal crash")),
     )
     with pytest.raises(OSError, match="journal crash"):
         service.store.flush_event_outbox("evo_outbox")
     assert service.get("evo_outbox").status == "ACCEPTED"
 
-    monkeypatch.setattr(service.store, "append_events", original)
+    monkeypatch.setattr(service.store, "_append_sequenced_events_locked", original)
     path = service.export_evolution(
         "evo_outbox", output="user_output/outbox-export.json"
     )

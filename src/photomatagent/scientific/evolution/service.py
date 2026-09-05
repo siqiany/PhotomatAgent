@@ -394,10 +394,17 @@ class EvolutionService:
                 episode_version=current.version,
                 episode_id=current.episode_id,
                 execution_mode=current.execution_mode,
+                comparison_id=persisted_report.comparison_id,
             ),
         )
         if persisted_experience is not None:
-            events = (*events, ExperienceStateChanged(evolution_id=evolution_id))
+            events = (
+                *events,
+                ExperienceStateChanged(
+                    evolution_id=evolution_id,
+                    experience_id=persisted_experience.experience_id,
+                ),
+            )
         return MutationResult(
             persisted_report,
             events,
@@ -561,6 +568,7 @@ class EvolutionService:
 
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
+            recovery_events: tuple[RuntimeEvent, ...] = ()
             if task.status != "REVISION_READY":
                 raise InvalidEvolutionTransition(
                     "fresh evaluation requires REVISION_READY"
@@ -570,11 +578,43 @@ class EvolutionService:
                 current = transaction.load_evaluation_episode(
                     task.current_evaluation_version
                 )
-                if current.status in {"RESERVED", "RUNNING"}:
+                if current.status == "RUNNING":
+                    if not reclaim_reserved_owner or current.owner_token is None:
+                        raise EvolutionOperationConflict(
+                            "active evaluation is owned by another invocation"
+                        )
+                    recovery_error = bounded_summary(
+                        "Fresh evaluation owner disappeared while RUNNING; "
+                        "the exclusive evaluation lease was recovered."
+                    )
+                    reclaimed_at = utc_now()
+                    current = transaction.transition_evaluation_episode(
+                        current.model_copy(
+                            update={
+                                "status": "FAILED",
+                                "completed_at": reclaimed_at,
+                                "error": recovery_error,
+                                "previous_owner_sha256": hashlib.sha256(
+                                    current.owner_token.encode("utf-8")
+                                ).hexdigest(),
+                                "owner_reclaimed_at": reclaimed_at,
+                            }
+                        ),
+                        expected_status="RUNNING",
+                    )
+                    recovery_events = (
+                        EvolutionEpisodeFailed(
+                            evolution_id=evolution_id,
+                            episode_version=current.version,
+                            episode_id=current.episode_id,
+                            execution_mode=current.execution_mode,
+                            error_summary=recovery_error,
+                        ),
+                    )
+                elif current.status == "RESERVED":
                     if current.owner_token != owner_token:
                         if (
-                            current.status != "RESERVED"
-                            or not reclaim_reserved_owner
+                            not reclaim_reserved_owner
                             or current.owner_token is None
                         ):
                             raise EvolutionOperationConflict(
@@ -709,7 +749,7 @@ class EvolutionService:
                 strategy=strategy,
                 episode=persisted,
                 owner_token=owner_token,
-                events=self._reservation_events(persisted, False),
+                events=(*recovery_events, *self._reservation_events(persisted, False)),
             )
 
     def export_evolution(
@@ -1545,6 +1585,7 @@ class EvolutionService:
             episode_version=persisted.episode_version,
             episode_id=episode.episode_id,
             execution_mode=episode.execution_mode,
+            compilation_id=persisted_id,
         )
         return MutationResult(persisted, (event,))
 
@@ -1673,6 +1714,7 @@ class EvolutionService:
             episode_version=persisted.source_version,
             episode_id=source_episode.episode_id,
             execution_mode=source_episode.execution_mode,
+            revision_id=persisted.revision_id,
         )
         return MutationResult(persisted, (event,))
 
@@ -2518,6 +2560,7 @@ class EvolutionService:
             ).encode("utf-8")
             item: dict[str, object] = {
                 "line": line_number,
+                "sequence": envelope.get("sequence"),
                 "event_id": envelope.get("event_id"),
                 "kind": safe.get("kind"),
                 "timestamp": safe.get("timestamp"),

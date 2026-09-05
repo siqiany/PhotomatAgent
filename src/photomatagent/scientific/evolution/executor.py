@@ -14,6 +14,12 @@ from typing import Any, Protocol
 from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger
 from photomatagent.redaction import redact_text
+from photomatagent.runtime.context import ContextBuilder
+from photomatagent.runtime.context_engine import (
+    ContextEngine,
+    ContextEngineConfig,
+    ProviderContextSummarizer,
+)
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import (
@@ -29,6 +35,7 @@ from photomatagent.scientific.evolution.artifacts import (
     sha256_file,
 )
 from photomatagent.scientific.evolution.comparison import evaluate_machine_acceptance
+from photomatagent.scientific.evolution.events import bounded_summary
 from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     CostSnapshot,
@@ -51,6 +58,7 @@ from photomatagent.scientific.loop import (
     ScientificLoopSummary,
 )
 from photomatagent.scientific.state import ScientificState
+from photomatagent.skills.loader import SkillLoader
 from photomatagent.scientific.backends.mock import MockBackend
 from photomatagent.workspace import Workspace
 from photomatagent.tools.bridges import ToolCallBridge, ToolDescribeTool, ToolSearchTool
@@ -59,7 +67,7 @@ from photomatagent.tools.echo import EchoTool
 from photomatagent.tools.mock_calculation import MockCalculationTool
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.scientific_state_inspect import ScientificStateInspectTool
-from photomatagent.tools.surface import ToolCatalog
+from photomatagent.tools.surface import ToolCatalog, ToolSurfaceConfig, ToolSurfacePlanner
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _REVISION_INSTRUCTION_MAX_CHARS = 12_000
@@ -277,13 +285,69 @@ class ScientificEpisodeExecutor:
                 raise ValueError("fresh runtime implementation is not trusted")
             if type(runtime.workspace) is not Workspace:
                 raise ValueError("fresh runtime workspace implementation is not trusted")
-            if type(runtime._tools) is not ToolRegistry:
-                raise ValueError("fresh runtime registry implementation is not trusted")
             if episode.evaluation_workspace_path is None:
                 raise ValueError("fresh evaluation workspace provenance is missing")
             expected_workspace = self.service.validate_evaluation_workspace(episode)
             if runtime.workspace.root != expected_workspace:
                 raise ValueError("fresh runtime must use its isolated evaluation workspace")
+            if type(runtime._tools) is not ToolRegistry:
+                raise ValueError("fresh runtime registry implementation is not trusted")
+            context_builder = runtime._context_builder
+            if (
+                type(context_builder) is not ContextBuilder
+                or set(vars(context_builder)) != {"skill_loader"}
+            ):
+                raise ValueError("fresh context builder is not trusted")
+            try:
+                trusted_skills_dir = runtime.workspace.resolve(
+                    ".photomatagent/fresh-context/skills",
+                    must_exist=True,
+                )
+            except (OSError, ValueError, ToolExecutionError) as exc:
+                raise ValueError("fresh context skill binding is not trusted") from exc
+            skill_loader = context_builder.skill_loader
+            sources = skill_loader.sources if type(skill_loader) is SkillLoader else []
+            if (
+                type(skill_loader) is not SkillLoader
+                or set(vars(skill_loader))
+                != {"skills_dir", "_explicit_skills_dir", "diagnostics", "_sources"}
+                or skill_loader.skills_dir != trusted_skills_dir
+                or not skill_loader._explicit_skills_dir
+                or skill_loader.diagnostics
+                or len(sources) != 1
+                or sources[0].path != trusted_skills_dir
+                or any(trusted_skills_dir.iterdir())
+            ):
+                raise ValueError("fresh context skill binding is not trusted")
+            context_engine = runtime._context_engine
+            if type(context_engine) is not ContextEngine:
+                raise ValueError("fresh context engine implementation is not trusted")
+            if context_engine.snapshot() != {
+                "compaction_state": None,
+                "compacted_message_count": 0,
+                "compaction_count": 0,
+            }:
+                raise ValueError("fresh runtime requires a blank context snapshot")
+            if context_engine.config != ContextEngineConfig():
+                raise ValueError("fresh context engine configuration is not trusted")
+            summarizer = context_engine.summarizer
+            if (
+                type(summarizer) is not ProviderContextSummarizer
+                or summarizer.provider is not runtime._model
+                or summarizer.last_usage is not None
+            ):
+                raise ValueError("fresh context summarizer binding is not trusted")
+            tool_surface = runtime._tool_surface
+            if (
+                type(tool_surface) is not ToolSurfacePlanner
+                or tool_surface.registry is not runtime._tools
+                or type(tool_surface.catalog) is not ToolCatalog
+                or tool_surface.catalog._registry is not runtime._tools
+                or tool_surface.config != ToolSurfaceConfig()
+            ):
+                raise ValueError("fresh tool-surface planner binding is not trusted")
+            if runtime._model_context_limit != context_engine.config.context_limit_tokens:
+                raise ValueError("fresh context limit binding is not trusted")
             expected_tools = {
                 "echo": EchoTool,
                 "calculator": CalculatorTool,
@@ -577,7 +641,7 @@ class ScientificEpisodeExecutor:
 
     @staticmethod
     def _bounded_error(exc: BaseException) -> str:
-        return redact_text(f"{type(exc).__name__}: {exc}")[:1000]
+        return bounded_summary(redact_text(f"{type(exc).__name__}: {exc}"))
 
     async def _reconcile_exception(
         self,

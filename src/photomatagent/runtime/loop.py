@@ -82,6 +82,7 @@ from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.state import ScientificState
+from photomatagent.skills.loader import SkillLoader
 from photomatagent.scientific.tasks import ScientificTask
 from photomatagent.sessions.store import SessionSnapshot
 from photomatagent.tools.base import ToolResult
@@ -131,6 +132,13 @@ class AgentRuntime:
             else Workspace(workspace or Path.cwd())
         )
         self._scientific = scientific_state or ScientificState()
+        if context_builder is None and fresh_approval:
+            fresh_skills_dir = self._workspace.resolve(
+                ".photomatagent/fresh-context/skills",
+                must_exist=False,
+            )
+            fresh_skills_dir.mkdir(parents=True, exist_ok=True)
+            context_builder = ContextBuilder(SkillLoader(fresh_skills_dir))
         self._context_builder = context_builder or ContextBuilder()
         self._tool_surface = tool_surface_planner or ToolSurfacePlanner(
             tools, tool_surface_config
