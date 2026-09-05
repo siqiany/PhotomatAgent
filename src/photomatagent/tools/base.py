@@ -43,6 +43,18 @@ class Tool(ABC):
     searchable: bool = True
     cost_class: str = "CHEAP"  # CHEAP | MODERATE | EXPENSIVE | VERY_EXPENSIVE
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Reject instance grafting once an authoritative registry is sealed."""
+
+        if self.__dict__.get("_tool_sealed", False):
+            raise RuntimeError(f"sealed tool {self.name!r} cannot be mutated")
+        object.__setattr__(self, name, value)
+
+    def _seal(self) -> None:
+        """Freeze this instance for use by a sealed authoritative registry."""
+
+        object.__setattr__(self, "_tool_sealed", True)
+
     @abstractmethod
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the tool with validated arguments."""

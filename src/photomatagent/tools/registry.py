@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from photomatagent.errors import ToolValidationError
@@ -12,9 +15,39 @@ from photomatagent.tools.exposure import ToolExposure
 
 class ToolRegistry:
     def __init__(self) -> None:
-        self._tools: dict[str, Tool] = {}
+        self._tools: Mapping[str, Tool] = {}
+        self._sealed = False
+        self._sealed_contracts: dict[str, tuple[object, ...]] = {}
+
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        """Make registrations and registered tool instances immutable.
+
+        Sealing is intentionally explicit: normal interactive registries may
+        still be assembled incrementally, while security-bound runtimes can
+        close the validation-to-execution mutation window.
+        """
+
+        if self._sealed:
+            self._assert_integrity()
+            return
+        tools = dict(self._tools)
+        for tool in tools.values():
+            Tool._seal(tool)
+        self._sealed_contracts = {
+            name: self._tool_contract(tool) for name, tool in tools.items()
+        }
+        self._tools = MappingProxyType(tools)
+        self._sealed = True
 
     def register(self, tool: Tool) -> None:
+        if self._sealed:
+            raise RuntimeError("sealed tool registry cannot be modified")
+        if not isinstance(self._tools, dict):
+            raise RuntimeError("sealed tool registry cannot be modified")
         if tool.name in self._tools:
             raise ValueError(f"tool already registered: {tool.name}")
         self._tools[tool.name] = tool
@@ -24,12 +57,62 @@ class ToolRegistry:
             self.register(tool)
 
     def get(self, name: str) -> Tool:
+        self._assert_integrity()
         if name not in self._tools:
             raise KeyError(f"unknown tool: {name}")
         return self._tools[name]
 
     def list_tools(self) -> list[Tool]:
+        self._assert_integrity()
         return sorted(self._tools.values(), key=lambda t: t.name)
+
+    @staticmethod
+    def _tool_contract(tool: Tool) -> tuple[object, ...]:
+        execute = tool.execute
+        execute_owner = getattr(execute, "__self__", None)
+        execute_function = getattr(execute, "__func__", execute)
+        try:
+            schema = json.dumps(
+                tool.input_schema,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        except (TypeError, ValueError):
+            schema = repr(tool.input_schema)
+        metadata = (
+            tool.name,
+            tool.description,
+            tool.short_description,
+            schema,
+            tool.exposure,
+            tool.namespace,
+            tool.source,
+            tool.tags,
+            tool.searchable,
+            tool.cost_class,
+        )
+        instance_state = tuple(
+            sorted((key, id(value)) for key, value in vars(tool).items())
+        )
+        return (
+            type(tool),
+            id(tool),
+            id(execute_owner),
+            id(execute_function),
+            metadata,
+            instance_state,
+        )
+
+    def _assert_integrity(self) -> None:
+        if not self._sealed:
+            return
+        if set(self._tools) != set(self._sealed_contracts):
+            raise RuntimeError("sealed tool registry mapping was mutated")
+        for name, expected in self._sealed_contracts.items():
+            tool = self._tools.get(name)
+            if tool is None or self._tool_contract(tool) != expected:
+                raise RuntimeError(f"sealed tool {name!r} was mutated")
 
     def tool_metadata_list(self) -> list[dict[str, Any]]:
         return [t.tool_metadata() for t in self.list_tools()]

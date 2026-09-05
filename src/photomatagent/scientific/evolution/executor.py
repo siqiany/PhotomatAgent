@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import tempfile
 import time
@@ -14,6 +15,7 @@ from typing import Any, Protocol
 from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger
 from photomatagent.redaction import redact_text
+from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context import ContextBuilder
 from photomatagent.runtime.context_engine import (
     ContextEngine,
@@ -62,8 +64,10 @@ from photomatagent.skills.loader import SkillLoader
 from photomatagent.scientific.backends.mock import MockBackend
 from photomatagent.workspace import Workspace
 from photomatagent.tools.bridges import ToolCallBridge, ToolDescribeTool, ToolSearchTool
+from photomatagent.tools.base import Tool
 from photomatagent.tools.calculator import CalculatorTool
 from photomatagent.tools.echo import EchoTool
+from photomatagent.tools.factory import create_default_registry
 from photomatagent.tools.mock_calculation import MockCalculationTool
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.scientific_state_inspect import ScientificStateInspectTool
@@ -77,10 +81,158 @@ _FRESH_STRATEGY_GUIDANCE = {
     "DIVERSITY_FIRST": "Prioritize diverse independently checked candidates.",
     "UNCERTAINTY_FIRST": "Prioritize resolving the largest scientific uncertainty.",
 }
+_FRESH_TOOL_TYPES: dict[str, type[object]] = {
+    "echo": EchoTool,
+    "calculator": CalculatorTool,
+    "scientific_state_inspect": ScientificStateInspectTool,
+    "mock.run_calculation": MockCalculationTool,
+    "tool_search": ToolSearchTool,
+    "tool_describe": ToolDescribeTool,
+    "tool_call": ToolCallBridge,
+}
+_FRESH_TOOL_INSTANCE_FIELDS: dict[str, set[str]] = {
+    "echo": set(),
+    "calculator": set(),
+    "scientific_state_inspect": {"_state"},
+    "mock.run_calculation": {"backend"},
+    "tool_search": {"catalog", "default_limit", "max_limit"},
+    "tool_describe": {"catalog"},
+    "tool_call": set(),
+}
+_TOOL_CONTRACT_FIELDS = (
+    "name",
+    "description",
+    "short_description",
+    "exposure",
+    "namespace",
+    "source",
+    "tags",
+    "searchable",
+    "cost_class",
+)
+
+
+def _class_tool_contract(tool_type: type[object]) -> tuple[object, ...]:
+    schema = json.dumps(
+        getattr(tool_type, "input_schema"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return (
+        *(getattr(tool_type, field) for field in _TOOL_CONTRACT_FIELDS),
+        schema,
+        getattr(tool_type, "execute"),
+        getattr(tool_type, "tool_metadata"),
+    )
+
+
+_FRESH_TOOL_CONTRACTS = {
+    name: _class_tool_contract(tool_type)
+    for name, tool_type in _FRESH_TOOL_TYPES.items()
+}
 
 
 class RuntimeFactory(Protocol):
     def __call__(self, **kwargs: Any) -> AgentRuntime: ...
+
+
+def _trusted_fresh_permission_components(
+    supplied: AgentRuntime,
+) -> tuple[SwitchablePermissionPolicy, object | None]:
+    policy = supplied.permission_policy
+    if (
+        type(policy) is not SwitchablePermissionPolicy
+        or set(vars(policy)) != {"_base", "_settings", "_session_allow_all"}
+        or policy._settings is not None  # type: ignore[attr-defined]
+        or policy._session_allow_all  # type: ignore[attr-defined]
+    ):
+        raise ValueError("fresh runtime permission wrapper is not trusted")
+    base = policy._base  # type: ignore[attr-defined]
+    if type(base) is PolicyRule:
+        expected = default_permission_policy()
+        if (
+            set(vars(base)) != {"_rules", "_default"}
+            or base._rules != expected._rules  # type: ignore[attr-defined]
+            or base._default != expected._default  # type: ignore[attr-defined]
+        ):
+            raise ValueError("fresh runtime permission rules were modified")
+        cloned_base = default_permission_policy()
+        from photomatagent.cli.prompt import CLIApprovalHandler
+
+        handler = supplied._approval_handler
+        if (
+            handler is None
+            or type(handler) is not CLIApprovalHandler
+            or set(vars(handler)) != {"session"}
+        ):
+            raise ValueError("fresh ask approval handler is not trusted")
+        cloned_handler: object | None = CLIApprovalHandler(handler.session)
+    elif type(base) is AllowAllPolicy:
+        if vars(base):
+            raise ValueError("fresh runtime base permission policy was modified")
+        cloned_base = AllowAllPolicy()
+        cloned_handler = None
+    elif type(base) is DenyAllPolicy:
+        if vars(base):
+            raise ValueError("fresh runtime base permission policy was modified")
+        cloned_base = DenyAllPolicy()
+        cloned_handler = None
+    else:
+        raise ValueError("fresh runtime base permission policy is not trusted")
+    if type(base) is not PolicyRule and supplied._approval_handler is not None:
+        raise ValueError("fresh non-interactive policy has an approval handler")
+    return SwitchablePermissionPolicy(cloned_base, settings=None), cloned_handler
+
+
+def _build_trusted_fresh_runtime(
+    supplied: AgentRuntime,
+    *,
+    workspace_root: Path,
+    application_approval_root: Path,
+) -> AgentRuntime:
+    """Rebuild the authoritative runtime without any supplier-owned tools."""
+
+    if type(supplied) is not AgentRuntime:
+        raise TypeError("runtime_factory must return an exact AgentRuntime")
+    if type(supplied.workspace) is not Workspace or supplied.workspace.root != workspace_root:
+        raise ValueError("runtime_factory did not bind the evaluation workspace")
+    if not supplied._fresh_approval:
+        raise ValueError("runtime_factory disabled fresh approval isolation")
+    if supplied._application_approval_root != application_approval_root:
+        raise ValueError("runtime_factory did not bind the evaluation approval namespace")
+    if supplied.conversation_state.messages:
+        raise ValueError("runtime_factory returned a reused conversation")
+    if type(supplied.budget) is not BudgetState or any(
+        value != 0 for value in supplied.budget.snapshot().values()
+    ):
+        raise ValueError("runtime_factory returned a reused budget")
+    if supplied.scientific_state != ScientificState():
+        raise ValueError("runtime_factory returned reused scientific state")
+    if not isinstance(supplied.session_id, str) or not supplied.session_id:
+        raise ValueError("runtime_factory returned an invalid session ID")
+
+    permission, approval_handler = _trusted_fresh_permission_components(supplied)
+    workspace = Workspace(workspace_root)
+    scientific = ScientificState()
+    registry = create_default_registry(
+        scientific,
+        workspace,
+        application_approval_root=application_approval_root,
+        evaluation_isolation=True,
+    )
+    return AgentRuntime(
+        model=supplied._model,
+        tools=registry,
+        workspace=workspace,
+        scientific_state=scientific,
+        permission_policy=permission,
+        budget=BudgetState(max_iterations=supplied.budget.max_iterations),
+        approval_handler=approval_handler,  # type: ignore[arg-type]
+        session_id=supplied.session_id,
+        fresh_approval=True,
+        application_approval_root=application_approval_root,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +424,39 @@ class ScientificEpisodeExecutor:
             cost=cost,
         )
 
+    @staticmethod
+    def _validate_canonical_fresh_tool(name: str, tool: object) -> None:
+        expected_type = _FRESH_TOOL_TYPES[name]
+        if type(tool) is not expected_type:
+            raise ValueError(
+                "fresh runtime tool implementations are not the trusted allowlist"
+            )
+        if set(vars(tool)) != _FRESH_TOOL_INSTANCE_FIELDS[name]:
+            raise ValueError(f"fresh canonical tool contract was modified: {name}")
+        execute = getattr(tool, "execute")
+        actual_contract = (
+            *(getattr(tool, field) for field in _TOOL_CONTRACT_FIELDS),
+            json.dumps(
+                getattr(tool, "input_schema"),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+            getattr(execute, "__func__", execute),
+            getattr(
+                getattr(tool, "tool_metadata"),
+                "__func__",
+                getattr(tool, "tool_metadata"),
+            ),
+        )
+        if (
+            getattr(execute, "__self__", None) is not tool
+            or getattr(getattr(tool, "tool_metadata"), "__self__", None) is not tool
+            or getattr(type(tool), "tool_metadata") is not Tool.tool_metadata
+            or actual_contract != _FRESH_TOOL_CONTRACTS[name]
+        ):
+            raise ValueError(f"fresh canonical tool contract was modified: {name}")
+
     def _validate_execution(
         self,
         *,
@@ -292,6 +477,8 @@ class ScientificEpisodeExecutor:
                 raise ValueError("fresh runtime must use its isolated evaluation workspace")
             if type(runtime._tools) is not ToolRegistry:
                 raise ValueError("fresh runtime registry implementation is not trusted")
+            if runtime._tools.sealed:
+                raise ValueError("fresh runtime registry was sealed before attestation")
             context_builder = runtime._context_builder
             if (
                 type(context_builder) is not ContextBuilder
@@ -348,23 +535,13 @@ class ScientificEpisodeExecutor:
                 raise ValueError("fresh tool-surface planner binding is not trusted")
             if runtime._model_context_limit != context_engine.config.context_limit_tokens:
                 raise ValueError("fresh context limit binding is not trusted")
-            expected_tools = {
-                "echo": EchoTool,
-                "calculator": CalculatorTool,
-                "scientific_state_inspect": ScientificStateInspectTool,
-                "mock.run_calculation": MockCalculationTool,
-                "tool_search": ToolSearchTool,
-                "tool_describe": ToolDescribeTool,
-                "tool_call": ToolCallBridge,
-            }
             actual_tools = {tool.name: tool for tool in runtime._tools.list_tools()}
-            if set(actual_tools) != set(expected_tools) or any(
-                type(actual_tools[name]) is not expected
-                for name, expected in expected_tools.items()
-            ):
+            if set(actual_tools) != set(_FRESH_TOOL_TYPES):
                 raise ValueError(
                     "fresh runtime tool implementations are not the trusted allowlist"
                 )
+            for name, tool in actual_tools.items():
+                self._validate_canonical_fresh_tool(name, tool)
             state_tool = actual_tools["scientific_state_inspect"]
             if state_tool._state is not runtime.scientific_state:  # type: ignore[attr-defined]
                 raise ValueError("fresh state tool is not bound to the runtime state")
@@ -443,6 +620,8 @@ class ScientificEpisodeExecutor:
             raise ValueError("executor owner token does not match the reserved episode")
         if task.goal != stored_task.goal or task.target != stored_task.target:
             raise ValueError("task does not match the persisted immutable task snapshot")
+        if episode.execution_mode == "FRESH_EVALUATION":
+            runtime._tools.seal()
 
     def _runtime_session_id(self, runtime: AgentRuntime) -> str:
         runtime_id = runtime.session_id
@@ -829,14 +1008,12 @@ async def run_fresh_evaluation(
         raise ValueError("evaluation workspace provenance is missing")
     evaluation_workspace = service.validate_evaluation_workspace(claim.episode)
     try:
-        runtime = runtime_factory(
+        supplied_runtime = runtime_factory(
             workspace_root=evaluation_workspace,
             scientific_state=ScientificState(),
             fresh_approval=True,
             application_approval_root=approval_root,
         )
-        if not isinstance(runtime, AgentRuntime):
-            raise TypeError("runtime_factory must return AgentRuntime")
         if not service.store.has_active_evaluation_lease(
             _lease,
             task.evolution_id,
@@ -844,7 +1021,12 @@ async def run_fresh_evaluation(
             raise EvolutionOperationConflict(
                 "fresh evaluation lost its execution lease"
             )
-        service.validate_evaluation_workspace(claim.episode)
+        evaluation_workspace = service.validate_evaluation_workspace(claim.episode)
+        runtime = _build_trusted_fresh_runtime(
+            supplied_runtime,
+            workspace_root=evaluation_workspace,
+            application_approval_root=evaluation_workspace / approval_root,
+        )
         await executor._publish(
             MutationResult(claim.episode, claim.events),
             on_event,

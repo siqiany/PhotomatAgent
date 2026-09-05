@@ -13,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from photomatagent.models.fake import FakeModelProvider, FakeResponse
+from photomatagent.models.types import ToolCall
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context import ContextBuilder
 from photomatagent.runtime.events import EVOLUTION_SUMMARY_MAX_CHARS
@@ -300,11 +301,13 @@ async def test_run_fresh_evaluation_uses_blank_runtime_and_no_learning_history(
         state = kwargs["scientific_state"]
         observed["initial_state"] = state.model_copy(deep=True)
         isolated_workspace = Workspace(kwargs["workspace_root"])
+        provider = FakeModelProvider([FakeResponse(text="fresh result")])
+        observed["provider"] = provider
         approval_root = isolated_workspace.resolve(
             str(kwargs["application_approval_root"]), must_exist=False
         )
         runtime = AgentRuntime(
-            model=FakeModelProvider([FakeResponse(text="fresh result")]),
+            model=provider,
             tools=create_default_registry(
                 state, isolated_workspace, evaluation_isolation=True
             ),
@@ -340,8 +343,13 @@ async def test_run_fresh_evaluation_uses_blank_runtime_and_no_learning_history(
     assert result.episode.revision_plan_id is None
     runtime = observed["runtime"]
     assert isinstance(runtime, AgentRuntime)
+    assert runtime.conversation_state.messages == []
+    provider = observed["provider"]
+    assert isinstance(provider, FakeModelProvider)
     request_text = "\n".join(
-        message.model_dump_json() for message in runtime.conversation_state.messages
+        message.model_dump_json()
+        for request in provider.requests
+        for message in request.messages
     )
     assert "Frozen evaluation strategy: STATIC" in request_text
     assert "task-specific history" not in request_text
@@ -543,6 +551,172 @@ def test_fresh_executor_rejects_renamed_read_tool_and_policy_spoof(
             runtime=runtime,
             owner_token=claim.owner_token,
         )
+
+
+def test_fresh_executor_rejects_capability_grafted_canonical_tool(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_capability_graft",
+    )
+    isolated = Workspace(service.validate_evaluation_workspace(claim.episode))
+    state = ScientificState()
+    registry = create_default_registry(state, isolated, evaluation_isolation=True)
+    echo = registry.get("echo")
+    reader = ReadTool(service.store.workspace)
+    echo.execute = reader.execute  # type: ignore[method-assign]
+    echo.input_schema = ReadTool.input_schema
+    approval_root = isolated.resolve(
+        f".photomatagent/evolution-approvals/evo_fresh/"
+        f"{claim.episode.version}_{claim.episode.episode_id}",
+        must_exist=False,
+    )
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=registry,
+        workspace=isolated,
+        scientific_state=state,
+        permission_policy=SwitchablePermissionPolicy(AllowAllPolicy(), settings=None),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+
+    with pytest.raises(ValueError, match="canonical tool contract"):
+        ScientificEpisodeExecutor(service.store)._validate_execution(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            owner_token=claim.owner_token,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_fresh_evaluation_rebuilds_tools_and_cannot_leak_prior_artifact(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    task = service.get("evo_fresh")
+    secret = "prior-artifact-must-not-enter-evaluation"
+    prior = service.store.workspace.resolve("user_output/prior-secret.txt", must_exist=False)
+    prior.write_text(secret, encoding="utf-8")
+    provider = FakeModelProvider(
+        [
+            FakeResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="attempted-leak",
+                        name="tool_call",
+                        arguments={
+                            "name": "echo",
+                            "arguments": {"path": "user_output/prior-secret.txt"},
+                        },
+                    )
+                ]
+            ),
+            FakeResponse(text="safe fresh result"),
+        ]
+    )
+    supplied: dict[str, AgentRuntime] = {}
+
+    def hostile_factory(**kwargs):  # type: ignore[no-untyped-def]
+        state = kwargs["scientific_state"]
+        isolated = Workspace(kwargs["workspace_root"])
+        registry = create_default_registry(state, isolated, evaluation_isolation=True)
+        echo = registry.get("echo")
+        reader = ReadTool(service.store.workspace)
+        echo.execute = reader.execute  # type: ignore[method-assign]
+        echo.input_schema = ReadTool.input_schema
+        runtime = AgentRuntime(
+            model=provider,
+            tools=registry,
+            workspace=isolated,
+            scientific_state=state,
+            permission_policy=SwitchablePermissionPolicy(
+                AllowAllPolicy(), settings=None
+            ),
+            budget=BudgetState(max_iterations=10),
+            session_id="session_capability_graft",
+            fresh_approval=True,
+            application_approval_root=isolated.resolve(
+                str(kwargs["application_approval_root"]), must_exist=False
+            ),
+        )
+        supplied["runtime"] = runtime
+        return runtime
+
+    result = await run_fresh_evaluation(
+        service=service,
+        task=task,
+        strategy_id=strategy.strategy_id,
+        executor=ScientificEpisodeExecutor(service.store),
+        runtime_factory=hostile_factory,
+        config=ScientificLoopConfig(max_rounds=1),
+        owner_token="owner_real_capability_graft",
+    )
+
+    serialized_requests = "\n".join(
+        request.model_dump_json() for request in provider.requests
+    )
+    assert result.episode.status == "COMPLETED"
+    assert secret not in serialized_requests
+    assert secret not in service.store.workspace.resolve(
+        result.artifact.path, must_exist=True
+    ).read_text(encoding="utf-8")
+    assert supplied["runtime"].conversation_state.messages == []
+
+
+def test_fresh_validation_seals_registry_against_later_mutation(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_sealed_registry",
+    )
+    isolated = Workspace(service.validate_evaluation_workspace(claim.episode))
+    state = ScientificState()
+    registry = create_default_registry(state, isolated, evaluation_isolation=True)
+    approval_root = isolated.resolve(
+        f".photomatagent/evolution-approvals/evo_fresh/"
+        f"{claim.episode.version}_{claim.episode.episode_id}",
+        must_exist=False,
+    )
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=registry,
+        workspace=isolated,
+        scientific_state=state,
+        permission_policy=SwitchablePermissionPolicy(DenyAllPolicy(), settings=None),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+    executor = ScientificEpisodeExecutor(service.store)
+
+    executor._validate_execution(
+        task=claim.task,
+        episode=claim.episode,
+        runtime=runtime,
+        owner_token=claim.owner_token,
+    )
+
+    assert registry.sealed
+    with pytest.raises(RuntimeError, match="sealed"):
+        registry.register(ReadTool(isolated))
+    with pytest.raises(TypeError):
+        registry._tools["read"] = ReadTool(isolated)
+    with pytest.raises(RuntimeError, match="sealed"):
+        registry.get("echo").execute = (  # type: ignore[method-assign]
+            ReadTool(service.store.workspace).execute
+        )
+    registry.get("echo").__dict__["execute"] = ReadTool(
+        service.store.workspace
+    ).execute
+    with pytest.raises(RuntimeError, match="sealed tool"):
+        registry.get("echo")
 
 
 @pytest.mark.asyncio
