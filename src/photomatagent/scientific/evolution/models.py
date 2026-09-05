@@ -477,9 +477,15 @@ class ArtifactRef(StrictModel):
 
 
 class CostSnapshot(StrictModel):
-    input_tokens: int = Field(default=0, ge=0)
-    output_tokens: int = Field(default=0, ge=0)
-    tool_calls: int = Field(default=0, ge=0)
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        allow_inf_nan=False,
+    )
+
+    input_tokens: int = Field(default=0, strict=True, ge=0)
+    output_tokens: int = Field(default=0, strict=True, ge=0)
+    tool_calls: int = Field(default=0, strict=True, ge=0)
     runtime_seconds: float = Field(default=0.0, ge=0.0)
     hpc_cost: float | None = Field(default=None, ge=0.0)
 
@@ -802,9 +808,15 @@ class ArtifactDiff(StrictModel):
 
 
 class CostDelta(StrictModel):
-    input_tokens: int = 0
-    output_tokens: int = 0
-    tool_calls: int = 0
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        allow_inf_nan=False,
+    )
+
+    input_tokens: int = Field(default=0, strict=True)
+    output_tokens: int = Field(default=0, strict=True)
+    tool_calls: int = Field(default=0, strict=True)
     runtime_seconds: float = 0.0
     hpc_cost: float | None = None
 
@@ -820,6 +832,8 @@ class ComparisonReport(StrictModel):
     phase: ComparisonPhase = "PRE_FEEDBACK"
     current_feedback_id: ManagedId | None = None
     current_feedback_sha256: Sha256 | None = None
+    current_compilation_id: ManagedId | None = None
+    current_compilation_sha256: Sha256 | None = None
     score_deltas: list[RubricScoreDelta] = Field(default_factory=list)
     acceptance_results: list[AcceptanceResult] = Field(default_factory=list)
     closed_issue_ids: list[ManagedId] = Field(default_factory=list)
@@ -913,10 +927,24 @@ class ComparisonReport(StrictModel):
             if (
                 self.current_feedback_id is not None
                 or self.current_feedback_sha256 is not None
+                or self.current_compilation_id is not None
+                or self.current_compilation_sha256 is not None
             ):
-                raise ValueError("pre-feedback comparison cannot bind current feedback")
-        elif self.current_feedback_id is None or self.current_feedback_sha256 is None:
-            raise ValueError("post-feedback comparison requires exact feedback identity")
+                raise ValueError(
+                    "pre-feedback comparison cannot bind current feedback/compilation"
+                )
+        elif any(
+            value is None
+            for value in (
+                self.current_feedback_id,
+                self.current_feedback_sha256,
+                self.current_compilation_id,
+                self.current_compilation_sha256,
+            )
+        ):
+            raise ValueError(
+                "post-feedback comparison requires exact feedback and compilation identity"
+            )
         machine = [
             result
             for result in self.acceptance_results

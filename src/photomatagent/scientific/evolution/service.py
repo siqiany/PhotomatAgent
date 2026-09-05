@@ -283,6 +283,12 @@ class EvolutionService:
                 if current_feedback is not None
                 else None
             )
+            if current_feedback is not None and current_compilation is None:
+                raise InvalidEvolutionTransition(
+                    "current feedback is recorded but has no exact AVAILABLE "
+                    "compilation; compile the current feedback before requesting "
+                    "a POST_FEEDBACK comparison"
+                )
             machine_results: dict[str, bool | str | AcceptanceResult] = {}
             for result in current.acceptance_results:
                 machine_results[result.acceptance_id] = result
@@ -294,12 +300,8 @@ class EvolutionService:
                 previous_plan=plan,
                 previous_feedback=previous_feedback,
                 current_feedback=current_feedback,
+                current_compilation=current_compilation,
                 previous_items=previous_compilation.items,
-                current_items=(
-                    current_compilation.items
-                    if current_compilation is not None
-                    else None
-                ),
                 machine_results=machine_results,
                 previous_state=previous_state,
                 current_state=current_state,

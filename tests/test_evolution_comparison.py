@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from photomatagent.scientific.evolution.experience import (
 from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     ComparisonReport,
+    CostDelta,
     CostSnapshot,
     EpisodeRecord,
     EvolutionTask,
@@ -132,6 +134,24 @@ def _feedback(version: str, value: int, *, feedback_id: str) -> ExpertFeedbackRe
             actionability=value,
             overall=value,
         ),
+    )
+
+
+def _compilation(
+    version: str,
+    *,
+    feedback_id: str,
+    items: tuple[FeedbackDelta, ...] = (),
+) -> FeedbackCompilation:
+    return FeedbackCompilation(
+        compilation_id=f"comp_{version}",
+        evolution_id="evo_compare",
+        feedback_id=feedback_id,
+        episode_version=version,  # type: ignore[arg-type]
+        status="AVAILABLE",
+        items=items,
+        provider="fake",
+        model="fake",
     )
 
 
@@ -259,6 +279,7 @@ def test_scores_require_two_reviews_and_signature_issue_changes() -> None:
         current_feedback=None,
         previous_items=prior_items,
     )
+    current_feedback = _feedback("v002", 4, feedback_id="fb_v2")
     report = compare_episodes(
         previous=_episode("v001"),
         current=_episode("v002"),
@@ -270,9 +291,13 @@ def test_scores_require_two_reviews_and_signature_issue_changes() -> None:
             confirmed=True,
         ),
         previous_feedback=_feedback("v001", 2, feedback_id="fb_v1"),
-        current_feedback=_feedback("v002", 4, feedback_id="fb_v2"),
+        current_feedback=current_feedback,
+        current_compilation=_compilation(
+            "v002",
+            feedback_id=current_feedback.feedback_id,
+            items=current_items,
+        ),
         previous_items=prior_items,
-        current_items=current_items,
     )
 
     assert without_review.score_deltas == []
@@ -445,6 +470,15 @@ def test_comparison_report_rejects_unbounded_or_inconsistent_learning_fields() -
 
 
 def test_module_credit_is_bounded_and_does_not_create_extra_observations() -> None:
+    current_feedback = _feedback("v002", 3, feedback_id="fb_v2")
+    current_items = (
+        _delta(
+            "retrieval_again",
+            category="EVIDENCE_SUFFICIENCY",
+            module="retrieval",
+        ),
+        _delta("novelty_new", category="NOVELTY", module="search"),
+    )
     report = compare_episodes(
         previous=_episode("v001"),
         current=_episode("v002"),
@@ -459,13 +493,11 @@ def test_module_credit_is_bounded_and_does_not_create_extra_observations() -> No
             _delta("retrieval_1", category="EVIDENCE_SUFFICIENCY", module="retrieval"),
             _delta("retrieval_2", category="EVIDENCE_SUFFICIENCY", module="retrieval"),
         ),
-        current_items=(
-            _delta(
-                "retrieval_again",
-                category="EVIDENCE_SUFFICIENCY",
-                module="retrieval",
-            ),
-            _delta("novelty_new", category="NOVELTY", module="search"),
+        current_feedback=current_feedback,
+        current_compilation=_compilation(
+            "v002",
+            feedback_id=current_feedback.feedback_id,
+            items=current_items,
         ),
     )
     experience = create_experience(report, task_group_id="group_compare")
@@ -476,6 +508,17 @@ def test_module_credit_is_bounded_and_does_not_create_extra_observations() -> No
 
 
 def test_later_positive_signal_explicitly_closes_human_issue() -> None:
+    current_feedback = _feedback("v002", 3, feedback_id="fb_v2").model_copy(
+        update={"resolved_issue_ids": ["issue_evidence"]}
+    )
+    current_items = (
+        _delta(
+            "confirmation",
+            category="EVIDENCE_SUFFICIENCY",
+            module="retrieval",
+            status="POSITIVE_SIGNAL",
+        ),
+    )
     report = compare_episodes(
         previous=_episode("v001"),
         current=_episode("v002"),
@@ -494,16 +537,11 @@ def test_later_positive_signal_explicitly_closes_human_issue() -> None:
                 module="retrieval",
             ),
         ),
-        current_feedback=_feedback("v002", 3, feedback_id="fb_v2").model_copy(
-            update={"resolved_issue_ids": ["issue_evidence"]}
-        ),
-        current_items=(
-            _delta(
-                "confirmation",
-                category="EVIDENCE_SUFFICIENCY",
-                module="retrieval",
-                status="POSITIVE_SIGNAL",
-            ),
+        current_feedback=current_feedback,
+        current_compilation=_compilation(
+            "v002",
+            feedback_id=current_feedback.feedback_id,
+            items=current_items,
         ),
     )
 
@@ -514,6 +552,15 @@ def test_later_positive_signal_explicitly_closes_human_issue() -> None:
 
 
 def test_unrelated_positive_signal_never_human_closes_issue() -> None:
+    current_feedback = _feedback("v002", 3, feedback_id="fb_v2")
+    current_items = (
+        _delta(
+            "praise_only",
+            category="EVIDENCE_SUFFICIENCY",
+            module="retrieval",
+            status="POSITIVE_SIGNAL",
+        ),
+    )
     report = compare_episodes(
         previous=_episode("v001"),
         current=_episode("v002"),
@@ -528,14 +575,11 @@ def test_unrelated_positive_signal_never_human_closes_issue() -> None:
         previous_items=(
             _delta("issue_evidence", category="EVIDENCE_SUFFICIENCY", module="retrieval"),
         ),
-        current_feedback=_feedback("v002", 3, feedback_id="fb_v2"),
-        current_items=(
-            _delta(
-                "praise_only",
-                category="EVIDENCE_SUFFICIENCY",
-                module="retrieval",
-                status="POSITIVE_SIGNAL",
-            ),
+        current_feedback=current_feedback,
+        current_compilation=_compilation(
+            "v002",
+            feedback_id=current_feedback.feedback_id,
+            items=current_items,
         ),
     )
 
@@ -544,6 +588,9 @@ def test_unrelated_positive_signal_never_human_closes_issue() -> None:
 
 
 def test_human_check_uses_its_exact_query_issue_reference() -> None:
+    current_feedback = _feedback("v002", 3, feedback_id="fb_v2").model_copy(
+        update={"resolved_issue_ids": ["issue_query"]}
+    )
     report = compare_episodes(
         previous=_episode("v001"),
         current=_episode("v002"),
@@ -559,8 +606,10 @@ def test_human_check_uses_its_exact_query_issue_reference() -> None:
             _delta("issue_unrelated"),
             _delta("issue_query", status="QUERY"),
         ),
-        current_feedback=_feedback("v002", 3, feedback_id="fb_v2").model_copy(
-            update={"resolved_issue_ids": ["issue_query"]}
+        current_feedback=current_feedback,
+        current_compilation=_compilation(
+            "v002",
+            feedback_id=current_feedback.feedback_id,
         ),
     )
 
@@ -570,6 +619,13 @@ def test_human_check_uses_its_exact_query_issue_reference() -> None:
 
 
 def test_module_credit_redacts_sensitive_module_names() -> None:
+    current_feedback = _feedback("v002", 3, feedback_id="fb_v2")
+    current_items = (
+        _delta(
+            "unsafe_module_name",
+            module="Authorization: Bearer module-secret",
+        ),
+    )
     report = compare_episodes(
         previous=_episode("v001"),
         current=_episode("v002"),
@@ -580,11 +636,11 @@ def test_module_credit_redacts_sensitive_module_names() -> None:
             feedback_id="fb_v1",
             confirmed=True,
         ),
-        current_items=(
-            _delta(
-                "unsafe_module_name",
-                module="Authorization: Bearer module-secret",
-            ),
+        current_feedback=current_feedback,
+        current_compilation=_compilation(
+            "v002",
+            feedback_id=current_feedback.feedback_id,
+            items=current_items,
         ),
     )
 
@@ -782,6 +838,34 @@ def test_store_revalidates_maturity_when_model_construction_is_bypassed(
         service.store.write_experience(forged)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_store_revalidates_non_finite_comparison_cost(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    service, task = _persisted_pair(tmp_path)
+    valid = ComparisonReport(
+        comparison_id="cmp_nonfinite",
+        evolution_id=task.evolution_id,
+        previous_version="v001",
+        current_version="v002",
+    )
+    forged = valid.model_copy(
+        update={
+            "cost_delta": CostDelta.model_construct(
+                input_tokens=0,
+                output_tokens=0,
+                tool_calls=0,
+                runtime_seconds=value,
+                hpc_cost=None,
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        service.store.write_comparison(forged)
+
+
 def _persisted_pair(
     tmp_path: Path,
     *,
@@ -936,6 +1020,21 @@ def test_preliminary_then_reviewed_comparison_has_distinct_snapshot_and_one_samp
         raw_input="reviewed",
     )
 
+    with pytest.raises(InvalidEvolutionTransition, match="compile.*current feedback"):
+        service.compare(task.evolution_id, "v001", "v002")
+    incomplete = service.get(task.evolution_id)
+    assert incomplete.comparison_ids == [preliminary.comparison_id]
+    assert incomplete.experience_ids == []
+
+    current_feedback = service.store.load_feedback(task.evolution_id, "fb_v2")
+    compilation = _compilation(
+        "v002",
+        feedback_id=current_feedback.feedback_id,
+    )
+    first_compilation = service.save_compilation(task.evolution_id, compilation)
+    retried_compilation = service.save_compilation(task.evolution_id, compilation)
+    assert retried_compilation.entity == first_compilation.entity
+
     reviewed = service.compare(task.evolution_id, "v001", "v002").entity
     retried = service.compare(task.evolution_id, "v001", "v002").entity
 
@@ -943,6 +1042,8 @@ def test_preliminary_then_reviewed_comparison_has_distinct_snapshot_and_one_samp
     assert reviewed.phase == "POST_FEEDBACK"
     assert preliminary.comparison_id != reviewed.comparison_id
     assert reviewed.current_feedback_id == "fb_v2"
+    assert reviewed.current_compilation_id == "comp_v002"
+    assert reviewed.current_compilation_sha256 is not None
     assert retried == reviewed
     stored = service.get(task.evolution_id)
     assert stored.comparison_ids == [
@@ -1045,3 +1146,34 @@ def test_compare_cli_is_bounded_redacted_and_does_not_construct_runtime(
     assert "Unresolved human checks" in result.output
     assert "cli-secret" not in result.output
     assert len(service.get(task.evolution_id).comparison_ids) == 1
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_compare_cli_rejects_non_finite_persisted_episode_cost(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    service, task = _persisted_pair(tmp_path)
+    episode_path = service.store.workspace.resolve(
+        f".photomatagent/evolutions/{task.evolution_id}/episodes/v002.json"
+    )
+    payload = json.loads(episode_path.read_text(encoding="utf-8"))
+    payload["cost"]["runtime_seconds"] = value
+    episode_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "evolve",
+            "compare",
+            task.evolution_id,
+            "v001",
+            "v002",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "corrupt evolution record" in result.output
+    assert len(result.output) <= 1_200

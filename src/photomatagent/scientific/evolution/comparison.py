@@ -19,6 +19,7 @@ from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
     EvidenceChangeSummary,
     ExpertFeedbackRecord,
+    FeedbackCompilation,
     FeedbackDelta,
     FidelityChangeSummary,
     RevisionPlan,
@@ -55,6 +56,7 @@ def compare_episodes(
     previous_plan: RevisionPlan,
     previous_feedback: ExpertFeedbackRecord | None = None,
     current_feedback: ExpertFeedbackRecord | None = None,
+    current_compilation: FeedbackCompilation | None = None,
     previous_items: Sequence[FeedbackDelta] | None = None,
     current_items: Sequence[FeedbackDelta] | None = None,
     machine_results: Mapping[str, bool | str | AcceptanceResult] | None = None,
@@ -76,9 +78,21 @@ def compare_episodes(
         previous_plan=previous_plan,
         previous_feedback=previous_feedback,
         current_feedback=current_feedback,
+        current_compilation=current_compilation,
     )
     prior = tuple(previous_items or ())
-    later = None if current_items is None else tuple(current_items)
+    if current_compilation is None:
+        if current_items is not None:
+            raise ValueError(
+                "current items require the exact AVAILABLE current compilation"
+            )
+        later = None
+    else:
+        later = tuple(current_compilation.items)
+        if current_items is not None and tuple(current_items) != later:
+            raise ValueError(
+                "current items do not match the exact AVAILABLE compilation"
+            )
     score_deltas = _score_deltas(previous_feedback, current_feedback)
     acceptance, closed = _acceptance_results(
         previous_plan=previous_plan,
@@ -148,6 +162,11 @@ def compare_episodes(
         if current_feedback is not None
         else None
     )
+    current_compilation_hash = (
+        _content_hash(current_compilation.model_dump(mode="json"))
+        if current_compilation is not None
+        else None
+    )
     identity = {
         "evolution_id": previous.evolution_id,
         "previous_version": previous.version,
@@ -160,6 +179,12 @@ def compare_episodes(
             current_feedback.feedback_id if current_feedback is not None else None
         ),
         "current_feedback_sha256": current_feedback_hash,
+        "current_compilation_id": (
+            current_compilation.compilation_id
+            if current_compilation is not None
+            else None
+        ),
+        "current_compilation_sha256": current_compilation_hash,
     }
     generated_id = f"cmp_{phase.lower()}_{_content_hash(identity)[:16]}"
     return ComparisonReport(
@@ -172,6 +197,12 @@ def compare_episodes(
             current_feedback.feedback_id if current_feedback is not None else None
         ),
         current_feedback_sha256=current_feedback_hash,
+        current_compilation_id=(
+            current_compilation.compilation_id
+            if current_compilation is not None
+            else None
+        ),
+        current_compilation_sha256=current_compilation_hash,
         score_deltas=score_deltas,
         acceptance_results=acceptance,
         closed_issue_ids=closed_ids,
@@ -277,6 +308,7 @@ def _validate_inputs(
     previous_plan: RevisionPlan,
     previous_feedback: ExpertFeedbackRecord | None,
     current_feedback: ExpertFeedbackRecord | None,
+    current_compilation: FeedbackCompilation | None,
 ) -> None:
     if previous.status != "COMPLETED" or current.status != "COMPLETED":
         raise ValueError("episode comparison requires two completed episodes")
@@ -313,6 +345,23 @@ def _validate_inputs(
         and previous_plan.feedback_id != previous_feedback.feedback_id
     ):
         raise ValueError("revision plan is not bound to previous feedback")
+    if current_feedback is None:
+        if current_compilation is not None:
+            raise ValueError("current compilation requires current feedback")
+        return
+    if current_compilation is None:
+        raise ValueError(
+            "POST_FEEDBACK comparison requires an exact AVAILABLE current compilation"
+        )
+    if (
+        current_compilation.status != "AVAILABLE"
+        or current_compilation.evolution_id != current_feedback.evolution_id
+        or current_compilation.feedback_id != current_feedback.feedback_id
+        or current_compilation.episode_version != current_feedback.episode_version
+    ):
+        raise ValueError(
+            "current compilation is not AVAILABLE and bound to current feedback"
+        )
 
 
 def _score_deltas(

@@ -559,6 +559,30 @@ def test_episode_lifecycle_fields_remain_mutable():
     assert episode.cost == cost
 
 
+@pytest.mark.parametrize("model_type", [CostSnapshot, CostDelta])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_cost_models_reject_non_finite_values_in_python_and_json(
+    model_type: type[CostSnapshot] | type[CostDelta],
+    value: float,
+) -> None:
+    for field in ("runtime_seconds", "hpc_cost"):
+        with pytest.raises(ValidationError):
+            model_type(**{field: value})
+        with pytest.raises(ValidationError):
+            model_type.model_validate_json(
+                json.dumps({field: value}),
+            )
+
+
+@pytest.mark.parametrize("model_type", [CostSnapshot, CostDelta])
+def test_cost_token_and_tool_counts_reject_float_values(
+    model_type: type[CostSnapshot] | type[CostDelta],
+) -> None:
+    for field in ("input_tokens", "output_tokens", "tool_calls"):
+        with pytest.raises(ValidationError):
+            model_type(**{field: 1.0})
+
+
 def test_explicit_datetimes_reject_naive_values_and_normalize_to_utc():
     with pytest.raises(ValidationError):
         _task(created_at=datetime(2026, 9, 4, 10, 0))

@@ -62,7 +62,10 @@ from photomatagent.scientific.evolution.service import (
     MutationResult,
 )
 from photomatagent.scientific.evolution.strategy import FixedStrategySelector
-from photomatagent.scientific.evolution.store import EvolutionStore
+from photomatagent.scientific.evolution.store import (
+    EvolutionStore,
+    EvolutionStoreError,
+)
 from photomatagent.scientific.loop import (
     ScientificJudge,
     ScientificLoopConfig,
@@ -399,7 +402,13 @@ def evolve_compare(
             cast(EpisodeVersion, left_version),
             cast(EpisodeVersion, right_version),
         )
-    except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
+    except (
+        OSError,
+        ValueError,
+        ToolExecutionError,
+        EvolutionServiceError,
+        EvolutionStoreError,
+    ) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
         raise typer.Exit(code=2) from None
     _render_comparison(console, mutation.entity)
@@ -410,6 +419,16 @@ def _render_comparison(output: Console, report: ComparisonReport) -> None:
     table.add_row("Comparison ID", _bounded_plan_text(report.comparison_id))
     table.add_row("Versions", f"{report.previous_version} → {report.current_version}")
     table.add_row("Phase", report.phase)
+    if report.current_feedback_id is not None:
+        table.add_row(
+            "Current feedback ID",
+            _bounded_plan_text(report.current_feedback_id),
+        )
+    if report.current_compilation_id is not None:
+        table.add_row(
+            "Current compilation ID",
+            _bounded_plan_text(report.current_compilation_id),
+        )
     table.add_row("Closure rate", _render_optional_rate(report.closure_rate))
     table.add_row("Recurrence rate", _render_optional_rate(report.recurrence_rate))
     table.add_row("New issue rate", _render_optional_rate(report.new_issue_rate))
