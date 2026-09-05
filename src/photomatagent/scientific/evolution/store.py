@@ -279,6 +279,7 @@ class EvolutionTransaction:
             raise EvolutionConflictError(
                 "experience belongs to a different transaction"
             )
+        self.store._validate_experience_lineage(experience)
         return self.store._write_record_locked(
             evolution_id=self.evolution_id,
             directory="experience",
@@ -698,6 +699,7 @@ class EvolutionStore:
         """Persist one immutable experience maturity snapshot."""
 
         self._validate_id(experience.experience_id)
+        self._validate_experience_lineage(experience)
         return self._write_record(
             evolution_id=experience.evolution_id,
             directory="experience",
@@ -705,6 +707,29 @@ class EvolutionStore:
             record=experience,
             model_type=ExperienceRecord,
         )
+
+    def _validate_experience_lineage(self, experience: ExperienceRecord) -> None:
+        if experience.maturity == "OBSERVATION":
+            return
+        if experience.base_experience_id is None:
+            raise EvolutionConflictError("promoted experience requires a base record")
+        try:
+            base = self.load_experience(
+                experience.evolution_id,
+                experience.base_experience_id,
+            )
+        except FileNotFoundError as exc:
+            raise EvolutionConflictError(
+                "promoted experience base record is unavailable"
+            ) from exc
+        if (
+            base.evolution_id != experience.evolution_id
+            or base.maturity != experience.previous_maturity
+            or not set(base.observations).issubset(set(experience.observations))
+        ):
+            raise EvolutionConflictError(
+                "promoted experience does not extend its exact legal base"
+            )
 
     def load_experience(
         self,

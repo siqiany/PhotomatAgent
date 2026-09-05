@@ -13,6 +13,7 @@ from photomatagent.scientific.evolution.models import (
     ExpertFeedbackRecord,
     FeedbackCompilation,
     FeedbackDelta,
+    MachineAcceptanceCheck,
     RevisionPlan,
     StrategyArm,
     validate_managed_id,
@@ -73,6 +74,7 @@ def build_revision_plan(
     prohibited_repeats: list[str] = []
     invalidated_conclusions: list[str] = []
     machine_tests: list[str] = []
+    machine_checks: list[MachineAcceptanceCheck] = []
     human_tests: list[str] = []
     ambiguities: list[str] = []
     evidence_warnings: list[str] = []
@@ -146,6 +148,9 @@ def build_revision_plan(
                     human_tests.append(f"QUERY {item_id}: {acceptance}")
                 else:
                     machine_tests.append(acceptance)
+                    machine_checks.append(
+                        _machine_acceptance_check(item_id, acceptance)
+                    )
             elif item.status == "QUERY":
                 human_tests.append(
                     f"QUERY {item_id}: resolve uncertainty before treating it as fact"
@@ -199,6 +204,7 @@ def build_revision_plan(
         invalidated_conclusions=_dedupe(invalidated_conclusions),
         invalidated_evidence_ids=_dedupe(invalidated_evidence_ids),
         machine_acceptance_tests=_dedupe(machine_tests),
+        machine_acceptance_checks=_dedupe_checks(machine_checks),
         human_acceptance_tests=_dedupe(human_tests),
         strategy_arm=arm,
         strategy_reason=reason,
@@ -268,6 +274,41 @@ def _validate_context(
         or compilation.episode_version != feedback.episode_version
     ):
         raise ValueError("feedback compilation identity mismatch")
+
+
+def _machine_acceptance_check(
+    item_id: str,
+    description: str,
+) -> MachineAcceptanceCheck:
+    evaluator = "UNREGISTERED"
+    subject: str | None = None
+    for prefix, known in (
+        ("constraint_pass:", "CONSTRAINT_PASS"),
+        ("evidence_present:", "EVIDENCE_PRESENT"),
+    ):
+        if description.startswith(prefix):
+            candidate = description.removeprefix(prefix).strip()
+            if candidate and len(candidate) <= 200:
+                evaluator = known
+                subject = candidate
+            break
+    if description == "artifact_present":
+        evaluator = "ARTIFACT_PRESENT"
+    return MachineAcceptanceCheck(
+        acceptance_id=validate_managed_id(item_id),
+        description=description,
+        evaluator=evaluator,  # type: ignore[arg-type]
+        subject=subject,
+    )
+
+
+def _dedupe_checks(
+    values: Sequence[MachineAcceptanceCheck],
+) -> list[MachineAcceptanceCheck]:
+    by_description: dict[str, MachineAcceptanceCheck] = {}
+    for value in values:
+        by_description.setdefault(value.description, value)
+    return list(by_description.values())
 
 
 def _route_destination(category: str, module: str) -> str:

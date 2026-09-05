@@ -43,6 +43,7 @@ class ExperienceRecord(StrictModel):
     experience_id: ManagedId
     evolution_id: ManagedId
     base_experience_id: ManagedId | None = None
+    previous_maturity: ExperienceMaturity | None = None
     maturity: ExperienceMaturity = "OBSERVATION"
     observations: tuple[ExperienceEvidence, ...] = Field(
         default_factory=tuple,
@@ -52,11 +53,44 @@ class ExperienceRecord(StrictModel):
     created_at: UtcDatetime
 
     @model_validator(mode="after")
-    def validate_reuse_approval(self) -> Self:
+    def validate_record(self) -> Self:
+        try:
+            _validate_maturity(
+                self.maturity,
+                self.observations,
+                user_approved=self.user_approved_for_reuse,
+            )
+        except ExperiencePromotionError as exc:
+            raise ValueError(str(exc)) from exc
+        if self.maturity == "OBSERVATION":
+            if self.base_experience_id is not None or self.previous_maturity is not None:
+                raise ValueError("OBSERVATION cannot reference a base experience")
+        else:
+            allowed = {
+                "HYPOTHESIS": "OBSERVATION",
+                "VALIDATED_EXPERIENCE": "HYPOTHESIS",
+                "REUSABLE_SKILL": "VALIDATED_EXPERIENCE",
+            }
+            if (
+                self.base_experience_id is None
+                or self.previous_maturity != allowed[self.maturity]
+            ):
+                raise ValueError("experience requires a legal transition/base reference")
         if self.maturity == "REUSABLE_SKILL" and not self.user_approved_for_reuse:
             raise ValueError("REUSABLE_SKILL requires explicit user approval")
         if self.maturity != "REUSABLE_SKILL" and self.user_approved_for_reuse:
             raise ValueError("reuse approval is valid only for REUSABLE_SKILL")
+        expected_id = derive_experience_id(
+            evolution_id=self.evolution_id,
+            maturity=self.maturity,
+            observations=self.observations,
+            base_experience_id=self.base_experience_id,
+            previous_maturity=self.previous_maturity,
+            user_approved_for_reuse=self.user_approved_for_reuse,
+            created_at=self.created_at,
+        )
+        if self.experience_id != expected_id:
+            raise ValueError("experience_id does not match record content")
         return self
 
 
@@ -75,7 +109,12 @@ def create_experience(
         safety_or_fabrication_failure=safety_or_fabrication_failure,
     )
     return ExperienceRecord(
-        experience_id=_experience_id("OBSERVATION", (observation,)),
+        experience_id=derive_experience_id(
+            evolution_id=comparison.evolution_id,
+            maturity="OBSERVATION",
+            observations=(observation,),
+            created_at=comparison.created_at,
+        ),
         evolution_id=comparison.evolution_id,
         maturity="OBSERVATION",
         observations=(observation,),
@@ -107,41 +146,21 @@ def promote_experience(
             f"invalid experience maturity transition: {experience.maturity} -> {to}"
         )
     observations = _merge_observations(experience, evidence)
-    distinct_tasks = {item.task_group_id for item in observations}
-    rewards = [item.reward for item in observations]
-    if to == "HYPOTHESIS":
-        if len(distinct_tasks) < 2 or any(
-            value is None or value <= 0 for value in rewards
-        ):
-            raise ExperiencePromotionError(
-                "HYPOTHESIS requires positive rewards from at least two "
-                "distinct task groups"
-            )
-    else:
-        if to == "REUSABLE_SKILL" and not user_approved:
-            raise ExperiencePromotionError(
-                "REUSABLE_SKILL requires explicit user approval"
-            )
-        if len(distinct_tasks) < 5:
-            raise ExperiencePromotionError(
-                "validated experience requires at least five distinct tasks"
-            )
-        if any(item.safety_or_fabrication_failure for item in observations):
-            raise ExperiencePromotionError(
-                "validated experience cannot contain a safety or fabrication failure"
-            )
-        known_rewards = [value for value in rewards if value is not None]
-        if (
-            len(known_rewards) != len(rewards)
-            or sum(known_rewards) / len(known_rewards) <= 0
-        ):
-            raise ExperiencePromotionError(
-                "validated experience requires a positive average known reward"
-            )
+    _validate_maturity(to, observations, user_approved=user_approved)
+    experience_id = derive_experience_id(
+        evolution_id=experience.evolution_id,
+        maturity=to,
+        observations=observations,
+        base_experience_id=experience.experience_id,
+        previous_maturity=experience.maturity,
+        user_approved_for_reuse=to == "REUSABLE_SKILL" and user_approved,
+        created_at=experience.created_at,
+    )
     return ExperienceRecord(
-        experience_id=_experience_id(to, observations),
+        experience_id=experience_id,
         evolution_id=experience.evolution_id,
         base_experience_id=experience.experience_id,
+        previous_maturity=experience.maturity,
         maturity=to,
         observations=observations,
         user_approved_for_reuse=to == "REUSABLE_SKILL" and user_approved,
@@ -173,12 +192,23 @@ def _merge_observations(
     return tuple(by_comparison[key] for key in sorted(by_comparison))
 
 
-def _experience_id(
+def derive_experience_id(
+    *,
+    evolution_id: str,
     maturity: ExperienceMaturity,
     observations: Sequence[ExperienceEvidence],
+    base_experience_id: str | None = None,
+    previous_maturity: ExperienceMaturity | None = None,
+    user_approved_for_reuse: bool = False,
+    created_at: UtcDatetime,
 ) -> str:
     payload = {
+        "evolution_id": evolution_id,
         "maturity": maturity,
+        "base_experience_id": base_experience_id,
+        "previous_maturity": previous_maturity,
+        "user_approved_for_reuse": user_approved_for_reuse,
+        "created_at": created_at.isoformat(),
         "observations": [
             item.model_dump(mode="json")
             for item in sorted(observations, key=lambda value: value.comparison_id)
@@ -190,10 +220,64 @@ def _experience_id(
     return f"exp_{digest[:16]}"
 
 
+def _group_rewards(
+    observations: Sequence[ExperienceEvidence],
+) -> dict[str, float | None]:
+    grouped: dict[str, list[float | None]] = {}
+    for item in observations:
+        grouped.setdefault(item.task_group_id, []).append(item.reward)
+    return {
+        group: (
+            sum(value for value in rewards if value is not None) / len(rewards)
+            if all(value is not None for value in rewards)
+            else None
+        )
+        for group, rewards in grouped.items()
+    }
+
+
+def _validate_maturity(
+    maturity: ExperienceMaturity,
+    observations: Sequence[ExperienceEvidence],
+    *,
+    user_approved: bool,
+) -> None:
+    groups = _group_rewards(observations)
+    if maturity == "OBSERVATION":
+        if len(observations) != 1:
+            raise ExperiencePromotionError("OBSERVATION requires exactly one comparison")
+        return
+    if maturity == "HYPOTHESIS":
+        if len(groups) < 2 or any(
+            value is None or value <= 0 for value in groups.values()
+        ):
+            raise ExperiencePromotionError(
+                "HYPOTHESIS requires positive per-group results from at least two distinct task groups"
+            )
+        return
+    if len(groups) < 5:
+        raise ExperiencePromotionError(
+            "validated experience requires at least five distinct task groups"
+        )
+    if any(item.safety_or_fabrication_failure for item in observations):
+        raise ExperiencePromotionError(
+            "validated experience cannot contain a safety or fabrication failure"
+        )
+    if any(value is None for value in groups.values()) or (
+        sum(value for value in groups.values() if value is not None) / len(groups) <= 0
+    ):
+        raise ExperiencePromotionError(
+            "validated experience requires a positive average known reward after averaging once per task group"
+        )
+    if maturity == "REUSABLE_SKILL" and not user_approved:
+        raise ExperiencePromotionError("REUSABLE_SKILL requires explicit user approval")
+
+
 __all__ = [
     "ExperienceEvidence",
     "ExperiencePromotionError",
     "ExperienceRecord",
     "create_experience",
+    "derive_experience_id",
     "promote_experience",
 ]

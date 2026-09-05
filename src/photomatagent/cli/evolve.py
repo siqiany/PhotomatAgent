@@ -407,11 +407,24 @@ def evolve_compare(
 
 def _render_comparison(output: Console, report: ComparisonReport) -> None:
     table = Table("Comparison", "Value")
-    table.add_row("Comparison ID", report.comparison_id)
+    table.add_row("Comparison ID", _bounded_plan_text(report.comparison_id))
     table.add_row("Versions", f"{report.previous_version} → {report.current_version}")
+    table.add_row("Phase", report.phase)
     table.add_row("Closure rate", _render_optional_rate(report.closure_rate))
     table.add_row("Recurrence rate", _render_optional_rate(report.recurrence_rate))
     table.add_row("New issue rate", _render_optional_rate(report.new_issue_rate))
+    table.add_row(
+        "Expert utility delta",
+        "—"
+        if report.expert_utility_delta is None
+        else f"{report.expert_utility_delta:.3f}",
+    )
+    table.add_row(
+        "Normalized cost increase",
+        "—"
+        if report.normalized_cost_increase is None
+        else f"{report.normalized_cost_increase:.3f}",
+    )
     table.add_row("Reward", "—" if report.reward is None else f"{report.reward:.3f}")
     table.add_row("Components", ", ".join(report.components_used) or "—")
     table.add_row(
@@ -423,20 +436,97 @@ def _render_comparison(output: Console, report: ComparisonReport) -> None:
         ),
     )
     output.print(table)
+    if report.score_deltas:
+        scores = Table("Score", "Previous", "Current", "Delta")
+        for score_delta in report.score_deltas:
+            scores.add_row(
+                score_delta.dimension,
+                str(score_delta.previous),
+                str(score_delta.current),
+                str(score_delta.delta),
+            )
+        output.print(scores)
+    changes = Table("Scientific delta", "Value")
+    for change_label, change_values in (
+        ("Issues closed", report.closed_issue_ids),
+        ("Issues recurring", report.recurring_issue_ids),
+        ("Issues new", report.new_issue_ids),
+        ("Constraints newly passed", report.constraint_changes.newly_passed),
+        ("Constraints newly failed", report.constraint_changes.newly_failed),
+        ("Constraints newly unknown", report.constraint_changes.newly_unknown),
+        ("Constraints still failed", report.constraint_changes.still_failed),
+        ("Constraints still unknown", report.constraint_changes.still_unknown),
+        ("Evidence added", report.evidence_changes.added_ids),
+        ("Evidence removed", report.evidence_changes.removed_ids),
+        ("Evidence carried", report.evidence_changes.carried_ids),
+        ("Evidence invalidated", report.evidence_changes.invalidated_ids),
+        ("Evidence gaps resolved", report.evidence_changes.resolved_gaps),
+        ("Evidence gaps new", report.evidence_changes.new_gaps),
+        ("Fidelity upgraded", report.fidelity_changes.upgraded_ids),
+        ("Fidelity downgraded", report.fidelity_changes.downgraded_ids),
+        ("Fidelity unchanged", report.fidelity_changes.unchanged_ids),
+    ):
+        changes.add_row(
+            change_label,
+            _bounded_plan_text(", ".join(change_values) or "—"),
+        )
+    output.print(changes)
+    if report.artifact_diff is not None:
+        artifact = Table("Primary artifact delta", "Value")
+        for artifact_label, artifact_value in (
+            ("Previous SHA-256", report.artifact_diff.previous_sha256),
+            ("Current SHA-256", report.artifact_diff.current_sha256),
+            ("Changed", str(report.artifact_diff.changed).lower()),
+            ("Size bytes", str(report.artifact_diff.size_bytes_delta)),
+            ("Summary", report.artifact_diff.summary or "—"),
+        ):
+            artifact.add_row(artifact_label, _bounded_plan_text(artifact_value))
+        output.print(artifact)
+    cost = Table("Cost delta", "Value")
+    for cost_label, cost_value in (
+        ("Input tokens", report.cost_delta.input_tokens),
+        ("Output tokens", report.cost_delta.output_tokens),
+        ("Tool calls", report.cost_delta.tool_calls),
+        ("Runtime seconds", report.cost_delta.runtime_seconds),
+        ("HPC cost", report.cost_delta.hpc_cost),
+    ):
+        cost.add_row(
+            cost_label,
+            "—" if cost_value is None else _bounded_plan_text(str(cost_value)),
+        )
+    output.print(cost)
     if report.acceptance_results:
-        checks = Table("Acceptance ID", "Status", "Check")
-        for item in report.acceptance_results[:20]:
+        checks = Table("Acceptance ID", "Kind", "Status", "Check")
+        for acceptance in report.acceptance_results[:20]:
             checks.add_row(
-                item.acceptance_id,
-                item.status,
-                _bounded_plan_text(item.detail),
+                _bounded_plan_text(acceptance.acceptance_id),
+                acceptance.kind,
+                acceptance.status,
+                _bounded_plan_text(acceptance.detail),
             )
         output.print(checks)
+    if report.unresolved_human_checks:
+        human = Table("Unresolved human checks")
+        for check_text in report.unresolved_human_checks[:20]:
+            human.add_row(_bounded_plan_text(check_text))
+        omitted = len(report.unresolved_human_checks) - min(
+            len(report.unresolved_human_checks),
+            20,
+        )
+        if omitted:
+            human.add_row(f"[{omitted} additional bounded checks omitted]")
+        output.print(human)
     if report.module_credit:
-        credits = Table("Module", "Credit")
-        for module, value in list(sorted(report.module_credit.items()))[:20]:
-            credits.add_row(_bounded_plan_text(module), f"{value:.3f}")
-        output.print(credits)
+        credit = Table("Module", "Credit")
+        for module, credit_value in list(sorted(report.module_credit.items()))[:20]:
+            credit.add_row(_bounded_plan_text(module), f"{credit_value:.3f}")
+        omitted = len(report.module_credit) - min(len(report.module_credit), 20)
+        if omitted:
+            credit.add_row(
+                f"[{omitted} additional bounded modules omitted]",
+                "—",
+            )
+        output.print(credit)
 
 
 def _render_optional_rate(value: float | None) -> str:
@@ -962,11 +1052,19 @@ async def collect_expert_feedback(
         session,
         _expert_prompt(evolution_id, version, "comments"),
     )
+    resolved_raw = await _prompt_value(
+        session,
+        _expert_prompt(evolution_id, version, "resolved_issue_ids [comma-separated]"),
+    )
+    resolved_issue_ids = [
+        value.strip() for value in resolved_raw.split(",") if value.strip()
+    ]
     return ExpertFeedbackDraft(
         scores=RubricScores.model_validate(scores),
         flags=RubricFlags.model_validate(flags),
         fatal_issue=fatal_issue,
         comments=comments,
+        resolved_issue_ids=resolved_issue_ids,
     )
 
 
@@ -1118,6 +1216,10 @@ def _render_feedback_confirmation(
     table.add_row("Flags", ", ".join(active_flags) if active_flags else "none")
     table.add_row("Fatal issue", "yes" if draft.fatal_issue else "no")
     table.add_row("Comments length", str(len(draft.comments)))
+    table.add_row(
+        "Resolved issue IDs",
+        _bounded_plan_text(", ".join(draft.resolved_issue_ids) or "none"),
+    )
     output.print(table)
     output.print(f"Result SHA-256: {result_sha256}", soft_wrap=True)
     output.print("[bold]Only exact input 'y' records this feedback.[/]")

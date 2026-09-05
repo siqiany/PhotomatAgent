@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from collections.abc import Mapping, Sequence
 
 from photomatagent.redaction import redact_secrets
@@ -11,6 +13,7 @@ from photomatagent.scientific.evolution.models import (
     AcceptanceStatus,
     ArtifactDiff,
     ComparisonReport,
+    ComparisonPhase,
     ConstraintChangeSummary,
     CostDelta,
     EpisodeRecord,
@@ -19,6 +22,7 @@ from photomatagent.scientific.evolution.models import (
     FeedbackDelta,
     FidelityChangeSummary,
     RevisionPlan,
+    RewardComponent,
     RubricScoreDelta,
     validate_managed_id,
 )
@@ -33,7 +37,7 @@ _DIMENSIONS = (
     "actionability",
     "overall",
 )
-_WEIGHTS: tuple[tuple[str, float], ...] = (
+_WEIGHTS: tuple[tuple[RewardComponent, float], ...] = (
     ("expert_utility_delta", 0.45),
     ("closure_rate", 0.25),
     ("recurrence_rate", -0.15),
@@ -41,6 +45,7 @@ _WEIGHTS: tuple[tuple[str, float], ...] = (
     ("normalized_cost_increase", -0.05),
 )
 _SEVERITY_WEIGHT = {"LOW": 0.25, "MEDIUM": 0.5, "HIGH": 0.75, "CRITICAL": 1.0}
+_QUERY_ACCEPTANCE_REFERENCE = re.compile(r"^QUERY ([A-Za-z0-9_-]+):")
 
 
 def compare_episodes(
@@ -79,9 +84,14 @@ def compare_episodes(
         previous_plan=previous_plan,
         previous_items=prior,
         current_items=later,
+        current_feedback=current_feedback,
         machine_results=machine_results or {},
     )
-    evaluated = [item for item in acceptance if item.status in {"PASS", "FAIL"}]
+    evaluated = [
+        item
+        for item in acceptance
+        if item.kind == "MACHINE" and item.status in {"PASS", "FAIL"}
+    ]
     closure_rate = (
         sum(item.status == "PASS" for item in evaluated) / len(evaluated)
         if evaluated
@@ -100,10 +110,16 @@ def compare_episodes(
     cost_delta = _cost_delta(previous, current)
     normalized_cost = _normalized_cost_increase(previous, current)
     utility_delta = (
-        round(
-            expert_utility(current_feedback.scores)
-            - expert_utility(previous_feedback.scores),
-            6,
+        max(
+            -1.0,
+            min(
+                1.0,
+                round(
+                    expert_utility(current_feedback.scores)
+                    - expert_utility(previous_feedback.scores),
+                    6,
+                ),
+            ),
         )
         if previous_feedback is not None and current_feedback is not None
         else None
@@ -124,11 +140,38 @@ def compare_episodes(
     # Keep the explicit set returned by the matcher to avoid classifying an
     # unlinked plan-level check as an expert issue.
     closed_ids = [value for value in closed_ids if value in closed]
+    phase: ComparisonPhase = (
+        "POST_FEEDBACK" if current_feedback is not None else "PRE_FEEDBACK"
+    )
+    current_feedback_hash = (
+        _content_hash(current_feedback.model_dump(mode="json"))
+        if current_feedback is not None
+        else None
+    )
+    identity = {
+        "evolution_id": previous.evolution_id,
+        "previous_version": previous.version,
+        "current_version": current.version,
+        "previous_artifact": previous.artifact.sha256 if previous.artifact else None,
+        "current_artifact": current.artifact.sha256 if current.artifact else None,
+        "revision_id": previous_plan.revision_id,
+        "phase": phase,
+        "current_feedback_id": (
+            current_feedback.feedback_id if current_feedback is not None else None
+        ),
+        "current_feedback_sha256": current_feedback_hash,
+    }
+    generated_id = f"cmp_{phase.lower()}_{_content_hash(identity)[:16]}"
     return ComparisonReport(
-        comparison_id=comparison_id or f"cmp_{previous.version}_{current.version}",
+        comparison_id=comparison_id or generated_id,
         evolution_id=previous.evolution_id,
         previous_version=previous.version,
         current_version=current.version,
+        phase=phase,
+        current_feedback_id=(
+            current_feedback.feedback_id if current_feedback is not None else None
+        ),
+        current_feedback_sha256=current_feedback_hash,
         score_deltas=score_deltas,
         acceptance_results=acceptance,
         closed_issue_ids=closed_ids,
@@ -163,10 +206,10 @@ def compute_learning_signal(
     recurrence_rate: float | None,
     new_issue_rate: float | None,
     normalized_cost_increase: float | None,
-) -> tuple[float | None, list[str]]:
+) -> tuple[float | None, list[RewardComponent]]:
     """Apply the approved fixed reward with missing-weight renormalization."""
 
-    values = {
+    values: dict[RewardComponent, float | None] = {
         "expert_utility_delta": expert_utility_delta,
         "closure_rate": closure_rate,
         "recurrence_rate": recurrence_rate,
@@ -184,6 +227,47 @@ def compute_learning_signal(
     denominator = sum(abs(weight) for _name, weight, _value in available)
     raw = sum(weight * value for _name, weight, value in available)
     return round(max(-1.0, min(1.0, raw / denominator)), 6), used
+
+
+def evaluate_machine_acceptance(
+    *,
+    plan: RevisionPlan,
+    episode: EpisodeRecord,
+    state: ScientificState | None,
+) -> list[AcceptanceResult]:
+    """Evaluate the closed registry of structured checks without model judgment."""
+
+    checks = {item.description: item for item in plan.machine_acceptance_checks}
+    results: list[AcceptanceResult] = []
+    for description in plan.machine_acceptance_tests:
+        check = checks.get(description)
+        status: AcceptanceStatus = "NEEDS_HUMAN_REVIEW"
+        acceptance_id = _acceptance_id(None, description)
+        if check is not None:
+            acceptance_id = check.acceptance_id
+            if check.evaluator == "CONSTRAINT_PASS" and check.subject:
+                outcome = _outcomes(episode).get(check.subject)
+                result = getattr(outcome, "result", None)
+                if result == "PASS":
+                    status = "PASS"
+                elif result == "FAIL":
+                    status = "FAIL"
+            elif check.evaluator == "EVIDENCE_PRESENT" and check.subject:
+                if state is not None:
+                    identifiers = {str(item.id) for item in state.evidence}
+                    status = "PASS" if check.subject in identifiers else "FAIL"
+            elif check.evaluator == "ARTIFACT_PRESENT":
+                status = "PASS" if episode.artifact is not None else "FAIL"
+        results.append(
+            AcceptanceResult(
+                acceptance_id=acceptance_id,
+                status=status,
+                detail=description,
+                kind="MACHINE",
+                provenance="DETERMINISTIC_EVALUATOR",
+            )
+        )
+    return results
 
 
 def _validate_inputs(
@@ -293,6 +377,7 @@ def _acceptance_results(
     previous_plan: RevisionPlan,
     previous_items: Sequence[FeedbackDelta],
     current_items: Sequence[FeedbackDelta] | None,
+    current_feedback: ExpertFeedbackRecord | None,
     machine_results: Mapping[str, bool | str | AcceptanceResult],
 ) -> tuple[list[AcceptanceResult], set[str]]:
     results: list[AcceptanceResult] = []
@@ -319,9 +404,9 @@ def _acceptance_results(
         if status == "PASS" and issue is not None and issue.item_id:
             closed.add(issue.item_id)
 
-    positive_signatures = (
-        {_signature(item) for item in current_items if item.status == "POSITIVE_SIGNAL"}
-        if current_items is not None
+    resolved_issue_ids = (
+        set(current_feedback.resolved_issue_ids)
+        if current_feedback is not None
         else set()
     )
     human_candidates = [
@@ -329,10 +414,10 @@ def _acceptance_results(
         for item in _negative(previous_items)
         if item.item_id not in linked_ids
     ]
-    for index, test in enumerate(previous_plan.human_acceptance_tests):
-        issue = human_candidates[index] if index < len(human_candidates) else None
+    for test in previous_plan.human_acceptance_tests:
+        issue = _human_acceptance_issue(test, human_candidates)
         acceptance_id = _acceptance_id(issue, test)
-        confirmed = issue is not None and _signature(issue) in positive_signatures
+        confirmed = issue is not None and issue.item_id in resolved_issue_ids
         human_status: AcceptanceStatus = (
             "PASS" if confirmed else "NEEDS_HUMAN_REVIEW"
         )
@@ -341,29 +426,46 @@ def _acceptance_results(
                 acceptance_id=acceptance_id,
                 status=human_status,
                 detail=test,
+                kind="HUMAN",
+                provenance="EXPERT_FEEDBACK",
             )
         )
         if confirmed and issue is not None and issue.item_id:
             closed.add(issue.item_id)
 
-    # A structured positive signal is an explicit expert confirmation even if
-    # the plan did not render a separate human-only test for that item.
+    # Exact expert issue references can close an issue even if the plan did not
+    # render a separate human-only test. Coarse category/module praise cannot.
     represented = {item.acceptance_id for item in results}
     for issue in _negative(previous_items):
         if (
             issue.item_id
             and issue.item_id not in represented
-            and _signature(issue) in positive_signatures
+            and issue.item_id in resolved_issue_ids
         ):
             results.append(
                 AcceptanceResult(
                     acceptance_id=issue.item_id,
                     status="PASS",
                     detail="later expert review explicitly confirmed this issue",
+                    kind="HUMAN",
+                    provenance="EXPERT_FEEDBACK",
                 )
             )
             closed.add(issue.item_id)
     return results, closed
+
+
+def _human_acceptance_issue(
+    test: str,
+    candidates: Sequence[FeedbackDelta],
+) -> FeedbackDelta | None:
+    reference = _QUERY_ACCEPTANCE_REFERENCE.match(test)
+    if reference is not None:
+        issue_id = reference.group(1)
+        return next((item for item in candidates if item.item_id == issue_id), None)
+    # Legacy/manual plans do not carry a structured human-check ID. They are
+    # linkable only when the candidate is unambiguous; ordering is not evidence.
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _acceptance_id(item: FeedbackDelta | None, test: str) -> str:
@@ -377,6 +479,8 @@ def _machine_status(
     value: bool | str | AcceptanceResult | None,
 ) -> AcceptanceStatus:
     if isinstance(value, AcceptanceResult):
+        if value.kind != "MACHINE":
+            return "NEEDS_HUMAN_REVIEW"
         return (
             value.status
             if value.status in {"PASS", "FAIL"}
@@ -552,7 +656,6 @@ def _module_credit(
     closed_ids: set[str],
 ) -> dict[str, float]:
     scores: dict[str, list[float]] = {}
-    prior_signatures = {_signature(item) for item in _negative(previous)}
     for item in _negative(previous):
         if item.item_id in closed_ids:
             scores.setdefault(_safe_module(item.responsible_module), []).append(
@@ -563,10 +666,6 @@ def _module_credit(
             penalty = -_SEVERITY_WEIGHT[item.severity]
             module = _safe_module(item.responsible_module)
             scores.setdefault(module, []).append(penalty)
-            if _signature(item) in prior_signatures:
-                # Recurrence is deliberately visible as a second penalty while
-                # still remaining one episode-pair observation.
-                scores[module].append(penalty)
     return {
         module: round(max(-1.0, min(1.0, sum(values) / len(values))), 6)
         for module, values in sorted(scores.items())
@@ -580,4 +679,19 @@ def _safe_module(value: str) -> str:
     return safe if len(safe) <= 200 else safe[:199] + "…"
 
 
-__all__ = ["compare_episodes", "compute_learning_signal"]
+def _content_hash(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+__all__ = [
+    "compare_episodes",
+    "compute_learning_signal",
+    "evaluate_machine_acceptance",
+]

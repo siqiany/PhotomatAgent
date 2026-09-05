@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from photomatagent.cli.app import app
@@ -11,11 +12,14 @@ from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evolution.comparison import (
     compare_episodes,
     compute_learning_signal,
+    evaluate_machine_acceptance,
 )
 from photomatagent.scientific.evolution.experience import (
     ExperienceEvidence,
     ExperiencePromotionError,
+    ExperienceRecord,
     create_experience,
+    derive_experience_id,
     promote_experience,
 )
 from photomatagent.scientific.evolution.models import (
@@ -24,6 +28,7 @@ from photomatagent.scientific.evolution.models import (
     CostSnapshot,
     EpisodeRecord,
     EvolutionTask,
+    ExpertFeedbackDraft,
     ExpertFeedbackRecord,
     FeedbackCompilation,
     FeedbackDelta,
@@ -34,12 +39,14 @@ from photomatagent.scientific.evolution.service import (
     ArtifactMismatchError,
     EvolutionOperationConflict,
     EvolutionService,
+    InvalidEvolutionTransition,
 )
 from photomatagent.scientific.evolution.revision import build_revision_plan
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
     EvolutionStore,
 )
+from photomatagent.scientific.evolution.strategy import FixedStrategySelector
 from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
 from photomatagent.scientific.loop.evaluation import (
     EvaluationReport,
@@ -394,6 +401,49 @@ def test_learning_signal_renormalizes_missing_components_and_records_them() -> N
     ]
 
 
+def test_comparison_report_rejects_unbounded_or_inconsistent_learning_fields() -> None:
+    base = {
+        "comparison_id": "cmp_bounded",
+        "evolution_id": "evo_compare",
+        "previous_version": "v001",
+        "current_version": "v002",
+    }
+    with pytest.raises(ValidationError, match="module credit"):
+        ComparisonReport(**base, module_credit={"planner": 1.1})
+    with pytest.raises(ValidationError, match="reward components"):
+        ComparisonReport(
+            **base,
+            expert_utility_delta=0.5,
+            reward=0.5,
+            components_used=["expert_utility_delta", "expert_utility_delta"],
+        )
+    with pytest.raises(ValidationError, match="reward components"):
+        ComparisonReport(
+            **base,
+            expert_utility_delta=0.5,
+            closure_rate=1.0,
+            reward=0.678571,
+            components_used=["closure_rate", "expert_utility_delta"],
+            acceptance_results=[
+                {
+                    "acceptance_id": "issue_closed",
+                    "status": "PASS",
+                }
+            ],
+        )
+    report = ComparisonReport(
+        **base,
+        expert_utility_delta=0.5,
+        reward=0.5,
+        components_used=["expert_utility_delta"],
+        module_credit={"planner": 0.5},
+    )
+    with pytest.raises(ValidationError):
+        report.reward = 0.2
+    with pytest.raises(TypeError):
+        report.module_credit["planner"] = 0.2
+
+
 def test_module_credit_is_bounded_and_does_not_create_extra_observations() -> None:
     report = compare_episodes(
         previous=_episode("v001"),
@@ -444,6 +494,9 @@ def test_later_positive_signal_explicitly_closes_human_issue() -> None:
                 module="retrieval",
             ),
         ),
+        current_feedback=_feedback("v002", 3, feedback_id="fb_v2").model_copy(
+            update={"resolved_issue_ids": ["issue_evidence"]}
+        ),
         current_items=(
             _delta(
                 "confirmation",
@@ -455,7 +508,64 @@ def test_later_positive_signal_explicitly_closes_human_issue() -> None:
     )
 
     assert report.closed_issue_ids == ["issue_evidence"]
-    assert report.closure_rate == pytest.approx(1.0)
+    assert report.closure_rate is None
+    assert report.acceptance_results[0].status == "PASS"
+    assert report.acceptance_results[0].kind == "HUMAN"
+
+
+def test_unrelated_positive_signal_never_human_closes_issue() -> None:
+    report = compare_episodes(
+        previous=_episode("v001"),
+        current=_episode("v002"),
+        previous_plan=RevisionPlan(
+            revision_id="rp_compare",
+            evolution_id="evo_compare",
+            source_version="v001",
+            feedback_id="fb_v1",
+            human_acceptance_tests=["Expert confirms evidence chain"],
+            confirmed=True,
+        ),
+        previous_items=(
+            _delta("issue_evidence", category="EVIDENCE_SUFFICIENCY", module="retrieval"),
+        ),
+        current_feedback=_feedback("v002", 3, feedback_id="fb_v2"),
+        current_items=(
+            _delta(
+                "praise_only",
+                category="EVIDENCE_SUFFICIENCY",
+                module="retrieval",
+                status="POSITIVE_SIGNAL",
+            ),
+        ),
+    )
+
+    assert report.closed_issue_ids == []
+    assert report.acceptance_results[0].status == "NEEDS_HUMAN_REVIEW"
+
+
+def test_human_check_uses_its_exact_query_issue_reference() -> None:
+    report = compare_episodes(
+        previous=_episode("v001"),
+        current=_episode("v002"),
+        previous_plan=RevisionPlan(
+            revision_id="rp_compare",
+            evolution_id="evo_compare",
+            source_version="v001",
+            feedback_id="fb_v1",
+            human_acceptance_tests=["QUERY issue_query: Expert confirms the answer"],
+            confirmed=True,
+        ),
+        previous_items=(
+            _delta("issue_unrelated"),
+            _delta("issue_query", status="QUERY"),
+        ),
+        current_feedback=_feedback("v002", 3, feedback_id="fb_v2").model_copy(
+            update={"resolved_issue_ids": ["issue_query"]}
+        ),
+    )
+
+    assert report.closed_issue_ids == ["issue_query"]
+    assert report.acceptance_results[0].acceptance_id == "issue_query"
     assert report.acceptance_results[0].status == "PASS"
 
 
@@ -502,7 +612,9 @@ def test_experience_maturity_uses_distinct_tasks_safety_and_user_approval() -> N
         evolution_id="evo_compare",
         previous_version="v001",
         current_version="v002",
+        expert_utility_delta=0.5,
         reward=0.5,
+        components_used=["expert_utility_delta"],
     )
     observation = create_experience(comparison, task_group_id="task_0")
     assert observation.maturity == "OBSERVATION"
@@ -568,10 +680,113 @@ def test_experience_maturity_uses_distinct_tasks_safety_and_user_approval() -> N
         )
 
 
+def test_experience_model_rejects_forged_id_and_bypassed_maturity() -> None:
+    observation = _experience_evidence(1, 0.5)
+    with pytest.raises(ValidationError, match="experience_id"):
+        ExperienceRecord(
+            experience_id="exp_forged",
+            evolution_id="evo_compare",
+            maturity="OBSERVATION",
+            observations=(observation,),
+            created_at=_episode("v001").created_at,
+        )
+    with pytest.raises(ValidationError, match="HYPOTHESIS"):
+        ExperienceRecord(
+            experience_id="exp_forged",
+            evolution_id="evo_compare",
+            base_experience_id="exp_parent",
+            previous_maturity="OBSERVATION",
+            maturity="HYPOTHESIS",
+            observations=(observation,),
+            created_at=_episode("v001").created_at,
+        )
+
+
+def test_grouped_rewards_are_averaged_once_per_task_group() -> None:
+    comparison = ComparisonReport(
+        comparison_id="cmp_seed",
+        evolution_id="evo_compare",
+        previous_version="v001",
+        current_version="v002",
+        expert_utility_delta=0.1,
+        reward=0.1,
+        components_used=["expert_utility_delta"],
+    )
+    observation = create_experience(comparison, task_group_id="task_0")
+    hypothesis = promote_experience(
+        observation,
+        to="HYPOTHESIS",
+        evidence=[_experience_evidence(1, 0.1)],
+    )
+    # Duplicate positive samples in one group receive only one group-level vote.
+    grouped = [
+        ExperienceEvidence(
+            comparison_id=f"cmp_group_a_{index}",
+            task_group_id="task_0",
+            reward=1.0,
+        )
+        for index in range(4)
+    ]
+    grouped.extend(
+        ExperienceEvidence(
+            comparison_id=f"cmp_group_{index}",
+            task_group_id=f"task_{index}",
+            reward=-0.3,
+        )
+        for index in range(2, 6)
+    )
+    with pytest.raises(ExperiencePromotionError, match="positive average"):
+        promote_experience(
+            hypothesis,
+            to="VALIDATED_EXPERIENCE",
+            evidence=grouped,
+        )
+
+
+def test_store_revalidates_maturity_when_model_construction_is_bypassed(
+    tmp_path: Path,
+) -> None:
+    service, task = _persisted_pair(tmp_path)
+    comparison = ComparisonReport(
+        comparison_id="cmp_direct",
+        evolution_id=task.evolution_id,
+        previous_version="v001",
+        current_version="v002",
+        expert_utility_delta=0.5,
+        reward=0.5,
+        components_used=["expert_utility_delta"],
+    )
+    observation = create_experience(comparison, task_group_id="only_group")
+    service.store.write_experience(observation)
+    observations = observation.observations
+    forged = ExperienceRecord.model_construct(
+        schema_version=1,
+        experience_id=derive_experience_id(
+            evolution_id=task.evolution_id,
+            maturity="HYPOTHESIS",
+            observations=observations,
+            base_experience_id=observation.experience_id,
+            previous_maturity="OBSERVATION",
+            created_at=observation.created_at,
+        ),
+        evolution_id=task.evolution_id,
+        base_experience_id=observation.experience_id,
+        previous_maturity="OBSERVATION",
+        maturity="HYPOTHESIS",
+        observations=observations,
+        user_approved_for_reuse=False,
+        created_at=observation.created_at,
+    )
+
+    with pytest.raises(ValidationError, match="HYPOTHESIS"):
+        service.store.write_experience(forged)
+
+
 def _persisted_pair(
     tmp_path: Path,
     *,
     forge_plan: bool = False,
+    current_overrides: dict[str, object] | None = None,
 ) -> tuple[EvolutionService, EvolutionTask]:
     workspace = Workspace(tmp_path)
     store = EvolutionStore(workspace)
@@ -626,6 +841,8 @@ def _persisted_pair(
         compilation_ids=["comp_v1"],
         revision_ids=[plan.revision_id],
     )
+    strategy = FixedStrategySelector().select(task, plan)
+    task = task.model_copy(update={"strategy_ids": [strategy.strategy_id]})
     store.create_task(task)
     for version, content in (("v001", previous_content), ("v002", b"current")):
         relative = f"user_output/evo_compare/{version}/result.md"
@@ -637,23 +854,42 @@ def _persisted_pair(
             version,
             ScientificState(),
         )
-        store.write_episode(
-            _episode(version, artifact=_artifact(relative, content)).model_copy(
+        episode_updates: dict[str, object] = {
+            "scientific_state_path": workspace.relative(state_path),
+            "task_snapshot": task.model_dump(mode="json"),
+            "episode_id": EvolutionService._episode_id(
+                "evo_compare", version  # type: ignore[arg-type]
+            ),
+            "revision_plan_id": plan.revision_id if version == "v002" else None,
+            "applied_feedback_id": plan.feedback_id if version == "v002" else None,
+            "strategy_id": strategy.strategy_id if version == "v002" else None,
+            "strategy_arm": strategy.arm if version == "v002" else "STATIC",
+        }
+        if version == "v002" and current_overrides:
+            episode_updates.update(current_overrides)
+        persisted_episode = _episode(
+            version,
+            artifact=_artifact(relative, content),
+        ).model_copy(update=episode_updates)
+        if version == "v002" and "acceptance_results" not in (
+            current_overrides or {}
+        ):
+            persisted_episode = persisted_episode.model_copy(
                 update={
-                    "scientific_state_path": workspace.relative(state_path),
-                    "task_snapshot": task.model_dump(mode="json"),
-                    "episode_id": EvolutionService._episode_id(
-                        "evo_compare", version  # type: ignore[arg-type]
-                    ),
-                    "revision_plan_id": (
-                        plan.revision_id if version == "v002" else None
-                    ),
+                    "acceptance_results": evaluate_machine_acceptance(
+                        plan=plan,
+                        episode=persisted_episode,
+                        state=ScientificState(),
+                    )
                 }
             )
+        store.write_episode(
+            persisted_episode
         )
     store.write_feedback(feedback)
     store.write_compilation(compilation)
     store.write_revision(plan)
+    store.write_strategy(strategy)
     return service, task
 
 
@@ -666,16 +902,54 @@ def test_service_comparison_is_immutable_and_idempotent(tmp_path: Path) -> None:
     assert second.entity == first.entity
     stored_task = service.get(task.evolution_id)
     assert stored_task.comparison_ids == [first.entity.comparison_id]
-    assert len(stored_task.experience_ids) == 1
+    assert first.entity.phase == "PRE_FEEDBACK"
+    assert stored_task.experience_ids == []
     assert service.store.load_comparison(
         task.evolution_id, first.entity.comparison_id
     ) == first.entity
-    experience = service.store.load_experience(
-        task.evolution_id, stored_task.experience_ids[0]
-    )
-    assert len(experience.observations) == 1
     with pytest.raises(EvolutionAlreadyExistsError):
         service.store.write_comparison(first.entity)
+
+
+def test_preliminary_then_reviewed_comparison_has_distinct_snapshot_and_one_sample(
+    tmp_path: Path,
+) -> None:
+    service, task = _persisted_pair(tmp_path)
+    preliminary = service.compare(task.evolution_id, "v001", "v002").entity
+    current = service.store.load_episode(task.evolution_id, "v002")
+    assert current.artifact is not None
+    service.attach_feedback(
+        task.evolution_id,
+        "v002",
+        feedback_id="fb_v2",
+        draft=ExpertFeedbackDraft(
+            scores=RubricScores(
+                scientific_correctness=4,
+                evidence_sufficiency=4,
+                novelty=4,
+                actionability=4,
+                overall=4,
+            ),
+            resolved_issue_ids=["issue_secret"],
+        ),
+        result_sha256=current.artifact.sha256,
+        raw_input="reviewed",
+    )
+
+    reviewed = service.compare(task.evolution_id, "v001", "v002").entity
+    retried = service.compare(task.evolution_id, "v001", "v002").entity
+
+    assert preliminary.phase == "PRE_FEEDBACK"
+    assert reviewed.phase == "POST_FEEDBACK"
+    assert preliminary.comparison_id != reviewed.comparison_id
+    assert reviewed.current_feedback_id == "fb_v2"
+    assert retried == reviewed
+    stored = service.get(task.evolution_id)
+    assert stored.comparison_ids == [
+        preliminary.comparison_id,
+        reviewed.comparison_id,
+    ]
+    assert len(stored.experience_ids) == 1
 
 
 def test_service_revalidates_physical_artifacts(tmp_path: Path) -> None:
@@ -696,6 +970,42 @@ def test_service_rebuilds_canonical_revision_before_comparing(tmp_path: Path) ->
     service, task = _persisted_pair(tmp_path, forge_plan=True)
 
     with pytest.raises(EvolutionOperationConflict, match="canonical"):
+        service.compare(task.evolution_id, "v001", "v002")
+
+    assert service.get(task.evolution_id).comparison_ids == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"applied_feedback_id": "fb_wrong"}, "feedback"),
+        ({"revision_plan_id": "rp_wrong"}, "revision plan"),
+        ({"strategy_id": "strategy_wrong"}, "strategy"),
+        ({"strategy_arm": "DIVERSITY_FIRST"}, "strategy"),
+        ({"parent_version": "v000"}, "parent/child"),
+        (
+            {
+                "acceptance_results": [
+                    {
+                        "acceptance_id": "issue_secret",
+                        "status": "PASS",
+                    }
+                ]
+            },
+            "acceptance",
+        ),
+    ],
+)
+def test_service_rejects_each_tampered_comparison_provenance_link(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    service, task = _persisted_pair(tmp_path, current_overrides=overrides)
+
+    with pytest.raises(
+        (EvolutionOperationConflict, InvalidEvolutionTransition), match=match
+    ):
         service.compare(task.evolution_id, "v001", "v002")
 
     assert service.get(task.evolution_id).comparison_ids == []
@@ -729,5 +1039,9 @@ def test_compare_cli_is_bounded_redacted_and_does_not_construct_runtime(
     assert result.exit_code == 0, result.output
     assert "v001" in result.output and "v002" in result.output
     assert "NEEDS_HUMAN_REVIEW" in result.output
+    assert "Primary artifact delta" in result.output
+    assert "Previous SHA-256" in result.output
+    assert "Input tokens" in result.output
+    assert "Unresolved human checks" in result.output
     assert "cli-secret" not in result.output
     assert len(service.get(task.evolution_id).comparison_ids) == 1

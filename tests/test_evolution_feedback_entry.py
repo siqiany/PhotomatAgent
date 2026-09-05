@@ -93,6 +93,7 @@ async def test_feedback_form_collects_every_field_with_distinct_chinese_rubric(
         "证据不足",
         "需要补充原始数据",
         "/submit",
+        "",
     )
     console = Console(file=(tmp_path / "console.txt").open("w", encoding="utf-8"))
 
@@ -179,6 +180,7 @@ async def test_feedback_flow_requires_override_then_confirmation_before_write(
         "5", "5", "5", "5", "5",
         "y", "n", "n", "n", "n", "n",
         "review", "/submit",
+        "",
         "专家复核了原始来源，判定标记来自自动误报",
         "y",
     )
@@ -239,7 +241,7 @@ async def test_raw_feedback_is_persisted_only_in_feedback_record_not_event_or_ou
     session = ScriptedPrompt(
         "3", "3", "3", "3", "3",
         "n", "n", "n", "n", "n", "n",
-        marker, "/submit", "y",
+        marker, "/submit", "", "y",
     )
     output_path = tmp_path / "console.txt"
     console = Console(file=output_path.open("w", encoding="utf-8"))

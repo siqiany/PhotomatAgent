@@ -16,6 +16,7 @@ from photomatagent.scientific.evolution.artifacts import (
     EpisodeArtifactCollector,
     materialize_primary_result,
 )
+from photomatagent.scientific.evolution.comparison import evaluate_machine_acceptance
 from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     CostSnapshot,
@@ -149,13 +150,32 @@ class ScientificEpisodeExecutor:
                     "cost": cost,
                 }
             )
+            if persisted_revision is not None:
+                completion = completion.model_copy(
+                    update={
+                        "acceptance_results": evaluate_machine_acceptance(
+                            plan=persisted_revision,
+                            episode=completion,
+                            state=runtime.scientific_state,
+                        )
+                    }
+                )
             completed_result = self.service.complete_episode(
                 task.evolution_id,
                 episode.version,
                 result=completion,
                 owner_token=owner_token,
             )
+            comparison_result = None
+            if persisted_revision is not None and episode.parent_version is not None:
+                comparison_result = self.service.compare(
+                    task.evolution_id,
+                    episode.parent_version,
+                    episode.version,
+                )
             await self._publish(completed_result, on_event)
+            if comparison_result is not None:
+                await self._publish(comparison_result, on_event)
         except BaseException as exc:
             await self._reconcile_exception(
                 task=task,

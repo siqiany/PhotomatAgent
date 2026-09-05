@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import secrets
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from pydantic import (
     Field,
     JsonValue,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 from pydantic_core import core_schema
@@ -136,6 +138,19 @@ FeedbackCategory = Literal[
 ]
 CompilationStatus = Literal["PENDING", "AVAILABLE", "UNAVAILABLE"]
 AcceptanceStatus = Literal["PENDING", "PASS", "FAIL", "NEEDS_HUMAN_REVIEW"]
+AcceptanceKind = Literal["MACHINE", "HUMAN"]
+AcceptanceProvenance = Literal["DETERMINISTIC_EVALUATOR", "EXPERT_FEEDBACK"]
+AcceptanceEvaluator = Literal[
+    "CONSTRAINT_PASS", "EVIDENCE_PRESENT", "ARTIFACT_PRESENT", "UNREGISTERED"
+]
+ComparisonPhase = Literal["PRE_FEEDBACK", "POST_FEEDBACK"]
+RewardComponent = Literal[
+    "expert_utility_delta",
+    "closure_rate",
+    "recurrence_rate",
+    "new_issue_rate",
+    "normalized_cost_increase",
+]
 ExperienceMaturity = Literal[
     "OBSERVATION", "HYPOTHESIS", "VALIDATED_EXPERIENCE", "REUSABLE_SKILL"
 ]
@@ -444,6 +459,14 @@ class ExpertFeedbackDraft(StrictModel):
     priority_corrections: list[str] = Field(default_factory=list, max_length=3)
     preserved_strengths: list[str] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
+    resolved_issue_ids: list[ManagedId] = Field(default_factory=list, max_length=100)
+
+    @field_validator("resolved_issue_ids")
+    @classmethod
+    def validate_unique_resolutions(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("resolved issue IDs must be unique")
+        return value
 
 
 class ArtifactRef(StrictModel):
@@ -465,6 +488,28 @@ class AcceptanceResult(StrictModel):
     acceptance_id: ManagedId
     status: AcceptanceStatus = "PENDING"
     detail: str = ""
+    kind: AcceptanceKind = "MACHINE"
+    provenance: AcceptanceProvenance = "DETERMINISTIC_EVALUATOR"
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> Self:
+        expected = (
+            "DETERMINISTIC_EVALUATOR"
+            if self.kind == "MACHINE"
+            else "EXPERT_FEEDBACK"
+        )
+        if self.provenance != expected:
+            raise ValueError("acceptance kind and provenance do not match")
+        return self
+
+
+class MachineAcceptanceCheck(StrictModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)
+
+    acceptance_id: ManagedId
+    description: str = Field(min_length=1, max_length=4_000)
+    evaluator: AcceptanceEvaluator
+    subject: str | None = Field(default=None, max_length=200)
 
 
 class EvolutionTask(StrictModel):
@@ -658,6 +703,7 @@ class ExpertFeedbackRecord(ExpertFeedbackDraft):
         object.__setattr__(self, "priority_corrections", list(self.priority_corrections))
         object.__setattr__(self, "preserved_strengths", list(self.preserved_strengths))
         object.__setattr__(self, "recommended_actions", list(self.recommended_actions))
+        object.__setattr__(self, "resolved_issue_ids", FrozenJsonList(self.resolved_issue_ids))
         object.__setattr__(self, "hard_cap_reasons", list(self.hard_cap_reasons))
         return self
 
@@ -677,6 +723,9 @@ class RevisionPlan(StrictModel):
     invalidated_conclusions: list[str] = Field(default_factory=list)
     invalidated_evidence_ids: list[ManagedId] = Field(default_factory=list)
     machine_acceptance_tests: list[str] = Field(default_factory=list)
+    machine_acceptance_checks: list[MachineAcceptanceCheck] = Field(
+        default_factory=list
+    )
     human_acceptance_tests: list[str] = Field(default_factory=list)
     strategy_arm: StrategyArm = "STATIC"
     strategy_reason: str = ""
@@ -761,11 +810,16 @@ class CostDelta(StrictModel):
 
 
 class ComparisonReport(StrictModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, frozen=True)
+
     schema_version: SchemaVersion = 1
     comparison_id: ManagedId = Field(frozen=True)
     evolution_id: ManagedId = Field(frozen=True)
     previous_version: EpisodeVersion = Field(frozen=True)
     current_version: EpisodeVersion = Field(frozen=True)
+    phase: ComparisonPhase = "PRE_FEEDBACK"
+    current_feedback_id: ManagedId | None = None
+    current_feedback_sha256: Sha256 | None = None
     score_deltas: list[RubricScoreDelta] = Field(default_factory=list)
     acceptance_results: list[AcceptanceResult] = Field(default_factory=list)
     closed_issue_ids: list[ManagedId] = Field(default_factory=list)
@@ -786,9 +840,113 @@ class ComparisonReport(StrictModel):
     artifact_diff: ArtifactDiff | None = None
     cost_delta: CostDelta = Field(default_factory=CostDelta)
     unresolved_human_checks: list[str] = Field(default_factory=list)
-    expert_utility_delta: float | None = None
-    normalized_cost_increase: float | None = None
+    expert_utility_delta: float | None = Field(default=None, ge=-1.0, le=1.0)
+    normalized_cost_increase: float | None = Field(default=None, ge=-1.0, le=1.0)
     reward: float | None = Field(default=None, ge=-1.0, le=1.0)
-    components_used: list[str] = Field(default_factory=list)
+    components_used: list[RewardComponent] = Field(
+        default_factory=list,
+        max_length=5,
+    )
     module_credit: dict[str, float] = Field(default_factory=dict)
     created_at: UtcDatetime = Field(default_factory=utc_now)
+
+    @field_validator("expert_utility_delta", "normalized_cost_increase", "reward")
+    @classmethod
+    def validate_finite_metric(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("comparison metrics must be finite")
+        return value
+
+    @field_validator("module_credit")
+    @classmethod
+    def validate_module_credit(cls, value: dict[str, float]) -> dict[str, float]:
+        if any(
+            not math.isfinite(score) or not -1.0 <= score <= 1.0
+            for score in value.values()
+        ):
+            raise ValueError("module credit must be finite and within [-1, 1]")
+        return value
+
+    @model_validator(mode="after")
+    def validate_comparison_consistency(self) -> Self:
+        if len(self.components_used) != len(set(self.components_used)):
+            raise ValueError("reward components must be unique")
+        values = {
+            "expert_utility_delta": self.expert_utility_delta,
+            "closure_rate": self.closure_rate,
+            "recurrence_rate": self.recurrence_rate,
+            "new_issue_rate": self.new_issue_rate,
+            "normalized_cost_increase": self.normalized_cost_increase,
+        }
+        expected = [name for name, value in values.items() if value is not None]
+        if list(self.components_used) != expected:
+            raise ValueError("reward components do not match available metrics")
+        weighted = {
+            "expert_utility_delta": 0.45,
+            "closure_rate": 0.25,
+            "recurrence_rate": -0.15,
+            "new_issue_rate": -0.10,
+            "normalized_cost_increase": -0.05,
+        }
+        if expected:
+            denominator = sum(abs(weighted[name]) for name in expected)
+            weighted_total = 0.0
+            for name in expected:
+                value = values[name]
+                assert value is not None
+                weighted_total += weighted[name] * value
+            calculated = round(
+                max(
+                    -1.0,
+                    min(
+                        1.0,
+                        weighted_total / denominator,
+                    ),
+                ),
+                6,
+            )
+            if self.reward != calculated:
+                raise ValueError("reward does not match its recorded components")
+        elif self.reward is not None:
+            raise ValueError("reward requires at least one recorded component")
+        if self.phase == "PRE_FEEDBACK":
+            if (
+                self.current_feedback_id is not None
+                or self.current_feedback_sha256 is not None
+            ):
+                raise ValueError("pre-feedback comparison cannot bind current feedback")
+        elif self.current_feedback_id is None or self.current_feedback_sha256 is None:
+            raise ValueError("post-feedback comparison requires exact feedback identity")
+        machine = [
+            result
+            for result in self.acceptance_results
+            if result.kind == "MACHINE" and result.status in {"PASS", "FAIL"}
+        ]
+        expected_closure = (
+            sum(result.status == "PASS" for result in machine) / len(machine)
+            if machine
+            else None
+        )
+        if self.closure_rate != expected_closure:
+            raise ValueError("closure rate must use only evaluated machine checks")
+        object.__setattr__(self, "score_deltas", FrozenJsonList(self.score_deltas))
+        object.__setattr__(
+            self,
+            "acceptance_results",
+            FrozenJsonList(self.acceptance_results),
+        )
+        object.__setattr__(self, "closed_issue_ids", FrozenJsonList(self.closed_issue_ids))
+        object.__setattr__(
+            self,
+            "recurring_issue_ids",
+            FrozenJsonList(self.recurring_issue_ids),
+        )
+        object.__setattr__(self, "new_issue_ids", FrozenJsonList(self.new_issue_ids))
+        object.__setattr__(
+            self,
+            "unresolved_human_checks",
+            FrozenJsonList(self.unresolved_human_checks),
+        )
+        object.__setattr__(self, "components_used", FrozenJsonList(self.components_used))
+        object.__setattr__(self, "module_credit", FrozenJsonDict(self.module_credit))
+        return self

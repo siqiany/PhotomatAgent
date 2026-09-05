@@ -26,7 +26,10 @@ from photomatagent.runtime.events import (
 )
 from photomatagent.errors import ToolExecutionError
 from photomatagent.redaction import redact_secrets
-from photomatagent.scientific.evolution.comparison import compare_episodes
+from photomatagent.scientific.evolution.comparison import (
+    compare_episodes,
+    evaluate_machine_acceptance,
+)
 from photomatagent.scientific.evolution.events import bounded_summary
 from photomatagent.scientific.evolution.experience import create_experience
 from photomatagent.scientific.evolution.models import (
@@ -191,6 +194,10 @@ class EvolutionService:
                     "applied revision plan is not linked by the task manifest"
                 )
             plan = transaction.load_revision(current.revision_plan_id)
+            if current.applied_feedback_id != plan.feedback_id:
+                raise EvolutionOperationConflict(
+                    "revised episode feedback does not match its revision plan"
+                )
             feedback_records = self.store.list_feedback(evolution_id)
             previous_feedback = self._active_feedback(
                 feedback_records,
@@ -244,6 +251,33 @@ class EvolutionService:
                 raise EvolutionOperationConflict(
                     "comparison revision plan does not match canonical persisted inputs"
                 )
+            if current.strategy_id is None or current.strategy_id not in task.strategy_ids:
+                raise EvolutionOperationConflict(
+                    "revised episode strategy is not linked by the task manifest"
+                )
+            from photomatagent.scientific.evolution.strategy import FixedStrategySelector
+
+            strategy = transaction.load_strategy(current.strategy_id)
+            canonical_strategy = FixedStrategySelector().select(task, plan)
+            if (
+                strategy != canonical_strategy
+                or current.strategy_id != strategy.strategy_id
+                or current.strategy_arm != strategy.arm
+                or strategy.parameters.get("revision_id") != plan.revision_id
+            ):
+                raise EvolutionOperationConflict(
+                    "revised episode strategy does not match its canonical plan chain"
+                )
+            canonical_acceptance = evaluate_machine_acceptance(
+                plan=plan,
+                episode=current,
+                state=current_state,
+            )
+            if list(current.acceptance_results) != canonical_acceptance:
+                raise EvolutionOperationConflict(
+                    "revised episode acceptance results do not match the "
+                    "deterministic evaluator"
+                )
             current_compilation = (
                 self._comparison_compilation(task, current_feedback)
                 if current_feedback is not None
@@ -270,18 +304,6 @@ class EvolutionService:
                 previous_state=previous_state,
                 current_state=current_state,
             )
-            unsafe = self._unsafe_experience_observation(
-                previous_feedback,
-                current_feedback,
-                previous_compilation,
-                current_compilation,
-            )
-            experience = create_experience(
-                report,
-                task_group_id=task.task_group_id,
-                safety_or_fabrication_failure=unsafe,
-            )
-
             try:
                 persisted_report = transaction.load_comparison(report.comparison_id)
             except FileNotFoundError:
@@ -292,28 +314,42 @@ class EvolutionService:
                     raise EvolutionOperationConflict(
                         "comparison ID names different canonical content"
                     )
-            try:
-                persisted_experience = transaction.load_experience(
-                    experience.experience_id
+            persisted_experience = None
+            if report.phase == "POST_FEEDBACK":
+                unsafe = self._unsafe_experience_observation(
+                    previous_feedback,
+                    current_feedback,
+                    previous_compilation,
+                    current_compilation,
                 )
-            except FileNotFoundError:
-                transaction.write_experience(experience)
-                persisted_experience = transaction.load_experience(
-                    experience.experience_id
+                experience = create_experience(
+                    report,
+                    task_group_id=task.task_group_id,
+                    safety_or_fabrication_failure=unsafe,
                 )
-            else:
-                if persisted_experience != experience:
-                    raise EvolutionOperationConflict(
-                        "experience ID names different canonical content"
+                try:
+                    persisted_experience = transaction.load_experience(
+                        experience.experience_id
                     )
+                except FileNotFoundError:
+                    transaction.write_experience(experience)
+                    persisted_experience = transaction.load_experience(
+                        experience.experience_id
+                    )
+                else:
+                    if persisted_experience != experience:
+                        raise EvolutionOperationConflict(
+                            "experience ID names different canonical content"
+                        )
 
             comparison_ids = self._append_once(
                 task.comparison_ids,
                 persisted_report.comparison_id,
             )
-            experience_ids = self._append_once(
-                task.experience_ids,
-                persisted_experience.experience_id,
+            experience_ids = (
+                self._append_once(task.experience_ids, persisted_experience.experience_id)
+                if persisted_experience is not None
+                else task.experience_ids
             )
             if (
                 comparison_ids != task.comparison_ids
@@ -329,15 +365,17 @@ class EvolutionService:
                     expected_revision=task.revision,
                 )
 
+        events: tuple[RuntimeEvent, ...] = (
+            EvolutionComparisonCompleted(
+                evolution_id=evolution_id,
+                episode_version=current.version,
+            ),
+        )
+        if persisted_experience is not None:
+            events = (*events, ExperienceStateChanged(evolution_id=evolution_id))
         return MutationResult(
             persisted_report,
-            (
-                EvolutionComparisonCompleted(
-                    evolution_id=evolution_id,
-                    episode_version=current.version,
-                ),
-                ExperienceStateChanged(evolution_id=evolution_id),
-            ),
+            events,
         )
 
     def reconcile(self, evolution_id: str) -> MutationResult[EvolutionTask]:
@@ -1420,6 +1458,17 @@ class EvolutionService:
             )
         previous_index = int(previous.version[1:])
         current_index = int(current.version[1:])
+        if current_index <= previous_index:
+            raise InvalidEvolutionTransition(
+                "comparison versions must increase monotonically"
+            )
+        if (
+            task.current_version != current.version
+            or task.last_completed_version != current.version
+        ):
+            raise InvalidEvolutionTransition(
+                "comparison current episode must be the task current completed version"
+            )
         if current.parent_version != previous.version:
             raise InvalidEvolutionTransition(
                 "compare requires adjacent parent/child episodes"
@@ -1428,6 +1477,24 @@ class EvolutionService:
             raise InvalidEvolutionTransition(
                 "compare requires two completed episodes"
             )
+        for missing_index in range(previous_index + 1, current_index):
+            missing_version = cast(EpisodeVersion, f"v{missing_index:03d}")
+            missing = self.store.load_episode(task.evolution_id, missing_version)
+            if missing.status != "FAILED":
+                raise InvalidEvolutionTransition(
+                    "numeric comparison gaps must be durable FAILED episodes"
+                )
+            expected_id = self._episode_id(task.evolution_id, missing_version)
+            if (
+                missing_index > len(task.episode_ids)
+                or task.episode_ids[missing_index - 1] != expected_id
+                or missing.episode_id != expected_id
+                or missing.parent_version != previous.version
+            ):
+                raise EvolutionOperationConflict(
+                    f"failed episode {missing_version} is not a canonical retry "
+                    "between the compared parent/child episodes"
+                )
         for episode, index in ((previous, previous_index), (current, current_index)):
             if index < 1 or index > len(task.episode_ids):
                 raise EvolutionOperationConflict(
@@ -1708,6 +1775,7 @@ class EvolutionService:
             priority_corrections=draft.priority_corrections,
             preserved_strengths=draft.preserved_strengths,
             recommended_actions=draft.recommended_actions,
+            resolved_issue_ids=draft.resolved_issue_ids,
             suggested_scores=(assessment.suggested_scores if assessment.reasons else None),
             hard_cap_reasons=assessment.reasons,
             hard_cap_override_reason=hard_cap_override_reason,

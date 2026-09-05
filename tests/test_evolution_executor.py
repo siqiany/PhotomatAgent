@@ -28,6 +28,7 @@ from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     ExpertFeedbackDraft,
     FeedbackCompilation,
+    FeedbackDelta,
     RevisionPlan,
     RubricScores,
 )
@@ -60,7 +61,10 @@ def _reserved(service: EvolutionService):  # type: ignore[no-untyped-def]
     return task, episode
 
 
-def _reserved_revision(service: EvolutionService):  # type: ignore[no-untyped-def]
+def _reserved_revision(  # type: ignore[no-untyped-def]
+    service: EvolutionService,
+    acceptance_test: str | None = None,
+):
     task, first = _reserved(service)
     running = service.mark_episode_running(task.evolution_id, first.version).entity
     content = b"first result"
@@ -113,6 +117,19 @@ def _reserved_revision(service: EvolutionService):  # type: ignore[no-untyped-de
             feedback_id=feedback.feedback_id,
             episode_version=first.version,
             status="AVAILABLE",
+            items=(
+                FeedbackDelta(
+                    item_id="issue_check",
+                    category="ACTIONABILITY",
+                    status="CORRECTION",
+                    severity="HIGH",
+                    responsible_module="process",
+                    problem="process is incomplete",
+                    acceptance_test=acceptance_test,
+                    confidence=1.0,
+                    source_span="expert review",
+                ),
+            ) if acceptance_test is not None else (),
             provider="fake",
             model="fake",
         ),
@@ -132,6 +149,73 @@ def _reserved_revision(service: EvolutionService):  # type: ignore[no-untyped-de
         mode="CARRY_VERIFIED_EVIDENCE",
     ).entity
     return service.get(task.evolution_id), second, persisted_plan
+
+
+@pytest.mark.asyncio
+async def test_revised_executor_persists_unknown_check_and_preliminary_comparison(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    task, episode, revision = _reserved_revision(
+        service,
+        acceptance_test="free-form model judgment is not registered",
+    )
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="revised report")]),
+        session_id="session_revised",
+    )
+
+    result = await ScientificEpisodeExecutor(service.store).execute(
+        task=task,
+        episode=episode,
+        revision=revision,
+        runtime=runtime,
+        config=ScientificLoopConfig(max_rounds=1),
+    )
+
+    assert len(result.episode.acceptance_results) == 1
+    acceptance = result.episode.acceptance_results[0]
+    assert acceptance.kind == "MACHINE"
+    assert acceptance.status == "NEEDS_HUMAN_REVIEW"
+    updated = service.get(task.evolution_id)
+    assert len(updated.comparison_ids) == 1
+    report = service.store.load_comparison(task.evolution_id, updated.comparison_ids[0])
+    assert report.phase == "PRE_FEEDBACK"
+    assert updated.experience_ids == []
+
+
+@pytest.mark.asyncio
+async def test_revised_executor_persists_deterministic_machine_pass(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    task, episode, revision = _reserved_revision(
+        service,
+        acceptance_test="artifact_present",
+    )
+    runtime = _runtime(
+        service.store.workspace,
+        FakeModelProvider([FakeResponse(text="revised report")]),
+        session_id="session_machine_pass",
+    )
+
+    result = await ScientificEpisodeExecutor(service.store).execute(
+        task=task,
+        episode=episode,
+        revision=revision,
+        runtime=runtime,
+        config=ScientificLoopConfig(max_rounds=1),
+    )
+
+    acceptance = result.episode.acceptance_results[0]
+    assert acceptance.acceptance_id == "issue_check"
+    assert acceptance.status == "PASS"
+    assert acceptance.provenance == "DETERMINISTIC_EVALUATOR"
+    report_id = service.get(task.evolution_id).comparison_ids[0]
+    report = service.store.load_comparison(task.evolution_id, report_id)
+    assert report.closure_rate == 1.0
+    assert report.closed_issue_ids == ["issue_check"]
 
 
 def _runtime(
