@@ -6,6 +6,8 @@ import inspect
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
 
 from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger
@@ -23,6 +25,7 @@ from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
     EvolutionTask,
     RevisionPlan,
+    new_episode_owner_token,
 )
 from photomatagent.scientific.evolution.revision import format_revision_instruction
 from photomatagent.scientific.evolution.service import (
@@ -36,9 +39,20 @@ from photomatagent.scientific.loop import (
     ScientificLoopController,
     ScientificLoopSummary,
 )
+from photomatagent.scientific.state import ScientificState
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _REVISION_INSTRUCTION_MAX_CHARS = 12_000
+_FRESH_STRATEGY_GUIDANCE = {
+    "STATIC": "Use the fixed baseline procedure without learned task history.",
+    "EVIDENCE_FIRST": "Prioritize independently obtained structured evidence.",
+    "DIVERSITY_FIRST": "Prioritize diverse independently checked candidates.",
+    "UNCERTAINTY_FIRST": "Prioritize resolving the largest scientific uncertainty.",
+}
+
+
+class RuntimeFactory(Protocol):
+    def __call__(self, **kwargs: Any) -> AgentRuntime: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +223,11 @@ class ScientificEpisodeExecutor:
             raise ValueError("evolution episodes require a fresh runtime conversation")
         if any(value != 0 for value in runtime.budget.snapshot().values()):
             raise ValueError("evolution episodes require a fresh runtime budget")
+        if (
+            episode.execution_mode == "FRESH_EVALUATION"
+            and runtime.scientific_state != ScientificState()
+        ):
+            raise ValueError("fresh evaluation requires a blank ScientificState")
         if task.evolution_id != episode.evolution_id:
             raise ValueError("task and episode belong to different evolution tasks")
         stored_task = self.store.load_task(task.evolution_id)
@@ -280,6 +299,27 @@ class ScientificEpisodeExecutor:
         episode: EpisodeRecord,
         supplied: RevisionPlan | None,
     ) -> RevisionPlan | None:
+        if episode.execution_mode == "FRESH_EVALUATION":
+            if supplied is not None or episode.revision_plan_id is not None:
+                raise ValueError("fresh evaluation must not receive a revision")
+            if episode.applied_feedback_id is not None or episode.strategy_id is None:
+                raise ValueError("fresh evaluation provenance is not isolated")
+            strategy = self.store.load_strategy(
+                episode.evolution_id,
+                episode.strategy_id,
+            )
+            if (
+                strategy.strategy_id != episode.strategy_id
+                or strategy.arm != episode.strategy_arm
+                or strategy.strategy_sha256 != episode.strategy_sha256
+                or strategy.cutoff_at != episode.strategy_cutoff_at
+                or strategy.strategy_sha256 is None
+                or strategy.cutoff_at is None
+            ):
+                raise ValueError(
+                    "fresh evaluation strategy does not match its frozen snapshot"
+                )
+            return None
         if episode.revision_plan_id is None:
             if supplied is not None:
                 raise ValueError("initial episode must not receive a revision")
@@ -349,6 +389,12 @@ class ScientificEpisodeExecutor:
         episode: EpisodeRecord,
         revision: RevisionPlan | None,
     ) -> str:
+        if episode.execution_mode == "FRESH_EVALUATION":
+            guidance = _FRESH_STRATEGY_GUIDANCE[episode.strategy_arm]
+            return (
+                f"{task.goal}\n\n"
+                f"Frozen evaluation strategy: {episode.strategy_arm}. {guidance}"
+            )
         if revision is None:
             return task.goal
         revision_text = format_revision_instruction(
@@ -435,8 +481,87 @@ class ScientificEpisodeExecutor:
             )
 
 
+async def run_fresh_evaluation(
+    *,
+    service: EvolutionService,
+    task: EvolutionTask,
+    strategy_id: str,
+    executor: ScientificEpisodeExecutor,
+    runtime_factory: RuntimeFactory,
+    config: ScientificLoopConfig | None = None,
+    judge: ScientificJudge | None = None,
+    on_event: EventSink | None = None,
+    owner_token: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> EpisodeExecutionResult:
+    """Claim and run an isolated evaluation from only task + frozen strategy."""
+
+    authoritative = service.get(task.evolution_id)
+    if (
+        task.goal != authoritative.goal
+        or task.target != authoritative.target
+        or task.input_sha256 != authoritative.input_sha256
+        or task.task_group_id != authoritative.task_group_id
+    ):
+        raise ValueError("task does not match the immutable persisted task input")
+    token = owner_token or new_episode_owner_token()
+    claim = service.claim_fresh_evaluation(
+        task.evolution_id,
+        strategy_id=strategy_id,
+        owner_token=token,
+        provider=provider,
+        model=model,
+    )
+    approval_root = Path(".photomatagent/evolution-approvals") / task.evolution_id / (
+        f"{claim.episode.version}_{claim.episode.episode_id}"
+    )
+    try:
+        runtime = runtime_factory(
+            scientific_state=ScientificState(),
+            fresh_approval=True,
+            application_approval_root=approval_root,
+        )
+        if not isinstance(runtime, AgentRuntime):
+            raise TypeError("runtime_factory must return AgentRuntime")
+        await executor._publish(
+            MutationResult(claim.episode, claim.events),
+            on_event,
+        )
+        return await executor.execute(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            config=config or ScientificLoopConfig(),
+            judge=judge,
+            on_event=on_event,
+            owner_token=token,
+        )
+    except BaseException as exc:
+        try:
+            persisted = service.store.load_episode(
+                task.evolution_id,
+                claim.episode.version,
+            )
+            if persisted.status in {"RESERVED", "RUNNING"}:
+                service.fail_episode(
+                    task.evolution_id,
+                    claim.episode.version,
+                    ScientificEpisodeExecutor._bounded_error(exc),
+                    owner_token=token,
+                )
+        except BaseException as recovery_exc:
+            exc.add_note(
+                "fresh-evaluation recovery failed: "
+                f"{ScientificEpisodeExecutor._bounded_error(recovery_exc)}"
+            )
+        raise
+
+
 __all__ = [
     "EpisodeExecutionResult",
     "EventSink",
     "ScientificEpisodeExecutor",
+    "RuntimeFactory",
+    "run_fresh_evaluation",
 ]

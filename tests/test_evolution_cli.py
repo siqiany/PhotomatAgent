@@ -295,10 +295,162 @@ def test_evolve_help_registers_feedback_and_labels_future_execution_commands(
     assert "history" in result.stdout
     assert "feedback" in result.stdout
     assert "iterate" in result.stdout
+    assert "evaluate" in result.stdout
+    assert "export" in result.stdout
+    assert "accept" in result.stdout
+    assert "stop" in result.stdout
+    assert "reopen" in result.stdout
     feedback_help = cli_runner.invoke(app, ["evolve", "feedback", "--help"])
     assert feedback_help.exit_code == 0
     assert "--file" in feedback_help.output
     assert "--version" in feedback_help.output
+
+
+def test_evaluate_fresh_builds_isolated_episode_runtime(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = _revision_ready_task(
+        tmp_path,
+        raw_feedback="Authorization: Bearer history-secret",
+    )
+    strategy_id = ready.strategy_ids[-1]
+    observed: list[dict[str, object]] = []
+
+    def build_evaluation_runtime(**kwargs):  # type: ignore[no-untyped-def]
+        observed.append(kwargs)
+        assert kwargs["scientific_state"] == ScientificState()
+        return (
+            _runtime(
+                tmp_path,
+                session_id="session_cli_fresh",
+                scientific_state=kwargs["scientific_state"],
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(chat_module, "build_runtime", build_evaluation_runtime)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "evaluate",
+            ready.evolution_id,
+            "--fresh",
+            "--strategy-id",
+            strategy_id,
+            "--provider",
+            "fake",
+            "--approval",
+            "deny",
+            "--max-rounds",
+            "1",
+            "--no-log-events",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(observed) == 1
+    assert observed[0]["fresh_approval"] is True
+    assert observed[0]["approval"] == "deny"
+    task = EvolutionStore(Workspace(tmp_path)).load_task(ready.evolution_id)
+    episode = EvolutionStore(Workspace(tmp_path)).load_episode(
+        ready.evolution_id,
+        "v002",
+    )
+    assert task.status == "AWAITING_EXPERT_FEEDBACK"
+    assert episode.execution_mode == "FRESH_EVALUATION"
+    assert episode.applied_feedback_id is None
+    assert episode.revision_plan_id is None
+    assert episode.strategy_sha256 is not None
+    assert "history-secret" not in result.output
+
+
+def test_evaluate_requires_explicit_fresh_flag_before_reservation(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    ready = _revision_ready_task(tmp_path, raw_feedback="feedback")
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "evaluate",
+            ready.evolution_id,
+            "--strategy-id",
+            ready.strategy_ids[-1],
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--fresh" in result.output
+    assert service_episode_count(tmp_path, ready.evolution_id) == 1
+
+
+def service_episode_count(workspace: Path, evolution_id: str) -> int:
+    return len(EvolutionStore(Workspace(workspace)).load_task(evolution_id).episode_ids)
+
+
+def test_export_accept_stop_and_reopen_commands(
+    cli_runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    task = _completed_task(tmp_path)
+    export_path = tmp_path / "user_output" / "cli-export.json"
+
+    exported = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "export",
+            task.evolution_id,
+            "--output",
+            str(export_path),
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+    accepted = cli_runner.invoke(
+        app,
+        [
+            "evolve",
+            "accept",
+            task.evolution_id,
+            "--version",
+            "v001",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+    reopened = cli_runner.invoke(
+        app,
+        ["evolve", "reopen", task.evolution_id, "--workspace", str(tmp_path)],
+    )
+    stopped = cli_runner.invoke(
+        app,
+        ["evolve", "stop", task.evolution_id, "--workspace", str(tmp_path)],
+    )
+    reopened_again = cli_runner.invoke(
+        app,
+        ["evolve", "reopen", task.evolution_id, "--workspace", str(tmp_path)],
+    )
+
+    assert exported.exit_code == 0, exported.output
+    assert export_path.is_file()
+    assert accepted.exit_code == 0, accepted.output
+    assert "ACCEPTED" in accepted.output
+    assert reopened.exit_code == 0, reopened.output
+    assert stopped.exit_code == 0, stopped.output
+    assert "STOPPED" in stopped.output
+    assert reopened_again.exit_code == 0, reopened_again.output
+    assert "AWAITING_EXPERT_FEEDBACK" in reopened_again.output
 
 
 def test_feedback_file_import_is_confirmed_without_constructing_runtime(

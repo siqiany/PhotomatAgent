@@ -8,7 +8,7 @@ import json
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, TypeVar, cast
+from typing import Any, Generic, TypeVar, cast
 
 from photomatagent.runtime.events import (
     EvolutionComparisonCompleted,
@@ -25,7 +25,7 @@ from photomatagent.runtime.events import (
     RuntimeEvent,
 )
 from photomatagent.errors import ToolExecutionError
-from photomatagent.redaction import redact_secrets
+from photomatagent.redaction import redact_secrets, redact_text
 from photomatagent.scientific.evolution.comparison import (
     compare_episodes,
     evaluate_machine_acceptance,
@@ -112,6 +112,17 @@ class IterationClaim:
     events: tuple[RuntimeEvent, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class FreshEvaluationClaim:
+    """One atomically owner-bound evaluation against a frozen strategy."""
+
+    task: EvolutionTask
+    strategy: StrategyVersion
+    episode: EpisodeRecord
+    owner_token: str
+    events: tuple[RuntimeEvent, ...] = ()
+
+
 ALLOWED_TRANSITIONS: dict[EvolutionStatus, frozenset[EvolutionStatus]] = {
     "CREATED": frozenset({"RUNNING", "STOPPED"}),
     "RUNNING": frozenset(
@@ -120,8 +131,8 @@ ALLOWED_TRANSITIONS: dict[EvolutionStatus, frozenset[EvolutionStatus]] = {
     "AWAITING_EXPERT_FEEDBACK": frozenset(
         {"FEEDBACK_RECORDED", "ACCEPTED", "STOPPED"}
     ),
-    "FEEDBACK_RECORDED": frozenset({"REVISION_READY", "STOPPED"}),
-    "REVISION_READY": frozenset({"RUNNING", "STOPPED"}),
+    "FEEDBACK_RECORDED": frozenset({"REVISION_READY", "ACCEPTED", "STOPPED"}),
+    "REVISION_READY": frozenset({"RUNNING", "ACCEPTED", "STOPPED"}),
     "ACCEPTED": frozenset({"AWAITING_EXPERT_FEEDBACK"}),
     "STOPPED": frozenset({"AWAITING_EXPERT_FEEDBACK"}),
     "BUDGET_EXHAUSTED": frozenset({"AWAITING_EXPERT_FEEDBACK", "STOPPED"}),
@@ -500,6 +511,231 @@ class EvolutionService:
                 data_source_fingerprints=data_source_fingerprints or {},
                 owner_token=owner_token,
             )
+
+    def claim_fresh_evaluation(
+        self,
+        evolution_id: str,
+        *,
+        strategy_id: str,
+        owner_token: str,
+        provider: str | None = None,
+        model: str | None = None,
+        tool_surface_fingerprint: Sha256 | None = None,
+        capability_fingerprint: Sha256 | None = None,
+        data_source_fingerprints: dict[str, Sha256] | None = None,
+    ) -> FreshEvaluationClaim:
+        """Atomically reserve a history-free Episode using a frozen strategy."""
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            if task.status == "RUNNING" and task.current_version is not None:
+                existing = transaction.load_episode(task.current_version)
+                if existing.execution_mode != "FRESH_EVALUATION":
+                    raise EvolutionOperationConflict(
+                        "active episode is not a fresh-evaluation invocation"
+                    )
+                if existing.owner_token != owner_token:
+                    raise EvolutionOperationConflict(
+                        "active episode is owned by another fresh-evaluation invocation"
+                    )
+                strategy = self._fresh_strategy(transaction, task, strategy_id)
+                self._validate_fresh_reservation(
+                    existing,
+                    task,
+                    strategy,
+                    provider=provider,
+                    model=model,
+                    tool_surface_fingerprint=tool_surface_fingerprint,
+                    capability_fingerprint=capability_fingerprint,
+                    data_source_fingerprints=data_source_fingerprints or {},
+                    owner_token=owner_token,
+                )
+                return FreshEvaluationClaim(
+                    task=task,
+                    strategy=strategy,
+                    episode=existing,
+                    owner_token=owner_token,
+                    events=self._reservation_events(existing, False),
+                )
+            if task.status != "REVISION_READY":
+                raise InvalidEvolutionTransition(
+                    "fresh evaluation requires REVISION_READY"
+                )
+            strategy = self._fresh_strategy(transaction, task, strategy_id)
+            version = self._next_version(task.current_version)
+            episode = EpisodeRecord(
+                evolution_id=evolution_id,
+                episode_id=self._episode_id(evolution_id, version),
+                version=version,
+                parent_version=task.last_completed_version,
+                applied_feedback_id=None,
+                revision_plan_id=None,
+                owner_token=owner_token,
+                execution_mode="FRESH_EVALUATION",
+                strategy_id=strategy.strategy_id,
+                strategy_arm=strategy.arm,
+                strategy_sha256=strategy.strategy_sha256,
+                strategy_cutoff_at=strategy.cutoff_at,
+                task_snapshot={
+                    "evolution_id": task.evolution_id,
+                    "goal": task.goal,
+                    "target": task.target.model_dump(mode="json"),
+                    "task_group_id": task.task_group_id,
+                    "input_sha256": task.input_sha256,
+                },
+                target_snapshot=TargetSnapshot.model_validate(task.target),
+                provider=provider,
+                model=model,
+                tool_surface_fingerprint=tool_surface_fingerprint,
+                capability_fingerprint=capability_fingerprint,
+                data_source_fingerprints=data_source_fingerprints or {},
+            )
+            transaction.write_episode(episode)
+            transaction.save_task(
+                task.model_copy(
+                    update={
+                        "status": "RUNNING",
+                        "resume_status": None,
+                        "current_version": version,
+                        "episode_ids": self._append_once(
+                            task.episode_ids,
+                            episode.episode_id,
+                        ),
+                    }
+                ),
+                expected_revision=task.revision,
+            )
+            return FreshEvaluationClaim(
+                task=task,
+                strategy=strategy,
+                episode=episode,
+                owner_token=owner_token,
+                events=self._reservation_events(episode, False),
+            )
+
+    def export_evolution(
+        self,
+        evolution_id: str,
+        *,
+        output: Path | str,
+        include_content: bool = False,
+        overwrite: bool = False,
+    ) -> Path:
+        """Export complete provenance, omitting bodies unless explicitly requested."""
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            episodes = [
+                transaction.load_episode(f"v{index:03d}")
+                for index in range(1, len(task.episode_ids) + 1)
+            ]
+            feedback = self.store.list_feedback(evolution_id)
+            compilations = self.store.list_compilations(evolution_id)
+            revisions = self.store.list_revisions(evolution_id)
+            strategies = self.store.list_strategies(evolution_id)
+            comparisons = self.store.list_comparisons(evolution_id)
+            experiences = self.store.list_experiences(evolution_id)
+
+        record_hashes: dict[str, dict[str, str]] = {}
+
+        def dumped(record: object, identity: str, category: str) -> dict[str, object]:
+            raw = cast(Any, record).model_dump(mode="json")
+            safe = cast(dict[str, object], redact_secrets(raw))
+            digest = hashlib.sha256(
+                json.dumps(
+                    safe,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            record_hashes.setdefault(category, {})[identity] = digest
+            return safe
+
+        task_payload = dumped(task, task.evolution_id, "task")
+        episode_payloads = [
+            dumped(item, item.episode_id, "episodes") for item in episodes
+        ]
+        feedback_payloads = [
+            dumped(item, item.feedback_id, "feedback") for item in feedback
+        ]
+        compilation_payloads = [
+            dumped(item, cast(str, item.compilation_id), "compilations")
+            for item in compilations
+        ]
+        revision_payloads = [
+            dumped(item, item.revision_id, "revisions") for item in revisions
+        ]
+        strategy_payloads = [
+            dumped(item, item.strategy_id, "strategies") for item in strategies
+        ]
+        comparison_payloads = [
+            dumped(item, item.comparison_id, "comparisons") for item in comparisons
+        ]
+        experience_payloads = [
+            dumped(item, item.experience_id, "experiences") for item in experiences
+        ]
+
+        if not include_content:
+            feedback_content_fields = {
+                "raw_input",
+                "comments",
+                "fatal_issue",
+                "priority_corrections",
+                "preserved_strengths",
+                "recommended_actions",
+                "resolved_issue_ids",
+                "hard_cap_override_reason",
+            }
+            feedback_payloads = [
+                {key: value for key, value in item.items() if key not in feedback_content_fields}
+                for item in feedback_payloads
+            ]
+            compilation_payloads = [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"items", "warnings", "error"}
+                }
+                for item in compilation_payloads
+            ]
+
+        events = self._export_events(episodes, include_content=include_content)
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "exported_at": utc_now().isoformat(),
+            "include_content": include_content,
+            "task": task_payload,
+            "episodes": episode_payloads,
+            "feedback": feedback_payloads,
+            "compilations": compilation_payloads,
+            "revisions": revision_payloads,
+            "strategies": strategy_payloads,
+            "comparisons": comparison_payloads,
+            "experiences": experience_payloads,
+            "events": events,
+            "record_hashes": record_hashes,
+        }
+        if include_content:
+            for episode, exported in zip(episodes, episode_payloads, strict=True):
+                if episode.artifact is None:
+                    continue
+                artifact = self._verify_artifact(episode.artifact)
+                path = self.store.workspace.resolve(artifact.path, must_exist=True)
+                body = path.read_bytes()
+                try:
+                    text = body.decode("utf-8")
+                except UnicodeDecodeError:
+                    exported["artifact_content"] = {
+                        "encoding": "binary-omitted",
+                        "sha256": artifact.sha256,
+                    }
+                else:
+                    exported["artifact_content"] = {
+                        "encoding": "utf-8",
+                        "body": redact_text(text),
+                    }
+        return self.store.write_export(output, payload, overwrite=overwrite)
 
     def _reserve_episode_locked(
         self,
@@ -1340,13 +1576,21 @@ class EvolutionService:
     ) -> MutationResult[EvolutionTask]:
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
-            if task.status != "AWAITING_EXPERT_FEEDBACK":
+            if task.status not in {
+                "AWAITING_EXPERT_FEEDBACK",
+                "FEEDBACK_RECORDED",
+                "REVISION_READY",
+            }:
                 raise InvalidEvolutionTransition(
-                    "accept requires AWAITING_EXPERT_FEEDBACK"
+                    "accept requires a completed non-running task checkpoint"
                 )
             episode = transaction.load_episode(version)
             if episode.status != "COMPLETED":
                 raise InvalidEvolutionTransition("accepted version must be completed")
+            if episode.episode_id not in task.episode_ids:
+                raise EvolutionOperationConflict(
+                    "accepted episode is not linked by the task manifest"
+                )
             self._verify_artifact(episode.artifact)
             self.validate_transition(task.status, "ACCEPTED")
             saved = transaction.save_task(
@@ -1628,6 +1872,155 @@ class EvolutionService:
             raise EvolutionOperationConflict(
                 "episode transition owner token does not match the active invocation"
             )
+
+    @staticmethod
+    def _fresh_strategy(
+        transaction: EvolutionTransaction,
+        task: EvolutionTask,
+        strategy_id: str,
+    ) -> StrategyVersion:
+        if strategy_id not in task.strategy_ids:
+            raise InvalidEvolutionTransition(
+                "fresh evaluation strategy must be linked by the task manifest"
+            )
+        strategy = transaction.load_strategy(strategy_id)
+        strategy_payload = {
+            "evolution_id": strategy.evolution_id,
+            "revision_id": strategy.parameters.get("revision_id"),
+            "arm": strategy.arm,
+            "reason": strategy.reason,
+            "parameters": strategy.parameters,
+        }
+        actual_hash = hashlib.sha256(
+            json.dumps(
+                strategy_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        claimed_at = utc_now()
+        if (
+            strategy.evolution_id != task.evolution_id
+            or strategy.strategy_sha256 is None
+            or strategy.cutoff_at is None
+            or strategy.created_at > claimed_at
+            or strategy.cutoff_at > claimed_at
+        ):
+            raise EvolutionOperationConflict(
+                "fresh evaluation requires a pre-existing frozen strategy snapshot"
+            )
+        if strategy.strategy_sha256 != actual_hash:
+            raise EvolutionOperationConflict(
+                "fresh evaluation strategy content does not match its frozen hash"
+            )
+        return strategy
+
+    @staticmethod
+    def _validate_fresh_reservation(
+        episode: EpisodeRecord,
+        task: EvolutionTask,
+        strategy: StrategyVersion,
+        *,
+        provider: str | None,
+        model: str | None,
+        tool_surface_fingerprint: Sha256 | None,
+        capability_fingerprint: Sha256 | None,
+        data_source_fingerprints: dict[str, Sha256],
+        owner_token: str,
+    ) -> None:
+        expected_snapshot = {
+            "evolution_id": task.evolution_id,
+            "goal": task.goal,
+            "target": task.target.model_dump(mode="json"),
+            "task_group_id": task.task_group_id,
+            "input_sha256": task.input_sha256,
+        }
+        if (
+            episode.status != "RESERVED"
+            or episode.execution_mode != "FRESH_EVALUATION"
+            or episode.applied_feedback_id is not None
+            or episode.revision_plan_id is not None
+            or episode.owner_token != owner_token
+            or episode.strategy_id != strategy.strategy_id
+            or episode.strategy_arm != strategy.arm
+            or episode.strategy_sha256 != strategy.strategy_sha256
+            or episode.strategy_cutoff_at != strategy.cutoff_at
+            or episode.parent_version != task.last_completed_version
+            or episode.task_snapshot != expected_snapshot
+            or episode.target_snapshot != TargetSnapshot.model_validate(task.target)
+            or episode.provider != provider
+            or episode.model != model
+            or episode.tool_surface_fingerprint != tool_surface_fingerprint
+            or episode.capability_fingerprint != capability_fingerprint
+            or episode.data_source_fingerprints != data_source_fingerprints
+        ):
+            raise EvolutionOperationConflict(
+                "mismatched durable fresh-evaluation reservation"
+            )
+
+    def _export_events(
+        self,
+        episodes: list[EpisodeRecord],
+        *,
+        include_content: bool,
+    ) -> list[dict[str, object]]:
+        exported: list[dict[str, object]] = []
+        seen_paths: set[str] = set()
+        for episode in episodes:
+            relative = episode.event_log_path
+            if relative is None or relative in seen_paths:
+                continue
+            seen_paths.add(relative)
+            try:
+                path = self.store.workspace.resolve(relative, must_exist=True)
+            except (OSError, ValueError, ToolExecutionError) as exc:
+                raise EvolutionOperationConflict(
+                    f"event log is unavailable for episode {episode.version}"
+                ) from exc
+            if not path.is_file():
+                raise EvolutionOperationConflict(
+                    f"event log is not a file for episode {episode.version}"
+                )
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError) as exc:
+                raise EvolutionOperationConflict(
+                    f"event log cannot be read for episode {episode.version}"
+                ) from exc
+            for line_number, line in enumerate(lines, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise EvolutionOperationConflict(
+                        f"event log contains invalid JSON for episode {episode.version}"
+                    ) from exc
+                if not isinstance(raw, dict):
+                    raise EvolutionOperationConflict("event log entries must be objects")
+                safe = cast(dict[str, object], redact_secrets(raw))
+                serialized = json.dumps(
+                    safe,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                item: dict[str, object] = {
+                    "episode_version": episode.version,
+                    "event_log_path": relative,
+                    "line": line_number,
+                    "schema_version": safe.get("schema_version"),
+                    "kind": safe.get("kind"),
+                    "timestamp": safe.get("timestamp"),
+                    "session_id": safe.get("session_id"),
+                    "run_id": safe.get("run_id"),
+                    "evolution_id": safe.get("evolution_id"),
+                    "event_sha256": hashlib.sha256(serialized).hexdigest(),
+                }
+                if include_content:
+                    item["payload"] = safe
+                exported.append(item)
+        return exported
 
     def _verify_artifact(self, artifact: ArtifactRef | None) -> ArtifactRef:
         if artifact is None:
@@ -2002,6 +2395,7 @@ __all__ = [
     "EvolutionOperationConflict",
     "EvolutionService",
     "EvolutionServiceError",
+    "FreshEvaluationClaim",
     "InvalidEvolutionTransition",
     "IterationContext",
     "MutationResult",

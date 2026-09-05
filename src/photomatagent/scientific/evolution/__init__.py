@@ -6,6 +6,10 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from photomatagent.scientific.evolution.executor import (
+        RuntimeFactory,
+        run_fresh_evaluation,
+    )
     from photomatagent.scientific.evolution.evidence import (
         EvidenceCarryDecision,
         build_inherited_scientific_state,
@@ -79,6 +83,7 @@ if TYPE_CHECKING:
         EvolutionOperationConflict,
         EvolutionService,
         EvolutionServiceError,
+        FreshEvaluationClaim,
         InvalidEvolutionTransition,
         IterationContext,
         IterationClaim,
@@ -160,6 +165,7 @@ _SERVICE_EXPORTS = (
     "EvolutionOperationConflict",
     "EvolutionService",
     "EvolutionServiceError",
+    "FreshEvaluationClaim",
     "InvalidEvolutionTransition",
     "IterationContext",
     "IterationClaim",
@@ -175,6 +181,7 @@ _REVISION_EXPORTS = (
     "format_revision_instruction",
 )
 _STRATEGY_EXPORTS = ("FixedStrategySelector",)
+_EXECUTOR_EXPORTS = ("RuntimeFactory", "run_fresh_evaluation")
 _STORE_EXPORTS = (
     "EvolutionAlreadyExistsError",
     "EvolutionConflictError",
@@ -187,6 +194,10 @@ _STORE_EXPORTS = (
 )
 
 _EXPORT_MODULE = {
+    **{
+        name: "photomatagent.scientific.evolution.executor"
+        for name in _EXECUTOR_EXPORTS
+    },
     **{
         name: "photomatagent.scientific.evolution.evidence"
         for name in _EVIDENCE_EXPORTS
@@ -219,6 +230,7 @@ _EXPORT_MODULE = {
 
 __all__ = [
     *_EVIDENCE_EXPORTS,
+    *_EXECUTOR_EXPORTS,
     *_MODEL_EXPORTS,
     *_RUBRIC_EXPORTS,
     *_SERVICE_EXPORTS,

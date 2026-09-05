@@ -73,6 +73,8 @@ _EPISODE_IMMUTABLE_FIELDS = (
     "execution_mode",
     "strategy_id",
     "strategy_arm",
+    "strategy_sha256",
+    "strategy_cutoff_at",
     "task_snapshot",
     "target_snapshot",
     "provider",
@@ -434,10 +436,16 @@ class EvolutionStore:
         episode: EpisodeRecord,
         expected_status: EpisodeStatus,
     ) -> EpisodeRecord:
-        candidate, payload = self._prepare_model(episode, EpisodeRecord)
         if expected_status not in _EPISODE_TRANSITIONS:
             raise ValueError(f"unsupported expected episode status: {expected_status!r}")
-        current = self.load_episode(candidate.evolution_id, candidate.version)
+        current = self.load_episode(episode.evolution_id, episode.version)
+        for field in _EPISODE_IMMUTABLE_FIELDS:
+            if getattr(episode, field) != getattr(current, field):
+                raise EvolutionConflictError(
+                    "immutable episode execution snapshot differs from stored "
+                    f"record for {episode.evolution_id}/{episode.version}: {field}"
+                )
+        candidate, payload = self._prepare_model(episode, EpisodeRecord)
         if current.status != expected_status:
             raise EvolutionConflictError(
                 f"stale episode transition for {candidate.evolution_id}/"
@@ -868,6 +876,24 @@ class EvolutionStore:
                 f"{version}.scientific.json",
             )
             self._write_immutable_json(path, payload)
+        return path
+
+    def write_export(
+        self,
+        output: Path | str,
+        payload: Any,
+        *,
+        overwrite: bool = False,
+    ) -> Path:
+        """Atomically write a workspace-contained export with explicit overwrite."""
+
+        path = self.workspace.resolve(str(output), must_exist=False)
+        if path == self.workspace.root or path.is_dir():
+            raise ValueError("export output must name a file")
+        if overwrite:
+            self._write_json_atomic(path, redact_secrets(payload))
+        else:
+            self._write_immutable_json(path, redact_secrets(payload))
         return path
 
     def load_scientific_state(

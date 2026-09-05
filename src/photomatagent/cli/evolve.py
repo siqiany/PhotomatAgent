@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
@@ -29,6 +29,7 @@ from photomatagent.scientific.evolution.executor import (
     EpisodeExecutionResult,
     EventSink,
     ScientificEpisodeExecutor,
+    run_fresh_evaluation,
 )
 from photomatagent.scientific.evolution.evidence import (
     build_inherited_scientific_state,
@@ -72,6 +73,7 @@ from photomatagent.scientific.loop import (
     ScientificLoopSummary,
     TargetSpec,
 )
+from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
 
 ApprovalMode = Literal["ask", "auto", "deny"]
@@ -769,6 +771,232 @@ def evolve_cancel(
             param_hint="evolution_id",
         ) from exc
     _render_task_details(cancelled.entity, boundary.root)
+
+
+@evolve_app.command("evaluate")
+def evolve_evaluate(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Required: run without task-specific feedback, evidence, or history.",
+    ),
+    strategy_id: str = typer.Option(..., "--strategy-id"),
+    provider: str | None = typer.Option(None, "--provider"),
+    model: str | None = typer.Option(None, "--model"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+    approval: str = typer.Option("auto", "--approval", help="ask | auto | deny"),
+    max_rounds: int = typer.Option(6, "--max-rounds", min=1),
+    patience: int = typer.Option(3, "--patience", min=1),
+    min_confidence: float = typer.Option(
+        0.6, "--min-confidence", min=0.0, max=1.0
+    ),
+    judge_provider: str | None = typer.Option(None, "--judge-provider"),
+    judge_model: str | None = typer.Option(None, "--judge-model"),
+    judge_min_quality: float = typer.Option(
+        0.6, "--judge-min-quality", min=0.0, max=1.0
+    ),
+    require_judge: bool = typer.Option(False, "--require-judge"),
+    log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
+) -> None:
+    """Run an explicitly isolated evaluation against a frozen strategy."""
+
+    if not fresh:
+        console.print("[red]evaluate requires explicit --fresh[/]")
+        raise typer.Exit(code=2)
+    if approval not in {"ask", "auto", "deny"}:
+        console.print("[red]--approval must be ask | auto | deny[/]")
+        raise typer.Exit(code=2)
+    try:
+        boundary = Workspace(workspace)
+        store = EvolutionStore(boundary)
+        service = EvolutionService(store)
+        task = service.get(evolution_id)
+        provider_config = _resolve_provider_config(boundary.root, provider, model)
+        owner_token = new_episode_owner_token()
+        executor = ScientificEpisodeExecutor(store)
+        logger_box: list[EventLogger | None] = []
+
+        from photomatagent.cli.chat import build_runtime
+        from photomatagent.cli.loop import _build_judge, _render_event, _render_summary
+
+        def runtime_factory(**fresh_kwargs: object) -> AgentRuntime:
+            runtime, logger = build_runtime(
+                provider=provider_config.provider,
+                model=provider_config.model,
+                workspace_root=boundary.root,
+                approval=cast(ApprovalMode, approval),
+                fresh_approval=cast(bool, fresh_kwargs["fresh_approval"]),
+                application_approval_root=cast(
+                    Path,
+                    fresh_kwargs["application_approval_root"],
+                ),
+                max_iterations=10000,
+                session_dir=boundary.root / default_sessions_dir(),
+                log_events=log_events,
+                scientific_state=cast(
+                    ScientificState,
+                    fresh_kwargs["scientific_state"],
+                ),
+            )
+            executor.event_logger = logger
+            logger_box.append(logger)
+            return runtime
+
+        judge = _build_judge(judge_provider, judge_model, console)
+        execution = asyncio.run(
+            run_fresh_evaluation(
+                service=service,
+                task=task,
+                strategy_id=strategy_id,
+                executor=executor,
+                runtime_factory=runtime_factory,
+                config=ScientificLoopConfig(
+                    max_rounds=max_rounds,
+                    patience=patience,
+                    min_confidence=min_confidence,
+                    judge_min_quality=judge_min_quality,
+                    require_judge=require_judge,
+                ),
+                judge=judge,
+                on_event=lambda event: _render_event(
+                    console,
+                    _redacted_event(event),
+                ),
+                owner_token=owner_token,
+                provider=provider_config.provider,
+                model=provider_config.model,
+            )
+        )
+    except KeyboardInterrupt:
+        console.print("[red]fresh evaluation cancelled[/]")
+        raise typer.Exit(code=130) from None
+    except (
+        OSError,
+        ValueError,
+        ToolExecutionError,
+        EvolutionServiceError,
+        EvolutionStoreError,
+    ) as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        raise typer.Exit(code=2) from None
+    except Exception as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        _render_task_details(service.get(evolution_id), boundary.root)
+        raise typer.Exit(code=1) from None
+
+    _render_summary(console, _redacted_summary(execution.scientific_summary))
+    _render_start_result(service.get(evolution_id), execution, boundary.root)
+    if logger_box and logger_box[-1] is not None:
+        console.print(f"[dim]events logged: {logger_box[-1].events_path}[/]")
+
+
+@evolve_app.command("export")
+def evolve_export(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    output: Path | None = typer.Option(None, "--output"),
+    include_content: bool = typer.Option(False, "--include-content"),
+    overwrite: bool = typer.Option(False, "--overwrite"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Export redacted evolution provenance to a workspace-contained JSON file."""
+
+    try:
+        boundary = Workspace(workspace)
+        destination = output or Path("user_output") / evolution_id / "export.json"
+        path = EvolutionService(EvolutionStore(boundary)).export_evolution(
+            evolution_id,
+            output=destination,
+            include_content=include_content,
+            overwrite=overwrite,
+        )
+    except (
+        OSError,
+        ValueError,
+        ToolExecutionError,
+        EvolutionServiceError,
+        EvolutionStoreError,
+    ) as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        raise typer.Exit(code=2) from None
+    console.print(f"[green]Exported {boundary.relative(path)}[/]")
+
+
+@evolve_app.command("accept")
+def evolve_accept(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    version: str = typer.Option(..., "--version"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Accept any verified completed Episode artifact."""
+
+    _run_control_command(
+        evolution_id,
+        workspace,
+        lambda service: service.accept(
+            evolution_id,
+            cast(EpisodeVersion, version),
+        ),
+    )
+
+
+@evolve_app.command("stop")
+def evolve_stop(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Stop at the current resumable lifecycle checkpoint."""
+
+    _run_control_command(
+        evolution_id,
+        workspace,
+        lambda service: service.stop(evolution_id),
+    )
+
+
+@evolve_app.command("reopen")
+def evolve_reopen(
+    evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
+    workspace: Path = typer.Option(
+        Path.cwd(), "--workspace", exists=True, file_okay=False
+    ),
+) -> None:
+    """Reopen an accepted, stopped, blocked, or budget-exhausted task."""
+
+    _run_control_command(
+        evolution_id,
+        workspace,
+        lambda service: service.reopen(evolution_id),
+    )
+
+
+def _run_control_command(
+    evolution_id: str,
+    workspace: Path,
+    operation: Callable[[EvolutionService], MutationResult[EvolutionTask]],
+) -> None:
+    boundary = Workspace(workspace)
+    service = EvolutionService(EvolutionStore(boundary))
+    try:
+        mutation = operation(service)
+    except (
+        OSError,
+        ValueError,
+        ToolExecutionError,
+        EvolutionServiceError,
+        EvolutionStoreError,
+    ) as exc:
+        console.print(f"[red]{_bounded_error(exc)}[/]")
+        raise typer.Exit(code=2) from None
+    _render_task_details(mutation.entity, boundary.root)
 
 
 @evolve_app.command("compile")

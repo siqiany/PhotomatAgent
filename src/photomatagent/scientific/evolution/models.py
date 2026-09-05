@@ -571,6 +571,8 @@ class EpisodeRecord(StrictModel):
     execution_mode: ExecutionMode = Field(default="NORMAL", frozen=True)
     strategy_id: ManagedId | None = Field(default=None, frozen=True)
     strategy_arm: StrategyArm = Field(default="STATIC", frozen=True)
+    strategy_sha256: Sha256 | None = Field(default=None, frozen=True)
+    strategy_cutoff_at: UtcDatetime | None = Field(default=None, frozen=True)
     scientific_state_path: str | None = None
     task_snapshot: FrozenJsonObject = Field(frozen=True)
     target_snapshot: TargetSnapshot = Field(frozen=True)
@@ -592,6 +594,23 @@ class EpisodeRecord(StrictModel):
     acceptance_results: list[AcceptanceResult] = Field(default_factory=list)
     error: str | None = None
     created_at: UtcDatetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_fresh_evaluation_provenance(self) -> Self:
+        if self.execution_mode != "FRESH_EVALUATION":
+            return self
+        if (
+            self.strategy_id is None
+            or self.strategy_sha256 is None
+            or self.strategy_cutoff_at is None
+            or self.owner_token is None
+        ):
+            raise ValueError(
+                "fresh evaluation requires owner-bound frozen strategy provenance"
+            )
+        if self.applied_feedback_id is not None or self.revision_plan_id is not None:
+            raise ValueError("fresh evaluation cannot apply feedback or revision")
+        return self
 
 
 class FeedbackDelta(StrictModel):
