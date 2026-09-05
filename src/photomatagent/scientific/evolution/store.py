@@ -12,7 +12,7 @@ import stat
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock, local
 from typing import Any, Iterator, TypeVar
@@ -188,6 +188,21 @@ class EvaluationLease:
     active: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class _RegisteredTransaction:
+    transaction: EvolutionTransaction
+    store: EvolutionStore
+    evolution_id: str
+    learning: bool
+
+
+@dataclass(slots=True)
+class _WorkspaceThreadLockState:
+    learning_depth: int = 0
+    task_depths: dict[str, int] = field(default_factory=dict)
+    transactions: dict[int, _RegisteredTransaction] = field(default_factory=dict)
+
+
 class EvolutionTransaction:
     """Operations performed while one evolution task lock is held."""
 
@@ -195,13 +210,10 @@ class EvolutionTransaction:
         self,
         store: EvolutionStore,
         evolution_id: str,
-        *,
-        _learning_capability: object | None = None,
     ) -> None:
         self.store = store
         self.evolution_id = evolution_id
         self._active = False
-        self._learning_capability = _learning_capability
 
     def _require_active(self) -> None:
         if not self._active:
@@ -209,13 +221,7 @@ class EvolutionTransaction:
 
     def _require_learning_transaction(self) -> None:
         self._require_active()
-        if (
-            self._learning_capability is not self.store._strategy_learning_capability
-            or not self.store._strategy_learning_lock_held()
-        ):
-            raise EvolutionLockError(
-                "strategy learning writes require a strategy learning transaction"
-            )
+        self.store._require_registered_learning_transaction(self)
 
     def load_task(self) -> EvolutionTask:
         self._require_active()
@@ -469,7 +475,6 @@ class EvolutionStore:
         self.root = workspace.resolve(_STORE_PATH, must_exist=True)
         self._active_evaluation_leases: dict[int, EvaluationLease] = {}
         self._strategy_learning_thread_lock = RLock()
-        self._strategy_learning_capability = object()
 
     @contextmanager
     def transaction(self, evolution_id: str) -> Iterator[EvolutionTransaction]:
@@ -478,11 +483,8 @@ class EvolutionStore:
         task_dir = self._task_dir(evolution_id)
         transaction = EvolutionTransaction(self, evolution_id)
         with self._task_lock(task_dir):
-            transaction._active = True
-            try:
+            with self._registered_transaction(transaction, learning=False):
                 yield transaction
-            finally:
-                transaction._active = False
 
     @contextmanager
     def strategy_learning_transaction(
@@ -491,17 +493,10 @@ class EvolutionStore:
         """Hold the task lock, then the cross-task learning publication lock."""
 
         task_dir = self._task_dir(evolution_id)
-        transaction = EvolutionTransaction(
-            self,
-            evolution_id,
-            _learning_capability=self._strategy_learning_capability,
-        )
+        transaction = EvolutionTransaction(self, evolution_id)
         with self._task_lock(task_dir), self.strategy_learning_lock():
-            transaction._active = True
-            try:
+            with self._registered_transaction(transaction, learning=True):
                 yield transaction
-            finally:
-                transaction._active = False
 
     @contextmanager
     def strategy_learning_lock(self) -> Iterator[None]:
@@ -509,13 +504,13 @@ class EvolutionStore:
 
         with self._strategy_learning_thread_lock:
             state = self._workspace_thread_lock_state()
-            depth = state["learning"]
+            depth = state.learning_depth
             if depth:
-                state["learning"] = depth + 1
+                state.learning_depth = depth + 1
                 try:
                     yield
                 finally:
-                    state["learning"] = depth
+                    state.learning_depth = depth
                 return
             lock_path = self.workspace.resolve(
                 self.workspace.relative(self.root / ".strategy-learning.lock"),
@@ -536,10 +531,10 @@ class EvolutionStore:
                             "timed out acquiring strategy learning lock"
                         )
                     time.sleep(min(self.lock_poll_seconds, remaining))
-                state["learning"] = 1
+                state.learning_depth = 1
                 yield
             finally:
-                state["learning"] = 0
+                state.learning_depth = 0
                 try:
                     if acquired:
                         self._release_advisory_lock(descriptor)
@@ -2265,7 +2260,7 @@ class EvolutionStore:
     @contextmanager
     def _task_lock(self, task_dir: Path) -> Iterator[None]:
         state = self._workspace_thread_lock_state()
-        if state["learning"]:
+        if state.learning_depth:
             raise EvolutionLockError(
                 "strategy learning lock order violation: task lock cannot be "
                 "acquired while the workspace learning lock is held"
@@ -2288,11 +2283,18 @@ class EvolutionStore:
                         f"timed out acquiring evolution task lock: {task_dir.name}"
                     )
                 time.sleep(min(self.lock_poll_seconds, remaining))
-            state["task"] += 1
+            evolution_id = task_dir.name
+            state.task_depths[evolution_id] = (
+                state.task_depths.get(evolution_id, 0) + 1
+            )
             try:
                 yield
             finally:
-                state["task"] -= 1
+                remaining_depth = state.task_depths[evolution_id] - 1
+                if remaining_depth:
+                    state.task_depths[evolution_id] = remaining_depth
+                else:
+                    del state.task_depths[evolution_id]
         finally:
             try:
                 if acquired:
@@ -2300,7 +2302,7 @@ class EvolutionStore:
             finally:
                 os.close(descriptor)
 
-    def _workspace_thread_lock_state(self) -> dict[str, int]:
+    def _workspace_thread_lock_state(self) -> _WorkspaceThreadLockState:
         states = getattr(_WORKSPACE_LOCK_STATE, "states", None)
         if states is None:
             states = {}
@@ -2308,12 +2310,57 @@ class EvolutionStore:
         key = str(self.workspace.root)
         state = states.get(key)
         if state is None:
-            state = {"task": 0, "learning": 0}
+            state = _WorkspaceThreadLockState()
             states[key] = state
         return state
 
-    def _strategy_learning_lock_held(self) -> bool:
-        return self._workspace_thread_lock_state()["learning"] > 0
+    @contextmanager
+    def _registered_transaction(
+        self,
+        transaction: EvolutionTransaction,
+        *,
+        learning: bool,
+    ) -> Iterator[None]:
+        state = self._workspace_thread_lock_state()
+        transaction_key = id(transaction)
+        if transaction_key in state.transactions:
+            raise EvolutionLockError("evolution transaction is already registered")
+        registration = _RegisteredTransaction(
+            transaction=transaction,
+            store=self,
+            evolution_id=transaction.evolution_id,
+            learning=learning,
+        )
+        state.transactions[transaction_key] = registration
+        transaction._active = True
+        try:
+            yield
+        finally:
+            current = state.transactions.get(transaction_key)
+            if current is registration:
+                del state.transactions[transaction_key]
+            transaction._active = False
+
+    def _require_registered_learning_transaction(
+        self,
+        transaction: EvolutionTransaction,
+    ) -> None:
+        state = self._workspace_thread_lock_state()
+        registration = state.transactions.get(id(transaction))
+        if (
+            registration is None
+            or registration.transaction is not transaction
+            or registration.store is not self
+            or registration.evolution_id != transaction.evolution_id
+            or not registration.learning
+            or not transaction._active
+            or state.learning_depth <= 0
+            or state.task_depths.get(transaction.evolution_id, 0) <= 0
+        ):
+            raise EvolutionLockError(
+                "strategy learning transaction is not registered with both "
+                "task and learning locks"
+            )
 
     @staticmethod
     def _initialize_lock_file(descriptor: int) -> None:

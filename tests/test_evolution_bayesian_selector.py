@@ -33,6 +33,7 @@ from photomatagent.scientific.evolution.store import (
     EvolutionCorruptRecordError,
     EvolutionLockError,
     EvolutionStore,
+    EvolutionTransaction,
 )
 from photomatagent.scientific.evolution.strategy import (
     FEATURE_SCHEMA,
@@ -681,6 +682,96 @@ def test_cross_instance_reverse_learning_to_task_lock_is_rejected_immediately(
         elapsed = time.monotonic() - started
 
     assert elapsed < 0.5
+
+
+def test_forged_transaction_cannot_write_observation_with_stolen_capability(
+    tmp_path: Path,
+) -> None:
+    attacker_store, observation = _persist_observation_sources(
+        tmp_path,
+        index=10_000,
+        task_group_id="group_forged_observation",
+    )
+    task_holder_store = EvolutionStore(Workspace(tmp_path))
+    stolen_capability = getattr(
+        attacker_store,
+        "_strategy_learning_capability",
+        object(),
+    )
+    task_locked = Event()
+    release_task = Event()
+
+    def hold_task_lock() -> None:
+        with task_holder_store.transaction(observation.evolution_id):
+            task_locked.set()
+            assert release_task.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        holder = executor.submit(hold_task_lock)
+        assert task_locked.wait(timeout=5)
+        try:
+            with attacker_store.strategy_learning_lock():
+                forged = EvolutionTransaction(
+                    attacker_store,
+                    observation.evolution_id,
+                )
+                forged._active = True
+                forged._learning_capability = stolen_capability
+                with pytest.raises(EvolutionLockError, match="registered"):
+                    forged.write_strategy_observation(observation)
+        finally:
+            release_task.set()
+            holder.result(timeout=5)
+
+    assert attacker_store.list_strategy_observations(observation.evolution_id) == []
+
+
+def test_forged_transaction_cannot_write_posterior_with_stolen_capability(
+    tmp_path: Path,
+) -> None:
+    observations: list[StrategyObservation] = []
+    attacker_store: EvolutionStore | None = None
+    for index in range(20):
+        attacker_store, observation = _persist_observation_sources(
+            tmp_path,
+            index=11_000 + index,
+            task_group_id=f"group_forged_posterior_{index % 8}",
+        )
+        attacker_store.write_strategy_observation(observation)
+        observations.append(observation)
+    assert attacker_store is not None
+    posterior = BayesianLinearStrategySelector().fit(observations).posterior
+    assert posterior is not None
+    task_holder_store = EvolutionStore(Workspace(tmp_path))
+    stolen_capability = getattr(
+        attacker_store,
+        "_strategy_learning_capability",
+        object(),
+    )
+    task_locked = Event()
+    release_task = Event()
+
+    def hold_task_lock() -> None:
+        with task_holder_store.transaction(observations[0].evolution_id):
+            task_locked.set()
+            assert release_task.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        holder = executor.submit(hold_task_lock)
+        assert task_locked.wait(timeout=5)
+        try:
+            with attacker_store.strategy_learning_lock():
+                forged = EvolutionTransaction(
+                    attacker_store,
+                    observations[0].evolution_id,
+                )
+                forged._active = True
+                forged._learning_capability = stolen_capability
+                with pytest.raises(EvolutionLockError, match="registered"):
+                    forged.write_strategy_posterior(posterior)
+        finally:
+            release_task.set()
+            holder.result(timeout=5)
 
 
 def _persist_observation_sources(
