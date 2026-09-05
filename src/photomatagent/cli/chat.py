@@ -44,6 +44,7 @@ def build_runtime(
     scientific_state: ScientificState | None = None,
     fresh_approval: bool = False,
     application_approval_root: Path | str | None = None,
+    evaluation_isolation: bool = False,
 ) -> tuple[AgentRuntime, EventLogger | None]:
     workspace = Workspace(workspace_root or Path.cwd())
     scientific = (
@@ -58,6 +59,7 @@ def build_runtime(
         scientific,
         workspace,
         application_approval_root=resolved_approval_root,
+        evaluation_isolation=evaluation_isolation,
     )
     model_provider = create_provider(provider, model)
     budget = BudgetState(max_iterations=max_iterations)

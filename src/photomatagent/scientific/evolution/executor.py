@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import os
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.scientific.evolution.artifacts import (
     EpisodeArtifactCollector,
     materialize_primary_result,
+    sha256_file,
 )
 from photomatagent.scientific.evolution.comparison import evaluate_machine_acceptance
 from photomatagent.scientific.evolution.models import (
@@ -40,6 +43,7 @@ from photomatagent.scientific.loop import (
     ScientificLoopSummary,
 )
 from photomatagent.scientific.state import ScientificState
+from photomatagent.workspace import Workspace
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _REVISION_INSTRUCTION_MAX_CHARS = 12_000
@@ -96,7 +100,8 @@ class ScientificEpisodeExecutor:
         on_event: EventSink | None = None,
         owner_token: str | None = None,
     ) -> EpisodeExecutionResult:
-        self.service.reconcile(task.evolution_id)
+        if episode.execution_mode != "FRESH_EVALUATION":
+            self.service.reconcile(task.evolution_id)
         self._validate_execution(
             task=task,
             episode=episode,
@@ -116,13 +121,24 @@ class ScientificEpisodeExecutor:
         started_at = time.monotonic()
         runtime_logs_events = self._runtime_uses_event_logger(runtime)
         try:
-            running_result = self.service.mark_episode_running(
-                task.evolution_id,
-                episode.version,
-                owner_token=owner_token,
-                runtime_session_id=runtime_session_id,
-                event_log_path=event_log_path,
-            )
+            if episode.execution_mode == "FRESH_EVALUATION":
+                if owner_token is None:
+                    raise ValueError("fresh evaluation requires an owner token")
+                running_result = self.service.mark_evaluation_running(
+                    task.evolution_id,
+                    episode.version,
+                    owner_token=owner_token,
+                    runtime_session_id=runtime_session_id,
+                    event_log_path=event_log_path,
+                )
+            else:
+                running_result = self.service.mark_episode_running(
+                    task.evolution_id,
+                    episode.version,
+                    owner_token=owner_token,
+                    runtime_session_id=runtime_session_id,
+                    event_log_path=event_log_path,
+                )
             running = running_result.entity
             controller = ScientificLoopController(
                 target=episode.target_snapshot.to_target_spec(),
@@ -143,17 +159,30 @@ class ScientificEpisodeExecutor:
             if controller.summary is None:
                 raise RuntimeError("scientific loop ended without a summary")
             artifact = materialize_primary_result(
-                workspace=self.store.workspace,
+                workspace=runtime.workspace,
                 evolution_id=task.evolution_id,
                 version=episode.version,
                 conversation=runtime.conversation_state,
                 collector=collector,
             )
-            state_path = self.store.write_scientific_state(
-                task.evolution_id,
-                episode.version,
-                runtime.scientific_state,
-            )
+            if episode.execution_mode == "FRESH_EVALUATION":
+                artifact = self._copy_evaluation_artifact(
+                    task.evolution_id,
+                    episode.version,
+                    runtime.workspace,
+                    artifact,
+                )
+                state_path = self.store.write_evaluation_scientific_state(
+                    task.evolution_id,
+                    episode.version,
+                    runtime.scientific_state,
+                )
+            else:
+                state_path = self.store.write_scientific_state(
+                    task.evolution_id,
+                    episode.version,
+                    runtime.scientific_state,
+                )
             scientific_state_path = self.store.workspace.relative(state_path)
             cost = self._cost_snapshot(runtime, started_at)
             completion = running.model_copy(
@@ -174,12 +203,22 @@ class ScientificEpisodeExecutor:
                         )
                     }
                 )
-            completed_result = self.service.complete_episode(
-                task.evolution_id,
-                episode.version,
-                result=completion,
-                owner_token=owner_token,
-            )
+            if episode.execution_mode == "FRESH_EVALUATION":
+                if owner_token is None:
+                    raise ValueError("fresh evaluation requires an owner token")
+                completed_result = self.service.complete_evaluation(
+                    task.evolution_id,
+                    episode.version,
+                    result=completion,
+                    owner_token=owner_token,
+                )
+            else:
+                completed_result = self.service.complete_episode(
+                    task.evolution_id,
+                    episode.version,
+                    result=completion,
+                    owner_token=owner_token,
+                )
             comparison_result = None
             if persisted_revision is not None and episode.parent_version is not None:
                 comparison_result = self.service.compare(
@@ -217,7 +256,33 @@ class ScientificEpisodeExecutor:
         runtime: AgentRuntime,
         owner_token: str | None,
     ) -> None:
-        if runtime.workspace.root != self.store.workspace.root:
+        if episode.execution_mode == "FRESH_EVALUATION":
+            if episode.evaluation_workspace_path is None:
+                raise ValueError("fresh evaluation workspace provenance is missing")
+            expected_workspace = self.store.workspace.resolve(
+                episode.evaluation_workspace_path,
+                must_exist=True,
+            )
+            if runtime.workspace.root != expected_workspace:
+                raise ValueError("fresh runtime must use its isolated evaluation workspace")
+            if not runtime._tools.evaluation_isolated:
+                raise ValueError("fresh runtime requires an evaluation-isolated registry")
+            allowed_tools = {
+                "echo",
+                "calculator",
+                "scientific_state_inspect",
+                "mock.run_calculation",
+                "tool_search",
+                "tool_describe",
+                "tool_call",
+            }
+            exposed = {tool.name for tool in runtime._tools.list_tools()}
+            forbidden = sorted(exposed - allowed_tools)
+            if forbidden:
+                raise ValueError(
+                    "fresh runtime contains non-isolated tools: " + ", ".join(forbidden)
+                )
+        elif runtime.workspace.root != self.store.workspace.root:
             raise ValueError("runtime and evolution store must use the same workspace")
         if runtime.conversation_state.messages:
             raise ValueError("evolution episodes require a fresh runtime conversation")
@@ -231,8 +296,15 @@ class ScientificEpisodeExecutor:
         if task.evolution_id != episode.evolution_id:
             raise ValueError("task and episode belong to different evolution tasks")
         stored_task = self.store.load_task(task.evolution_id)
-        stored_episode = self.store.load_episode(task.evolution_id, episode.version)
-        if stored_task.current_version != episode.version:
+        stored_episode = (
+            self.store.load_evaluation_episode(task.evolution_id, episode.version)
+            if episode.execution_mode == "FRESH_EVALUATION"
+            else self.store.load_episode(task.evolution_id, episode.version)
+        )
+        if episode.execution_mode == "FRESH_EVALUATION":
+            if stored_task.current_evaluation_version != episode.version:
+                raise ValueError("evaluation is not the current reserved evaluation")
+        elif stored_task.current_version != episode.version:
             raise ValueError("episode is not the task's current reserved version")
         if stored_episode != episode or stored_episode.status != "RESERVED":
             raise ValueError("executor requires the exact persisted RESERVED episode")
@@ -291,6 +363,19 @@ class ScientificEpisodeExecutor:
                 ):
                     raise ValueError(
                         "runtime session is already attributed to another episode"
+                    )
+            for number in range(1, len(existing_task.evaluation_episode_ids) + 1):
+                existing = self.store.load_evaluation_episode(
+                    existing_task.evolution_id,
+                    f"v{number:03d}",
+                )
+                if (
+                    existing.runtime_session_id == session_id
+                    and (existing.evolution_id, existing.version)
+                    != (evolution_id, version)
+                ):
+                    raise ValueError(
+                        "runtime session is already attributed to another evaluation"
                     )
 
     def _persisted_revision(
@@ -370,6 +455,13 @@ class ScientificEpisodeExecutor:
         result: MutationResult[object],
         on_event: EventSink | None,
     ) -> None:
+        evolution_id = getattr(result.entity, "evolution_id", None)
+        if isinstance(evolution_id, str):
+            self.store.append_events(
+                evolution_id,
+                result.events,
+                idempotency_scope=self.store.event_scope(result.entity),
+            )
         for event in result.events:
             if self.event_logger is not None:
                 await self.event_logger.log(event)
@@ -434,11 +526,29 @@ class ScientificEpisodeExecutor:
         recovery_error: BaseException | None = None
         for _ in range(2):
             try:
-                persisted = self.store.load_episode(
-                    task.evolution_id,
-                    episode.version,
+                persisted = (
+                    self.store.load_evaluation_episode(
+                        task.evolution_id,
+                        episode.version,
+                    )
+                    if episode.execution_mode == "FRESH_EVALUATION"
+                    else self.store.load_episode(task.evolution_id, episode.version)
                 )
                 persisted_task = self.store.load_task(task.evolution_id)
+                if episode.execution_mode == "FRESH_EVALUATION":
+                    if persisted.status == "COMPLETED":
+                        return
+                    if persisted.status == "FAILED":
+                        return
+                    if owner_token is None:
+                        raise ValueError("fresh evaluation requires an owner token")
+                    self.service.fail_evaluation(
+                        task.evolution_id,
+                        episode.version,
+                        self._bounded_error(error),
+                        owner_token=owner_token,
+                    )
+                    return
                 if persisted.status == "COMPLETED":
                     if persisted_task.status == "RUNNING":
                         reconciled = self.service.complete_episode(
@@ -480,6 +590,49 @@ class ScientificEpisodeExecutor:
                 f"{safe_recovery_error}"
             )
 
+    def _copy_evaluation_artifact(
+        self,
+        evolution_id: str,
+        version: str,
+        isolated_workspace: Workspace,
+        artifact: ArtifactRef,
+    ) -> ArtifactRef:
+        source = isolated_workspace.resolve(artifact.path, must_exist=True)
+        if not source.is_file() or source.is_symlink():
+            raise ValueError("isolated evaluation result must be a regular file")
+        destination_relative = (
+            f"user_output/{evolution_id}/evaluations/{version}/result.md"
+        )
+        destination = self.store.workspace.resolve(
+            destination_relative,
+            must_exist=False,
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".result.", suffix=".tmp", dir=destination.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle, source.open("rb") as reader:
+                descriptor = -1
+                for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, destination)
+        except FileExistsError as exc:
+            raise ValueError("evaluation result already exists") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+        return ArtifactRef(
+            path=destination_relative,
+            media_type=artifact.media_type,
+            size_bytes=destination.stat().st_size,
+            sha256=sha256_file(destination),
+        )
+
 
 async def run_fresh_evaluation(
     *,
@@ -513,11 +666,23 @@ async def run_fresh_evaluation(
         provider=provider,
         model=model,
     )
+    service.store.append_events(
+        task.evolution_id,
+        claim.events,
+        idempotency_scope=service.store.event_scope(claim.episode),
+    )
     approval_root = Path(".photomatagent/evolution-approvals") / task.evolution_id / (
         f"{claim.episode.version}_{claim.episode.episode_id}"
     )
+    if claim.episode.evaluation_workspace_path is None:
+        raise ValueError("evaluation workspace provenance is missing")
+    evaluation_workspace = service.store.workspace.resolve(
+        claim.episode.evaluation_workspace_path,
+        must_exist=True,
+    )
     try:
         runtime = runtime_factory(
+            workspace_root=evaluation_workspace,
             scientific_state=ScientificState(),
             fresh_approval=True,
             application_approval_root=approval_root,
@@ -539,12 +704,12 @@ async def run_fresh_evaluation(
         )
     except BaseException as exc:
         try:
-            persisted = service.store.load_episode(
+            persisted = service.store.load_evaluation_episode(
                 task.evolution_id,
                 claim.episode.version,
             )
             if persisted.status in {"RESERVED", "RUNNING"}:
-                service.fail_episode(
+                service.fail_evaluation(
                     task.evolution_id,
                     claim.episode.version,
                     ScientificEpisodeExecutor._bounded_error(exc),

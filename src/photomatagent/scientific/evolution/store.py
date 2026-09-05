@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+import hashlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, TypeVar
@@ -16,6 +17,7 @@ from typing import Any, Iterator, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from photomatagent.redaction import redact_secrets
+from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.scientific.evolution.models import (
     ComparisonReport,
     EpisodeRecord,
@@ -47,7 +49,10 @@ _TASK_MUTABLE_FIELDS = (
     "current_version",
     "last_completed_version",
     "accepted_version",
+    "accepted_resume_status",
     "episode_ids",
+    "evaluation_episode_ids",
+    "current_evaluation_version",
     "feedback_ids",
     "compilation_ids",
     "revision_ids",
@@ -75,6 +80,7 @@ _EPISODE_IMMUTABLE_FIELDS = (
     "strategy_arm",
     "strategy_sha256",
     "strategy_cutoff_at",
+    "evaluation_workspace_path",
     "task_snapshot",
     "target_snapshot",
     "provider",
@@ -174,6 +180,32 @@ class EvolutionTransaction:
             filename=f"{episode.version}.json",
             record=episode,
             model_type=EpisodeRecord,
+        )
+
+    def load_evaluation_episode(self, version: str) -> EpisodeRecord:
+        self._require_active()
+        return self.store.load_evaluation_episode(self.evolution_id, version)
+
+    def write_evaluation_episode(self, episode: EpisodeRecord) -> Path:
+        self._require_active()
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="evaluations",
+            filename=f"{episode.version}.json",
+            record=episode,
+            model_type=EpisodeRecord,
+        )
+
+    def transition_evaluation_episode(
+        self,
+        episode: EpisodeRecord,
+        *,
+        expected_status: EpisodeStatus,
+    ) -> EpisodeRecord:
+        self._require_active()
+        return self.store._transition_evaluation_episode_locked(
+            episode,
+            expected_status,
         )
 
     def transition_episode(
@@ -339,6 +371,127 @@ class EvolutionStore:
             )
         return task
 
+    def append_events(
+        self,
+        evolution_id: str,
+        events: Iterator[RuntimeEvent] | tuple[RuntimeEvent, ...] | list[RuntimeEvent],
+        *,
+        idempotency_scope: str | None = None,
+    ) -> None:
+        """Append lifecycle events to the evolution journal, once per exact event."""
+
+        pending = list(events)
+        if not pending:
+            return
+        task_dir = self._task_dir(evolution_id)
+        with self._task_lock(task_dir):
+            path = self._managed_path(evolution_id, "events.jsonl")
+            existing_ids: set[str] = set()
+            if path.exists():
+                if path.is_symlink() or not path.is_file():
+                    raise EvolutionCorruptRecordError(path, "event journal is not a regular file")
+                for line_number, line in enumerate(path.read_bytes().splitlines(), start=1):
+                    try:
+                        envelope = json.loads(line)
+                        existing_ids.add(str(envelope["event_id"]))
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise EvolutionCorruptRecordError(
+                            path, f"invalid event journal line {line_number}: {exc}"
+                        ) from exc
+            additions: list[bytes] = []
+            for event in pending:
+                payload = event.model_dump(mode="json")
+                source = json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                identity_payload = dict(payload)
+                if idempotency_scope is not None:
+                    identity_payload.pop("timestamp", None)
+                    identity_payload.pop("session_id", None)
+                    identity_payload.pop("run_id", None)
+                identity = json.dumps(
+                    {"scope": idempotency_scope, "event": identity_payload},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                event_id = hashlib.sha256(identity).hexdigest()
+                if event_id in existing_ids:
+                    continue
+                envelope = {"event_id": event_id, "event": payload}
+                additions.append(
+                    json.dumps(
+                        envelope,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                existing_ids.add(event_id)
+            if not additions:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            descriptor = os.open(path, flags, 0o600)
+            try:
+                with os.fdopen(descriptor, "ab", closefd=True) as stream:
+                    for addition in additions:
+                        stream.write(addition)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except Exception:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+
+    def read_event_journal(self, evolution_id: str) -> list[tuple[bytes, dict[str, Any]]]:
+        """Return exact source lines and decoded journal envelopes."""
+
+        path = self._managed_path(evolution_id, "events.jsonl")
+        if not path.exists():
+            return []
+        if path.is_symlink() or not path.is_file():
+            raise EvolutionCorruptRecordError(path, "event journal is not a regular file")
+        records: list[tuple[bytes, dict[str, Any]]] = []
+        for line_number, raw in enumerate(
+            path.read_bytes().splitlines(keepends=True), start=1
+        ):
+            try:
+                decoded = json.loads(raw)
+                if not isinstance(decoded, dict) or not isinstance(decoded.get("event"), dict):
+                    raise TypeError("journal envelope must contain an event object")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise EvolutionCorruptRecordError(
+                    path, f"invalid event journal line {line_number}: {exc}"
+                ) from exc
+            records.append((raw, decoded))
+        return records
+
+    @staticmethod
+    def event_scope(record: object) -> str:
+        """Stable mutation identity used to suppress crash/retry event duplicates."""
+
+        if isinstance(record, EvolutionTask):
+            return f"task:{record.revision}:{record.status}"
+        if isinstance(record, EpisodeRecord):
+            return f"episode:{record.execution_mode}:{record.episode_id}"
+        for field in (
+            "feedback_id",
+            "compilation_id",
+            "revision_id",
+            "comparison_id",
+            "experience_id",
+            "strategy_id",
+        ):
+            value = getattr(record, field, None)
+            if isinstance(value, str):
+                return f"{field}:{value}"
+        raise ValueError("event-bearing record has no stable journal identity")
+
     def save_task(
         self, task: EvolutionTask, expected_revision: int
     ) -> EvolutionTask:
@@ -419,6 +572,90 @@ class EvolutionStore:
                 f"stored={episode.evolution_id!r}/{episode.version!r}",
             )
         return episode
+
+    def load_evaluation_episode(
+        self,
+        evolution_id: str,
+        version: str,
+    ) -> EpisodeRecord:
+        self._validate_episode_version(version)
+        path = self._managed_path(evolution_id, "evaluations", f"{version}.json")
+        episode = self._load_model(path, EpisodeRecord, require_schema_version=True)
+        if (
+            episode.evolution_id != evolution_id
+            or episode.version != version
+            or episode.execution_mode != "FRESH_EVALUATION"
+        ):
+            raise EvolutionCorruptRecordError(
+                path,
+                "evaluation episode identity does not match its managed path",
+            )
+        return episode
+
+    def transition_evaluation_episode(
+        self,
+        episode: EpisodeRecord,
+        *,
+        expected_status: EpisodeStatus,
+    ) -> EpisodeRecord:
+        task_dir = self._task_dir(episode.evolution_id)
+        with self._task_lock(task_dir):
+            return self._transition_evaluation_episode_locked(episode, expected_status)
+
+    def _transition_evaluation_episode_locked(
+        self,
+        episode: EpisodeRecord,
+        expected_status: EpisodeStatus,
+    ) -> EpisodeRecord:
+        if expected_status not in _EPISODE_TRANSITIONS:
+            raise ValueError(f"unsupported expected episode status: {expected_status!r}")
+        current = self.load_evaluation_episode(episode.evolution_id, episode.version)
+        for field in _EPISODE_IMMUTABLE_FIELDS:
+            if getattr(episode, field) != getattr(current, field):
+                raise EvolutionConflictError(
+                    f"immutable evaluation field differs: {field}"
+                )
+        candidate, payload = self._prepare_model(episode, EpisodeRecord)
+        if current.status != expected_status:
+            raise EvolutionConflictError(
+                f"stale evaluation transition: stored={current.status}, expected={expected_status}"
+            )
+        if candidate.status not in _EPISODE_TRANSITIONS[current.status]:
+            raise EvolutionConflictError(
+                f"illegal evaluation transition: {current.status} -> {candidate.status}"
+            )
+        if current.status == "RESERVED" and candidate.status == "RUNNING":
+            if candidate.started_at is None:
+                raise EvolutionConflictError(
+                    "RUNNING evaluation transition requires started_at provenance"
+                )
+            for field in ("completed_at", "summary", "artifact", "error"):
+                if getattr(candidate, field) != getattr(current, field):
+                    raise EvolutionConflictError(
+                        f"RUNNING evaluation transition cannot set terminal field {field}"
+                    )
+        if current.status == "RESERVED" and candidate.status == "FAILED":
+            for field in _EPISODE_RUNNING_PROVENANCE_FIELDS:
+                if getattr(candidate, field) != getattr(current, field):
+                    raise EvolutionConflictError(
+                        "unstarted FAILED evaluation cannot add runtime provenance "
+                        f"field {field}"
+                    )
+        if current.status == "RUNNING":
+            for field in _EPISODE_RUNNING_PROVENANCE_FIELDS:
+                if getattr(candidate, field) != getattr(current, field):
+                    raise EvolutionConflictError(
+                        f"running evaluation provenance differs: {field}"
+                    )
+        self._write_json_atomic(
+            self._managed_path(
+                candidate.evolution_id,
+                "evaluations",
+                f"{candidate.version}.json",
+            ),
+            payload,
+        )
+        return candidate
 
     def transition_episode(
         self,
@@ -877,6 +1114,40 @@ class EvolutionStore:
             )
             self._write_immutable_json(path, payload)
         return path
+
+    def write_evaluation_scientific_state(
+        self,
+        evolution_id: str,
+        version: str,
+        state: ScientificState,
+    ) -> Path:
+        self._validate_episode_version(version)
+        _, payload = self._prepare_model(state, ScientificState)
+        task_dir = self._task_dir(evolution_id)
+        with self._task_lock(task_dir):
+            path = self._managed_path(
+                evolution_id,
+                "evaluations",
+                f"{version}.scientific.json",
+            )
+            self._write_immutable_json(path, payload)
+        return path
+
+    def load_evaluation_scientific_state(
+        self,
+        evolution_id: str,
+        version: str,
+    ) -> ScientificState:
+        self._validate_episode_version(version)
+        return self._load_model(
+            self._managed_path(
+                evolution_id,
+                "evaluations",
+                f"{version}.scientific.json",
+            ),
+            ScientificState,
+            require_schema_version=False,
+        )
 
     def write_export(
         self,

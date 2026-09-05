@@ -17,6 +17,7 @@ from photomatagent.runtime.events import (
     EvolutionIterationStarted,
     EvolutionTaskAccepted,
     EvolutionTaskCreated,
+    EvolutionTaskReopened,
     EvolutionTaskStopped,
     ExperienceStateChanged,
     ExpertFeedbackCompiled,
@@ -55,6 +56,7 @@ from photomatagent.scientific.evolution.models import (
 )
 from photomatagent.scientific.evolution.rubric import assess_hard_caps
 from photomatagent.scientific.evolution.store import (
+    EvolutionAlreadyExistsError,
     EvolutionStore,
     EvolutionTransaction,
 )
@@ -368,7 +370,7 @@ class EvolutionService:
                 comparison_ids != task.comparison_ids
                 or experience_ids != task.experience_ids
             ):
-                transaction.save_task(
+                task = transaction.save_task(
                     task.model_copy(
                         update={
                             "comparison_ids": comparison_ids,
@@ -528,44 +530,47 @@ class EvolutionService:
 
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
-            if task.status == "RUNNING" and task.current_version is not None:
-                existing = transaction.load_episode(task.current_version)
-                if existing.execution_mode != "FRESH_EVALUATION":
-                    raise EvolutionOperationConflict(
-                        "active episode is not a fresh-evaluation invocation"
-                    )
-                if existing.owner_token != owner_token:
-                    raise EvolutionOperationConflict(
-                        "active episode is owned by another fresh-evaluation invocation"
-                    )
-                strategy = self._fresh_strategy(transaction, task, strategy_id)
-                self._validate_fresh_reservation(
-                    existing,
-                    task,
-                    strategy,
-                    provider=provider,
-                    model=model,
-                    tool_surface_fingerprint=tool_surface_fingerprint,
-                    capability_fingerprint=capability_fingerprint,
-                    data_source_fingerprints=data_source_fingerprints or {},
-                    owner_token=owner_token,
-                )
-                return FreshEvaluationClaim(
-                    task=task,
-                    strategy=strategy,
-                    episode=existing,
-                    owner_token=owner_token,
-                    events=self._reservation_events(existing, False),
-                )
             if task.status != "REVISION_READY":
                 raise InvalidEvolutionTransition(
                     "fresh evaluation requires REVISION_READY"
                 )
             strategy = self._fresh_strategy(transaction, task, strategy_id)
-            version = self._next_version(task.current_version)
+            if task.current_evaluation_version is not None:
+                current = transaction.load_evaluation_episode(
+                    task.current_evaluation_version
+                )
+                if current.status in {"RESERVED", "RUNNING"}:
+                    if current.owner_token != owner_token:
+                        raise EvolutionOperationConflict(
+                            "active evaluation is owned by another invocation"
+                        )
+                    self._validate_fresh_reservation(
+                        current,
+                        task,
+                        strategy,
+                        provider=provider,
+                        model=model,
+                        tool_surface_fingerprint=tool_surface_fingerprint,
+                        capability_fingerprint=capability_fingerprint,
+                        data_source_fingerprints=data_source_fingerprints or {},
+                        owner_token=owner_token,
+                    )
+                    return FreshEvaluationClaim(
+                        task=task,
+                        strategy=strategy,
+                        episode=current,
+                        owner_token=owner_token,
+                        events=self._reservation_events(current, False),
+                    )
+            version = cast(EpisodeVersion, f"v{len(task.evaluation_episode_ids) + 1:03d}")
+            episode_id = self._evaluation_episode_id(evolution_id, version)
+            workspace_path = (
+                f".photomatagent/evaluation-workspaces/{evolution_id}/"
+                f"{version}_{episode_id}"
+            )
             episode = EpisodeRecord(
                 evolution_id=evolution_id,
-                episode_id=self._episode_id(evolution_id, version),
+                episode_id=episode_id,
                 version=version,
                 parent_version=task.last_completed_version,
                 applied_feedback_id=None,
@@ -576,6 +581,7 @@ class EvolutionService:
                 strategy_arm=strategy.arm,
                 strategy_sha256=strategy.strategy_sha256,
                 strategy_cutoff_at=strategy.cutoff_at,
+                evaluation_workspace_path=workspace_path,
                 task_snapshot={
                     "evolution_id": task.evolution_id,
                     "goal": task.goal,
@@ -590,27 +596,48 @@ class EvolutionService:
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
             )
-            transaction.write_episode(episode)
-            transaction.save_task(
-                task.model_copy(
-                    update={
-                        "status": "RUNNING",
-                        "resume_status": None,
-                        "current_version": version,
-                        "episode_ids": self._append_once(
-                            task.episode_ids,
-                            episode.episode_id,
-                        ),
-                    }
-                ),
-                expected_revision=task.revision,
+            try:
+                existing = transaction.load_evaluation_episode(version)
+            except FileNotFoundError:
+                transaction.write_evaluation_episode(episode)
+                persisted = episode
+            else:
+                self._validate_fresh_reservation(
+                    existing,
+                    task,
+                    strategy,
+                    provider=provider,
+                    model=model,
+                    tool_surface_fingerprint=tool_surface_fingerprint,
+                    capability_fingerprint=capability_fingerprint,
+                    data_source_fingerprints=data_source_fingerprints or {},
+                    owner_token=owner_token,
+                )
+                persisted = existing
+            self._prepare_evaluation_workspace(persisted, task, strategy)
+            evaluation_ids = self._append_once(
+                task.evaluation_episode_ids,
+                persisted.episode_id,
             )
+            if (
+                evaluation_ids != task.evaluation_episode_ids
+                or task.current_evaluation_version != version
+            ):
+                task = transaction.save_task(
+                    task.model_copy(
+                        update={
+                            "evaluation_episode_ids": evaluation_ids,
+                            "current_evaluation_version": version,
+                        }
+                    ),
+                    expected_revision=task.revision,
+                )
             return FreshEvaluationClaim(
                 task=task,
                 strategy=strategy,
-                episode=episode,
+                episode=persisted,
                 owner_token=owner_token,
-                events=self._reservation_events(episode, False),
+                events=self._reservation_events(persisted, False),
             )
 
     def export_evolution(
@@ -629,6 +656,10 @@ class EvolutionService:
                 transaction.load_episode(f"v{index:03d}")
                 for index in range(1, len(task.episode_ids) + 1)
             ]
+            evaluation_episodes = [
+                transaction.load_evaluation_episode(f"v{index:03d}")
+                for index in range(1, len(task.evaluation_episode_ids) + 1)
+            ]
             feedback = self.store.list_feedback(evolution_id)
             compilations = self.store.list_compilations(evolution_id)
             revisions = self.store.list_revisions(evolution_id)
@@ -640,7 +671,10 @@ class EvolutionService:
 
         def dumped(record: object, identity: str, category: str) -> dict[str, object]:
             raw = cast(Any, record).model_dump(mode="json")
-            safe = cast(dict[str, object], redact_secrets(raw))
+            safe = cast(
+                dict[str, object],
+                self._sanitize_export_value(redact_secrets(raw)),
+            )
             digest = hashlib.sha256(
                 json.dumps(
                     safe,
@@ -650,11 +684,17 @@ class EvolutionService:
                 ).encode("utf-8")
             ).hexdigest()
             record_hashes.setdefault(category, {})[identity] = digest
-            return safe
+            if include_content:
+                return safe
+            return self._metadata_projection(category, safe)
 
         task_payload = dumped(task, task.evolution_id, "task")
         episode_payloads = [
             dumped(item, item.episode_id, "episodes") for item in episodes
+        ]
+        evaluation_payloads = [
+            dumped(item, item.episode_id, "evaluation_episodes")
+            for item in evaluation_episodes
         ]
         feedback_payloads = [
             dumped(item, item.feedback_id, "feedback") for item in feedback
@@ -676,37 +716,17 @@ class EvolutionService:
             dumped(item, item.experience_id, "experiences") for item in experiences
         ]
 
-        if not include_content:
-            feedback_content_fields = {
-                "raw_input",
-                "comments",
-                "fatal_issue",
-                "priority_corrections",
-                "preserved_strengths",
-                "recommended_actions",
-                "resolved_issue_ids",
-                "hard_cap_override_reason",
-            }
-            feedback_payloads = [
-                {key: value for key, value in item.items() if key not in feedback_content_fields}
-                for item in feedback_payloads
-            ]
-            compilation_payloads = [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key not in {"items", "warnings", "error"}
-                }
-                for item in compilation_payloads
-            ]
-
-        events = self._export_events(episodes, include_content=include_content)
+        events = self._export_journal(evolution_id, include_content=include_content)
+        runtime_events = self._export_events(
+            [*episodes, *evaluation_episodes], include_content=include_content
+        )
         payload: dict[str, object] = {
             "schema_version": 1,
             "exported_at": utc_now().isoformat(),
             "include_content": include_content,
             "task": task_payload,
             "episodes": episode_payloads,
+            "evaluation_episodes": evaluation_payloads,
             "feedback": feedback_payloads,
             "compilations": compilation_payloads,
             "revisions": revision_payloads,
@@ -714,10 +734,13 @@ class EvolutionService:
             "comparisons": comparison_payloads,
             "experiences": experience_payloads,
             "events": events,
+            "runtime_events": runtime_events,
             "record_hashes": record_hashes,
         }
         if include_content:
-            for episode, exported in zip(episodes, episode_payloads, strict=True):
+            all_episodes = [*episodes, *evaluation_episodes]
+            all_payloads = [*episode_payloads, *evaluation_payloads]
+            for episode, exported in zip(all_episodes, all_payloads, strict=True):
                 if episode.artifact is None:
                     continue
                 artifact = self._verify_artifact(episode.artifact)
@@ -731,10 +754,10 @@ class EvolutionService:
                         "sha256": artifact.sha256,
                     }
                 else:
-                    exported["artifact_content"] = {
+                    exported["artifact_content"] = cast(dict[str, object], self._sanitize_export_value({
                         "encoding": "utf-8",
                         "body": redact_text(text),
-                    }
+                    }))
         return self.store.write_export(output, payload, overwrite=overwrite)
 
     def _reserve_episode_locked(
@@ -884,6 +907,110 @@ class EvolutionService:
             episode_version=version,
         )
         return MutationResult(saved, (event,))
+
+    def mark_evaluation_running(
+        self,
+        evolution_id: str,
+        version: EpisodeVersion,
+        *,
+        owner_token: str,
+        runtime_session_id: str | None = None,
+        event_log_path: str | None = None,
+    ) -> MutationResult[EpisodeRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            episode = transaction.load_evaluation_episode(version)
+            self._require_episode_owner(episode, owner_token)
+            if episode.status == "RUNNING":
+                if (
+                    episode.runtime_session_id != runtime_session_id
+                    or episode.event_log_path != event_log_path
+                ):
+                    raise EvolutionOperationConflict(
+                        "running evaluation provenance differs from retry"
+                    )
+                saved = episode
+            elif episode.status == "RESERVED":
+                saved = transaction.transition_evaluation_episode(
+                    episode.model_copy(
+                        update={
+                            "status": "RUNNING",
+                            "runtime_session_id": runtime_session_id,
+                            "event_log_path": event_log_path,
+                            "started_at": utc_now(),
+                        }
+                    ),
+                    expected_status="RESERVED",
+                )
+            else:
+                raise InvalidEvolutionTransition("only a reserved evaluation can start")
+        return MutationResult(
+            saved,
+            (
+                EvolutionEpisodeStarted(
+                    evolution_id=evolution_id,
+                    episode_version=version,
+                ),
+            ),
+        )
+
+    def complete_evaluation(
+        self,
+        evolution_id: str,
+        version: EpisodeVersion,
+        *,
+        result: EpisodeRecord,
+        owner_token: str,
+    ) -> MutationResult[EpisodeRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            existing = transaction.load_evaluation_episode(version)
+            self._require_episode_owner(existing, owner_token)
+            artifact = self._verify_artifact(result.artifact)
+            completed = self._validated_completion(existing, result, artifact)
+            if existing.status == "COMPLETED":
+                saved = existing
+            elif existing.status == "RUNNING":
+                saved = transaction.transition_evaluation_episode(
+                    completed,
+                    expected_status="RUNNING",
+                )
+            else:
+                raise InvalidEvolutionTransition("only a running evaluation can complete")
+        return MutationResult(
+            saved,
+            (
+                EvolutionEpisodeCompleted(
+                    evolution_id=evolution_id,
+                    episode_version=version,
+                ),
+            ),
+        )
+
+    def fail_evaluation(
+        self,
+        evolution_id: str,
+        version: EpisodeVersion,
+        error: str,
+        *,
+        owner_token: str,
+    ) -> MutationResult[EpisodeRecord]:
+        with self.store.transaction(evolution_id) as transaction:
+            existing = transaction.load_evaluation_episode(version)
+            self._require_episode_owner(existing, owner_token)
+            if existing.status == "FAILED":
+                return MutationResult(existing)
+            if existing.status not in {"RESERVED", "RUNNING"}:
+                raise InvalidEvolutionTransition("only an active evaluation may fail")
+            saved = transaction.transition_evaluation_episode(
+                existing.model_copy(
+                    update={
+                        "status": "FAILED",
+                        "completed_at": utc_now(),
+                        "error": error,
+                    }
+                ),
+                expected_status=existing.status,
+            )
+        return MutationResult(saved)
 
     def complete_episode(
         self,
@@ -1599,6 +1726,10 @@ class EvolutionService:
                         "status": "ACCEPTED",
                         "resume_status": None,
                         "accepted_version": version,
+                        "accepted_resume_status": cast(
+                            EvolutionResumeStatus,
+                            task.status,
+                        ),
                     }
                 ),
                 expected_revision=task.revision,
@@ -1634,7 +1765,11 @@ class EvolutionService:
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
             if task.status == "ACCEPTED":
-                checkpoint: EvolutionStatus = "AWAITING_EXPERT_FEEDBACK"
+                if task.accepted_resume_status is None:  # model invariant
+                    raise InvalidEvolutionTransition(
+                        "accepted task has no resume checkpoint"
+                    )
+                checkpoint: EvolutionStatus = task.accepted_resume_status
             elif task.status in {"STOPPED", "BLOCKED", "BUDGET_EXHAUSTED"}:
                 if task.resume_status is None:
                     raise InvalidEvolutionTransition("paused task has no resume checkpoint")
@@ -1645,11 +1780,18 @@ class EvolutionService:
                 )
             saved = transaction.save_task(
                 task.model_copy(
-                    update={"status": checkpoint, "resume_status": None}
+                    update={
+                        "status": checkpoint,
+                        "resume_status": None,
+                        "accepted_resume_status": None,
+                    }
                 ),
                 expected_revision=task.revision,
             )
-        return MutationResult(saved)
+        return MutationResult(
+            saved,
+            (EvolutionTaskReopened(evolution_id=evolution_id),),
+        )
 
     async def publish(
         self,
@@ -1657,10 +1799,19 @@ class EvolutionService:
     ) -> None:
         """Explicitly publish one result's events; never drive an event loop."""
 
+        events = result.events if isinstance(result, MutationResult) else result
+        materialized = tuple(events)
+        if isinstance(result, MutationResult):
+            evolution_id = getattr(result.entity, "evolution_id", None)
+            if isinstance(evolution_id, str):
+                self.store.append_events(
+                    evolution_id,
+                    materialized,
+                    idempotency_scope=self.store.event_scope(result.entity),
+                )
         if self.event_sink is None:
             return
-        events = result.events if isinstance(result, MutationResult) else result
-        for event in events:
+        for event in materialized:
             pending = self.event_sink(event)
             if inspect.isawaitable(pending):
                 await pending
@@ -1685,7 +1836,12 @@ class EvolutionService:
             raise InvalidEvolutionTransition(
                 f"episode version {version} is not current version {task.current_version}"
             )
-        return task, transaction.load_episode(version)
+        episode = transaction.load_episode(version)
+        if episode.execution_mode == "FRESH_EVALUATION":
+            raise EvolutionOperationConflict(
+                "fresh evaluation episodes cannot enter the main evolution lifecycle"
+            )
+        return task, episode
 
     def _validate_comparison_episodes(
         self,
@@ -1701,6 +1857,13 @@ class EvolutionService:
         ):
             raise EvolutionOperationConflict(
                 "comparison episodes do not belong to the requested task"
+            )
+        if (
+            previous.execution_mode == "FRESH_EVALUATION"
+            or current.execution_mode == "FRESH_EVALUATION"
+        ):
+            raise EvolutionOperationConflict(
+                "fresh evaluation episodes cannot enter comparison or experience"
             )
         previous_index = int(previous.version[1:])
         current_index = int(current.version[1:])
@@ -1936,7 +2099,7 @@ class EvolutionService:
             "input_sha256": task.input_sha256,
         }
         if (
-            episode.status != "RESERVED"
+            episode.status not in {"RESERVED", "RUNNING"}
             or episode.execution_mode != "FRESH_EVALUATION"
             or episode.applied_feedback_id is not None
             or episode.revision_plan_id is not None
@@ -1945,6 +2108,11 @@ class EvolutionService:
             or episode.strategy_arm != strategy.arm
             or episode.strategy_sha256 != strategy.strategy_sha256
             or episode.strategy_cutoff_at != strategy.cutoff_at
+            or episode.evaluation_workspace_path
+            != (
+                f".photomatagent/evaluation-workspaces/{task.evolution_id}/"
+                f"{episode.version}_{episode.episode_id}"
+            )
             or episode.parent_version != task.last_completed_version
             or episode.task_snapshot != expected_snapshot
             or episode.target_snapshot != TargetSnapshot.model_validate(task.target)
@@ -1957,6 +2125,224 @@ class EvolutionService:
             raise EvolutionOperationConflict(
                 "mismatched durable fresh-evaluation reservation"
             )
+
+    def _prepare_evaluation_workspace(
+        self,
+        episode: EpisodeRecord,
+        task: EvolutionTask,
+        strategy: StrategyVersion,
+    ) -> None:
+        if episode.evaluation_workspace_path is None:
+            raise EvolutionOperationConflict("evaluation workspace provenance is missing")
+        cursor = self.store.workspace.root
+        for part in Path(episode.evaluation_workspace_path).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise EvolutionOperationConflict(
+                    "evaluation workspace cannot traverse a symbolic link"
+                )
+        root = self.store.workspace.resolve(
+            episode.evaluation_workspace_path,
+            must_exist=False,
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink() or not root.is_dir():
+            raise EvolutionOperationConflict("evaluation workspace is not an isolated directory")
+        frozen = root / "frozen"
+        frozen.mkdir(parents=True, exist_ok=True)
+        snapshots = {
+            frozen / "task.json": {
+                "goal": task.goal,
+                "target": task.target.model_dump(mode="json"),
+                "input_sha256": task.input_sha256,
+            },
+            frozen / "strategy.json": {
+                "strategy_id": strategy.strategy_id,
+                "arm": strategy.arm,
+                "strategy_sha256": strategy.strategy_sha256,
+                "cutoff_at": strategy.cutoff_at.isoformat()
+                if strategy.cutoff_at is not None
+                else None,
+            },
+        }
+        for path, payload in snapshots.items():
+            safe = redact_secrets(payload)
+            try:
+                self.store._write_immutable_json(path, safe)
+            except EvolutionAlreadyExistsError:
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise EvolutionOperationConflict(
+                        "evaluation frozen input is unreadable"
+                    ) from exc
+                if existing != safe:
+                    raise EvolutionOperationConflict(
+                        "evaluation frozen input differs from claim"
+                    )
+
+    def _sanitize_export_value(self, value: object) -> object:
+        """Redact host paths recursively without changing relative artifact paths."""
+
+        if isinstance(value, dict):
+            return {
+                str(key): self._sanitize_export_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._sanitize_export_value(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._sanitize_export_value(item) for item in value]
+        if not isinstance(value, str):
+            return value
+        windows_absolute = (
+            len(value) >= 3
+            and value[0].isalpha()
+            and value[1] == ":"
+            and value[2] in {"/", "\\"}
+        ) or value.startswith("\\\\")
+        if windows_absolute:
+            return "[EXTERNAL_PATH]"
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            return value
+        try:
+            contained = self.store.workspace.resolve(str(candidate), must_exist=False)
+        except (OSError, ValueError, ToolExecutionError):
+            return "[EXTERNAL_PATH]"
+        return self.store.workspace.relative(contained)
+
+    @staticmethod
+    def _metadata_projection(
+        category: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Return explicit non-prose provenance for the default export."""
+
+        fields: dict[str, frozenset[str]] = {
+            "task": frozenset(
+                {
+                    "schema_version", "revision", "evolution_id", "goal", "target", "input_sha256",
+                    "task_group_id", "status", "resume_status", "current_version",
+                    "last_completed_version", "accepted_version", "accepted_resume_status",
+                    "episode_ids", "evaluation_episode_ids", "current_evaluation_version",
+                    "feedback_ids", "compilation_ids", "revision_ids", "strategy_ids",
+                    "comparison_ids", "experience_ids", "created_at", "updated_at",
+                }
+            ),
+            "episodes": frozenset(
+                {
+                    "schema_version", "evolution_id", "episode_id", "version", "status",
+                    "parent_version", "applied_feedback_id", "revision_plan_id", "owner_token",
+                    "runtime_session_id", "event_log_path", "execution_mode", "strategy_id",
+                    "strategy_arm", "strategy_sha256", "strategy_cutoff_at",
+                    "evaluation_workspace_path", "scientific_state_path", "provider", "model",
+                    "tool_surface_fingerprint", "capability_fingerprint", "data_source_fingerprints",
+                    "artifact", "cost", "started_at", "completed_at", "created_at",
+                    "acceptance_results", "task_snapshot", "target_snapshot",
+                }
+            ),
+            "evaluation_episodes": frozenset(),
+            "feedback": frozenset(
+                {
+                    "schema_version", "feedback_id", "evolution_id", "episode_version",
+                    "result_sha256", "rubric_version", "scores", "flags", "suggested_scores",
+                    "compilation_id", "confirmed_at", "supersedes_feedback_id",
+                }
+            ),
+            "compilations": frozenset(
+                {
+                    "schema_version", "compilation_id", "evolution_id", "feedback_id",
+                    "episode_version", "status", "provider", "model", "created_at",
+                }
+            ),
+            "revisions": frozenset(
+                {
+                    "schema_version", "revision_id", "evolution_id", "source_version",
+                    "feedback_id", "strategy_arm", "has_blocking_ambiguity", "confirmed",
+                    "confirmed_at", "created_at", "preserved_evidence_ids",
+                    "invalidated_evidence_ids",
+                }
+            ),
+            "strategies": frozenset(
+                {
+                    "schema_version", "strategy_id", "evolution_id", "arm",
+                    "strategy_sha256", "cutoff_at", "created_at",
+                }
+            ),
+            "comparisons": frozenset(
+                {
+                    "schema_version", "comparison_id", "evolution_id", "previous_version",
+                    "current_version", "phase", "current_feedback_id", "current_feedback_sha256",
+                    "current_compilation_id", "current_compilation_sha256", "score_deltas",
+                    "closed_issue_ids", "recurring_issue_ids", "new_issue_ids", "closure_rate",
+                    "recurrence_rate", "new_issue_rate", "artifact_diff", "cost_delta",
+                    "expert_utility_delta", "normalized_cost_increase", "reward", "components_used",
+                    "created_at",
+                }
+            ),
+            "experiences": frozenset(
+                {
+                    "schema_version", "experience_id", "evolution_id", "base_experience_id",
+                    "previous_maturity", "maturity", "observations", "user_approved_for_reuse",
+                    "created_at",
+                }
+            ),
+        }
+        allowed = fields["episodes"] if category == "evaluation_episodes" else fields[category]
+        projected = {key: value for key, value in payload.items() if key in allowed}
+        if category in {"episodes", "evaluation_episodes"}:
+            acceptance = projected.get("acceptance_results")
+            if isinstance(acceptance, list):
+                projected["acceptance_results"] = [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key in {"acceptance_id", "status", "kind", "provenance"}
+                    }
+                    for item in acceptance
+                    if isinstance(item, dict)
+                ]
+        if category == "comparisons":
+            artifact_diff = projected.get("artifact_diff")
+            if isinstance(artifact_diff, dict):
+                projected["artifact_diff"] = {
+                    key: value
+                    for key, value in artifact_diff.items()
+                    if key != "summary"
+                }
+        return projected
+
+    def _export_journal(
+        self,
+        evolution_id: str,
+        *,
+        include_content: bool,
+    ) -> list[dict[str, object]]:
+        exported: list[dict[str, object]] = []
+        for line_number, (source, envelope) in enumerate(
+            self.store.read_event_journal(evolution_id), start=1
+        ):
+            raw_event = cast(dict[str, object], envelope["event"])
+            safe = cast(
+                dict[str, object],
+                self._sanitize_export_value(redact_secrets(raw_event)),
+            )
+            redacted_bytes = json.dumps(
+                safe, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            item: dict[str, object] = {
+                "line": line_number,
+                "event_id": envelope.get("event_id"),
+                "kind": safe.get("kind"),
+                "timestamp": safe.get("timestamp"),
+                "source_sha256": hashlib.sha256(source).hexdigest(),
+                "redacted_payload_sha256": hashlib.sha256(redacted_bytes).hexdigest(),
+            }
+            if include_content:
+                item["payload"] = safe
+            exported.append(item)
+        return exported
 
     def _export_events(
         self,
@@ -1998,7 +2384,10 @@ class EvolutionService:
                     ) from exc
                 if not isinstance(raw, dict):
                     raise EvolutionOperationConflict("event log entries must be objects")
-                safe = cast(dict[str, object], redact_secrets(raw))
+                safe = cast(
+                    dict[str, object],
+                    self._sanitize_export_value(redact_secrets(raw)),
+                )
                 serialized = json.dumps(
                     safe,
                     ensure_ascii=False,
@@ -2007,7 +2396,7 @@ class EvolutionService:
                 ).encode("utf-8")
                 item: dict[str, object] = {
                     "episode_version": episode.version,
-                    "event_log_path": relative,
+                    "event_log_path": self._sanitize_export_value(relative),
                     "line": line_number,
                     "schema_version": safe.get("schema_version"),
                     "kind": safe.get("kind"),
@@ -2376,6 +2765,16 @@ class EvolutionService:
     def _episode_id(evolution_id: str, version: EpisodeVersion) -> str:
         digest = hashlib.sha256(f"{evolution_id}:{version}".encode()).hexdigest()[:10]
         return f"ep_{digest}"
+
+    @staticmethod
+    def _evaluation_episode_id(
+        evolution_id: str,
+        version: EpisodeVersion,
+    ) -> str:
+        digest = hashlib.sha256(
+            f"{evolution_id}:evaluation:{version}".encode()
+        ).hexdigest()[:10]
+        return f"eval_{digest}"
 
     @staticmethod
     def _input_hash(goal: str, target: TargetSpec) -> str:

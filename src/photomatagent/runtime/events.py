@@ -479,6 +479,10 @@ class EvolutionTaskStopped(EvolutionRuntimeEvent):
     kind: Literal["evolution_task_stopped"] = "evolution_task_stopped"
 
 
+class EvolutionTaskReopened(EvolutionRuntimeEvent):
+    kind: Literal["evolution_task_reopened"] = "evolution_task_reopened"
+
+
 AnyRuntimeEvent = Annotated[
     Union[
         LoopStarted,
@@ -527,6 +531,7 @@ AnyRuntimeEvent = Annotated[
         ExperienceStateChanged,
         EvolutionTaskAccepted,
         EvolutionTaskStopped,
+        EvolutionTaskReopened,
     ],
     Field(discriminator="kind"),
 ]

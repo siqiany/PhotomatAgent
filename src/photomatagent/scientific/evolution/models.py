@@ -531,7 +531,10 @@ class EvolutionTask(StrictModel):
     current_version: EpisodeVersion | None = None
     last_completed_version: EpisodeVersion | None = None
     accepted_version: EpisodeVersion | None = None
+    accepted_resume_status: EvolutionResumeStatus | None = None
     episode_ids: list[ManagedId] = Field(default_factory=list)
+    evaluation_episode_ids: list[ManagedId] = Field(default_factory=list)
+    current_evaluation_version: EpisodeVersion | None = None
     feedback_ids: list[ManagedId] = Field(default_factory=list)
     compilation_ids: list[ManagedId] = Field(default_factory=list)
     revision_ids: list[ManagedId] = Field(default_factory=list)
@@ -553,6 +556,10 @@ class EvolutionTask(StrictModel):
             raise ValueError(f"{self.status} tasks require resume_status")
         if self.status not in checkpoint_states and self.resume_status is not None:
             raise ValueError("resume_status is valid only for a paused task")
+        if self.status != "ACCEPTED" and self.accepted_resume_status is not None:
+            raise ValueError("accepted_resume_status is valid only for ACCEPTED tasks")
+        if self.status == "ACCEPTED" and self.accepted_resume_status is None:
+            raise ValueError("ACCEPTED tasks require accepted_resume_status")
         return self
 
 
@@ -573,6 +580,7 @@ class EpisodeRecord(StrictModel):
     strategy_arm: StrategyArm = Field(default="STATIC", frozen=True)
     strategy_sha256: Sha256 | None = Field(default=None, frozen=True)
     strategy_cutoff_at: UtcDatetime | None = Field(default=None, frozen=True)
+    evaluation_workspace_path: str | None = Field(default=None, frozen=True)
     scientific_state_path: str | None = None
     task_snapshot: FrozenJsonObject = Field(frozen=True)
     target_snapshot: TargetSnapshot = Field(frozen=True)

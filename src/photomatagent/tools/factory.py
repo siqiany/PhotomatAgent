@@ -36,31 +36,39 @@ def create_default_registry(
     skill_loader: SkillLoader | None = None,
     surface_config: ToolSurfaceConfig | None = None,
     application_approval_root: Path | str | None = None,
+    evaluation_isolation: bool = False,
 ) -> ToolRegistry:
     boundary = workspace if isinstance(workspace, Workspace) else Workspace(workspace or Path.cwd())
-    registry = ToolRegistry()
-    registry.register_all(
-        [
-            ReadTool(boundary),
-            GlobTool(boundary),
-            GrepTool(boundary),
-            WriteTool(boundary),
-            EditTool(boundary),
-            BashTool(boundary),
-            EchoTool(),
-            CalculatorTool(),
-            ScientificStateInspectTool(scientific_state),
-            MockCalculationTool(),
-        ]
-    )
-    scientific_config = ScientificConfig.from_environment(workspace=boundary.root)
-    registry.register_all(
-        build_scientific_tools(
-            scientific_config,
-            boundary,
-            vasp_approval_root=application_approval_root,
+    registry = ToolRegistry(evaluation_isolated=evaluation_isolation)
+    safe_tools = [
+        EchoTool(),
+        CalculatorTool(),
+        ScientificStateInspectTool(scientific_state),
+        MockCalculationTool(),
+    ]
+    if evaluation_isolation:
+        registry.register_all(safe_tools)
+    else:
+        registry.register_all(
+            [
+                ReadTool(boundary),
+                GlobTool(boundary),
+                GrepTool(boundary),
+                WriteTool(boundary),
+                EditTool(boundary),
+                BashTool(boundary),
+                *safe_tools,
+            ]
         )
-    )
+    scientific_config = ScientificConfig.from_environment(workspace=boundary.root)
+    if not evaluation_isolation:
+        registry.register_all(
+            build_scientific_tools(
+                scientific_config,
+                boundary,
+                vasp_approval_root=application_approval_root,
+            )
+        )
     config = surface_config or ToolSurfaceConfig()
     catalog = ToolCatalog(registry)
     registry.register_all(
@@ -72,7 +80,7 @@ def create_default_registry(
             ),
             ToolDescribeTool(catalog),
             ToolCallBridge(),
-            SkillViewTool(skill_loader or SkillLoader()),
+            *([] if evaluation_isolation else [SkillViewTool(skill_loader or SkillLoader())]),
         ]
     )
     return registry

@@ -14,6 +14,7 @@ from photomatagent.models.fake import FakeModelProvider, FakeResponse
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import DenyAllPolicy
+from photomatagent.runtime.events import EvolutionTaskStopped
 from photomatagent.scientific.evolution.executor import (
     ScientificEpisodeExecutor,
     run_fresh_evaluation,
@@ -38,6 +39,7 @@ from photomatagent.scientific.loop import ScientificLoopConfig, ScientificLoopSu
 from photomatagent.scientific.loop.target import TargetSpec
 from photomatagent.scientific.state import ScientificState
 from photomatagent.tools.registry import ToolRegistry
+from photomatagent.tools.factory import create_default_registry
 from photomatagent.workspace import Workspace
 
 
@@ -211,8 +213,10 @@ def test_fresh_claim_is_atomic_and_only_one_owner_wins(tmp_path: Path) -> None:
     assert sum(not isinstance(item, Exception) for item in results) == 1
     assert sum(isinstance(item, EvolutionOperationConflict) for item in results) == 1
     task = service.get("evo_fresh")
-    episode = service.store.load_episode("evo_fresh", "v002")
-    assert task.status == "RUNNING"
+    episode = service.store.load_evaluation_episode("evo_fresh", "v001")
+    assert task.status == "REVISION_READY"
+    assert task.current_version == "v001"
+    assert task.current_evaluation_version == "v001"
     assert episode.owner_token in {"owner_a", "owner_b"}
 
 
@@ -275,10 +279,13 @@ async def test_run_fresh_evaluation_uses_blank_runtime_and_no_learning_history(
         observed.update(kwargs)
         state = kwargs["scientific_state"]
         observed["initial_state"] = state.model_copy(deep=True)
+        isolated_workspace = Workspace(kwargs["workspace_root"])
         runtime = AgentRuntime(
             model=FakeModelProvider([FakeResponse(text="fresh result")]),
-            tools=ToolRegistry(),
-            workspace=Workspace(tmp_path),
+            tools=create_default_registry(
+                state, isolated_workspace, evaluation_isolation=True
+            ),
+            workspace=isolated_workspace,
             scientific_state=state,
             permission_policy=DenyAllPolicy(),
             budget=BudgetState(max_iterations=10),
@@ -300,7 +307,7 @@ async def test_run_fresh_evaluation_uses_blank_runtime_and_no_learning_history(
     assert result.episode.execution_mode == "FRESH_EVALUATION"
     assert observed["fresh_approval"] is True
     assert str(observed["application_approval_root"]).endswith(
-        f"v002_{result.episode.episode_id}"
+        f"v001_{result.episode.episode_id}"
     )
     assert observed["initial_state"] == ScientificState()
     assert result.episode.revision_plan_id is None
@@ -313,6 +320,12 @@ async def test_run_fresh_evaluation_uses_blank_runtime_and_no_learning_history(
     assert "task-specific history" not in request_text
     assert service.get("evo_fresh").comparison_ids == []
     assert service.get("evo_fresh").experience_ids == []
+    persisted_task = service.get("evo_fresh")
+    assert persisted_task.status == "REVISION_READY"
+    assert persisted_task.current_version == "v001"
+    assert persisted_task.last_completed_version == "v001"
+    assert persisted_task.current_evaluation_version == "v001"
+    assert persisted_task.episode_ids == task.episode_ids
 
 
 def test_export_defaults_to_metadata_and_hashes_then_content_is_redacted(
@@ -391,6 +404,152 @@ def test_export_rejects_output_outside_workspace(tmp_path: Path) -> None:
         )
 
 
+def test_fresh_registry_and_workspace_cannot_reach_prior_evolution_files(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    old = tmp_path / "user_output" / "prior-secret.txt"
+    old.write_text("prior secret", encoding="utf-8")
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_isolation",
+    )
+    isolated = Workspace(
+        service.store.workspace.resolve(
+            claim.episode.evaluation_workspace_path,  # type: ignore[arg-type]
+            must_exist=True,
+        )
+    )
+    names = {
+        tool.name
+        for tool in create_default_registry(
+            ScientificState(), isolated, evaluation_isolation=True
+        ).list_tools()
+    }
+
+    assert names.isdisjoint({"read", "glob", "grep", "write", "edit", "bash"})
+    assert not (isolated.root / "user_output" / "prior-secret.txt").exists()
+    with pytest.raises(Exception, match="outside workspace"):
+        isolated.resolve(str(old), must_exist=True)
+    with pytest.raises(Exception, match="outside workspace"):
+        isolated.resolve("../../../../user_output/prior-secret.txt", must_exist=True)
+
+
+def test_fresh_claim_rejects_symlinked_evaluation_workspace(tmp_path: Path) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    episode_id = service._evaluation_episode_id("evo_fresh", "v001")
+    evaluation_root = (
+        tmp_path
+        / ".photomatagent"
+        / "evaluation-workspaces"
+        / "evo_fresh"
+    )
+    evaluation_root.mkdir(parents=True)
+    (evaluation_root / f"v001_{episode_id}").symlink_to(tmp_path / "user_output")
+
+    with pytest.raises(EvolutionOperationConflict, match="symbolic link"):
+        service.claim_fresh_evaluation(
+            "evo_fresh",
+            strategy_id=strategy.strategy_id,
+            owner_token="owner_symlink",
+        )
+
+
+def test_fresh_claim_adopts_owner_record_after_record_manifest_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    original = service._prepare_evaluation_workspace
+
+    def crash_after_record(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(service, "_prepare_evaluation_workspace", crash_after_record)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        service.claim_fresh_evaluation(
+            "evo_fresh",
+            strategy_id=strategy.strategy_id,
+            owner_token="owner_recovery",
+        )
+    assert service.get("evo_fresh").evaluation_episode_ids == []
+
+    monkeypatch.setattr(service, "_prepare_evaluation_workspace", original)
+    adopted = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_recovery",
+    )
+    assert adopted.episode.version == "v001"
+    assert adopted.task.evaluation_episode_ids == [adopted.episode.episode_id]
+    with pytest.raises(EvolutionOperationConflict, match="owned"):
+        service.claim_fresh_evaluation(
+            "evo_fresh",
+            strategy_id=strategy.strategy_id,
+            owner_token="owner_other",
+        )
+
+
+def test_event_journal_is_idempotent_and_export_hashes_exact_source(
+    tmp_path: Path,
+) -> None:
+    service, _strategy = _fresh_ready_service(tmp_path)
+    event = EvolutionTaskStopped(evolution_id="evo_fresh")
+    service.store.append_events("evo_fresh", (event,))
+    service.store.append_events("evo_fresh", (event,))
+    journal = service.store.read_event_journal("evo_fresh")
+    assert len(journal) == 1
+
+    export = service.export_evolution(
+        "evo_fresh", output="user_output/journal-export.json", include_content=True
+    )
+    payload = json.loads(export.read_text(encoding="utf-8"))
+    exported = payload["events"][0]
+    assert exported["source_sha256"] == hashlib.sha256(journal[0][0]).hexdigest()
+    assert exported["payload"]["kind"] == "evolution_task_stopped"
+
+
+def test_export_path_sanitization_is_recursive_and_metadata_drops_prose(
+    tmp_path: Path,
+) -> None:
+    service, _strategy = _fresh_ready_service(tmp_path)
+    sanitized = service._sanitize_export_value(
+        {
+            "paths": [
+                str(tmp_path / "user_output" / "inside.txt"),
+                "/etc/passwd",
+                r"C:\Users\operator\secret.txt",
+            ]
+        }
+    )
+    assert sanitized == {
+        "paths": ["user_output/inside.txt", "[EXTERNAL_PATH]", "[EXTERNAL_PATH]"]
+    }
+    revision = service._metadata_projection(
+        "revisions",
+        {
+            "revision_id": "rp_safe",
+            "contract_changes": ["expert-derived prose"],
+            "strategy_reason": "expert-derived reason",
+        },
+    )
+    comparison = service._metadata_projection(
+        "comparisons",
+        {
+            "comparison_id": "cmp_safe",
+            "artifact_diff": {
+                "previous_sha256": "a" * 64,
+                "current_sha256": "b" * 64,
+                "changed": True,
+                "summary": "expert-derived summary",
+            },
+        },
+    )
+    assert revision == {"revision_id": "rp_safe"}
+    assert "summary" not in comparison["artifact_diff"]  # type: ignore[operator]
+
+
 def test_accept_stop_and_reopen_preserve_exact_checkpoints(tmp_path: Path) -> None:
     service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
     completed = _complete_initial(service, "evo_controls")
@@ -399,12 +558,32 @@ def test_accept_stop_and_reopen_preserve_exact_checkpoints(tmp_path: Path) -> No
     assert accepted.status == "ACCEPTED"
     assert accepted.accepted_version == "v001"
     assert service.reopen("evo_controls").entity.status == "AWAITING_EXPERT_FEEDBACK"
-
     stopped = service.stop("evo_controls").entity
     assert stopped.status == "STOPPED"
     assert stopped.resume_status == "AWAITING_EXPERT_FEEDBACK"
     assert service.reopen("evo_controls").entity.status == "AWAITING_EXPERT_FEEDBACK"
 
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["AWAITING_EXPERT_FEEDBACK", "FEEDBACK_RECORDED", "REVISION_READY"],
+)
+def test_accept_reopen_restores_exact_legal_source_status(
+    tmp_path: Path,
+    checkpoint: str,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    completed = _complete_initial(service, f"evo_accept_{checkpoint.lower()}")
+    task = service.get(completed.evolution_id)
+    if task.status != checkpoint:
+        service.store.save_task(
+            task.model_copy(update={"status": checkpoint}),
+            expected_revision=task.revision,
+        )
+
+    accepted = service.accept(completed.evolution_id, completed.version).entity
+    assert accepted.accepted_resume_status == checkpoint
+    assert service.reopen(completed.evolution_id).entity.status == checkpoint
 
 def test_accept_can_select_any_completed_artifact_not_only_latest(tmp_path: Path) -> None:
     service, strategy = _fresh_ready_service(tmp_path, evolution_id="evo_accept_old")
@@ -413,14 +592,12 @@ def test_accept_can_select_any_completed_artifact_not_only_latest(tmp_path: Path
         strategy_id=strategy.strategy_id,
         owner_token="owner_accept_old",
     )
-    service.fail_episode(
+    service.fail_evaluation(
         "evo_accept_old",
         claim.episode.version,
         "evaluation stopped",
         owner_token=claim.owner_token,
     )
-    service.reopen("evo_accept_old")
-
     accepted = service.accept("evo_accept_old", "v001").entity
 
     assert accepted.status == "ACCEPTED"

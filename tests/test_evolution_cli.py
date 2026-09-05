@@ -43,6 +43,7 @@ from photomatagent.scientific.loop import (
 )
 from photomatagent.scientific.state import ScientificState
 from photomatagent.tools.registry import ToolRegistry
+from photomatagent.tools.factory import create_default_registry
 from photomatagent.workspace import Workspace
 
 
@@ -111,14 +112,22 @@ def _runtime(
     *,
     session_id: str = "session_cli_test",
     scientific_state: ScientificState | None = None,
+    evaluation_isolated: bool = False,
 ) -> AgentRuntime:
     scientific = (
         scientific_state if scientific_state is not None else ScientificState()
     )
+    boundary = Workspace(workspace)
     return AgentRuntime(
         model=FakeModelProvider([FakeResponse(text="final reviewable report")]),
-        tools=ToolRegistry(),
-        workspace=Workspace(workspace),
+        tools=(
+            create_default_registry(
+                scientific, boundary, evaluation_isolation=True
+            )
+            if evaluation_isolated
+            else ToolRegistry()
+        ),
+        workspace=boundary,
         scientific_state=scientific,
         permission_policy=AllowAllPolicy(),
         budget=BudgetState(max_iterations=10),
@@ -323,9 +332,10 @@ def test_evaluate_fresh_builds_isolated_episode_runtime(
         assert kwargs["scientific_state"] == ScientificState()
         return (
             _runtime(
-                tmp_path,
+                Path(kwargs["workspace_root"]),
                 session_id="session_cli_fresh",
                 scientific_state=kwargs["scientific_state"],
+                evaluation_isolated=True,
             ),
             None,
         )
@@ -358,11 +368,13 @@ def test_evaluate_fresh_builds_isolated_episode_runtime(
     assert observed[0]["fresh_approval"] is True
     assert observed[0]["approval"] == "deny"
     task = EvolutionStore(Workspace(tmp_path)).load_task(ready.evolution_id)
-    episode = EvolutionStore(Workspace(tmp_path)).load_episode(
+    episode = EvolutionStore(Workspace(tmp_path)).load_evaluation_episode(
         ready.evolution_id,
-        "v002",
+        "v001",
     )
-    assert task.status == "AWAITING_EXPERT_FEEDBACK"
+    assert task.status == "REVISION_READY"
+    assert task.current_version == "v001"
+    assert task.current_evaluation_version == "v001"
     assert episode.execution_mode == "FRESH_EVALUATION"
     assert episode.applied_feedback_id is None
     assert episode.revision_plan_id is None
@@ -423,8 +435,6 @@ def test_export_accept_stop_and_reopen_commands(
             "evolve",
             "accept",
             task.evolution_id,
-            "--version",
-            "v001",
             "--workspace",
             str(tmp_path),
         ],
@@ -451,6 +461,15 @@ def test_export_accept_stop_and_reopen_commands(
     assert "STOPPED" in stopped.output
     assert reopened_again.exit_code == 0, reopened_again.output
     assert "AWAITING_EXPERT_FEEDBACK" in reopened_again.output
+    journal = EvolutionStore(Workspace(tmp_path)).read_event_journal(
+        task.evolution_id
+    )
+    assert [entry[1]["event"]["kind"] for entry in journal] == [
+        "evolution_task_accepted",
+        "evolution_task_reopened",
+        "evolution_task_stopped",
+        "evolution_task_reopened",
+    ]
 
 
 def test_feedback_file_import_is_confirmed_without_constructing_runtime(

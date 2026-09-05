@@ -231,6 +231,12 @@ def evolve_start(
         )
         prior_mutations.append(reserved)
         episode = reserved.entity
+        for mutation in prior_mutations:
+            store.append_events(
+                task.evolution_id,
+                mutation.events,
+                idempotency_scope=store.event_scope(mutation.entity),
+            )
     except (OSError, ValueError) as exc:
         console.print(f"[red]{redact_text(str(exc))}[/]")
         raise typer.Exit(code=2) from None
@@ -413,6 +419,11 @@ def evolve_compare(
     ) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
         raise typer.Exit(code=2) from None
+    service.store.append_events(
+        evolution_id,
+        mutation.events,
+        idempotency_scope=service.store.event_scope(mutation.entity),
+    )
     _render_comparison(console, mutation.entity)
 
 
@@ -665,6 +676,11 @@ def evolve_iterate(
         context = claim.context
         episode = claim.episode
         reserved = MutationResult(episode, claim.events)
+        store.append_events(
+            evolution_id,
+            claim.events,
+            idempotency_scope=store.event_scope(claim.episode),
+        )
     except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
         raise typer.Exit(code=2) from None
@@ -826,7 +842,7 @@ def evolve_evaluate(
             runtime, logger = build_runtime(
                 provider=provider_config.provider,
                 model=provider_config.model,
-                workspace_root=boundary.root,
+                workspace_root=cast(Path, fresh_kwargs["workspace_root"]),
                 approval=cast(ApprovalMode, approval),
                 fresh_approval=cast(bool, fresh_kwargs["fresh_approval"]),
                 application_approval_root=cast(
@@ -840,6 +856,7 @@ def evolve_evaluate(
                     ScientificState,
                     fresh_kwargs["scientific_state"],
                 ),
+                evaluation_isolation=True,
             )
             executor.event_logger = logger
             logger_box.append(logger)
@@ -929,21 +946,22 @@ def evolve_export(
 @evolve_app.command("accept")
 def evolve_accept(
     evolution_id: str = typer.Argument(..., help="Persistent evolution task ID"),
-    version: str = typer.Option(..., "--version"),
+    version: str | None = typer.Option(
+        None, "--version", help="Completed main version; defaults to the latest."
+    ),
     workspace: Path = typer.Option(
         Path.cwd(), "--workspace", exists=True, file_okay=False
     ),
 ) -> None:
     """Accept any verified completed Episode artifact."""
 
-    _run_control_command(
-        evolution_id,
-        workspace,
-        lambda service: service.accept(
-            evolution_id,
-            cast(EpisodeVersion, version),
-        ),
-    )
+    def accept_selected(service: EvolutionService) -> MutationResult[EvolutionTask]:
+        selected = version or service.get(evolution_id).last_completed_version
+        if selected is None:
+            raise ValueError("task has no completed main episode to accept")
+        return service.accept(evolution_id, cast(EpisodeVersion, selected))
+
+    _run_control_command(evolution_id, workspace, accept_selected)
 
 
 @evolve_app.command("stop")
@@ -996,6 +1014,11 @@ def _run_control_command(
     ) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
         raise typer.Exit(code=2) from None
+    service.store.append_events(
+        evolution_id,
+        mutation.events,
+        idempotency_scope=service.store.event_scope(mutation.entity),
+    )
     _render_task_details(mutation.entity, boundary.root)
 
 
@@ -1506,6 +1529,12 @@ async def _execute_initial_episode(
     on_event: EventSink | None,
     owner_token: str | None = None,
 ) -> EpisodeExecutionResult:
+    for mutation in prior_mutations:
+        store.append_events(
+            task.evolution_id,
+            mutation.events,
+            idempotency_scope=store.event_scope(mutation.entity),
+        )
     if logger is not None:
         for mutation in prior_mutations:
             for event in mutation.events:
@@ -1535,6 +1564,12 @@ async def _execute_revised_episode(
     on_event: EventSink | None,
     owner_token: str | None = None,
 ) -> EpisodeExecutionResult:
+    for mutation in prior_mutations:
+        store.append_events(
+            task.evolution_id,
+            mutation.events,
+            idempotency_scope=store.event_scope(mutation.entity),
+        )
     if logger is not None:
         for mutation in prior_mutations:
             for event in mutation.events:
