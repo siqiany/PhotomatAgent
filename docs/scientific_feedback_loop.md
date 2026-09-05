@@ -159,3 +159,64 @@ subsequent rounds, and deterministic termination are all exercised.
 - Soft-constraint optimisation is scored but not required for PASS.
 - Natural-language → `TargetSpec` compilation is intentionally out of P0
   scope: the CLI requires an explicit target (`--demo` / `--target-json`).
+
+## 专家反馈驱动的跨 Episode 演化层
+
+P0 `ScientificLoopController` 是单个 Episode 内的科学闭环。外层 `evolve` 工作流
+解决的是不同时间尺度的问题：CLI 可以退出，专家稍后评价某个已固化结果，再由用户
+显式启动一个新 Episode。两层不会合并：
+
+```text
+Episode 内：Maker → 结构化证据 → 确定性 Checker → 修正/停止
+Episode 间：v001 结果 → 专家反馈 → 编译 → 人工确认 → v002 → 比较
+```
+
+生产 CLI 必须按状态机顺序执行。`target.json` 必须是可由 `TargetSpec` 验证的 JSON，
+并且 `.env` 需要配置能够完成普通生成和严格结构化 JSON 编译的真实 provider。省略
+`--provider` 时使用该配置；将尖括号占位符替换为前一步输出的真实 ID：
+
+```bash
+uv run photomatagent evolve start --target-file target.json --goal "生成中红外光窗材料候选与工艺"
+uv run photomatagent evolve feedback <evolution-id> --version v001
+uv run photomatagent evolve compile <evolution-id> --version v001
+uv run photomatagent evolve evaluate <evolution-id> --fresh --strategy-id <strategy-id>
+uv run photomatagent evolve iterate <evolution-id>
+uv run photomatagent evolve compare <evolution-id> v001 v002
+```
+
+专家反馈入口与普通聊天严格隔离。反馈先绑定 `v001` 主结果的 SHA-256，再保存为不可变
+记录；它不会作为 `runtime.run(raw_feedback)` 的用户消息发送，也不会触发工具、网络或
+HPC。反馈保存后必须显式运行 `compile`。无工具 `FeedbackCompiler` 的请求固定为
+`tools=[]`，只把反馈编译为结构化 `FeedbackDelta`；命令会预览 RevisionPlan 和
+Strategy ID，并要求用户确认。Compiler 失败时原始反馈仍保留，可重跑同一条命令。
+
+确认后任务进入 `REVISION_READY`。`evaluate --fresh` 只接受该状态，并要求显式传入
+`--strategy-id`，所以 fresh evaluation 必须先于 `iterate`；它完成后主任务仍保持
+`REVISION_READY`。随后 `iterate` 才创建 v002 和新的 runtime session。进入 v002 的
+只有有界结构化修订指令和符合 provenance、subject、fidelity 规则的已验证证据；旧
+`ConversationState`、旧答案、专家自由文本与未验证预测均不继承。专家评分和可选
+Judge 始终是咨询信号，不能把确定性 FAIL/UNKNOWN 改为 PASS，也不能绕过运行时权限
+或 HPC 提交门禁。
+
+`evaluate --fresh` 使用冻结策略快照和空白 `ScientificState`，排除当前任务的反馈、
+历史答案和继承证据，用于更严格的跨任务评估。离线两轮 smoke 由
+`tests/test_evolution_end_to_end.py` 权威执行；
+`experiments/expert-feedback-evolution-smoke.json` 只声明输入与期望，不在 experiment
+runner 中复制演化服务：
+
+```bash
+uv run pytest -q tests/test_evolution_end_to_end.py
+```
+
+这是权威、完全离线且可重复的两轮 smoke：测试夹具显式提供符合 schema 的固定 compiler
+响应。内置 fake provider 虽可用于局部 runtime/loop 演示，却不会自行生成合法的
+`FeedbackCompilation`，因此不能把上面的生产 CLI 链称为 fake 离线全流程。
+
+策略选择在数据不足时安全回退到 deterministic fixed selector。只有累计至少 20 条
+observation 且覆盖至少 8 个不同 `task_group_id`，Bayesian Linear Thompson Sampling
+才可能启用。即使达到 20/8，只要权威
+`reviewed comparison → Experience → StrategyObservation` 链存在缺口，selector 和
+status 仍保持 `fixed baseline`；按 status 列出的 evolution/comparison ID 重跑相应
+`evolve compare`，补齐链路后再判断门槛。同一任务的 v001/v002 是相关样本，统计时
+不能当作两个独立任务。经验从 `OBSERVATION` 开始，满足跨任务证据门槛后才能逐级
+晋升；系统不会自动创建或修改 Skill，`REUSABLE_SKILL` 还要求显式用户批准。

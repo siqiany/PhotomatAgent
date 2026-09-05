@@ -7,9 +7,12 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from photomatagent.scientific.evolution.executor import (
+        EpisodeExecutionResult,
         RuntimeFactory,
+        ScientificEpisodeExecutor,
         run_fresh_evaluation,
     )
+    from photomatagent.scientific.evolution.feedback import FeedbackCompiler
     from photomatagent.scientific.evolution.evidence import (
         EvidenceCarryDecision,
         build_inherited_scientific_state,
@@ -183,7 +186,13 @@ _REVISION_EXPORTS = (
     "format_revision_instruction",
 )
 _STRATEGY_EXPORTS = ("FixedStrategySelector",)
-_EXECUTOR_EXPORTS = ("RuntimeFactory", "run_fresh_evaluation")
+_EXECUTOR_EXPORTS = (
+    "EpisodeExecutionResult",
+    "RuntimeFactory",
+    "ScientificEpisodeExecutor",
+    "run_fresh_evaluation",
+)
+_FEEDBACK_EXPORTS = ("FeedbackCompiler",)
 _STORE_EXPORTS = (
     "EvolutionAlreadyExistsError",
     "EvolutionConflictError",
@@ -203,6 +212,10 @@ _EXPORT_MODULE = {
     **{
         name: "photomatagent.scientific.evolution.evidence"
         for name in _EVIDENCE_EXPORTS
+    },
+    **{
+        name: "photomatagent.scientific.evolution.feedback"
+        for name in _FEEDBACK_EXPORTS
     },
     **{
         name: "photomatagent.scientific.evolution.models"
@@ -233,6 +246,7 @@ _EXPORT_MODULE = {
 __all__ = [
     *_EVIDENCE_EXPORTS,
     *_EXECUTOR_EXPORTS,
+    *_FEEDBACK_EXPORTS,
     *_MODEL_EXPORTS,
     *_RUBRIC_EXPORTS,
     *_SERVICE_EXPORTS,

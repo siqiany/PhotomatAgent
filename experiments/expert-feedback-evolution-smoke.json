@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "name": "expert-feedback-evolution-offline-smoke",
+  "description": "由 tests/test_evolution_end_to_end.py 执行的完全离线两轮演化语义场景；本文件只声明输入和期望。",
+  "execution": {
+    "authoritative_fixture": "tests/test_evolution_end_to_end.py",
+    "provider": "fake",
+    "network": false,
+    "hpc": false,
+    "fixed_responses": true
+  },
+  "input": {
+    "evolution_id": "evo_offline_e2e",
+    "task_group_id": "task_group_offline_e2e",
+    "goal": "生成中红外光窗材料候选与工艺",
+    "target": {
+      "goal": "筛选满足带隙硬约束的中红外光窗候选",
+      "constraints": [
+        {
+          "property": "band_gap",
+          "operator": "le",
+          "value": 0.2,
+          "unit": "eV",
+          "severity": "HARD"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "versions": ["v001", "v002"],
+    "final_status": "AWAITING_EXPERT_FEEDBACK",
+    "fresh_required_status": "REVISION_READY",
+    "fresh_precedes_version": "v002",
+    "workflow_order": [
+      {
+        "kind": "evolution_task_created"
+      },
+      {
+        "kind": "evolution_episode_started",
+        "episode_version": "v001",
+        "execution_mode": "NORMAL"
+      },
+      {
+        "kind": "evolution_episode_completed",
+        "episode_version": "v001",
+        "execution_mode": "NORMAL"
+      },
+      {
+        "kind": "expert_feedback_recorded",
+        "episode_version": "v001",
+        "execution_mode": "NORMAL"
+      },
+      {
+        "kind": "expert_feedback_compiled",
+        "episode_version": "v001",
+        "execution_mode": "NORMAL"
+      },
+      {
+        "kind": "revision_plan_confirmed",
+        "episode_version": "v001",
+        "execution_mode": "NORMAL"
+      },
+      {
+        "kind": "evolution_episode_started",
+        "episode_version": "v001",
+        "execution_mode": "FRESH_EVALUATION"
+      },
+      {
+        "kind": "evolution_episode_completed",
+        "episode_version": "v001",
+        "execution_mode": "FRESH_EVALUATION"
+      },
+      {
+        "kind": "evolution_iteration_started",
+        "episode_version": "v002",
+        "execution_mode": "CARRY_VERIFIED_EVIDENCE"
+      },
+      {
+        "kind": "evolution_episode_started",
+        "episode_version": "v002",
+        "execution_mode": "CARRY_VERIFIED_EVIDENCE"
+      },
+      {
+        "kind": "evolution_episode_completed",
+        "episode_version": "v002",
+        "execution_mode": "CARRY_VERIFIED_EVIDENCE"
+      },
+      {
+        "kind": "evolution_comparison_completed",
+        "episode_version": "v002",
+        "execution_mode": "CARRY_VERIFIED_EVIDENCE"
+      }
+    ],
+    "distinct_runtime_sessions": true,
+    "feedback_isolated_from_runtime": true,
+    "fresh_evaluation_has_no_task_history": true,
+    "deterministic_fail_survives_five_star_review": true,
+    "closure_rate": 1.0
+  }
+}

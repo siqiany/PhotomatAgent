@@ -17,6 +17,9 @@ It is designed to run as a CLI application. The runtime owns context constructio
   (`TargetSpec` → candidates → deterministic evaluation → structured feedback →
   convergence policy → stagnation detection) that decides scientific success
   from evidence and constraints — never from the model's own "final answer".
+- **专家反馈驱动的跨版本演化**：将异步专家评价绑定到准确的 Episode
+  结果哈希，经无工具 Compiler 编译和人工确认后，显式创建全新 runtime session
+  运行下一版本；普通聊天不会被当作专家反馈。
 - Capability packs for materials databases, literature retrieval, crystal structures, electronic structure, infrared constraints, quantum dots, detector metrics, and more.
 - Optional VASP, Hefei-NAMD, MAGUS, Slurm/SCNet, and MCP integrations.
 - JSONL execution traces, replay, session analysis, and deterministic experiment runs.
@@ -160,6 +163,24 @@ CLI / experiment runner
 
 The main control loop is implemented in `src/photomatagent/runtime/loop.py`. It does not delegate tool execution to a model SDK.
 
+一次 `loop` 只负责一个 Episode 内的“候选—证据—确定性检查”科学闭环；持久化的
+`evolve` 位于它的外层，负责跨 Episode 的专家反馈、修订计划、策略版本和结果比较：
+
+```text
+EvolutionService（跨 Episode，持久化编排）
+  → v001 ScientificLoopController
+  → 专家反馈（绑定结果 SHA-256；不进入普通聊天）
+  → 无工具 FeedbackCompiler → 人工确认 RevisionPlan
+  → 可选且显式的 fresh evaluation
+      （仅在 REVISION_READY；独立 evaluation 记录；主线仍为 v001）
+  → iterate → v002 全新 AgentRuntime / runtime session
+  → v001/v002 确定性比较
+```
+
+`EvolutionService` 不直接执行工具、MCP、SSH、Slurm 或 HPC。所有模型请求的工具调用仍
+只通过 `AgentRuntime` 的 registry、权限和审批路径执行；专家高分也不能覆盖确定性
+Checker 的 FAIL/UNKNOWN。
+
 ### Tool exposure
 
 Every tool is registered with one of three exposure modes:
@@ -249,6 +270,16 @@ trace, and you keep asking follow-up questions without restarting.
 
 Experiment JSON files define independent tasks and deterministic expectations. The runner creates a fresh runtime and trace for each task, then stores experiment results under `.photomatagent/experiments/`.
 
+两轮专家反馈演化的离线 smoke 输入和期望记录在
+`experiments/expert-feedback-evolution-smoke.json`。它是多阶段场景描述，不复制
+`EvolutionService`，权威执行入口是：
+
+```bash
+uv run pytest -q tests/test_evolution_end_to_end.py
+```
+
+该测试只使用固定 `FakeModelProvider` 轨迹和本地测试工具，不访问网络，也不会提交 HPC。
+
 ## Evidence-Guided Scientific Feedback Loop
 
 The main `AgentRuntime` remains the **inner execution loop** (the Maker). A
@@ -325,6 +356,51 @@ fake provider for CI:
 ```bash
 uv run photomatagent experiments run experiments/scientific-feedback-loop-smoke.json
 ```
+
+## 专家反馈驱动的跨 Episode 演化
+
+下面是生产 CLI 的正确状态顺序。先准备可由 `TargetSpec` 验证的 `target.json`，并在
+`.env` 中配置能够完成普通生成和严格结构化 JSON 编译的真实 provider；命令省略
+`--provider` 时使用该配置。将尖括号占位符替换为前一步输出的真实 ID：
+
+```bash
+uv run photomatagent evolve start --target-file target.json --goal "生成中红外光窗材料候选与工艺"
+uv run photomatagent evolve feedback <evolution-id> --version v001
+uv run photomatagent evolve compile <evolution-id> --version v001
+uv run photomatagent evolve evaluate <evolution-id> --fresh --strategy-id <strategy-id>
+uv run photomatagent evolve iterate <evolution-id>
+uv run photomatagent evolve compare <evolution-id> v001 v002
+```
+
+`evolve start` 先持久化任务再运行 `v001`。CLI 退出后仍可用同一个 evolution ID
+录入反馈；反馈会绑定到专家实际查看的结果 SHA-256。`feedback` 只走专用专家入口，
+不会调用 `runtime.run(raw_feedback)`，也不会自动运行工具或提交 HPC。随后必须显式
+执行 `compile`；该命令使用 `tools=[]` 的独立 provider 请求，展示 RevisionPlan 和
+Strategy ID，并要求交互确认。只有确认后任务才进入 `REVISION_READY`。编译失败时原始
+反馈仍保留，可重跑同一条 `compile` 命令。
+
+`evaluate --fresh` 要求 `REVISION_READY`、`--fresh` 和已确认生成的
+`--strategy-id`，因此必须在 `iterate` 之前运行；它保持主任务的修订就绪状态，并使用
+空白科学状态排除该任务的历史反馈、答案和继承证据。之后 `iterate` 才创建 v002 与
+全新 runtime session。正常迭代只继承满足 provenance 规则的已验证结构化证据；旧
+对话、旧答案、专家自由文本和未经验证的模型预测不会进入下一轮。
+
+内置 fake provider 能支持局部 runtime/loop 演示，但不会自行生成符合
+`FeedbackCompilation` schema 的编译响应，因此上述生产 CLI 全流程不能标为 fake
+离线流程。权威、完全离线且可重复的两轮 smoke 只有：
+
+```bash
+uv run pytest -q tests/test_evolution_end_to_end.py
+```
+
+策略学习有明确安全边界：少于 20 条 observation 或少于 8 个不同
+`task_group_id` 时使用可解释的 fixed selector；门槛满足前不会宣称 Bayesian 学习已经
+启用。即使数量达到 20/8，只要任一权威
+`reviewed comparison → Experience → StrategyObservation` 链不完整，selector/status
+仍显示 `fixed baseline`；按 status 提示重跑相应的 `evolve compare`，补齐链路后才会
+重新评估启用条件。同一任务的多个 Episode 是相关样本，不能冒充独立任务。经验默认
+从 `OBSERVATION` 开始，系统不会自动把它晋升为 Skill；可复用 Skill 还需要跨任务证据
+和显式用户批准。
 
 ## Development
 
