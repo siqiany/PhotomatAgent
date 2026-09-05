@@ -62,7 +62,10 @@ from photomatagent.scientific.evolution.service import (
     EvolutionService,
     MutationResult,
 )
-from photomatagent.scientific.evolution.strategy import FixedStrategySelector
+from photomatagent.scientific.evolution.strategy import (
+    BayesianLinearStrategySelector,
+    FixedStrategySelector,
+)
 from photomatagent.scientific.evolution.store import (
     EvolutionStore,
     EvolutionStoreError,
@@ -338,6 +341,17 @@ def evolve_status(
     boundary = Workspace(workspace)
     task = _load_task(boundary.root, evolution_id)
     _render_task_details(task, boundary.root)
+    selector = BayesianLinearStrategySelector().fit(
+        EvolutionStore(boundary).list_all_strategy_observations()
+    )
+    diagnostics = selector.diagnostics
+    selector_state = "Bayesian enabled" if selector.enabled else "fixed baseline"
+    console.print(
+        f"Strategy selector: {selector_state} "
+        f"({diagnostics.observation_count} reviewed observations; "
+        f"{diagnostics.distinct_tasks} distinct task groups; "
+        f"{diagnostics.effective_training_rows} effective training rows)"
+    )
 
 
 @evolve_app.command("history")

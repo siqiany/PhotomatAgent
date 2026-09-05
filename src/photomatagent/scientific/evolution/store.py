@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, TypeVar
 
+import numpy as np
 from pydantic import BaseModel, ValidationError
 
 from photomatagent.redaction import redact_secrets
@@ -48,8 +49,17 @@ from photomatagent.scientific.evolution.models import (
     utc_now,
     validate_managed_id,
 )
-from photomatagent.scientific.evolution.experience import ExperienceRecord
+from photomatagent.scientific.evolution.experience import (
+    ExperienceRecord,
+    StrategyObservation,
+    TaskContext,
+    canonical_record_sha256,
+)
 from photomatagent.scientific.evolution.events import bounded_summary
+from photomatagent.scientific.evolution.strategy import (
+    BayesianLinearStrategySelector,
+    StrategyPosteriorSnapshot,
+)
 from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
 
@@ -384,6 +394,43 @@ class EvolutionTransaction:
             filename=f"{experience.experience_id}.json",
             record=experience,
             model_type=ExperienceRecord,
+        )
+
+    def load_strategy_observation(
+        self, observation_id: str
+    ) -> StrategyObservation:
+        self._require_active()
+        return self.store.load_strategy_observation(
+            self.evolution_id, observation_id
+        )
+
+    def write_strategy_observation(
+        self, observation: StrategyObservation
+    ) -> Path:
+        self._require_active()
+        if observation.evolution_id != self.evolution_id:
+            raise EvolutionConflictError(
+                "strategy observation belongs to a different transaction"
+            )
+        return self.store._write_strategy_observation_locked(observation)
+
+    def load_strategy_posterior(
+        self, posterior_id: str
+    ) -> StrategyPosteriorSnapshot:
+        self._require_active()
+        return self.store.load_strategy_posterior(self.evolution_id, posterior_id)
+
+    def write_strategy_posterior(
+        self, posterior: StrategyPosteriorSnapshot
+    ) -> Path:
+        self._require_active()
+        self.store._validate_strategy_posterior_provenance(posterior)
+        return self.store._write_record_locked(
+            evolution_id=self.evolution_id,
+            directory="strategy_posteriors",
+            filename=f"{posterior.posterior_id}.json",
+            record=posterior,
+            model_type=StrategyPosteriorSnapshot,
         )
 
 
@@ -1511,6 +1558,335 @@ class EvolutionStore:
             "experience",
             self.load_experience,
         )
+
+    def write_strategy_observation(
+        self,
+        observation: StrategyObservation,
+    ) -> Path:
+        """Persist one reviewed observation after rechecking every source link."""
+
+        self._validate_id(observation.observation_id)
+        task_dir = self._task_dir(observation.evolution_id)
+        with self._task_lock(task_dir):
+            return self._write_strategy_observation_locked(observation)
+
+    def _write_strategy_observation_locked(
+        self,
+        observation: StrategyObservation,
+    ) -> Path:
+        candidate, payload = self._prepare_model(observation, StrategyObservation)
+        self._validate_strategy_observation_provenance(candidate)
+        path = self._managed_path(
+            candidate.evolution_id,
+            "strategy_observations",
+            f"{candidate.observation_id}.json",
+        )
+        if path.exists():
+            stored = self.load_strategy_observation(
+                candidate.evolution_id, candidate.observation_id
+            )
+            if stored == candidate:
+                return path
+            raise EvolutionAlreadyExistsError(
+                f"immutable evolution record already exists: {path}"
+            )
+        for stored in self.list_strategy_observations(candidate.evolution_id):
+            if stored.comparison_id == candidate.comparison_id:
+                if stored == candidate:
+                    return self._managed_path(
+                        stored.evolution_id,
+                        "strategy_observations",
+                        f"{stored.observation_id}.json",
+                    )
+                raise EvolutionConflictError(
+                    f"comparison {candidate.comparison_id} already has a conflicting "
+                    "strategy observation"
+                )
+        self._write_immutable_json(path, payload)
+        return path
+
+    def _validate_strategy_observation_provenance(
+        self,
+        observation: StrategyObservation,
+    ) -> None:
+        task = self.load_task(observation.evolution_id)
+        if task.task_group_id != observation.task_group_id:
+            raise EvolutionConflictError(
+                "strategy observation task group does not match task manifest"
+            )
+        required = (
+            (observation.comparison_id, task.comparison_ids, "comparison"),
+            (observation.experience_id, task.experience_ids, "experience"),
+            (observation.strategy_id, task.strategy_ids, "strategy"),
+        )
+        for record_id, manifest_ids, label in required:
+            if record_id not in manifest_ids:
+                raise EvolutionConflictError(
+                    f"strategy observation {label} is not referenced by task manifest"
+                )
+        comparison = self.load_comparison(
+            observation.evolution_id, observation.comparison_id
+        )
+        experience = self.load_experience(
+            observation.evolution_id, observation.experience_id
+        )
+        strategy = self.load_strategy(
+            observation.evolution_id, observation.strategy_id
+        )
+        episode = self.load_episode(
+            observation.evolution_id, observation.current_version
+        )
+        previous_episode = self.load_episode(
+            observation.evolution_id, observation.previous_version
+        )
+        if (
+            comparison.phase != "POST_FEEDBACK"
+            or comparison.reward is None
+            or comparison.expert_utility_delta is None
+            or "expert_utility_delta" not in comparison.components_used
+        ):
+            raise EvolutionConflictError(
+                "strategy observations require a reviewed POST_FEEDBACK comparison "
+                "whose reward includes expert utility"
+            )
+        if canonical_record_sha256(comparison) != observation.comparison_sha256:
+            raise EvolutionConflictError("strategy observation comparison hash mismatch")
+        if canonical_record_sha256(experience) != observation.experience_sha256:
+            raise EvolutionConflictError("strategy observation experience hash mismatch")
+        if canonical_record_sha256(strategy) != observation.strategy_record_sha256:
+            raise EvolutionConflictError(
+                "strategy observation strategy record hash mismatch"
+            )
+        matching_evidence = [
+            item
+            for item in experience.observations
+            if item.comparison_id == comparison.comparison_id
+        ]
+        if (
+            len(matching_evidence) != 1
+            or matching_evidence[0].task_group_id != task.task_group_id
+            or matching_evidence[0].reward != comparison.reward
+        ):
+            raise EvolutionConflictError(
+                "strategy observation is not linked to matching Task-11 experience evidence"
+            )
+        expected_values = (
+            (
+                comparison.previous_version,
+                observation.previous_version,
+                "previous version",
+            ),
+            (
+                comparison.current_version,
+                observation.current_version,
+                "current version",
+            ),
+            (
+                comparison.current_feedback_id,
+                observation.current_feedback_id,
+                "feedback ID",
+            ),
+            (
+                comparison.current_feedback_sha256,
+                observation.current_feedback_sha256,
+                "feedback hash",
+            ),
+            (
+                comparison.current_compilation_id,
+                observation.current_compilation_id,
+                "compilation ID",
+            ),
+            (
+                comparison.current_compilation_sha256,
+                observation.current_compilation_sha256,
+                "compilation hash",
+            ),
+            (strategy.arm, observation.strategy_arm, "strategy arm"),
+            (strategy.strategy_sha256, observation.strategy_sha256, "strategy hash"),
+            (strategy.cutoff_at, observation.strategy_cutoff_at, "strategy cutoff"),
+            (
+                episode.execution_mode,
+                observation.source_execution_mode,
+                "execution mode",
+            ),
+            (episode.strategy_id, observation.strategy_id, "episode strategy ID"),
+            (episode.strategy_arm, observation.strategy_arm, "episode strategy arm"),
+            (
+                episode.strategy_sha256,
+                observation.strategy_sha256,
+                "episode strategy hash",
+            ),
+            (comparison.reward, observation.reward, "reward"),
+        )
+        for authoritative, recorded, label in expected_values:
+            if authoritative != recorded:
+                raise EvolutionConflictError(
+                    f"strategy observation {label} does not match provenance"
+                )
+        if episode.execution_mode == "FRESH_EVALUATION":
+            raise EvolutionConflictError(
+                "fresh evaluations cannot train the strategy selector"
+            )
+        if episode.parent_version != comparison.previous_version:
+            raise EvolutionConflictError(
+                "strategy observation current episode does not follow comparison parent"
+            )
+        critical_gaps: tuple[str, ...] = ()
+        if (
+            previous_episode.summary is not None
+            and previous_episode.summary.final_evaluation is not None
+        ):
+            critical_gaps = tuple(
+                dict.fromkeys(
+                    gap
+                    for gap in previous_episode.summary.final_evaluation.critical_evidence_gaps
+                    if gap
+                )
+            )
+        expected_context = TaskContext.from_target(
+            task.target,
+            previous_critical_gap_count=len(critical_gaps),
+        )
+        if observation.context != expected_context:
+            raise EvolutionConflictError(
+                "strategy observation task context does not match task target and "
+                "previous Episode critical gaps"
+            )
+
+    def load_strategy_observation(
+        self,
+        evolution_id: str,
+        observation_id: str,
+    ) -> StrategyObservation:
+        self._validate_id(observation_id)
+        path = self._managed_path(
+            evolution_id,
+            "strategy_observations",
+            f"{observation_id}.json",
+        )
+        observation = self._load_model(
+            path, StrategyObservation, require_schema_version=True
+        )
+        if (
+            observation.evolution_id != evolution_id
+            or observation.observation_id != observation_id
+        ):
+            raise EvolutionCorruptRecordError(
+                path, "strategy observation identity does not match its managed path"
+            )
+        self._validate_strategy_observation_provenance(observation)
+        return observation
+
+    def list_strategy_observations(
+        self,
+        evolution_id: str,
+    ) -> list[StrategyObservation]:
+        return self._list_managed_records(
+            evolution_id,
+            "strategy_observations",
+            self.load_strategy_observation,
+        )
+
+    def list_all_strategy_observations(self) -> list[StrategyObservation]:
+        observations: list[StrategyObservation] = []
+        for task in self.list_tasks():
+            observations.extend(self.list_strategy_observations(task.evolution_id))
+        return sorted(observations, key=lambda item: item.observation_sha256)
+
+    def write_strategy_posterior(
+        self,
+        evolution_id: str,
+        posterior: StrategyPosteriorSnapshot,
+    ) -> Path:
+        """Persist one immutable posterior under a managed evolution task."""
+
+        self._validate_id(posterior.posterior_id)
+        self._validate_strategy_posterior_provenance(posterior)
+        return self._write_record(
+            evolution_id=evolution_id,
+            directory="strategy_posteriors",
+            filename=f"{posterior.posterior_id}.json",
+            record=posterior,
+            model_type=StrategyPosteriorSnapshot,
+        )
+
+    def load_strategy_posterior(
+        self,
+        evolution_id: str,
+        posterior_id: str,
+    ) -> StrategyPosteriorSnapshot:
+        self._validate_id(posterior_id)
+        path = self._managed_path(
+            evolution_id,
+            "strategy_posteriors",
+            f"{posterior_id}.json",
+        )
+        posterior = self._load_model(
+            path, StrategyPosteriorSnapshot, require_schema_version=True
+        )
+        if posterior.posterior_id != posterior_id:
+            raise EvolutionCorruptRecordError(
+                path, "strategy posterior identity does not match its managed path"
+            )
+        self._validate_strategy_posterior_provenance(posterior)
+        return posterior
+
+    def list_strategy_posteriors(
+        self,
+        evolution_id: str,
+    ) -> list[StrategyPosteriorSnapshot]:
+        return self._list_managed_records(
+            evolution_id,
+            "strategy_posteriors",
+            self.load_strategy_posterior,
+        )
+
+    def _validate_strategy_posterior_provenance(
+        self,
+        posterior: StrategyPosteriorSnapshot,
+    ) -> None:
+        authoritative = self.list_all_strategy_observations()
+        by_hash = {item.observation_sha256: item for item in authoritative}
+        try:
+            training = [
+                by_hash[value] for value in posterior.training_observation_hashes
+            ]
+        except KeyError as exc:
+            raise EvolutionConflictError(
+                "strategy posterior references a non-authoritative observation hash"
+            ) from exc
+        recomputed_selector = BayesianLinearStrategySelector(
+            seed=0,
+            prior_precision=posterior.prior_precision,
+            noise_variance=posterior.noise_variance,
+        ).fit(training)
+        recomputed = recomputed_selector.posterior
+        if recomputed is None:
+            raise EvolutionConflictError(
+                "strategy posterior does not meet the authoritative learning gate"
+            )
+        counts_match = (
+            posterior.observation_count == recomputed.observation_count
+            and posterior.effective_training_rows
+            == recomputed.effective_training_rows
+            and posterior.distinct_task_groups == recomputed.distinct_task_groups
+            and posterior.training_cutoff_at == recomputed.training_cutoff_at
+        )
+        arrays_match = np.allclose(
+            posterior.mean,
+            recomputed.mean,
+            rtol=0.0,
+            atol=1e-12,
+        ) and np.allclose(
+            posterior.covariance,
+            recomputed.covariance,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        if not counts_match or not arrays_match:
+            raise EvolutionConflictError(
+                "strategy posterior does not match authoritative observations"
+            )
 
     def _list_managed_records(
         self,

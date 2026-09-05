@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from photomatagent.scientific.evolution.models import EvolutionTask, RevisionPlan
-from photomatagent.scientific.evolution.strategy import FixedStrategySelector
-from photomatagent.scientific.loop import TargetSpec
+from photomatagent.scientific.evolution.strategy import (
+    ARM_ORDER,
+    FEATURE_DIMENSION,
+    FEATURE_SCHEMA,
+    FixedStrategySelector,
+    TaskContext,
+    feature_vector,
+)
+from photomatagent.scientific.loop import ConstraintSpec, TargetSpec
 
 
 def _task() -> EvolutionTask:
@@ -61,3 +68,68 @@ def test_fixed_selector_rejects_cross_task_plan() -> None:
         assert "same evolution task" in str(exc)
     else:  # pragma: no cover - explicit assertion without pytest dependency
         raise AssertionError("cross-task plan was accepted")
+
+
+def test_task_context_and_feature_vector_have_fixed_bounded_schema() -> None:
+    target = TargetSpec(
+        goal="bounded context",
+        constraints=[
+            *[
+                ConstraintSpec(property=f"hard_{index}", operator="ge")
+                for index in range(12)
+            ],
+            *[
+                ConstraintSpec(
+                    property=f"soft_{index}", operator="ge", severity="SOFT"
+                )
+                for index in range(5)
+            ],
+        ],
+        objectives=[f"objective {index}" for index in range(3)],
+        operating_conditions={f"condition_{index}": index for index in range(20)},
+    )
+
+    context = TaskContext.from_target(target, previous_critical_gap_count=4)
+    vector = feature_vector(context, "DIVERSITY_FIRST")
+
+    assert context.values == (1.0, 1.0, 0.5, 0.3, 1.0, 0.4)
+    assert ARM_ORDER == (
+        "STATIC",
+        "EVIDENCE_FIRST",
+        "DIVERSITY_FIRST",
+        "UNCERTAINTY_FIRST",
+    )
+    assert FEATURE_DIMENSION == 30
+    assert len(FEATURE_SCHEMA) == FEATURE_DIMENSION
+    assert vector == (
+        1.0,
+        1.0,
+        0.5,
+        0.3,
+        1.0,
+        0.4,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.3,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.4,
+        0.0,
+    )
