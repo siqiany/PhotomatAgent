@@ -5,6 +5,7 @@ from datetime import timedelta
 import json
 from pathlib import Path
 from threading import Event
+import time
 
 import numpy as np
 import pytest
@@ -30,6 +31,7 @@ from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
     EvolutionConflictError,
     EvolutionCorruptRecordError,
+    EvolutionLockError,
     EvolutionStore,
 )
 from photomatagent.scientific.evolution.strategy import (
@@ -591,6 +593,94 @@ def test_learning_lock_hides_manifest_observation_gap_from_selector_fit(
 
     assert selector.enabled is True
     assert selector.diagnostics.observation_count == 20
+
+
+def test_plain_transaction_cannot_bypass_observation_learning_lock(
+    tmp_path: Path,
+) -> None:
+    store, observation = _persist_observation_sources(
+        tmp_path,
+        index=7_000,
+        task_group_id="group_transaction_observation",
+    )
+    entered = Event()
+    release = Event()
+    other = EvolutionStore(Workspace(tmp_path))
+
+    def hold_learning_lock() -> None:
+        with store.strategy_learning_lock():
+            entered.set()
+            assert release.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        holder = executor.submit(hold_learning_lock)
+        assert entered.wait(timeout=5)
+        try:
+            with other.transaction(observation.evolution_id) as transaction:
+                with pytest.raises(EvolutionLockError, match="learning transaction"):
+                    transaction.write_strategy_observation(observation)
+        finally:
+            release.set()
+            holder.result(timeout=5)
+
+    assert store.list_strategy_observations(observation.evolution_id) == []
+
+
+def test_plain_transaction_cannot_bypass_posterior_learning_lock(
+    tmp_path: Path,
+) -> None:
+    observations: list[StrategyObservation] = []
+    store: EvolutionStore | None = None
+    for index in range(20):
+        store, observation = _persist_observation_sources(
+            tmp_path,
+            index=8_000 + index,
+            task_group_id=f"group_transaction_posterior_{index % 8}",
+        )
+        store.write_strategy_observation(observation)
+        observations.append(observation)
+    assert store is not None
+    posterior = BayesianLinearStrategySelector().fit(observations).posterior
+    assert posterior is not None
+    entered = Event()
+    release = Event()
+    other = EvolutionStore(Workspace(tmp_path))
+
+    def hold_learning_lock() -> None:
+        with store.strategy_learning_lock():
+            entered.set()
+            assert release.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        holder = executor.submit(hold_learning_lock)
+        assert entered.wait(timeout=5)
+        try:
+            with other.transaction(observations[0].evolution_id) as transaction:
+                with pytest.raises(EvolutionLockError, match="learning transaction"):
+                    transaction.write_strategy_posterior(posterior)
+        finally:
+            release.set()
+            holder.result(timeout=5)
+
+
+def test_cross_instance_reverse_learning_to_task_lock_is_rejected_immediately(
+    tmp_path: Path,
+) -> None:
+    first, observation = _persist_observation_sources(
+        tmp_path,
+        index=9_000,
+        task_group_id="group_reverse_lock",
+    )
+    second = EvolutionStore(Workspace(tmp_path))
+
+    with first.strategy_learning_lock():
+        started = time.monotonic()
+        with pytest.raises(EvolutionLockError, match="lock order"):
+            with second.transaction(observation.evolution_id):
+                pass
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
 
 
 def _persist_observation_sources(

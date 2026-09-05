@@ -76,6 +76,7 @@ elif os.name == "posix":
 _STORE_PATH = ".photomatagent/evolutions"
 _EPISODE_VERSION = re.compile(r"^v[0-9]{3}$")
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+_WORKSPACE_LOCK_STATE = local()
 _TASK_MUTABLE_FIELDS = (
     "status",
     "resume_status",
@@ -190,14 +191,31 @@ class EvaluationLease:
 class EvolutionTransaction:
     """Operations performed while one evolution task lock is held."""
 
-    def __init__(self, store: EvolutionStore, evolution_id: str) -> None:
+    def __init__(
+        self,
+        store: EvolutionStore,
+        evolution_id: str,
+        *,
+        _learning_capability: object | None = None,
+    ) -> None:
         self.store = store
         self.evolution_id = evolution_id
         self._active = False
+        self._learning_capability = _learning_capability
 
     def _require_active(self) -> None:
         if not self._active:
             raise EvolutionLockError("evolution transaction is no longer active")
+
+    def _require_learning_transaction(self) -> None:
+        self._require_active()
+        if (
+            self._learning_capability is not self.store._strategy_learning_capability
+            or not self.store._strategy_learning_lock_held()
+        ):
+            raise EvolutionLockError(
+                "strategy learning writes require a strategy learning transaction"
+            )
 
     def load_task(self) -> EvolutionTask:
         self._require_active()
@@ -411,7 +429,7 @@ class EvolutionTransaction:
     def write_strategy_observation(
         self, observation: StrategyObservation
     ) -> Path:
-        self._require_active()
+        self._require_learning_transaction()
         if observation.evolution_id != self.evolution_id:
             raise EvolutionConflictError(
                 "strategy observation belongs to a different transaction"
@@ -427,7 +445,7 @@ class EvolutionTransaction:
     def write_strategy_posterior(
         self, posterior: StrategyPosteriorSnapshot
     ) -> Path:
-        self._require_active()
+        self._require_learning_transaction()
         self.store._validate_strategy_posterior_provenance(posterior)
         return self.store._write_record_locked(
             evolution_id=self.evolution_id,
@@ -451,7 +469,7 @@ class EvolutionStore:
         self.root = workspace.resolve(_STORE_PATH, must_exist=True)
         self._active_evaluation_leases: dict[int, EvaluationLease] = {}
         self._strategy_learning_thread_lock = RLock()
-        self._strategy_learning_local = local()
+        self._strategy_learning_capability = object()
 
     @contextmanager
     def transaction(self, evolution_id: str) -> Iterator[EvolutionTransaction]:
@@ -473,7 +491,11 @@ class EvolutionStore:
         """Hold the task lock, then the cross-task learning publication lock."""
 
         task_dir = self._task_dir(evolution_id)
-        transaction = EvolutionTransaction(self, evolution_id)
+        transaction = EvolutionTransaction(
+            self,
+            evolution_id,
+            _learning_capability=self._strategy_learning_capability,
+        )
         with self._task_lock(task_dir), self.strategy_learning_lock():
             transaction._active = True
             try:
@@ -486,13 +508,14 @@ class EvolutionStore:
         """Serialize global observation publication and posterior snapshots."""
 
         with self._strategy_learning_thread_lock:
-            depth = getattr(self._strategy_learning_local, "depth", 0)
+            state = self._workspace_thread_lock_state()
+            depth = state["learning"]
             if depth:
-                self._strategy_learning_local.depth = depth + 1
+                state["learning"] = depth + 1
                 try:
                     yield
                 finally:
-                    self._strategy_learning_local.depth = depth
+                    state["learning"] = depth
                 return
             lock_path = self.workspace.resolve(
                 self.workspace.relative(self.root / ".strategy-learning.lock"),
@@ -513,10 +536,10 @@ class EvolutionStore:
                             "timed out acquiring strategy learning lock"
                         )
                     time.sleep(min(self.lock_poll_seconds, remaining))
-                self._strategy_learning_local.depth = 1
+                state["learning"] = 1
                 yield
             finally:
-                self._strategy_learning_local.depth = 0
+                state["learning"] = 0
                 try:
                     if acquired:
                         self._release_advisory_lock(descriptor)
@@ -2241,6 +2264,12 @@ class EvolutionStore:
 
     @contextmanager
     def _task_lock(self, task_dir: Path) -> Iterator[None]:
+        state = self._workspace_thread_lock_state()
+        if state["learning"]:
+            raise EvolutionLockError(
+                "strategy learning lock order violation: task lock cannot be "
+                "acquired while the workspace learning lock is held"
+            )
         lock_path = self.workspace.resolve(
             self.workspace.relative(task_dir / ".lock"), must_exist=False
         )
@@ -2259,13 +2288,32 @@ class EvolutionStore:
                         f"timed out acquiring evolution task lock: {task_dir.name}"
                     )
                 time.sleep(min(self.lock_poll_seconds, remaining))
-            yield
+            state["task"] += 1
+            try:
+                yield
+            finally:
+                state["task"] -= 1
         finally:
             try:
                 if acquired:
                     self._release_advisory_lock(descriptor)
             finally:
                 os.close(descriptor)
+
+    def _workspace_thread_lock_state(self) -> dict[str, int]:
+        states = getattr(_WORKSPACE_LOCK_STATE, "states", None)
+        if states is None:
+            states = {}
+            _WORKSPACE_LOCK_STATE.states = states
+        key = str(self.workspace.root)
+        state = states.get(key)
+        if state is None:
+            state = {"task": 0, "learning": 0}
+            states[key] = state
+        return state
+
+    def _strategy_learning_lock_held(self) -> bool:
+        return self._workspace_thread_lock_state()["learning"] > 0
 
     @staticmethod
     def _initialize_lock_file(descriptor: int) -> None:
