@@ -587,48 +587,69 @@ def evolve_feedback(
     """Record one confirmed expert review without constructing a runtime."""
 
     try:
-        boundary = Workspace(workspace)
-        service = EvolutionService(EvolutionStore(boundary))
-        task = service.get(evolution_id)
-        selected_version = version or task.last_completed_version
-        if selected_version is None:
-            raise ValueError("task has no completed episode available for feedback")
-        draft: ExpertFeedbackDraft | None = None
-        raw_input: str | None = None
-        if feedback_file is not None:
-            resolved = boundary.resolve(str(feedback_file), must_exist=True)
-            if not resolved.is_file():
-                raise ValueError("--file must name a regular file")
-            raw_input = resolved.read_text(encoding="utf-8")
-            try:
-                draft = load_feedback_file(resolved)
-            except ValueError as exc:
-                raise ValueError(
-                    "invalid --file: expected strict ExpertFeedbackDraft JSON"
-                ) from exc
-        record = asyncio.run(
-            run_feedback_flow(
+        asyncio.run(
+            run_feedback_command(
                 session=make_prompt_session(),
-                console=console,
-                service=service,
+                output=console,
+                workspace=workspace,
                 evolution_id=evolution_id,
-                version=cast(EpisodeVersion, selected_version),
-                draft=draft,
-                raw_input=raw_input,
+                version=version,
+                feedback_file=feedback_file,
             )
         )
     except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
         console.print(f"[red]{redact_text(str(exc))}[/]")
         raise typer.Exit(code=2) from None
 
+
+async def run_feedback_command(
+    *,
+    session: PromptSessionLike,
+    output: Console,
+    workspace: Path,
+    evolution_id: str,
+    version: str | None = None,
+    feedback_file: Path | None = None,
+) -> ExpertFeedbackRecord | None:
+    """Run the feedback command with a caller-owned interactive session."""
+
+    boundary = Workspace(workspace)
+    service = EvolutionService(EvolutionStore(boundary))
+    task = service.get(evolution_id)
+    selected_version = version or task.last_completed_version
+    if selected_version is None:
+        raise ValueError("task has no completed episode available for feedback")
+    draft: ExpertFeedbackDraft | None = None
+    raw_input: str | None = None
+    if feedback_file is not None:
+        resolved = boundary.resolve(str(feedback_file), must_exist=True)
+        if not resolved.is_file():
+            raise ValueError("--file must name a regular file")
+        raw_input = resolved.read_text(encoding="utf-8")
+        try:
+            draft = load_feedback_file(resolved)
+        except ValueError as exc:
+            raise ValueError(
+                "invalid --file: expected strict ExpertFeedbackDraft JSON"
+            ) from exc
+    record = await run_feedback_flow(
+        session=session,
+        console=output,
+        service=service,
+        evolution_id=evolution_id,
+        version=cast(EpisodeVersion, selected_version),
+        draft=draft,
+        raw_input=raw_input,
+    )
     if record is None:
-        console.print("[dim]Expert feedback cancelled; no data was written.[/]")
-        return
-    console.print(
+        output.print("[dim]Expert feedback cancelled; no data was written.[/]")
+        return None
+    output.print(
         f"[green]Recorded feedback {record.feedback_id} for "
         f"{record.evolution_id} {record.episode_version}.[/]"
     )
-    _render_task_details(service.get(evolution_id), boundary.root)
+    _render_task_details(service.get(evolution_id), boundary.root, output=output)
+    return record
 
 
 @evolve_app.command("iterate")
@@ -1088,6 +1109,51 @@ def evolve_compile(
     _render_task_details(service.get(evolution_id), boundary.root)
 
 
+async def run_compile_command(
+    *,
+    session: PromptSessionLike,
+    output: Console,
+    workspace: Path,
+    evolution_id: str,
+    version: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> FeedbackCompilation:
+    """Compile feedback and confirm its revision with a caller-owned session."""
+
+    boundary = Workspace(workspace)
+    service = EvolutionService(EvolutionStore(boundary))
+    config = _resolve_provider_config(boundary.root, provider, model)
+    compiler = _build_feedback_compiler(config)
+    compilation = await run_compilation_flow(
+        service=service,
+        evolution_id=evolution_id,
+        version=cast(EpisodeVersion | None, version),
+        compiler=compiler,
+    )
+    _render_compilation(output, compilation)
+    if compilation.status == "UNAVAILABLE":
+        _render_task_details(service.get(evolution_id), boundary.root, output=output)
+        return compilation
+    try:
+        confirmed = await run_revision_confirmation_flow(
+            session=session,
+            console=output,
+            service=service,
+            evolution_id=evolution_id,
+            compilation=compilation,
+        )
+    except (ValueError, EvolutionServiceError):
+        _render_task_details(service.get(evolution_id), boundary.root, output=output)
+        raise
+    if confirmed is None:
+        output.print("[dim]Revision plan rejected; no plan or strategy was written.[/]")
+    else:
+        output.print(f"[green]Confirmed revision plan {confirmed.revision_id}.[/]")
+    _render_task_details(service.get(evolution_id), boundary.root, output=output)
+    return compilation
+
+
 async def run_compilation_flow(
     *,
     service: EvolutionService,
@@ -1420,6 +1486,13 @@ async def _prompt_value(session: PromptSessionLike, prompt: str) -> str:
         value = await session.prompt_async(prompt)
     except (EOFError, KeyboardInterrupt) as exc:
         raise FeedbackEntryCancelled from exc
+    except ValueError as exc:
+        # CliRunner and terminal teardown can surface an already-closed stdin
+        # as ValueError instead of EOFError. Treat only that exact condition as
+        # cancellation so a partial feedback/revision is never persisted.
+        if str(exc) != "I/O operation on closed file.":
+            raise
+        raise FeedbackEntryCancelled from exc
     if value.strip().lower() == "/cancel":
         raise FeedbackEntryCancelled
     return value
@@ -1742,7 +1815,13 @@ def _render_start_result(
     _print_next_command(task, workspace)
 
 
-def _render_task_details(task: EvolutionTask, workspace: Path) -> None:
+def _render_task_details(
+    task: EvolutionTask,
+    workspace: Path,
+    *,
+    output: Console | None = None,
+) -> None:
+    destination = output or console
     table = Table("Field", "Value")
     table.add_row("Evolution ID", task.evolution_id)
     table.add_row("Status", task.status)
@@ -1755,15 +1834,21 @@ def _render_task_details(task: EvolutionTask, workspace: Path) -> None:
         f"{len(task.feedback_ids)} / {len(task.revision_ids)}",
     )
     table.add_row("Next command", Text(_next_command(task, workspace)))
-    console.print(table)
-    _print_next_command(task, workspace)
+    destination.print(table)
+    _print_next_command(task, workspace, output=destination)
 
 
-def _print_next_command(task: EvolutionTask, workspace: Path) -> None:
+def _print_next_command(
+    task: EvolutionTask,
+    workspace: Path,
+    *,
+    output: Console | None = None,
+) -> None:
+    destination = output or console
     command = _next_command(task, workspace)
     line = Text("Next command: ")
     line.append(command, style="bold")
-    console.print(line, soft_wrap=True)
+    destination.print(line, soft_wrap=True)
 
 
 def _next_command(task: EvolutionTask, workspace: Path) -> str:
@@ -1796,7 +1881,9 @@ __all__ = [
     "collect_expert_feedback",
     "evolve_app",
     "load_feedback_file",
+    "run_compile_command",
     "run_compilation_flow",
+    "run_feedback_command",
     "run_feedback_flow",
     "run_revision_confirmation_flow",
 ]

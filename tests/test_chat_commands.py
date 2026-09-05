@@ -22,7 +22,7 @@ from photomatagent.runtime.permissions import (
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.state import ScientificState
 from photomatagent.sessions.store import load_session_snapshot, save_session_snapshot
-from photomatagent.tools.factory import create_default_registry
+from photomatagent.tools.registry import ToolRegistry
 from photomatagent.workspace import Workspace
 
 
@@ -34,7 +34,7 @@ def _router(tmp_path):
     )
     runtime = AgentRuntime(
         model=FakeModelProvider([]),
-        tools=create_default_registry(scientific, workspace),
+        tools=ToolRegistry(),
         workspace=workspace,
         scientific_state=scientific,
         permission_policy=policy,
@@ -53,6 +53,7 @@ async def test_help_lists_commands(tmp_path):
     assert "/approve -o" in output
     assert "/compact" in output
     assert "/resume" in output
+    assert "/evolve" in output
 
 
 @pytest.mark.asyncio

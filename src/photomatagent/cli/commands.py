@@ -8,13 +8,18 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from rich.console import Console
 
 from photomatagent.cli.render import ChatRenderer
+from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger
+from photomatagent.redaction import redact_text
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import ApprovalScope, SwitchablePermissionPolicy
+from photomatagent.scientific.evolution.service import EvolutionServiceError
+from photomatagent.scientific.evolution.store import EvolutionStoreError
 from photomatagent.workspace import Workspace
 
 
@@ -51,6 +56,10 @@ class CommandSpec:
     description: str
 
 
+class PromptSessionLike(Protocol):
+    async def prompt_async(self, message: str) -> str: ...
+
+
 COMMANDS = (
     CommandSpec("/help", "显示所有聊天命令及功能"),
     CommandSpec("/approve -o", "本次聊天任务完全允许所有工具"),
@@ -76,6 +85,10 @@ COMMANDS = (
     CommandSpec("/sessions replay [latest|id]", "离线重放任务轨迹"),
     CommandSpec("/experiments run <config>", "运行确定性实验"),
     CommandSpec("/experiments compare <a> <b>", "比较两份实验结果"),
+    CommandSpec(
+        "/evolve [list|status|history|start|feedback|compile|iterate]",
+        "管理专家反馈驱动的持久演化任务；feedback/compile 复用当前交互会话",
+    ),
     CommandSpec("/configure [options]", "配置工作区 LLM（可能交互询问）"),
     CommandSpec("/compact", "压缩较早的工作上下文"),
     CommandSpec("/resume <id|目录|latest>", "回溯加载历史 session，并在其基础上继续追问"),
@@ -86,13 +99,22 @@ COMMANDS = (
 class ChatCommandRouter:
     """Parse slash commands without sending them to the language model."""
 
-    _CLI_GROUPS = {"tools", "skills", "scientific", "mcp", "sessions", "experiments"}
+    _CLI_GROUPS = {
+        "tools",
+        "skills",
+        "scientific",
+        "mcp",
+        "sessions",
+        "experiments",
+        "evolve",
+    }
     _DEFAULT_SUBCOMMAND = {
         "tools": "list",
         "skills": "list",
         "scientific": "status",
         "mcp": "list",
         "sessions": "list",
+        "evolve": "list",
     }
 
     def __init__(
@@ -103,12 +125,14 @@ class ChatCommandRouter:
         *,
         logger: EventLogger | None = None,
         sessions_dir: Path | str | None = None,
+        prompt_session: PromptSessionLike | None = None,
     ) -> None:
         self.console = console
         self.runtime = runtime
         self.workspace = workspace
         self.logger = logger
         self.sessions_dir = sessions_dir
+        self.prompt_session = prompt_session
 
     async def execute(self, line: str) -> bool:
         try:
@@ -118,7 +142,8 @@ class ChatCommandRouter:
             return True
         if not parts:
             return True
-        command = parts[0].lower()
+        first_token = parts[0]
+        command = first_token.lower()
         args = parts[1:]
         if command == "/help":
             self._help()
@@ -132,7 +157,12 @@ class ChatCommandRouter:
             await self._run_cli(["doctor", *args])
         elif command == "/configure":
             await self._run_cli(["configure", *args])
-        elif command.removeprefix("/") in self._CLI_GROUPS:
+        elif first_token == "/evolve":
+            await self._evolve(args)
+        elif (
+            command.removeprefix("/") in self._CLI_GROUPS
+            and command.removeprefix("/") != "evolve"
+        ):
             group = command.removeprefix("/")
             if not args and group in self._DEFAULT_SUBCOMMAND:
                 args = [self._DEFAULT_SUBCOMMAND[group]]
@@ -140,6 +170,73 @@ class ChatCommandRouter:
         else:
             self.console.print(f"[yellow]未知命令：{command}。输入 /help 查看可用命令。[/]")
         return True
+
+    async def _evolve(self, args: list[str]) -> None:
+        """Route interactive evolve forms without redirecting process stdin."""
+
+        subcommand = args[0] if args else "list"
+        if subcommand not in {"feedback", "compile"} or "--help" in args:
+            await self._run_cli(["evolve", *(args or ["list"])])
+            return
+        if self.prompt_session is None:
+            self.console.print(
+                "[red]当前聊天未提供交互 PromptSession，无法填写反馈或确认修订。[/]"
+            )
+            return
+
+        try:
+            from photomatagent.cli.evolve import (
+                run_compile_command,
+                run_feedback_command,
+            )
+
+            if subcommand == "feedback":
+                parsed = _parse_evolve_form_args(
+                    args[1:],
+                    options={"--version", "--file"},
+                    usage="/evolve feedback <evolution-id> [--version VERSION] [--file PATH]",
+                )
+                await run_feedback_command(
+                    session=self.prompt_session,
+                    output=self.console,
+                    workspace=self.workspace.root,
+                    evolution_id=parsed.evolution_id,
+                    version=parsed.options.get("--version"),
+                    feedback_file=(
+                        Path(parsed.options["--file"])
+                        if "--file" in parsed.options
+                        else None
+                    ),
+                )
+            else:
+                parsed = _parse_evolve_form_args(
+                    args[1:],
+                    options={"--version", "--provider", "--model"},
+                    usage=(
+                        "/evolve compile <evolution-id> [--version VERSION] "
+                        "[--provider PROVIDER] [--model MODEL]"
+                    ),
+                )
+                await run_compile_command(
+                    session=self.prompt_session,
+                    output=self.console,
+                    workspace=self.workspace.root,
+                    evolution_id=parsed.evolution_id,
+                    version=parsed.options.get("--version"),
+                    provider=parsed.options.get("--provider"),
+                    model=parsed.options.get("--model"),
+                )
+        except KeyboardInterrupt:
+            self.console.print("[dim]Evolution flow cancelled; no partial data was written.[/]")
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            ToolExecutionError,
+            EvolutionServiceError,
+            EvolutionStoreError,
+        ) as exc:
+            self.console.print(f"[red]{redact_text(str(exc))}[/]")
 
     def _help(self) -> None:
         from rich.table import Table
@@ -254,3 +351,46 @@ class ChatCommandRouter:
             _print_cli_capture(self.console, result.stdout)
         if result.exception is not None and result.exit_code != 0:
             self.console.print(f"[red]命令失败（exit={result.exit_code}）：{result.exception}[/]")
+
+
+@dataclass(frozen=True)
+class _ParsedEvolveFormArgs:
+    evolution_id: str
+    options: dict[str, str]
+
+
+def _parse_evolve_form_args(
+    args: list[str],
+    *,
+    options: set[str],
+    usage: str,
+) -> _ParsedEvolveFormArgs:
+    """Parse the small interactive-only surface without invoking Click stdin."""
+
+    parsed_options: dict[str, str] = {}
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token.startswith("--"):
+            option, separator, inline_value = token.partition("=")
+            if option not in options:
+                raise ValueError(f"未知选项：{option}。用法：{usage}")
+            if option in parsed_options:
+                raise ValueError(f"选项重复：{option}。用法：{usage}")
+            if separator:
+                value = inline_value
+            else:
+                index += 1
+                if index >= len(args) or args[index].startswith("--"):
+                    raise ValueError(f"选项 {option} 缺少值。用法：{usage}")
+                value = args[index]
+            if not value:
+                raise ValueError(f"选项 {option} 缺少值。用法：{usage}")
+            parsed_options[option] = value
+        else:
+            positionals.append(token)
+        index += 1
+    if len(positionals) != 1:
+        raise ValueError(f"用法：{usage}")
+    return _ParsedEvolveFormArgs(positionals[0], parsed_options)

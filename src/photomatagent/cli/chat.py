@@ -150,6 +150,7 @@ async def run_interactive_chat(
         runtime.workspace,
         logger=logger,
         sessions_dir=(logger.session_dir.parent if logger is not None else None),
+        prompt_session=session,
     )
     console.print(
         "[dim]Type your research goal or [/][bold]/help[/][dim] for commands; "
