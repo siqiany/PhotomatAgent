@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -19,6 +20,7 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     RubricScores,
     StrategyVersion,
+    strategy_version_sha256,
 )
 from photomatagent.scientific.evolution.revision import build_revision_plan
 from photomatagent.scientific.evolution.service import (
@@ -181,10 +183,29 @@ def canonical_confirmation(
         target=episode.target_snapshot,
         previous_summary=episode.summary,
     )
-    return (
-        plan.model_copy(update={"confirmed": True}),
-        FixedStrategySelector().select(task, plan),
+    selection = service.prepare_strategy_selection(evolution_id, plan)
+    return plan.model_copy(update={"confirmed": True}), selection.strategy
+
+
+def test_production_selection_below_gate_is_exact_fixed_baseline(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    evolution_id, _episode, compilation = compiled_revision_context(service)
+    task, source, feedback = service.compilation_context(
+        evolution_id, compilation.episode_version
     )
+    plan = build_revision_plan(
+        feedback=feedback,
+        compilation=compilation,
+        target=source.target_snapshot,
+        previous_summary=source.summary,
+    )
+
+    selection = service.prepare_strategy_selection(evolution_id, plan)
+
+    assert selection.posterior is None
+    assert selection.strategy == FixedStrategySelector().select(task, plan)
 
 
 def compiled_revision_context(
@@ -232,6 +253,252 @@ def compiled_revision_context(
         evolution_id,
         compilation,
     ).entity
+
+
+def _ready_training_revision(
+    service: EvolutionService,
+    *,
+    index: int,
+    task_group_id: str,
+) -> tuple[str, EpisodeRecord, RevisionPlan, StrategyVersion, object]:
+    task = mutated(
+        service.create_task(
+            evolution_id=f"evo_training_{index}",
+            goal="learn production strategy",
+            target=TargetSpec(goal="learn production strategy"),
+            task_group_id=task_group_id,
+        )
+    )
+    reserved = mutated(service.reserve_episode(task.evolution_id, mode="NORMAL"))
+    running = mutated(service.mark_episode_running(task.evolution_id, reserved.version))
+    state_path = service.store.write_scientific_state(
+        task.evolution_id, running.version, ScientificState()
+    )
+    first = mutated(
+        service.complete_episode(
+            task.evolution_id,
+            running.version,
+            result=completed_result(
+                service,
+                running,
+                content=f"first-{index}".encode(),
+            ).model_copy(
+                update={
+                    "scientific_state_path": service.store.workspace.relative(
+                        state_path
+                    )
+                }
+            ),
+        )
+    )
+    feedback = mutated(
+        service.attach_feedback(
+            task.evolution_id,
+            first.version,
+            feedback_id=f"fb_training_{index}_v1",
+            draft=feedback_draft(),
+            result_sha256=first.artifact.sha256,  # type: ignore[union-attr]
+            raw_input="reviewed v1",
+        )
+    )
+    compilation = save_available_compilation(
+        service,
+        task.evolution_id,
+        feedback.feedback_id,
+        first.version,
+    )
+    plan = build_revision_plan(
+        feedback=feedback,
+        compilation=compilation,
+        target=first.target_snapshot,
+        previous_summary=first.summary,
+    )
+    selection = service.prepare_strategy_selection(task.evolution_id, plan)
+    return task.evolution_id, first, plan, selection.strategy, selection.posterior
+
+
+def _produce_reviewed_training_observation(
+    service: EvolutionService,
+    *,
+    index: int,
+    task_group_id: str,
+) -> None:
+    evolution_id, first, plan, strategy, posterior = _ready_training_revision(
+        service,
+        index=index,
+        task_group_id=task_group_id,
+    )
+    service.confirm_revision(
+        evolution_id,
+        plan.model_copy(update={"confirmed": True}),
+        strategy=strategy,
+        posterior=posterior,  # type: ignore[arg-type]
+    )
+    claim = service.claim_iteration(
+        evolution_id,
+        owner_token=f"owner_training_{index}",
+        mode="CARRY_VERIFIED_EVIDENCE",
+    )
+    running = mutated(
+        service.mark_episode_running(
+            evolution_id,
+            claim.episode.version,
+            owner_token=claim.owner_token,
+        )
+    )
+    state_path = service.store.write_scientific_state(
+        evolution_id, running.version, ScientificState()
+    )
+    current = mutated(
+        service.complete_episode(
+            evolution_id,
+            running.version,
+            owner_token=claim.owner_token,
+            result=completed_result(
+                service,
+                running,
+                content=f"current-{index}".encode(),
+            ).model_copy(
+                update={
+                    "scientific_state_path": service.store.workspace.relative(
+                        state_path
+                    )
+                }
+            ),
+        )
+    )
+    current_feedback = mutated(
+        service.attach_feedback(
+            evolution_id,
+            current.version,
+            feedback_id=f"fb_training_{index}_v2",
+            draft=feedback_draft(),
+            result_sha256=current.artifact.sha256,  # type: ignore[union-attr]
+            raw_input="reviewed v2",
+        )
+    )
+    save_available_compilation(
+        service,
+        evolution_id,
+        current_feedback.feedback_id,
+        current.version,
+    )
+    report = service.compare(evolution_id, first.version, current.version).entity
+    assert report.phase == "POST_FEEDBACK"
+    assert len(service.store.list_strategy_observations(evolution_id)) == 1
+
+
+def test_production_bayesian_confirmation_rejects_stale_preview_then_iterates(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    for index in range(20):
+        _produce_reviewed_training_observation(
+            service,
+            index=index,
+            task_group_id=f"group_training_{index % 8}",
+        )
+
+    evolution_id, first, plan, strategy, posterior = _ready_training_revision(
+        service,
+        index=100,
+        task_group_id="group_target",
+    )
+    assert strategy.parameters["selector"] == "bayesian-linear-thompson-v1"
+    assert posterior is not None
+
+    _produce_reviewed_training_observation(
+        service,
+        index=101,
+        task_group_id="group_training_extra",
+    )
+    with pytest.raises(EvolutionOperationConflict, match="submitted strategy"):
+        service.confirm_revision(
+            evolution_id,
+            plan.model_copy(update={"confirmed": True}),
+            strategy=strategy,
+            posterior=posterior,  # type: ignore[arg-type]
+        )
+    assert service.get(evolution_id).revision_ids == []
+    assert service.get(evolution_id).strategy_ids == []
+
+    retry = service.prepare_strategy_selection(evolution_id, plan)
+    assert retry.posterior is not None
+    assert retry.posterior.posterior_id != posterior.posterior_id  # type: ignore[union-attr]
+    service.confirm_revision(
+        evolution_id,
+        plan.model_copy(update={"confirmed": True}),
+        strategy=retry.strategy,
+        posterior=retry.posterior,
+    )
+    ready = service.get(evolution_id)
+    assert ready.status == "REVISION_READY"
+    assert service.store.load_strategy_posterior(
+        evolution_id, retry.posterior.posterior_id
+    ) == retry.posterior
+
+    forged_payload = retry.strategy.model_dump(mode="python")
+    assert retry.strategy.cutoff_at is not None
+    forged_time = retry.strategy.cutoff_at + timedelta(days=365)
+    forged_payload["cutoff_at"] = forged_time
+    forged_payload["created_at"] = forged_time
+    forged_digest = strategy_version_sha256(forged_payload)
+    forged_payload["strategy_sha256"] = forged_digest
+    forged_payload["strategy_id"] = f"strategy_{forged_digest[:10]}"
+    forged = StrategyVersion.model_validate(forged_payload)
+    persisted_revision = service.store.load_revision(
+        evolution_id, ready.revision_ids[-1]
+    )
+    with pytest.raises(EvolutionOperationConflict, match="canonical"):
+        service.validate_persisted_strategy(ready, persisted_revision, forged)
+
+    claim = service.claim_iteration(
+        evolution_id,
+        owner_token="owner_target",
+        mode="CARRY_VERIFIED_EVIDENCE",
+    )
+    assert claim.context.strategy == retry.strategy
+    running = mutated(
+        service.mark_episode_running(
+            evolution_id,
+            claim.episode.version,
+            owner_token=claim.owner_token,
+        )
+    )
+    state_path = service.store.write_scientific_state(
+        evolution_id, running.version, ScientificState()
+    )
+    current = mutated(
+        service.complete_episode(
+            evolution_id,
+            running.version,
+            owner_token=claim.owner_token,
+            result=completed_result(service, running, content=b"target-current").model_copy(
+                update={
+                    "scientific_state_path": service.store.workspace.relative(
+                        state_path
+                    )
+                }
+            ),
+        )
+    )
+    feedback = mutated(
+        service.attach_feedback(
+            evolution_id,
+            current.version,
+            feedback_id="fb_target_v2",
+            draft=feedback_draft(),
+            result_sha256=current.artifact.sha256,  # type: ignore[union-attr]
+            raw_input="reviewed target v2",
+        )
+    )
+    save_available_compilation(
+        service, evolution_id, feedback.feedback_id, current.version
+    )
+    reviewed = service.compare(evolution_id, first.version, current.version).entity
+    assert reviewed.phase == "POST_FEEDBACK"
+    observation = service.store.list_strategy_observations(evolution_id)[0]
+    assert observation.strategy_id == retry.strategy.strategy_id
 
 
 def test_confirm_revision_rebuilds_canonical_plan_before_any_write(

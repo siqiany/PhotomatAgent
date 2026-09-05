@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 import secrets
@@ -780,6 +782,40 @@ class RevisionPlan(StrictModel):
     created_at: UtcDatetime = Field(default_factory=utc_now)
 
 
+def strategy_version_sha256(strategy: StrategyVersion | dict[str, Any]) -> str:
+    """Hash every field that can influence a fixed or Bayesian decision."""
+
+    if isinstance(strategy, StrategyVersion):
+        evolution_id = strategy.evolution_id
+        revision_id = strategy.parameters.get("revision_id")
+        arm = strategy.arm
+        reason = strategy.reason
+        parameters = strategy.parameters
+        cutoff_at = strategy.cutoff_at
+    else:
+        evolution_id = strategy["evolution_id"]
+        parameters = strategy["parameters"]
+        revision_id = parameters.get("revision_id")
+        arm = strategy["arm"]
+        reason = strategy["reason"]
+        cutoff_at = strategy.get("cutoff_at")
+    payload: dict[str, Any] = {
+        "evolution_id": evolution_id,
+        "revision_id": revision_id,
+        "arm": arm,
+        "reason": reason,
+        "parameters": parameters,
+    }
+    if parameters.get("selector") == "bayesian-linear-thompson-v1":
+        cutoff_value: Any = cutoff_at
+        if isinstance(cutoff_value, datetime):
+            cutoff_value = cutoff_value.isoformat()
+        payload["cutoff_at"] = cutoff_value
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 class StrategyVersion(StrictModel):
     schema_version: SchemaVersion = 1
     strategy_id: ManagedId = Field(frozen=True)
@@ -790,6 +826,21 @@ class StrategyVersion(StrictModel):
     strategy_sha256: Sha256 | None = None
     cutoff_at: UtcDatetime | None = None
     created_at: UtcDatetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_bayesian_identity(self) -> Self:
+        if self.parameters.get("selector") != "bayesian-linear-thompson-v1":
+            return self
+        if self.strategy_sha256 is None or self.cutoff_at is None:
+            raise ValueError("Bayesian strategy requires a hash and training cutoff")
+        if self.created_at != self.cutoff_at:
+            raise ValueError("Bayesian strategy created_at must equal its training cutoff")
+        digest = strategy_version_sha256(self)
+        if self.strategy_sha256 != digest:
+            raise ValueError("strategy_sha256 does not match Bayesian strategy content")
+        if self.strategy_id != f"strategy_{digest[:10]}":
+            raise ValueError("strategy_id does not match Bayesian strategy content")
+        return self
 
 
 class RubricScoreDelta(StrictModel):

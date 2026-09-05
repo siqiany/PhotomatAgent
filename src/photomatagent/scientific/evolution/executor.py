@@ -733,9 +733,16 @@ class ScientificEpisodeExecutor:
         if episode.strategy_id is None:
             raise ValueError("revised episode has no persisted strategy")
         strategy = self.store.load_strategy(episode.evolution_id, episode.strategy_id)
-        from photomatagent.scientific.evolution.strategy import FixedStrategySelector
-
-        canonical = FixedStrategySelector().select(task, persisted)
+        try:
+            canonical = self.service.validate_persisted_strategy(
+                task,
+                persisted,
+                strategy,
+            )
+        except EvolutionOperationConflict as exc:
+            raise ValueError(
+                "persisted strategy does not match the reserved episode"
+            ) from exc
         if (
             strategy != canonical
             or strategy.arm != episode.strategy_arm

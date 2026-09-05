@@ -88,6 +88,7 @@ if TYPE_CHECKING:
         IterationContext,
         IterationClaim,
         MutationResult,
+        StrategySelection,
     )
     from photomatagent.scientific.evolution.store import (
         EvolutionAlreadyExistsError,
@@ -170,6 +171,7 @@ _SERVICE_EXPORTS = (
     "IterationContext",
     "IterationClaim",
     "MutationResult",
+    "StrategySelection",
 )
 _EVIDENCE_EXPORTS = (
     "EvidenceCarryDecision",

@@ -52,8 +52,8 @@ from photomatagent.scientific.evolution.models import (
 from photomatagent.scientific.evolution.experience import (
     ExperienceRecord,
     StrategyObservation,
-    TaskContext,
     canonical_record_sha256,
+    task_context_from_episode,
 )
 from photomatagent.scientific.evolution.events import bounded_summary
 from photomatagent.scientific.evolution.strategy import (
@@ -1717,6 +1717,7 @@ class EvolutionStore:
                 "episode strategy hash",
             ),
             (comparison.reward, observation.reward, "reward"),
+            (comparison.created_at, observation.created_at, "created at"),
         )
         for authoritative, recorded, label in expected_values:
             if authoritative != recorded:
@@ -1731,22 +1732,7 @@ class EvolutionStore:
             raise EvolutionConflictError(
                 "strategy observation current episode does not follow comparison parent"
             )
-        critical_gaps: tuple[str, ...] = ()
-        if (
-            previous_episode.summary is not None
-            and previous_episode.summary.final_evaluation is not None
-        ):
-            critical_gaps = tuple(
-                dict.fromkeys(
-                    gap
-                    for gap in previous_episode.summary.final_evaluation.critical_evidence_gaps
-                    if gap
-                )
-            )
-        expected_context = TaskContext.from_target(
-            task.target,
-            previous_critical_gap_count=len(critical_gaps),
-        )
+        expected_context = task_context_from_episode(task.target, previous_episode)
         if observation.context != expected_context:
             raise EvolutionConflictError(
                 "strategy observation task context does not match task target and "
@@ -1846,6 +1832,17 @@ class EvolutionStore:
         posterior: StrategyPosteriorSnapshot,
     ) -> None:
         authoritative = self.list_all_strategy_observations()
+        expected_hashes = tuple(
+            sorted(
+                item.observation_sha256
+                for item in authoritative
+                if item.created_at <= posterior.training_cutoff_at
+            )
+        )
+        if posterior.training_observation_hashes != expected_hashes:
+            raise EvolutionConflictError(
+                "strategy posterior is not a cutoff-complete authoritative snapshot"
+            )
         by_hash = {item.observation_sha256: item for item in authoritative}
         try:
             training = [

@@ -36,7 +36,11 @@ from photomatagent.scientific.evolution.comparison import (
     evaluate_machine_acceptance,
 )
 from photomatagent.scientific.evolution.events import bounded_summary
-from photomatagent.scientific.evolution.experience import create_experience
+from photomatagent.scientific.evolution.experience import (
+    create_experience,
+    create_strategy_observation,
+    task_context_from_episode,
+)
 from photomatagent.scientific.evolution.models import (
     AcceptanceResult,
     ArtifactRef,
@@ -55,8 +59,10 @@ from photomatagent.scientific.evolution.models import (
     StrategyArm,
     StrategyVersion,
     TargetSnapshot,
+    UtcDatetime,
     new_evolution_id,
     utc_now,
+    strategy_version_sha256,
 )
 from photomatagent.scientific.evolution.rubric import assess_hard_caps
 from photomatagent.scientific.evolution.store import (
@@ -64,6 +70,10 @@ from photomatagent.scientific.evolution.store import (
     EvaluationLease,
     EvolutionStore,
     EvolutionTransaction,
+)
+from photomatagent.scientific.evolution.strategy import (
+    BayesianLinearStrategySelector,
+    StrategyPosteriorSnapshot,
 )
 from photomatagent.scientific.loop.target import TargetSpec
 from photomatagent.scientific.state import ScientificState
@@ -110,6 +120,14 @@ class IterationContext:
     revision: RevisionPlan
     strategy: StrategyVersion
     previous_scientific_state: ScientificState
+
+
+@dataclass(frozen=True, slots=True)
+class StrategySelection:
+    """Canonical next strategy and the posterior that produced it, if enabled."""
+
+    strategy: StrategyVersion
+    posterior: StrategyPosteriorSnapshot | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +198,48 @@ class EvolutionService:
 
     def get(self, evolution_id: str) -> EvolutionTask:
         return self.store.load_task(evolution_id)
+
+    def build_strategy_selector(self, *, seed: int = 0) -> BayesianLinearStrategySelector:
+        """Fit the selector used by both status and production confirmation."""
+
+        return BayesianLinearStrategySelector(seed=seed).fit(
+            self.store.list_all_strategy_observations()
+        )
+
+    def prepare_strategy_selection(
+        self,
+        evolution_id: str,
+        plan: RevisionPlan,
+        *,
+        seed: int = 0,
+    ) -> StrategySelection:
+        """Preview the exact current production selection for a canonical plan."""
+
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            self._validate_revision(
+                task,
+                evolution_id,
+                plan.model_copy(update={"confirmed": True}),
+            )
+            source, feedback, compilation = self._revision_context(
+                transaction, task, evolution_id
+            )
+            from photomatagent.scientific.evolution.revision import build_revision_plan
+
+            canonical_plan = build_revision_plan(
+                feedback=feedback,
+                compilation=compilation,
+                target=source.target_snapshot,
+                previous_summary=source.summary,
+            )
+            self._require_canonical_plan(plan, canonical_plan)
+            return self._select_next_strategy(
+                task,
+                canonical_plan,
+                source,
+                seed=seed,
+            )
 
     def compare(
         self,
@@ -276,13 +336,16 @@ class EvolutionService:
                 raise EvolutionOperationConflict(
                     "revised episode strategy is not linked by the task manifest"
                 )
-            from photomatagent.scientific.evolution.strategy import FixedStrategySelector
-
             strategy = transaction.load_strategy(current.strategy_id)
-            canonical_strategy = FixedStrategySelector().select(task, plan)
+            self._require_canonical_strategy(
+                transaction,
+                task,
+                plan,
+                previous,
+                strategy,
+            )
             if (
-                strategy != canonical_strategy
-                or current.strategy_id != strategy.strategy_id
+                current.strategy_id != strategy.strategy_id
                 or current.strategy_arm != strategy.arm
                 or strategy.parameters.get("revision_id") != plan.revision_id
             ):
@@ -387,6 +450,16 @@ class EvolutionService:
                     ),
                     expected_revision=task.revision,
                 )
+            if persisted_experience is not None:
+                observation = create_strategy_observation(
+                    task=task,
+                    comparison=persisted_report,
+                    experience=persisted_experience,
+                    strategy=strategy,
+                    context=task_context_from_episode(task.target, previous),
+                    source_execution_mode=current.execution_mode,
+                )
+                transaction.write_strategy_observation(observation)
 
         events: tuple[RuntimeEvent, ...] = (
             EvolutionComparisonCompleted(
@@ -888,7 +961,12 @@ class EvolutionService:
         evolution_id = task.evolution_id
         initial = task.last_completed_version is None
         required_status: EvolutionStatus = "CREATED" if initial else "REVISION_READY"
-        strategy_id, strategy_arm = self._reservation_strategy(
+        (
+            strategy_id,
+            strategy_arm,
+            strategy_sha256,
+            strategy_cutoff_at,
+        ) = self._reservation_strategy(
             transaction,
             task,
         )
@@ -905,6 +983,8 @@ class EvolutionService:
                 data_source_fingerprints,
                 strategy_id,
                 strategy_arm,
+                strategy_sha256,
+                strategy_cutoff_at,
                 owner_token,
             )
             return MutationResult(existing, self._reservation_events(existing, initial))
@@ -932,6 +1012,8 @@ class EvolutionService:
             execution_mode=mode,
             strategy_id=strategy_id,
             strategy_arm=strategy_arm,
+            strategy_sha256=strategy_sha256,
+            strategy_cutoff_at=strategy_cutoff_at,
             task_snapshot=task.model_dump(mode="json"),
             target_snapshot=TargetSnapshot.model_validate(task.target),
             provider=provider,
@@ -957,6 +1039,8 @@ class EvolutionService:
                 data_source_fingerprints,
                 strategy_id,
                 strategy_arm,
+                strategy_sha256,
+                strategy_cutoff_at,
                 owner_token,
             )
             persisted = existing
@@ -1595,6 +1679,7 @@ class EvolutionService:
         plan: RevisionPlan,
         *,
         strategy: StrategyVersion | None = None,
+        posterior: StrategyPosteriorSnapshot | None = None,
     ) -> MutationResult[RevisionPlan]:
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
@@ -1607,10 +1692,6 @@ class EvolutionService:
             from photomatagent.scientific.evolution.revision import (
                 build_revision_plan,
             )
-            from photomatagent.scientific.evolution.strategy import (
-                FixedStrategySelector,
-            )
-
             canonical_plan = build_revision_plan(
                 feedback=feedback,
                 compilation=compilation,
@@ -1622,10 +1703,19 @@ class EvolutionService:
                 raise InvalidEvolutionTransition(
                     "revision plan has an unresolved blocking ambiguity"
                 )
-            canonical_strategy = FixedStrategySelector().select(task, canonical_plan)
+            canonical_selection = self._select_next_strategy(
+                task,
+                canonical_plan,
+                episode,
+            )
+            canonical_strategy = canonical_selection.strategy
             if strategy is not None and strategy != canonical_strategy:
                 raise EvolutionOperationConflict(
-                    "submitted strategy does not match canonical fixed strategy"
+                    "submitted strategy does not match canonical production strategy"
+                )
+            if posterior != canonical_selection.posterior:
+                raise EvolutionOperationConflict(
+                    "submitted posterior does not match canonical production data"
                 )
             strategy = canonical_strategy
             confirmed = canonical_plan.model_copy(
@@ -1676,6 +1766,20 @@ class EvolutionService:
                 assert existing_strategy is not None
                 self._require_matching_strategy(existing_strategy, strategy)
 
+            if canonical_selection.posterior is not None:
+                selected_posterior = canonical_selection.posterior
+                try:
+                    existing_posterior = transaction.load_strategy_posterior(
+                        selected_posterior.posterior_id
+                    )
+                except FileNotFoundError:
+                    transaction.write_strategy_posterior(selected_posterior)
+                else:
+                    if existing_posterior != selected_posterior:
+                        raise EvolutionOperationConflict(
+                            "posterior ID names different canonical content"
+                        )
+
             if existing_revision is None:
                 transaction.write_revision(confirmed)
                 persisted = confirmed
@@ -1717,6 +1821,21 @@ class EvolutionService:
             revision_id=persisted.revision_id,
         )
         return MutationResult(persisted, (event,))
+
+    def _select_next_strategy(
+        self,
+        task: EvolutionTask,
+        plan: RevisionPlan,
+        source: EpisodeRecord,
+        *,
+        seed: int = 0,
+    ) -> StrategySelection:
+        selector = self.build_strategy_selector(seed=seed)
+        context = task_context_from_episode(task.target, source)
+        return StrategySelection(
+            strategy=selector.select(task, plan, context),
+            posterior=selector.posterior if selector.enabled else None,
+        )
 
     def iteration_context(self, evolution_id: str) -> IterationContext:
         """Load and validate the exact confirmed state used by ``iterate``."""
@@ -1789,8 +1908,6 @@ class EvolutionService:
             transaction, task, evolution_id
         )
         from photomatagent.scientific.evolution.revision import build_revision_plan
-        from photomatagent.scientific.evolution.strategy import FixedStrategySelector
-
         revision = transaction.load_revision(task.revision_ids[-1])
         canonical_plan = build_revision_plan(
             feedback=feedback,
@@ -1807,12 +1924,14 @@ class EvolutionService:
             raise EvolutionOperationConflict(
                 "persisted revision plan does not match canonical persisted inputs"
             )
-        canonical_strategy = FixedStrategySelector().select(task, canonical_plan)
         strategy = transaction.load_strategy(task.strategy_ids[-1])
-        if strategy != canonical_strategy:
-            raise EvolutionOperationConflict(
-                "persisted strategy does not match canonical persisted inputs"
-            )
+        self._require_canonical_strategy(
+            transaction,
+            task,
+            canonical_plan,
+            source,
+            strategy,
+        )
         if revision.has_blocking_ambiguity:
             raise EvolutionOperationConflict(
                 "active revision has a blocking ambiguity"
@@ -2203,20 +2322,7 @@ class EvolutionService:
                 "fresh evaluation strategy must be linked by the task manifest"
             )
         strategy = transaction.load_strategy(strategy_id)
-        strategy_payload = {
-            "evolution_id": strategy.evolution_id,
-            "revision_id": strategy.parameters.get("revision_id"),
-            "arm": strategy.arm,
-            "reason": strategy.reason,
-            "parameters": strategy.parameters,
-        }
-        actual_hash = hashlib.sha256(
-            json.dumps(
-                strategy_payload,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        actual_hash = strategy_version_sha256(strategy)
         claimed_at = utc_now()
         if (
             strategy.evolution_id != task.evolution_id
@@ -2725,6 +2831,8 @@ class EvolutionService:
         data_source_fingerprints: dict[str, Sha256],
         strategy_id: str | None,
         strategy_arm: StrategyArm,
+        strategy_sha256: Sha256 | None,
+        strategy_cutoff_at: UtcDatetime | None,
         owner_token: str | None,
     ) -> None:
         expected_version = (
@@ -2745,6 +2853,8 @@ class EvolutionService:
             or episode.data_source_fingerprints != data_source_fingerprints
             or episode.strategy_id != strategy_id
             or episode.strategy_arm != strategy_arm
+            or episode.strategy_sha256 != strategy_sha256
+            or episode.strategy_cutoff_at != strategy_cutoff_at
             or episode.owner_token != owner_token
             or episode.parent_version != task.last_completed_version
             or episode.applied_feedback_id
@@ -2917,22 +3027,27 @@ class EvolutionService:
                 "submitted revision plan does not match canonical persisted inputs"
             )
 
-    @staticmethod
     def _reservation_strategy(
+        self,
         transaction: EvolutionTransaction,
         task: EvolutionTask,
-    ) -> tuple[str | None, StrategyArm]:
+    ) -> tuple[str | None, StrategyArm, Sha256 | None, UtcDatetime | None]:
         if task.last_completed_version is None:
-            return None, "STATIC"
+            return None, "STATIC", None, None
         if not task.revision_ids or not task.strategy_ids:
             raise InvalidEvolutionTransition(
                 "revised reservation requires a confirmed revision and strategy"
             )
         revision = transaction.load_revision(task.revision_ids[-1])
         strategy = transaction.load_strategy(task.strategy_ids[-1])
-        from photomatagent.scientific.evolution.strategy import FixedStrategySelector
-
-        canonical = FixedStrategySelector().select(task, revision)
+        source = transaction.load_episode(revision.source_version)
+        canonical = self._require_canonical_strategy(
+            transaction,
+            task,
+            revision,
+            source,
+            strategy,
+        )
         if (
             not revision.confirmed
             or revision.source_version != task.last_completed_version
@@ -2941,7 +3056,76 @@ class EvolutionService:
             raise EvolutionOperationConflict(
                 "active revision and strategy do not match the task checkpoint"
             )
-        return strategy.strategy_id, strategy.arm
+        return (
+            strategy.strategy_id,
+            strategy.arm,
+            strategy.strategy_sha256,
+            strategy.cutoff_at,
+        )
+
+    def validate_persisted_strategy(
+        self,
+        task: EvolutionTask,
+        revision: RevisionPlan,
+        strategy: StrategyVersion,
+    ) -> StrategyVersion:
+        """Rebuild a frozen fixed or Bayesian selection from its source episode."""
+
+        with self.store.transaction(task.evolution_id) as transaction:
+            source = transaction.load_episode(revision.source_version)
+            return self._require_canonical_strategy(
+                transaction,
+                task,
+                revision,
+                source,
+                strategy,
+            )
+
+    @staticmethod
+    def _require_canonical_strategy(
+        transaction: EvolutionTransaction,
+        task: EvolutionTask,
+        revision: RevisionPlan,
+        source: EpisodeRecord,
+        strategy: StrategyVersion,
+    ) -> StrategyVersion:
+        selector_name = strategy.parameters.get("selector")
+        if selector_name == "fixed-v1":
+            from photomatagent.scientific.evolution.strategy import (
+                FixedStrategySelector,
+            )
+
+            canonical = FixedStrategySelector().select(task, revision)
+        elif selector_name == "bayesian-linear-thompson-v1":
+            posterior_id = strategy.parameters.get("posterior_id")
+            posterior_hash = strategy.parameters.get("posterior_sha256")
+            seed = strategy.parameters.get("seed")
+            if (
+                not isinstance(posterior_id, str)
+                or not isinstance(posterior_hash, str)
+                or isinstance(seed, bool)
+                or not isinstance(seed, int)
+            ):
+                raise EvolutionOperationConflict(
+                    "Bayesian strategy parameters are incomplete"
+                )
+            posterior = transaction.load_strategy_posterior(posterior_id)
+            if posterior.posterior_sha256 != posterior_hash:
+                raise EvolutionOperationConflict(
+                    "Bayesian strategy posterior hash does not match persisted snapshot"
+                )
+            context = task_context_from_episode(task.target, source)
+            canonical = BayesianLinearStrategySelector.from_posterior(
+                posterior,
+                seed=seed,
+            ).select(task, revision, context)
+        else:
+            raise EvolutionOperationConflict("persisted strategy selector is unsupported")
+        if strategy != canonical:
+            raise EvolutionOperationConflict(
+                "persisted strategy does not match canonical persisted inputs"
+            )
+        return canonical
 
     @staticmethod
     def _require_matching_revision(existing: RevisionPlan, candidate: RevisionPlan) -> None:

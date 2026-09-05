@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import json
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from photomatagent.scientific.evolution.models import (
     EpisodeRecord,
     EvolutionTask,
     RevisionPlan,
+    StrategyVersion,
 )
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
@@ -201,6 +203,34 @@ def test_thompson_sampling_is_reproducible_without_shared_rng_state() -> None:
     ]
 
 
+def test_bayesian_strategy_digest_binds_training_cutoff() -> None:
+    selector = BayesianLinearStrategySelector(seed=23).fit(
+        _observations(20, distinct_tasks=8)
+    )
+    task = EvolutionTask(
+        evolution_id="evo_cutoff_digest",
+        goal="bind cutoff",
+        target=TargetSpec(goal="bind cutoff"),
+        task_group_id="group_cutoff_digest",
+        input_sha256="d" * 64,
+    )
+    plan = RevisionPlan(
+        revision_id="rp_cutoff_digest",
+        evolution_id=task.evolution_id,
+        source_version="v001",
+        feedback_id="fb_cutoff_digest",
+    )
+    strategy = selector.select(task, plan, TaskContext.from_target(task.target))
+    payload = strategy.model_dump(mode="python")
+    assert strategy.cutoff_at is not None
+    forged_time = strategy.cutoff_at + timedelta(days=365)
+    payload["cutoff_at"] = forged_time
+    payload["created_at"] = forged_time
+
+    with pytest.raises(ValidationError, match="strategy_sha256"):
+        StrategyVersion.model_validate(payload)
+
+
 def test_posterior_covariance_is_finite_symmetric_and_positive_definite() -> None:
     selector = BayesianLinearStrategySelector(seed=3).fit(
         _observations(24, distinct_tasks=8)
@@ -214,6 +244,17 @@ def test_posterior_covariance_is_finite_symmetric_and_positive_definite() -> Non
     assert selector.posterior.feature_schema == FEATURE_SCHEMA
     assert selector.posterior.prior_precision == 4.0
     assert selector.posterior.noise_variance == 0.25
+
+
+def test_repeated_fit_produces_the_same_canonical_posterior_snapshot() -> None:
+    observations = _observations(20, distinct_tasks=8)
+
+    first = BayesianLinearStrategySelector(seed=3).fit(observations).posterior
+    second = BayesianLinearStrategySelector(seed=99).fit(reversed(observations)).posterior
+
+    assert first is not None
+    assert second == first
+    assert first.generated_at == first.training_cutoff_at
 
 
 @pytest.mark.parametrize("value", ["0.0", True])
@@ -388,6 +429,13 @@ def test_posterior_snapshot_round_trips_atomically_and_detects_tampering(
     assert store.load_strategy_posterior(
         evolution_id, selector.posterior.posterior_id
     ) == selector.posterior
+    status = CliRunner().invoke(
+        app,
+        ["evolve", "status", evolution_id, "--workspace", str(tmp_path)],
+    )
+    assert status.exit_code == 0
+    assert f"Persisted posterior: {selector.posterior.posterior_id}" in status.stdout
+    assert selector.posterior.posterior_sha256 in status.stdout
     with pytest.raises(EvolutionAlreadyExistsError):
         store.write_strategy_posterior(evolution_id, selector.posterior)
 
@@ -540,6 +588,115 @@ def test_store_rejects_resigned_observation_with_forged_context(
 
     with pytest.raises(EvolutionConflictError, match="task context"):
         store.write_strategy_observation(forged)
+
+
+def test_store_rejects_resigned_observation_with_forged_created_at(
+    tmp_path: Path,
+) -> None:
+    store, observation = _persist_observation_sources(tmp_path)
+    payload = observation.model_dump(mode="python")
+    payload["created_at"] = observation.created_at + timedelta(days=365)
+    payload["context"] = observation.context
+    forged_draft = StrategyObservation.model_construct(**payload)
+    digest = strategy_observation_sha256(forged_draft)
+    payload["observation_sha256"] = digest
+    payload["observation_id"] = f"obs_{digest[:16]}"
+    forged = StrategyObservation.model_validate(payload)
+
+    with pytest.raises(EvolutionConflictError, match="created at"):
+        store.write_strategy_observation(forged)
+
+    forged_path = (
+        store.root
+        / observation.evolution_id
+        / "strategy_observations"
+        / f"{forged.observation_id}.json"
+    )
+    forged_path.parent.mkdir(parents=True, exist_ok=True)
+    forged_path.write_text(forged.model_dump_json(), encoding="utf-8")
+    with pytest.raises(EvolutionConflictError, match="created at"):
+        store.load_strategy_observation(
+            observation.evolution_id, forged.observation_id
+        )
+
+
+def test_store_rejects_posterior_that_omits_observation_before_cutoff(
+    tmp_path: Path,
+) -> None:
+    observations: list[StrategyObservation] = []
+    store: EvolutionStore | None = None
+    for index in range(21):
+        store, observation = _persist_observation_sources(
+            tmp_path,
+            index=2_000 + index,
+            task_group_id=f"group_cutoff_{index % 8}",
+        )
+        store.write_strategy_observation(observation)
+        observations.append(observation)
+    assert store is not None
+    incomplete = BayesianLinearStrategySelector(seed=0).fit(observations[1:]).posterior
+    assert incomplete is not None
+    assert observations[0].created_at <= incomplete.training_cutoff_at
+
+    with pytest.raises(EvolutionConflictError, match="cutoff-complete"):
+        store.write_strategy_posterior(observations[0].evolution_id, incomplete)
+
+
+def test_posterior_rejects_resigned_noncanonical_generated_at() -> None:
+    posterior = BayesianLinearStrategySelector(seed=0).fit(
+        _observations(20, distinct_tasks=8)
+    ).posterior
+    assert posterior is not None
+    payload = posterior.model_dump(mode="python")
+    payload["generated_at"] = posterior.generated_at + timedelta(days=365)
+    draft = StrategyPosteriorSnapshot.model_construct(**payload)
+    digest = posterior_sha256(draft)
+    payload["posterior_sha256"] = digest
+    payload["posterior_id"] = f"posterior_{digest[:16]}"
+
+    with pytest.raises(ValidationError, match="generated_at"):
+        StrategyPosteriorSnapshot.model_validate(payload)
+
+
+def test_store_write_and_load_reject_resigned_posterior_generated_at(
+    tmp_path: Path,
+) -> None:
+    observations: list[StrategyObservation] = []
+    store: EvolutionStore | None = None
+    for index in range(20):
+        store, observation = _persist_observation_sources(
+            tmp_path,
+            index=3_000 + index,
+            task_group_id=f"group_generated_{index % 8}",
+        )
+        store.write_strategy_observation(observation)
+        observations.append(observation)
+    assert store is not None
+    posterior = BayesianLinearStrategySelector(seed=0).fit(observations).posterior
+    assert posterior is not None
+    payload = posterior.model_dump(mode="python")
+    payload["generated_at"] = posterior.generated_at + timedelta(days=365)
+    draft = StrategyPosteriorSnapshot.model_construct(**payload)
+    digest = posterior_sha256(draft)
+    payload["posterior_sha256"] = digest
+    payload["posterior_id"] = f"posterior_{digest[:16]}"
+    forged = StrategyPosteriorSnapshot.model_construct(**payload)
+
+    with pytest.raises(ValidationError, match="generated_at"):
+        store.write_strategy_posterior(observations[0].evolution_id, forged)
+
+    path = (
+        store.root
+        / observations[0].evolution_id
+        / "strategy_posteriors"
+        / f"{forged.posterior_id}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(forged.model_dump_json(), encoding="utf-8")
+    with pytest.raises(EvolutionCorruptRecordError):
+        store.load_strategy_posterior(
+            observations[0].evolution_id, forged.posterior_id
+        )
 
 
 def test_store_rejects_observation_without_manifest_experience_link(

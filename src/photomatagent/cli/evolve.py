@@ -62,10 +62,6 @@ from photomatagent.scientific.evolution.service import (
     EvolutionService,
     MutationResult,
 )
-from photomatagent.scientific.evolution.strategy import (
-    BayesianLinearStrategySelector,
-    FixedStrategySelector,
-)
 from photomatagent.scientific.evolution.store import (
     EvolutionStore,
     EvolutionStoreError,
@@ -341,17 +337,24 @@ def evolve_status(
     boundary = Workspace(workspace)
     task = _load_task(boundary.root, evolution_id)
     _render_task_details(task, boundary.root)
-    selector = BayesianLinearStrategySelector().fit(
-        EvolutionStore(boundary).list_all_strategy_observations()
-    )
+    store = EvolutionStore(boundary)
+    service = EvolutionService(store)
+    selector = service.build_strategy_selector()
     diagnostics = selector.diagnostics
     selector_state = "Bayesian enabled" if selector.enabled else "fixed baseline"
     console.print(
-        f"Strategy selector: {selector_state} "
+        f"Next strategy selection: {selector_state} "
         f"({diagnostics.observation_count} reviewed observations; "
         f"{diagnostics.distinct_tasks} distinct task groups; "
         f"{diagnostics.effective_training_rows} effective training rows)"
     )
+    persisted = store.list_strategy_posteriors(evolution_id)
+    if persisted:
+        latest = max(persisted, key=lambda item: item.training_cutoff_at)
+        console.print(
+            f"Persisted posterior: {latest.posterior_id} "
+            f"sha256={latest.posterior_sha256}"
+        )
 
 
 @evolve_app.command("history")
@@ -1209,7 +1212,7 @@ async def run_revision_confirmation_flow(
 ) -> RevisionPlan | None:
     """Build, preview, and explicitly confirm one deterministic revision plan."""
 
-    task, episode, feedback = service.compilation_context(
+    _task, episode, feedback = service.compilation_context(
         evolution_id,
         compilation.episode_version,
     )
@@ -1219,7 +1222,8 @@ async def run_revision_confirmation_flow(
         target=episode.target_snapshot,
         previous_summary=episode.summary,
     )
-    strategy = FixedStrategySelector().select(task, plan)
+    selection = service.prepare_strategy_selection(evolution_id, plan)
+    strategy = selection.strategy
     _render_revision_plan(console, plan, strategy)
     if plan.has_blocking_ambiguity:
         raise EvolutionServiceError(
@@ -1244,6 +1248,7 @@ async def run_revision_confirmation_flow(
         evolution_id,
         confirmed,
         strategy=strategy,
+        posterior=selection.posterior,
     )
     await service.publish(mutation)
     return mutation.entity

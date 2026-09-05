@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from photomatagent.scientific.evolution.models import (
     ComparisonReport,
+    EpisodeRecord,
     EvolutionTask,
     ExperienceMaturity,
     ManagedId,
@@ -79,6 +80,27 @@ class TaskContext(StrictModel):
             self.operating_condition_ratio,
             self.previous_critical_gap_ratio,
         )
+
+
+def task_context_from_episode(
+    target: TargetSpec,
+    episode: EpisodeRecord,
+) -> TaskContext:
+    """Build the canonical selector context from a frozen source episode."""
+
+    critical_gaps: tuple[str, ...] = ()
+    if episode.summary is not None and episode.summary.final_evaluation is not None:
+        critical_gaps = tuple(
+            dict.fromkeys(
+                gap
+                for gap in episode.summary.final_evaluation.critical_evidence_gaps
+                if gap
+            )
+        )
+    return TaskContext.from_target(
+        target,
+        previous_critical_gap_count=len(critical_gaps),
+    )
 
 
 class StrategyObservation(StrictModel):

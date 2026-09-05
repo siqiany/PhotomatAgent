@@ -27,7 +27,7 @@ from photomatagent.scientific.evolution.models import (
     StrategyVersion,
     StrictModel,
     UtcDatetime,
-    utc_now,
+    strategy_version_sha256,
 )
 
 ARM_ORDER: tuple[StrategyArm, ...] = (
@@ -156,8 +156,8 @@ class StrategyPosteriorSnapshot(StrictModel):
             self.training_observation_hashes
         ):
             raise ValueError("training observation hashes must be unique and sorted")
-        if self.generated_at < self.training_cutoff_at:
-            raise ValueError("posterior cannot predate its training cutoff")
+        if self.generated_at != self.training_cutoff_at:
+            raise ValueError("posterior generated_at must equal training_cutoff_at")
         expected_hash = posterior_sha256(self)
         if self.posterior_sha256 != expected_hash:
             raise ValueError("posterior_sha256 does not match posterior content")
@@ -232,6 +232,34 @@ class BayesianLinearStrategySelector:
     @property
     def enabled(self) -> bool:
         return self.diagnostics.enabled
+
+    @classmethod
+    def from_posterior(
+        cls,
+        posterior: StrategyPosteriorSnapshot,
+        *,
+        seed: int = 0,
+    ) -> Self:
+        """Rehydrate a selector from one immutable historical posterior."""
+
+        selector = cls(
+            seed=seed,
+            prior_precision=posterior.prior_precision,
+            noise_variance=posterior.noise_variance,
+        )
+        if (
+            posterior.observation_count < _MIN_OBSERVATIONS
+            or posterior.distinct_task_groups < _MIN_DISTINCT_TASKS
+        ):
+            raise ValueError("historical posterior does not satisfy the learning gate")
+        selector.posterior = posterior
+        selector.diagnostics = BayesianSelectorDiagnostics(
+            True,
+            posterior.observation_count,
+            posterior.effective_training_rows,
+            posterior.distinct_task_groups,
+        )
+        return selector
 
     def fit(self, observations: Iterable[StrategyObservation]) -> Self:
         by_comparison: dict[str, StrategyObservation] = {}
@@ -311,6 +339,7 @@ class BayesianLinearStrategySelector:
         )
         if not np.isfinite(mean).all() or not np.isfinite(covariance).all():
             raise ValueError("Bayesian strategy posterior contains non-finite values")
+        training_cutoff_at = max(item.created_at for item in unique)
         data: dict[str, Any] = {
             "schema_version": 1,
             "feature_schema": FEATURE_SCHEMA,
@@ -327,8 +356,8 @@ class BayesianLinearStrategySelector:
             "training_observation_hashes": tuple(
                 sorted(item.observation_sha256 for item in unique)
             ),
-            "training_cutoff_at": max(item.created_at for item in unique),
-            "generated_at": utc_now(),
+            "training_cutoff_at": training_cutoff_at,
+            "generated_at": training_cutoff_at,
         }
         draft = StrategyPosteriorSnapshot.model_construct(
             **data,
@@ -379,7 +408,7 @@ class BayesianLinearStrategySelector:
         ).hexdigest()
         decision_payload = {
             "base_seed": self.seed,
-            "sampling_posterior_sha256": sampling_posterior_sha256,
+            "posterior_sha256": self.posterior.posterior_sha256,
             "evolution_id": task.evolution_id,
             "revision_id": plan.revision_id,
             "context": context.model_dump(mode="json"),
@@ -423,10 +452,9 @@ class BayesianLinearStrategySelector:
             "arm": selected_arm,
             "reason": reason,
             "parameters": parameters,
+            "cutoff_at": self.posterior.training_cutoff_at.isoformat(),
         }
-        digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        digest = strategy_version_sha256(payload)
         return StrategyVersion(
             strategy_id=f"strategy_{digest[:10]}",
             evolution_id=task.evolution_id,
@@ -458,9 +486,7 @@ class FixedStrategySelector:
             "reason": plan.strategy_reason[:1_000],
             "parameters": parameters,
         }
-        digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        digest = strategy_version_sha256(payload)
         return StrategyVersion(
             strategy_id=f"strategy_{digest[:10]}",
             evolution_id=task.evolution_id,

@@ -948,6 +948,10 @@ def _persisted_pair(
             "applied_feedback_id": plan.feedback_id if version == "v002" else None,
             "strategy_id": strategy.strategy_id if version == "v002" else None,
             "strategy_arm": strategy.arm if version == "v002" else "STATIC",
+            "strategy_sha256": (
+                strategy.strategy_sha256 if version == "v002" else None
+            ),
+            "strategy_cutoff_at": strategy.cutoff_at if version == "v002" else None,
         }
         if version == "v002" and current_overrides:
             episode_updates.update(current_overrides)
@@ -1051,6 +1055,64 @@ def test_preliminary_then_reviewed_comparison_has_distinct_snapshot_and_one_samp
         reviewed.comparison_id,
     ]
     assert len(stored.experience_ids) == 1
+    observations = service.store.list_strategy_observations(task.evolution_id)
+    assert len(observations) == 1
+    assert observations[0].comparison_id == reviewed.comparison_id
+    assert observations[0].created_at == reviewed.created_at
+
+
+def test_reviewed_comparison_retry_repairs_missing_observation_after_manifest_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, task = _persisted_pair(tmp_path)
+    current = service.store.load_episode(task.evolution_id, "v002")
+    assert current.artifact is not None
+    service.attach_feedback(
+        task.evolution_id,
+        "v002",
+        feedback_id="fb_v2",
+        draft=ExpertFeedbackDraft(
+            scores=RubricScores(
+                scientific_correctness=4,
+                evidence_sufficiency=4,
+                novelty=4,
+                actionability=4,
+                overall=4,
+            ),
+        ),
+        result_sha256=current.artifact.sha256,
+        raw_input="reviewed",
+    )
+    service.save_compilation(
+        task.evolution_id,
+        _compilation("v002", feedback_id="fb_v2"),
+    )
+    original = service.store._write_strategy_observation_locked
+    calls = 0
+
+    def fail_once(observation):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated observation persistence failure")
+        return original(observation)
+
+    monkeypatch.setattr(service.store, "_write_strategy_observation_locked", fail_once)
+    with pytest.raises(OSError, match="simulated"):
+        service.compare(task.evolution_id, "v001", "v002")
+
+    checkpoint = service.get(task.evolution_id)
+    assert len(checkpoint.comparison_ids) == 1
+    assert len(checkpoint.experience_ids) == 1
+    assert service.store.list_strategy_observations(task.evolution_id) == []
+
+    reviewed = service.compare(task.evolution_id, "v001", "v002").entity
+    assert len(service.get(task.evolution_id).comparison_ids) == 1
+    assert len(service.get(task.evolution_id).experience_ids) == 1
+    observations = service.store.list_strategy_observations(task.evolution_id)
+    assert len(observations) == 1
+    assert observations[0].comparison_id == reviewed.comparison_id
 
 
 def test_service_revalidates_physical_artifacts(tmp_path: Path) -> None:
