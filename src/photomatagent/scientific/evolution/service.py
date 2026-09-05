@@ -73,6 +73,7 @@ from photomatagent.scientific.evolution.store import (
 )
 from photomatagent.scientific.evolution.strategy import (
     BayesianLinearStrategySelector,
+    PRODUCTION_SELECTOR_SEED,
     StrategyPosteriorSnapshot,
 )
 from photomatagent.scientific.loop.target import TargetSpec
@@ -199,23 +200,30 @@ class EvolutionService:
     def get(self, evolution_id: str) -> EvolutionTask:
         return self.store.load_task(evolution_id)
 
-    def build_strategy_selector(self, *, seed: int = 0) -> BayesianLinearStrategySelector:
+    def build_strategy_selector(self) -> BayesianLinearStrategySelector:
         """Fit the selector used by both status and production confirmation."""
 
-        return BayesianLinearStrategySelector(seed=seed).fit(
-            self.store.list_all_strategy_observations()
-        )
+        with self.store.strategy_learning_lock():
+            observations = self.store.list_all_strategy_observations()
+            incomplete: tuple[str, ...] = ()
+            if observations:
+                cutoff = max(item.created_at for item in observations)
+                incomplete = self.store.incomplete_strategy_observation_chains(cutoff)
+            return BayesianLinearStrategySelector(
+                seed=PRODUCTION_SELECTOR_SEED
+            ).fit(
+                observations,
+                incomplete_observation_chains=incomplete,
+            )
 
     def prepare_strategy_selection(
         self,
         evolution_id: str,
         plan: RevisionPlan,
-        *,
-        seed: int = 0,
     ) -> StrategySelection:
         """Preview the exact current production selection for a canonical plan."""
 
-        with self.store.transaction(evolution_id) as transaction:
+        with self.store.strategy_learning_transaction(evolution_id) as transaction:
             task = transaction.load_task()
             self._validate_revision(
                 task,
@@ -238,7 +246,6 @@ class EvolutionService:
                 task,
                 canonical_plan,
                 source,
-                seed=seed,
             )
 
     def compare(
@@ -257,7 +264,7 @@ class EvolutionService:
         observation.
         """
 
-        with self.store.transaction(evolution_id) as transaction:
+        with self.store.strategy_learning_transaction(evolution_id) as transaction:
             task = transaction.load_task()
             previous = transaction.load_episode(previous_version)
             current = transaction.load_episode(current_version)
@@ -1681,7 +1688,7 @@ class EvolutionService:
         strategy: StrategyVersion | None = None,
         posterior: StrategyPosteriorSnapshot | None = None,
     ) -> MutationResult[RevisionPlan]:
-        with self.store.transaction(evolution_id) as transaction:
+        with self.store.strategy_learning_transaction(evolution_id) as transaction:
             task = transaction.load_task()
             self._validate_revision(task, evolution_id, plan)
             episode, feedback, compilation = self._revision_context(
@@ -1827,10 +1834,8 @@ class EvolutionService:
         task: EvolutionTask,
         plan: RevisionPlan,
         source: EpisodeRecord,
-        *,
-        seed: int = 0,
     ) -> StrategySelection:
-        selector = self.build_strategy_selector(seed=seed)
+        selector = self.build_strategy_selector()
         context = task_context_from_episode(task.target, source)
         return StrategySelection(
             strategy=selector.select(task, plan, context),
@@ -3103,11 +3108,13 @@ class EvolutionService:
             if (
                 not isinstance(posterior_id, str)
                 or not isinstance(posterior_hash, str)
-                or isinstance(seed, bool)
-                or not isinstance(seed, int)
             ):
                 raise EvolutionOperationConflict(
                     "Bayesian strategy parameters are incomplete"
+                )
+            if seed != PRODUCTION_SELECTOR_SEED:
+                raise EvolutionOperationConflict(
+                    "Bayesian strategy does not use the trusted production seed"
                 )
             posterior = transaction.load_strategy_posterior(posterior_id)
             if posterior.posterior_sha256 != posterior_hash:
@@ -3117,7 +3124,7 @@ class EvolutionService:
             context = task_context_from_episode(task.target, source)
             canonical = BayesianLinearStrategySelector.from_posterior(
                 posterior,
-                seed=seed,
+                seed=PRODUCTION_SELECTOR_SEED,
             ).select(task, revision, context)
         else:
             raise EvolutionOperationConflict("persisted strategy selector is unsupported")

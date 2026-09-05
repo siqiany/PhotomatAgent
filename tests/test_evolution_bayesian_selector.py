@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import json
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 import pytest
@@ -23,6 +25,7 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     StrategyVersion,
 )
+from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
     EvolutionConflictError,
@@ -31,6 +34,9 @@ from photomatagent.scientific.evolution.store import (
 )
 from photomatagent.scientific.evolution.strategy import (
     FEATURE_SCHEMA,
+    NOISE_VARIANCE,
+    PRIOR_PRECISION,
+    PRODUCTION_SELECTOR_SEED,
     BayesianLinearStrategySelector,
     FixedStrategySelector,
     StrategyPosteriorSnapshot,
@@ -449,7 +455,7 @@ def test_posterior_snapshot_round_trips_atomically_and_detects_tampering(
     forged_payload["posterior_sha256"] = forged_hash
     forged_payload["posterior_id"] = f"posterior_{forged_hash[:16]}"
     forged = StrategyPosteriorSnapshot.model_validate(forged_payload)
-    with pytest.raises(EvolutionConflictError, match="authoritative observations"):
+    with pytest.raises(EvolutionConflictError, match="exact canonical"):
         store.write_strategy_posterior(evolution_id, forged)
 
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -461,6 +467,130 @@ def test_posterior_snapshot_round_trips_atomically_and_detects_tampering(
         )
     with pytest.raises(ValueError):
         store.load_strategy_posterior(evolution_id, "../escape")
+
+
+def test_store_rejects_nonproduction_posterior_hyperparameters_on_write_and_load(
+    tmp_path: Path,
+) -> None:
+    observations: list[StrategyObservation] = []
+    store: EvolutionStore | None = None
+    for index in range(20):
+        store, observation = _persist_observation_sources(
+            tmp_path,
+            index=4_000 + index,
+            task_group_id=f"group_hyper_{index % 8}",
+        )
+        store.write_strategy_observation(observation)
+        observations.append(observation)
+    assert store is not None
+    forged = BayesianLinearStrategySelector(
+        seed=PRODUCTION_SELECTOR_SEED,
+        prior_precision=PRIOR_PRECISION * 2,
+        noise_variance=NOISE_VARIANCE * 2,
+    ).fit(observations).posterior
+    assert forged is not None
+
+    with pytest.raises(EvolutionConflictError, match="production hyperparameters"):
+        store.write_strategy_posterior(observations[0].evolution_id, forged)
+
+    path = (
+        store.root
+        / observations[0].evolution_id
+        / "strategy_posteriors"
+        / f"{forged.posterior_id}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(forged.model_dump_json(), encoding="utf-8")
+    with pytest.raises(EvolutionConflictError, match="production hyperparameters"):
+        store.load_strategy_posterior(
+            observations[0].evolution_id, forged.posterior_id
+        )
+
+
+def test_store_rejects_resigned_subpicosecond_posterior_drift_on_write_and_load(
+    tmp_path: Path,
+) -> None:
+    observations: list[StrategyObservation] = []
+    store: EvolutionStore | None = None
+    for index in range(20):
+        store, observation = _persist_observation_sources(
+            tmp_path,
+            index=5_000 + index,
+            task_group_id=f"group_exact_{index % 8}",
+        )
+        store.write_strategy_observation(observation)
+        observations.append(observation)
+    assert store is not None
+    posterior = BayesianLinearStrategySelector().fit(observations).posterior
+    assert posterior is not None
+    payload = posterior.model_dump(mode="python")
+    payload["mean"] = (payload["mean"][0] + 5e-13, *payload["mean"][1:])
+    draft = StrategyPosteriorSnapshot.model_construct(**payload)
+    digest = posterior_sha256(draft)
+    payload["posterior_sha256"] = digest
+    payload["posterior_id"] = f"posterior_{digest[:16]}"
+    forged = StrategyPosteriorSnapshot.model_validate(payload)
+
+    with pytest.raises(EvolutionConflictError, match="exact canonical arrays"):
+        store.write_strategy_posterior(observations[0].evolution_id, forged)
+
+    path = (
+        store.root
+        / observations[0].evolution_id
+        / "strategy_posteriors"
+        / f"{forged.posterior_id}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(forged.model_dump_json(), encoding="utf-8")
+    with pytest.raises(EvolutionConflictError, match="exact canonical arrays"):
+        store.load_strategy_posterior(
+            observations[0].evolution_id, forged.posterior_id
+        )
+
+
+def test_learning_lock_hides_manifest_observation_gap_from_selector_fit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store: EvolutionStore | None = None
+    for index in range(20):
+        store, observation = _persist_observation_sources(
+            tmp_path,
+            index=6_000 + index,
+            task_group_id=f"group_lock_{index % 8}",
+        )
+        if index < 19:
+            store.write_strategy_observation(observation)
+    assert store is not None
+    pending = observation
+    entered = Event()
+    release = Event()
+    selector_finished = Event()
+    original = store._write_strategy_observation_locked
+
+    def delayed_write(candidate: StrategyObservation) -> Path:
+        entered.set()
+        assert release.wait(timeout=5)
+        return original(candidate)
+
+    monkeypatch.setattr(store, "_write_strategy_observation_locked", delayed_write)
+
+    def fit_selector() -> BayesianLinearStrategySelector:
+        selected = EvolutionService(store).build_strategy_selector()
+        selector_finished.set()
+        return selected
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(store.write_strategy_observation, pending)
+        assert entered.wait(timeout=5)
+        selector_future = executor.submit(fit_selector)
+        assert selector_finished.wait(timeout=0.1) is False
+        release.set()
+        writer.result(timeout=5)
+        selector = selector_future.result(timeout=5)
+
+    assert selector.enabled is True
+    assert selector.diagnostics.observation_count == 20
 
 
 def _persist_observation_sources(

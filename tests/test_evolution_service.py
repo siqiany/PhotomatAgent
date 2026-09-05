@@ -35,7 +35,11 @@ from photomatagent.scientific.evolution.store import (
     EvolutionConflictError,
     EvolutionStore,
 )
-from photomatagent.scientific.evolution.strategy import FixedStrategySelector
+from photomatagent.scientific.evolution.strategy import (
+    BayesianLinearStrategySelector,
+    FixedStrategySelector,
+)
+from photomatagent.scientific.evolution.experience import task_context_from_episode
 from photomatagent.scientific.loop import ScientificLoopSummary, TargetSpec
 from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
@@ -390,8 +394,28 @@ def _produce_reviewed_training_observation(
 
 def test_production_bayesian_confirmation_rejects_stale_preview_then_iterates(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = make_service(tmp_path)
+    original_observation_write = service.store._write_strategy_observation_locked
+    monkeypatch.setattr(
+        service.store,
+        "_write_strategy_observation_locked",
+        lambda observation: (_ for _ in ()).throw(
+            OSError("simulated early observation gap")
+        ),
+    )
+    with pytest.raises(OSError, match="early observation gap"):
+        _produce_reviewed_training_observation(
+            service,
+            index=900,
+            task_group_id="group_missing_early",
+        )
+    monkeypatch.setattr(
+        service.store,
+        "_write_strategy_observation_locked",
+        original_observation_write,
+    )
     for index in range(20):
         _produce_reviewed_training_observation(
             service,
@@ -404,6 +428,46 @@ def test_production_bayesian_confirmation_rejects_stale_preview_then_iterates(
         index=100,
         task_group_id="group_target",
     )
+    assert strategy.parameters["selector"] == "fixed-v1"
+    assert posterior is None
+    selector = service.build_strategy_selector()
+    assert selector.enabled is False
+    assert selector.diagnostics.incomplete_observation_chains
+    bypass = BayesianLinearStrategySelector().fit(
+        service.store.list_all_strategy_observations()
+    ).posterior
+    assert bypass is not None
+    with pytest.raises(EvolutionConflictError, match="incomplete observation chains"):
+        service.store.write_strategy_posterior(evolution_id, bypass)
+
+    from photomatagent.cli.app import app
+    from typer.testing import CliRunner
+
+    status = CliRunner().invoke(
+        app,
+        ["evolve", "status", evolution_id, "--workspace", str(tmp_path)],
+    )
+    assert status.exit_code == 0
+    assert "fixed baseline" in status.stdout
+    assert "incomplete" in status.stdout.lower()
+
+    bypass_path = (
+        service.store.root
+        / "evo_training_0"
+        / "strategy_posteriors"
+        / f"{bypass.posterior_id}.json"
+    )
+    bypass_path.parent.mkdir(parents=True, exist_ok=True)
+    bypass_path.write_text(bypass.model_dump_json(), encoding="utf-8")
+    with pytest.raises(EvolutionConflictError, match="incomplete observation chains"):
+        service.store.load_strategy_posterior(
+            "evo_training_0", bypass.posterior_id
+        )
+
+    service.compare("evo_training_900", "v001", "v002")
+    selection_after_repair = service.prepare_strategy_selection(evolution_id, plan)
+    strategy = selection_after_repair.strategy
+    posterior = selection_after_repair.posterior
     assert strategy.parameters["selector"] == "bayesian-linear-thompson-v1"
     assert posterior is not None
 
@@ -451,6 +515,23 @@ def test_production_bayesian_confirmation_rejects_stale_preview_then_iterates(
     )
     with pytest.raises(EvolutionOperationConflict, match="canonical"):
         service.validate_persisted_strategy(ready, persisted_revision, forged)
+
+    source = service.store.load_episode(evolution_id, persisted_revision.source_version)
+    attacker_seed_strategy = BayesianLinearStrategySelector.from_posterior(
+        retry.posterior,
+        seed=99,
+    ).select(
+        ready,
+        persisted_revision,
+        task_context_from_episode(ready.target, source),
+    )
+    assert attacker_seed_strategy.parameters["seed"] == 99
+    with pytest.raises(EvolutionOperationConflict, match="production seed"):
+        service.validate_persisted_strategy(
+            ready,
+            persisted_revision,
+            attacker_seed_strategy,
+        )
 
     claim = service.claim_iteration(
         evolution_id,

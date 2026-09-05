@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib
 import json
 import os
@@ -10,13 +11,12 @@ import re
 import stat
 import tempfile
 import time
-import hashlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock, local
 from typing import Any, Iterator, TypeVar
 
-import numpy as np
 from pydantic import BaseModel, ValidationError
 
 from photomatagent.redaction import redact_secrets
@@ -46,6 +46,7 @@ from photomatagent.scientific.evolution.models import (
     FeedbackCompilation,
     RevisionPlan,
     StrategyVersion,
+    UtcDatetime,
     utc_now,
     validate_managed_id,
 )
@@ -58,6 +59,9 @@ from photomatagent.scientific.evolution.experience import (
 from photomatagent.scientific.evolution.events import bounded_summary
 from photomatagent.scientific.evolution.strategy import (
     BayesianLinearStrategySelector,
+    NOISE_VARIANCE,
+    PRIOR_PRECISION,
+    PRODUCTION_SELECTOR_SEED,
     StrategyPosteriorSnapshot,
 )
 from photomatagent.scientific.state import ScientificState
@@ -446,6 +450,8 @@ class EvolutionStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.root = workspace.resolve(_STORE_PATH, must_exist=True)
         self._active_evaluation_leases: dict[int, EvaluationLease] = {}
+        self._strategy_learning_thread_lock = RLock()
+        self._strategy_learning_local = local()
 
     @contextmanager
     def transaction(self, evolution_id: str) -> Iterator[EvolutionTransaction]:
@@ -459,6 +465,63 @@ class EvolutionStore:
                 yield transaction
             finally:
                 transaction._active = False
+
+    @contextmanager
+    def strategy_learning_transaction(
+        self, evolution_id: str
+    ) -> Iterator[EvolutionTransaction]:
+        """Hold the task lock, then the cross-task learning publication lock."""
+
+        task_dir = self._task_dir(evolution_id)
+        transaction = EvolutionTransaction(self, evolution_id)
+        with self._task_lock(task_dir), self.strategy_learning_lock():
+            transaction._active = True
+            try:
+                yield transaction
+            finally:
+                transaction._active = False
+
+    @contextmanager
+    def strategy_learning_lock(self) -> Iterator[None]:
+        """Serialize global observation publication and posterior snapshots."""
+
+        with self._strategy_learning_thread_lock:
+            depth = getattr(self._strategy_learning_local, "depth", 0)
+            if depth:
+                self._strategy_learning_local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._strategy_learning_local.depth = depth
+                return
+            lock_path = self.workspace.resolve(
+                self.workspace.relative(self.root / ".strategy-learning.lock"),
+                must_exist=False,
+            )
+            deadline = time.monotonic() + self.lock_timeout_seconds
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            acquired = False
+            try:
+                self._initialize_lock_file(descriptor)
+                while not acquired:
+                    acquired = self._try_advisory_lock(descriptor)
+                    if acquired:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EvolutionLockError(
+                            "timed out acquiring strategy learning lock"
+                        )
+                    time.sleep(min(self.lock_poll_seconds, remaining))
+                self._strategy_learning_local.depth = 1
+                yield
+            finally:
+                self._strategy_learning_local.depth = 0
+                try:
+                    if acquired:
+                        self._release_advisory_lock(descriptor)
+                finally:
+                    os.close(descriptor)
 
     @contextmanager
     def evaluation_lease(self, evolution_id: str) -> Iterator[EvaluationLease]:
@@ -1567,7 +1630,7 @@ class EvolutionStore:
 
         self._validate_id(observation.observation_id)
         task_dir = self._task_dir(observation.evolution_id)
-        with self._task_lock(task_dir):
+        with self._task_lock(task_dir), self.strategy_learning_lock():
             return self._write_strategy_observation_locked(observation)
 
     def _write_strategy_observation_locked(
@@ -1779,6 +1842,47 @@ class EvolutionStore:
             observations.extend(self.list_strategy_observations(task.evolution_id))
         return sorted(observations, key=lambda item: item.observation_sha256)
 
+    def incomplete_strategy_observation_chains(
+        self,
+        cutoff_at: UtcDatetime,
+    ) -> tuple[str, ...]:
+        """Return reviewed manifest comparisons lacking one canonical observation."""
+
+        incomplete: list[str] = []
+        for task in self.list_tasks():
+            observations = self.list_strategy_observations(task.evolution_id)
+            by_comparison: dict[str, list[StrategyObservation]] = {}
+            for observation in observations:
+                by_comparison.setdefault(observation.comparison_id, []).append(
+                    observation
+                )
+            experiences = {
+                item.experience_id: item
+                for item in self.list_experiences(task.evolution_id)
+                if item.experience_id in task.experience_ids
+            }
+            for comparison_id in task.comparison_ids:
+                comparison = self.load_comparison(task.evolution_id, comparison_id)
+                if (
+                    comparison.created_at > cutoff_at
+                    or comparison.phase != "POST_FEEDBACK"
+                    or comparison.reward is None
+                    or comparison.expert_utility_delta is None
+                    or "expert_utility_delta" not in comparison.components_used
+                ):
+                    continue
+                has_experience = any(
+                    any(
+                        evidence.comparison_id == comparison_id
+                        for evidence in experience.observations
+                    )
+                    for experience in experiences.values()
+                )
+                matching = by_comparison.get(comparison_id, [])
+                if not has_experience or len(matching) != 1:
+                    incomplete.append(f"{task.evolution_id}:{comparison_id}")
+        return tuple(sorted(incomplete))
+
     def write_strategy_posterior(
         self,
         evolution_id: str,
@@ -1787,14 +1891,16 @@ class EvolutionStore:
         """Persist one immutable posterior under a managed evolution task."""
 
         self._validate_id(posterior.posterior_id)
-        self._validate_strategy_posterior_provenance(posterior)
-        return self._write_record(
-            evolution_id=evolution_id,
-            directory="strategy_posteriors",
-            filename=f"{posterior.posterior_id}.json",
-            record=posterior,
-            model_type=StrategyPosteriorSnapshot,
-        )
+        task_dir = self._task_dir(evolution_id)
+        with self._task_lock(task_dir), self.strategy_learning_lock():
+            self._validate_strategy_posterior_provenance(posterior)
+            return self._write_record_locked(
+                evolution_id=evolution_id,
+                directory="strategy_posteriors",
+                filename=f"{posterior.posterior_id}.json",
+                record=posterior,
+                model_type=StrategyPosteriorSnapshot,
+            )
 
     def load_strategy_posterior(
         self,
@@ -1807,15 +1913,16 @@ class EvolutionStore:
             "strategy_posteriors",
             f"{posterior_id}.json",
         )
-        posterior = self._load_model(
-            path, StrategyPosteriorSnapshot, require_schema_version=True
-        )
-        if posterior.posterior_id != posterior_id:
-            raise EvolutionCorruptRecordError(
-                path, "strategy posterior identity does not match its managed path"
+        with self.strategy_learning_lock():
+            posterior = self._load_model(
+                path, StrategyPosteriorSnapshot, require_schema_version=True
             )
-        self._validate_strategy_posterior_provenance(posterior)
-        return posterior
+            if posterior.posterior_id != posterior_id:
+                raise EvolutionCorruptRecordError(
+                    path, "strategy posterior identity does not match its managed path"
+                )
+            self._validate_strategy_posterior_provenance(posterior)
+            return posterior
 
     def list_strategy_posteriors(
         self,
@@ -1831,6 +1938,21 @@ class EvolutionStore:
         self,
         posterior: StrategyPosteriorSnapshot,
     ) -> None:
+        if (
+            posterior.prior_precision != PRIOR_PRECISION
+            or posterior.noise_variance != NOISE_VARIANCE
+        ):
+            raise EvolutionConflictError(
+                "strategy posterior does not use production hyperparameters"
+            )
+        incomplete = self.incomplete_strategy_observation_chains(
+            posterior.training_cutoff_at
+        )
+        if incomplete:
+            raise EvolutionConflictError(
+                "strategy posterior training cutoff has incomplete observation chains: "
+                + ", ".join(incomplete)
+            )
         authoritative = self.list_all_strategy_observations()
         expected_hashes = tuple(
             sorted(
@@ -1853,9 +1975,9 @@ class EvolutionStore:
                 "strategy posterior references a non-authoritative observation hash"
             ) from exc
         recomputed_selector = BayesianLinearStrategySelector(
-            seed=0,
-            prior_precision=posterior.prior_precision,
-            noise_variance=posterior.noise_variance,
+            seed=PRODUCTION_SELECTOR_SEED,
+            prior_precision=PRIOR_PRECISION,
+            noise_variance=NOISE_VARIANCE,
         ).fit(training)
         recomputed = recomputed_selector.posterior
         if recomputed is None:
@@ -1869,20 +1991,13 @@ class EvolutionStore:
             and posterior.distinct_task_groups == recomputed.distinct_task_groups
             and posterior.training_cutoff_at == recomputed.training_cutoff_at
         )
-        arrays_match = np.allclose(
-            posterior.mean,
-            recomputed.mean,
-            rtol=0.0,
-            atol=1e-12,
-        ) and np.allclose(
-            posterior.covariance,
-            recomputed.covariance,
-            rtol=0.0,
-            atol=1e-12,
+        arrays_match = (
+            posterior.mean == recomputed.mean
+            and posterior.covariance == recomputed.covariance
         )
         if not counts_match or not arrays_match:
             raise EvolutionConflictError(
-                "strategy posterior does not match authoritative observations"
+                "strategy posterior does not match exact canonical arrays and counts"
             )
 
     def _list_managed_records(

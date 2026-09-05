@@ -58,6 +58,9 @@ FEATURE_SCHEMA = (
 FEATURE_DIMENSION = len(FEATURE_SCHEMA)
 _MIN_OBSERVATIONS = 20
 _MIN_DISTINCT_TASKS = 8
+PRODUCTION_SELECTOR_SEED = 0
+PRIOR_PRECISION = 4.0
+NOISE_VARIANCE = 0.25
 
 
 def feature_vector(
@@ -196,6 +199,7 @@ class BayesianSelectorDiagnostics:
     distinct_tasks: int
     minimum_observations: int = _MIN_OBSERVATIONS
     minimum_distinct_tasks: int = _MIN_DISTINCT_TASKS
+    incomplete_observation_chains: tuple[str, ...] = ()
 
 
 class BayesianLinearStrategySelector:
@@ -204,9 +208,9 @@ class BayesianLinearStrategySelector:
     def __init__(
         self,
         *,
-        seed: int = 0,
-        prior_precision: float = 4.0,
-        noise_variance: float = 0.25,
+        seed: int = PRODUCTION_SELECTOR_SEED,
+        prior_precision: float = PRIOR_PRECISION,
+        noise_variance: float = NOISE_VARIANCE,
         fallback: FixedStrategySelector | None = None,
     ) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int):
@@ -238,14 +242,19 @@ class BayesianLinearStrategySelector:
         cls,
         posterior: StrategyPosteriorSnapshot,
         *,
-        seed: int = 0,
+        seed: int = PRODUCTION_SELECTOR_SEED,
     ) -> Self:
         """Rehydrate a selector from one immutable historical posterior."""
 
+        if (
+            posterior.prior_precision != PRIOR_PRECISION
+            or posterior.noise_variance != NOISE_VARIANCE
+        ):
+            raise ValueError("historical posterior uses non-production hyperparameters")
         selector = cls(
             seed=seed,
-            prior_precision=posterior.prior_precision,
-            noise_variance=posterior.noise_variance,
+            prior_precision=PRIOR_PRECISION,
+            noise_variance=NOISE_VARIANCE,
         )
         if (
             posterior.observation_count < _MIN_OBSERVATIONS
@@ -261,7 +270,12 @@ class BayesianLinearStrategySelector:
         )
         return selector
 
-    def fit(self, observations: Iterable[StrategyObservation]) -> Self:
+    def fit(
+        self,
+        observations: Iterable[StrategyObservation],
+        *,
+        incomplete_observation_chains: Iterable[str] = (),
+    ) -> Self:
         by_comparison: dict[str, StrategyObservation] = {}
         by_id: dict[str, StrategyObservation] = {}
         for raw in observations:
@@ -292,15 +306,18 @@ class BayesianLinearStrategySelector:
             )
         rows = sorted(grouped.items(), key=lambda item: item[0])
         effective_rows = len(rows)
+        incomplete = tuple(sorted(set(incomplete_observation_chains)))
         enabled = (
             len(unique) >= _MIN_OBSERVATIONS
             and distinct_tasks >= _MIN_DISTINCT_TASKS
+            and not incomplete
         )
         self.diagnostics = BayesianSelectorDiagnostics(
             enabled,
             len(unique),
             effective_rows,
             distinct_tasks,
+            incomplete_observation_chains=incomplete,
         )
         self.posterior = None
         if not enabled:
@@ -507,6 +524,9 @@ __all__ = [
     "FEATURE_DIMENSION",
     "FEATURE_SCHEMA",
     "FixedStrategySelector",
+    "NOISE_VARIANCE",
+    "PRIOR_PRECISION",
+    "PRODUCTION_SELECTOR_SEED",
     "StrategyPosteriorSnapshot",
     "TaskContext",
     "feature_vector",

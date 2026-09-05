@@ -348,6 +348,12 @@ def evolve_status(
         f"{diagnostics.distinct_tasks} distinct task groups; "
         f"{diagnostics.effective_training_rows} effective training rows)"
     )
+    if diagnostics.incomplete_observation_chains:
+        console.print(
+            "[yellow]Strategy learning data is incomplete; retry compare for: "
+            + ", ".join(diagnostics.incomplete_observation_chains)
+            + "[/]"
+        )
     persisted = store.list_strategy_posteriors(evolution_id)
     if persisted:
         latest = max(persisted, key=lambda item: item.training_cutoff_at)
