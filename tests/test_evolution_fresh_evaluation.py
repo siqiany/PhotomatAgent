@@ -479,9 +479,10 @@ def test_fresh_claim_adopts_owner_record_after_record_manifest_crash(
     adopted = service.claim_fresh_evaluation(
         "evo_fresh",
         strategy_id=strategy.strategy_id,
-        owner_token="owner_recovery",
+        owner_token="owner_adopter",
     )
     assert adopted.episode.version == "v001"
+    assert adopted.owner_token == "owner_recovery"
     assert adopted.task.evaluation_episode_ids == [adopted.episode.episode_id]
     with pytest.raises(EvolutionOperationConflict, match="owned"):
         service.claim_fresh_evaluation(

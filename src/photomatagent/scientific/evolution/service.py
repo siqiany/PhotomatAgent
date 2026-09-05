@@ -602,6 +602,10 @@ class EvolutionService:
                 transaction.write_evaluation_episode(episode)
                 persisted = episode
             else:
+                if existing.status != "RESERVED" or existing.owner_token is None:
+                    raise EvolutionOperationConflict(
+                        "orphan fresh-evaluation record is not safely adoptable"
+                    )
                 self._validate_fresh_reservation(
                     existing,
                     task,
@@ -611,7 +615,7 @@ class EvolutionService:
                     tool_surface_fingerprint=tool_surface_fingerprint,
                     capability_fingerprint=capability_fingerprint,
                     data_source_fingerprints=data_source_fingerprints or {},
-                    owner_token=owner_token,
+                    owner_token=existing.owner_token,
                 )
                 persisted = existing
             self._prepare_evaluation_workspace(persisted, task, strategy)
@@ -636,7 +640,7 @@ class EvolutionService:
                 task=task,
                 strategy=strategy,
                 episode=persisted,
-                owner_token=owner_token,
+                owner_token=cast(str, persisted.owner_token),
                 events=self._reservation_events(persisted, False),
             )
 

@@ -700,7 +700,7 @@ async def run_fresh_evaluation(
             config=config or ScientificLoopConfig(),
             judge=judge,
             on_event=on_event,
-            owner_token=token,
+            owner_token=claim.owner_token,
         )
     except BaseException as exc:
         try:
@@ -713,7 +713,7 @@ async def run_fresh_evaluation(
                     task.evolution_id,
                     claim.episode.version,
                     ScientificEpisodeExecutor._bounded_error(exc),
-                    owner_token=token,
+                    owner_token=claim.owner_token,
                 )
         except BaseException as recovery_exc:
             exc.add_note(
