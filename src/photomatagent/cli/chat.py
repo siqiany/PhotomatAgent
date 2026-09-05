@@ -97,6 +97,8 @@ def build_runtime(
         approval_handler=approval_handler,
         event_sinks=sinks,
         session_id=logger.session_id if logger else None,
+        fresh_approval=fresh_approval,
+        application_approval_root=resolved_approval_root,
     )
     return runtime, logger
 

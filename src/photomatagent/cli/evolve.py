@@ -231,11 +231,12 @@ def evolve_start(
         )
         prior_mutations.append(reserved)
         episode = reserved.entity
+        store.flush_event_outbox(task.evolution_id)
         for mutation in prior_mutations:
             store.append_events(
                 task.evolution_id,
                 mutation.events,
-                idempotency_scope=store.event_scope(mutation.entity),
+                idempotency_scope="durable-outbox",
             )
     except (OSError, ValueError) as exc:
         console.print(f"[red]{redact_text(str(exc))}[/]")
@@ -419,10 +420,11 @@ def evolve_compare(
     ) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
         raise typer.Exit(code=2) from None
+    service.store.flush_event_outbox(evolution_id)
     service.store.append_events(
         evolution_id,
         mutation.events,
-        idempotency_scope=service.store.event_scope(mutation.entity),
+        idempotency_scope="durable-outbox",
     )
     _render_comparison(console, mutation.entity)
 
@@ -676,10 +678,11 @@ def evolve_iterate(
         context = claim.context
         episode = claim.episode
         reserved = MutationResult(episode, claim.events)
+        store.flush_event_outbox(evolution_id)
         store.append_events(
             evolution_id,
             claim.events,
-            idempotency_scope=store.event_scope(claim.episode),
+            idempotency_scope="durable-outbox",
         )
     except (OSError, ValueError, ToolExecutionError, EvolutionServiceError) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
@@ -1014,10 +1017,11 @@ def _run_control_command(
     ) as exc:
         console.print(f"[red]{_bounded_error(exc)}[/]")
         raise typer.Exit(code=2) from None
+    service.store.flush_event_outbox(evolution_id)
     service.store.append_events(
         evolution_id,
         mutation.events,
-        idempotency_scope=service.store.event_scope(mutation.entity),
+        idempotency_scope="durable-outbox",
     )
     _render_task_details(mutation.entity, boundary.root)
 
@@ -1530,10 +1534,11 @@ async def _execute_initial_episode(
     owner_token: str | None = None,
 ) -> EpisodeExecutionResult:
     for mutation in prior_mutations:
+        store.flush_event_outbox(task.evolution_id)
         store.append_events(
             task.evolution_id,
             mutation.events,
-            idempotency_scope=store.event_scope(mutation.entity),
+            idempotency_scope="durable-outbox",
         )
     if logger is not None:
         for mutation in prior_mutations:
@@ -1565,10 +1570,11 @@ async def _execute_revised_episode(
     owner_token: str | None = None,
 ) -> EpisodeExecutionResult:
     for mutation in prior_mutations:
+        store.flush_event_outbox(task.evolution_id)
         store.append_events(
             task.evolution_id,
             mutation.events,
-            idempotency_scope=store.event_scope(mutation.entity),
+            idempotency_scope="durable-outbox",
         )
     if logger is not None:
         for mutation in prior_mutations:

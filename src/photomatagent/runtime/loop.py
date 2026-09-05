@@ -120,6 +120,8 @@ class AgentRuntime:
         approval_handler: ApprovalHandler | None = None,
         event_sinks: list[EventSink] | None = None,
         session_id: str | None = None,
+        fresh_approval: bool = False,
+        application_approval_root: Path | None = None,
     ) -> None:
         self._model = model
         self._tools = tools
@@ -154,6 +156,8 @@ class AgentRuntime:
         self._session_id = session_id or uuid4().hex
         self._run_id: str | None = None
         self._run_meta: dict[str, Any] = {}
+        self._fresh_approval = fresh_approval
+        self._application_approval_root = application_approval_root
 
     @property
     def scientific_state(self) -> ScientificState:

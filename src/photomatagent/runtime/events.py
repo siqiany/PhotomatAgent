@@ -424,6 +424,10 @@ class EvolutionEpisodeEvent(EvolutionRuntimeEvent):
     """Base envelope for evolution events tied to one episode version."""
 
     episode_version: EvolutionEpisodeVersion
+    episode_id: EvolutionEventId | None = None
+    execution_mode: Literal[
+        "NORMAL", "CARRY_VERIFIED_EVIDENCE", "FRESH_EVALUATION"
+    ] | None = None
 
 
 class EvolutionTaskCreated(EvolutionRuntimeEvent):
@@ -437,6 +441,11 @@ class EvolutionEpisodeStarted(EvolutionEpisodeEvent):
 
 class EvolutionEpisodeCompleted(EvolutionEpisodeEvent):
     kind: Literal["evolution_episode_completed"] = "evolution_episode_completed"
+
+
+class EvolutionEpisodeFailed(EvolutionEpisodeEvent):
+    kind: Literal["evolution_episode_failed"] = "evolution_episode_failed"
+    error_summary: EvolutionSummary = ""
 
 
 class ExpertFeedbackRecorded(EvolutionEpisodeEvent):
@@ -473,14 +482,17 @@ class ExperienceStateChanged(EvolutionRuntimeEvent):
 
 class EvolutionTaskAccepted(EvolutionEpisodeEvent):
     kind: Literal["evolution_task_accepted"] = "evolution_task_accepted"
+    task_revision: int | None = None
 
 
 class EvolutionTaskStopped(EvolutionRuntimeEvent):
     kind: Literal["evolution_task_stopped"] = "evolution_task_stopped"
+    task_revision: int | None = None
 
 
 class EvolutionTaskReopened(EvolutionRuntimeEvent):
     kind: Literal["evolution_task_reopened"] = "evolution_task_reopened"
+    task_revision: int | None = None
 
 
 AnyRuntimeEvent = Annotated[
@@ -523,6 +535,7 @@ AnyRuntimeEvent = Annotated[
         EvolutionTaskCreated,
         EvolutionEpisodeStarted,
         EvolutionEpisodeCompleted,
+        EvolutionEpisodeFailed,
         ExpertFeedbackRecorded,
         ExpertFeedbackCompiled,
         RevisionPlanConfirmed,

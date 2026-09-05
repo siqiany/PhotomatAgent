@@ -80,6 +80,7 @@ def test_store_round_trip_and_revision_conflict(tmp_path: Path) -> None:
     saved = store.save_task(loaded, expected_revision=0)
 
     assert created == task
+    assert created.event_outbox[0]["kind"] == "evolution_task_created"
     assert saved.revision == 1
     assert saved.status == "RUNNING"
     assert saved.updated_at >= created.updated_at

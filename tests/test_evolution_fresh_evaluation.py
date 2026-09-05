@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,7 +15,11 @@ from pydantic import ValidationError
 from photomatagent.models.fake import FakeModelProvider, FakeResponse
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.loop import AgentRuntime
-from photomatagent.runtime.permissions import DenyAllPolicy
+from photomatagent.runtime.permissions import (
+    AllowAllPolicy,
+    DenyAllPolicy,
+    SwitchablePermissionPolicy,
+)
 from photomatagent.runtime.events import EvolutionTaskStopped
 from photomatagent.scientific.evolution.executor import (
     ScientificEpisodeExecutor,
@@ -32,7 +38,9 @@ from photomatagent.scientific.evolution.service import (
     InvalidEvolutionTransition,
 )
 from photomatagent.scientific.evolution.store import (
+    EvaluationLease,
     EvolutionAlreadyExistsError,
+    EvolutionLockError,
     EvolutionStore,
 )
 from photomatagent.scientific.loop import ScientificLoopConfig, ScientificLoopSummary
@@ -40,6 +48,8 @@ from photomatagent.scientific.loop.target import TargetSpec
 from photomatagent.scientific.state import ScientificState
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.factory import create_default_registry
+from photomatagent.tools.read import ReadTool
+from photomatagent.tools.surface import ToolCatalog
 from photomatagent.workspace import Workspace
 
 
@@ -186,6 +196,10 @@ def test_fresh_episode_model_requires_complete_isolated_provenance() -> None:
             strategy_id="strategy_invalid_fresh",
             strategy_sha256="a" * 64,
             strategy_cutoff_at=datetime(2026, 9, 1, tzinfo=UTC),
+            evaluation_workspace_path="evaluation",
+            evaluation_workspace_device=1,
+            evaluation_workspace_inode=1,
+            evaluation_workspace_fingerprint="b" * 64,
             applied_feedback_id="fb_invalid",
             task_snapshot={"goal": "test"},
             target_snapshot=TargetSpec(goal="test"),
@@ -211,7 +225,10 @@ def test_fresh_claim_is_atomic_and_only_one_owner_wins(tmp_path: Path) -> None:
         results = list(pool.map(claim, ["owner_a", "owner_b"]))
 
     assert sum(not isinstance(item, Exception) for item in results) == 1
-    assert sum(isinstance(item, EvolutionOperationConflict) for item in results) == 1
+    assert sum(
+        isinstance(item, (EvolutionOperationConflict, EvolutionLockError))
+        for item in results
+    ) == 1
     task = service.get("evo_fresh")
     episode = service.store.load_evaluation_episode("evo_fresh", "v001")
     assert task.status == "REVISION_READY"
@@ -280,6 +297,9 @@ async def test_run_fresh_evaluation_uses_blank_runtime_and_no_learning_history(
         state = kwargs["scientific_state"]
         observed["initial_state"] = state.model_copy(deep=True)
         isolated_workspace = Workspace(kwargs["workspace_root"])
+        approval_root = isolated_workspace.resolve(
+            str(kwargs["application_approval_root"]), must_exist=False
+        )
         runtime = AgentRuntime(
             model=FakeModelProvider([FakeResponse(text="fresh result")]),
             tools=create_default_registry(
@@ -287,9 +307,13 @@ async def test_run_fresh_evaluation_uses_blank_runtime_and_no_learning_history(
             ),
             workspace=isolated_workspace,
             scientific_state=state,
-            permission_policy=DenyAllPolicy(),
+            permission_policy=SwitchablePermissionPolicy(
+                DenyAllPolicy(), settings=None
+            ),
             budget=BudgetState(max_iterations=10),
             session_id="session_fresh_evaluation",
+            fresh_approval=True,
+            application_approval_root=approval_root,
         )
         observed["runtime"] = runtime
         return runtime
@@ -436,6 +460,88 @@ def test_fresh_registry_and_workspace_cannot_reach_prior_evolution_files(
         isolated.resolve("../../../../user_output/prior-secret.txt", must_exist=True)
 
 
+def test_fresh_executor_rejects_renamed_read_tool_and_policy_spoof(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_spoof",
+    )
+    isolated = Workspace(service.validate_evaluation_workspace(claim.episode))
+    state = ScientificState()
+    registry = create_default_registry(state, isolated, evaluation_isolation=True)
+    renamed = ReadTool(isolated)
+    renamed.name = "echo"
+    registry._tools["echo"] = renamed
+    approval_root = isolated.resolve(
+        f".photomatagent/evolution-approvals/evo_fresh/"
+        f"{claim.episode.version}_{claim.episode.episode_id}",
+        must_exist=False,
+    )
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=registry,
+        workspace=isolated,
+        scientific_state=state,
+        permission_policy=SwitchablePermissionPolicy(
+            DenyAllPolicy(), settings=None
+        ),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+    executor = ScientificEpisodeExecutor(service.store)
+    with pytest.raises(ValueError, match="trusted allowlist"):
+        executor._validate_execution(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            owner_token=claim.owner_token,
+        )
+
+    state = ScientificState()
+    registry = create_default_registry(state, isolated, evaluation_isolation=True)
+    registry.get("tool_search").catalog = ToolCatalog(ToolRegistry())  # type: ignore[attr-defined]
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=registry,
+        workspace=isolated,
+        scientific_state=state,
+        permission_policy=SwitchablePermissionPolicy(
+            DenyAllPolicy(), settings=None
+        ),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+    with pytest.raises(ValueError, match="catalog binding"):
+        executor._validate_execution(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            owner_token=claim.owner_token,
+        )
+
+    state = ScientificState()
+    registry = create_default_registry(state, isolated, evaluation_isolation=True)
+    runtime = AgentRuntime(
+        model=FakeModelProvider([FakeResponse(text="never runs")]),
+        tools=registry,
+        workspace=isolated,
+        scientific_state=state,
+        permission_policy=AllowAllPolicy(),
+        fresh_approval=True,
+        application_approval_root=approval_root,
+    )
+    with pytest.raises(ValueError, match="permission wrapper"):
+        executor._validate_execution(
+            task=claim.task,
+            episode=claim.episode,
+            runtime=runtime,
+            owner_token=claim.owner_token,
+        )
+
+
 def test_fresh_claim_rejects_symlinked_evaluation_workspace(tmp_path: Path) -> None:
     service, strategy = _fresh_ready_service(tmp_path)
     episode_id = service._evaluation_episode_id("evo_fresh", "v001")
@@ -456,6 +562,28 @@ def test_fresh_claim_rejects_symlinked_evaluation_workspace(tmp_path: Path) -> N
         )
 
 
+def test_active_fresh_retry_rejects_workspace_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_identity",
+    )
+    root = service.validate_evaluation_workspace(claim.episode)
+    backup = root.with_name(root.name + "-old")
+    root.rename(backup)
+    root.symlink_to(tmp_path / "user_output", target_is_directory=True)
+
+    with pytest.raises(EvolutionOperationConflict, match="symbolic link"):
+        service.claim_fresh_evaluation(
+            "evo_fresh",
+            strategy_id=strategy.strategy_id,
+            owner_token="owner_identity",
+        )
+
+
 def test_fresh_claim_adopts_owner_record_after_record_manifest_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -473,6 +601,7 @@ def test_fresh_claim_adopts_owner_record_after_record_manifest_crash(
             strategy_id=strategy.strategy_id,
             owner_token="owner_recovery",
         )
+
     assert service.get("evo_fresh").evaluation_episode_ids == []
 
     monkeypatch.setattr(service, "_prepare_evaluation_workspace", original)
@@ -482,13 +611,83 @@ def test_fresh_claim_adopts_owner_record_after_record_manifest_crash(
         owner_token="owner_adopter",
     )
     assert adopted.episode.version == "v001"
-    assert adopted.owner_token == "owner_recovery"
+    assert adopted.owner_token == "owner_adopter"
+    assert adopted.episode.previous_owner_sha256 == hashlib.sha256(
+        b"owner_recovery"
+    ).hexdigest()
     assert adopted.task.evaluation_episode_ids == [adopted.episode.episode_id]
     with pytest.raises(EvolutionOperationConflict, match="owned"):
         service.claim_fresh_evaluation(
             "evo_fresh",
             strategy_id=strategy.strategy_id,
             owner_token="owner_other",
+        )
+
+
+def test_dead_process_releases_lease_and_reserved_owner_is_replaced(
+    tmp_path: Path,
+) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    original = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_killed",
+    )
+    script = (
+        "import time\n"
+        "from photomatagent.workspace import Workspace\n"
+        "from photomatagent.scientific.evolution.store import EvolutionStore\n"
+        f"store=EvolutionStore(Workspace({str(tmp_path)!r}))\n"
+        "with store.evaluation_lease('evo_fresh'):\n"
+        " print('leased', flush=True)\n"
+        " time.sleep(60)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "leased"
+        with pytest.raises(EvolutionLockError, match="leased"):
+            with service.store.evaluation_lease("evo_fresh"):
+                pass
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+
+    with service.store.evaluation_lease("evo_fresh") as lease:
+        recovered = service.claim_fresh_evaluation(
+            "evo_fresh",
+            strategy_id=strategy.strategy_id,
+            owner_token="owner_recovered",
+            lease=lease,
+            reclaim_reserved_owner=True,
+        )
+    assert recovered.owner_token == "owner_recovered"
+    assert recovered.episode.owner_token == "owner_recovered"
+    assert recovered.episode.previous_owner_sha256 == hashlib.sha256(
+        original.owner_token.encode("utf-8")
+    ).hexdigest()
+
+
+def test_fresh_claim_rejects_unregistered_lease_object(tmp_path: Path) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    fake = EvaluationLease(
+        evolution_id="evo_fresh",
+        descriptor=-1,
+        workspace_root=service.store.workspace.root,
+    )
+
+    with pytest.raises(EvolutionOperationConflict, match="active lease"):
+        service.claim_fresh_evaluation(
+            "evo_fresh",
+            strategy_id=strategy.strategy_id,
+            owner_token="owner_fake_lease",
+            lease=fake,
         )
 
 
@@ -511,6 +710,38 @@ def test_event_journal_is_idempotent_and_export_hashes_exact_source(
     assert exported["payload"]["kind"] == "evolution_task_stopped"
 
 
+def test_export_recovers_durable_event_intent_after_journal_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = EvolutionService(EvolutionStore(Workspace(tmp_path)))
+    completed = _complete_initial(service, "evo_outbox")
+    accepted = service.accept("evo_outbox", completed.version).entity
+    assert any(
+        item["kind"] == "evolution_task_accepted"
+        for item in accepted.event_outbox
+    )
+
+    original = service.store.append_events
+    monkeypatch.setattr(
+        service.store,
+        "append_events",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("journal crash")),
+    )
+    with pytest.raises(OSError, match="journal crash"):
+        service.store.flush_event_outbox("evo_outbox")
+    assert service.get("evo_outbox").status == "ACCEPTED"
+
+    monkeypatch.setattr(service.store, "append_events", original)
+    path = service.export_evolution(
+        "evo_outbox", output="user_output/outbox-export.json"
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert "evolution_task_accepted" in {
+        event["kind"] for event in payload["events"]
+    }
+
+
 def test_export_path_sanitization_is_recursive_and_metadata_drops_prose(
     tmp_path: Path,
 ) -> None:
@@ -521,12 +752,22 @@ def test_export_path_sanitization_is_recursive_and_metadata_drops_prose(
                 str(tmp_path / "user_output" / "inside.txt"),
                 "/etc/passwd",
                 r"C:\Users\operator\secret.txt",
-            ]
+            ],
+            "message": (
+                f"inside={tmp_path / 'user_output' / 'inside.txt'}\n"
+                "outside=/etc/shadow win=C:\\Users\\operator\\token.txt"
+            ),
         }
     )
-    assert sanitized == {
-        "paths": ["user_output/inside.txt", "[EXTERNAL_PATH]", "[EXTERNAL_PATH]"]
-    }
+    assert sanitized["paths"] == [  # type: ignore[index]
+        "user_output/inside.txt",
+        "[EXTERNAL_PATH]",
+        "[EXTERNAL_PATH]",
+    ]
+    assert sanitized["message"] == (  # type: ignore[index]
+        "inside=user_output/inside.txt\n"
+        "outside=[EXTERNAL_PATH] win=[EXTERNAL_PATH]"
+    )
     revision = service._metadata_projection(
         "revisions",
         {
@@ -549,6 +790,29 @@ def test_export_path_sanitization_is_recursive_and_metadata_drops_prose(
     )
     assert revision == {"revision_id": "rp_safe"}
     assert "summary" not in comparison["artifact_diff"]  # type: ignore[operator]
+
+
+def test_export_never_exposes_fresh_owner_tokens(tmp_path: Path) -> None:
+    service, strategy = _fresh_ready_service(tmp_path)
+    claim = service.claim_fresh_evaluation(
+        "evo_fresh",
+        strategy_id=strategy.strategy_id,
+        owner_token="owner_export_secret",
+    )
+    for include_content, filename in (
+        (False, "owner-metadata.json"),
+        (True, "owner-content.json"),
+    ):
+        path = service.export_evolution(
+            "evo_fresh",
+            output=f"user_output/{filename}",
+            include_content=include_content,
+        )
+        serialized = path.read_text(encoding="utf-8")
+        payload = json.loads(serialized)
+        assert "owner_export_secret" not in serialized
+        assert payload["evaluation_episodes"][0]["owner_token"] == "[REDACTED]"
+        assert payload["evaluation_episodes"][0]["episode_id"] == claim.episode.episode_id
 
 
 def test_accept_stop_and_reopen_preserve_exact_checkpoints(tmp_path: Path) -> None:

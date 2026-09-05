@@ -21,7 +21,7 @@ from photomatagent.models.types import ModelRequest, ModelStreamEvent
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
-from photomatagent.runtime.permissions import AllowAllPolicy
+from photomatagent.runtime.permissions import AllowAllPolicy, SwitchablePermissionPolicy
 from photomatagent.scientific.evolution.models import (
     ArtifactRef,
     ExpertFeedbackDraft,
@@ -113,6 +113,7 @@ def _runtime(
     session_id: str = "session_cli_test",
     scientific_state: ScientificState | None = None,
     evaluation_isolated: bool = False,
+    application_approval_root: Path | None = None,
 ) -> AgentRuntime:
     scientific = (
         scientific_state if scientific_state is not None else ScientificState()
@@ -129,9 +130,15 @@ def _runtime(
         ),
         workspace=boundary,
         scientific_state=scientific,
-        permission_policy=AllowAllPolicy(),
+        permission_policy=(
+            SwitchablePermissionPolicy(AllowAllPolicy(), settings=None)
+            if evaluation_isolated
+            else AllowAllPolicy()
+        ),
         budget=BudgetState(max_iterations=10),
         session_id=session_id,
+        fresh_approval=evaluation_isolated,
+        application_approval_root=application_approval_root,
     )
 
 
@@ -336,6 +343,12 @@ def test_evaluate_fresh_builds_isolated_episode_runtime(
                 session_id="session_cli_fresh",
                 scientific_state=kwargs["scientific_state"],
                 evaluation_isolated=True,
+                application_approval_root=Workspace(
+                    Path(kwargs["workspace_root"])
+                ).resolve(
+                    str(kwargs["application_approval_root"]),
+                    must_exist=False,
+                ),
             ),
             None,
         )
@@ -464,12 +477,18 @@ def test_export_accept_stop_and_reopen_commands(
     journal = EvolutionStore(Workspace(tmp_path)).read_event_journal(
         task.evolution_id
     )
-    assert [entry[1]["event"]["kind"] for entry in journal] == [
+    kinds = [entry[1]["event"]["kind"] for entry in journal]
+    assert kinds[:3] == [
+        "evolution_task_created",
+        "evolution_episode_started",
+        "evolution_episode_completed",
+    ]
+    assert kinds[-4:] == [
         "evolution_task_accepted",
         "evolution_task_reopened",
         "evolution_task_stopped",
         "evolution_task_reopened",
-    ]
+    ], kinds
 
 
 def test_feedback_file_import_is_confirmed_without_constructing_runtime(

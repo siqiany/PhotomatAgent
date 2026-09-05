@@ -11,9 +11,8 @@ from photomatagent.tools.exposure import ToolExposure
 
 
 class ToolRegistry:
-    def __init__(self, *, evaluation_isolated: bool = False) -> None:
+    def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
-        self.evaluation_isolated = evaluation_isolated
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:

@@ -7,17 +7,35 @@ import importlib
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 import hashlib
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from photomatagent.redaction import redact_secrets
-from photomatagent.runtime.events import RuntimeEvent
+from photomatagent.runtime.events import (
+    EvolutionComparisonCompleted,
+    EvolutionEpisodeCompleted,
+    EvolutionEpisodeFailed,
+    EvolutionEpisodeStarted,
+    EvolutionIterationStarted,
+    EvolutionTaskAccepted,
+    EvolutionTaskCreated,
+    EvolutionTaskReopened,
+    EvolutionTaskStopped,
+    ExperienceStateChanged,
+    ExpertFeedbackCompiled,
+    ExpertFeedbackRecorded,
+    RevisionPlanConfirmed,
+    RuntimeEvent,
+    parse_event,
+)
 from photomatagent.scientific.evolution.models import (
     ComparisonReport,
     EpisodeRecord,
@@ -59,6 +77,7 @@ _TASK_MUTABLE_FIELDS = (
     "strategy_ids",
     "comparison_ids",
     "experience_ids",
+    "event_outbox",
 )
 _TASK_IMMUTABLE_FIELDS = (
     "goal",
@@ -81,6 +100,11 @@ _EPISODE_IMMUTABLE_FIELDS = (
     "strategy_sha256",
     "strategy_cutoff_at",
     "evaluation_workspace_path",
+    "evaluation_workspace_device",
+    "evaluation_workspace_inode",
+    "evaluation_workspace_fingerprint",
+    "previous_owner_sha256",
+    "owner_reclaimed_at",
     "task_snapshot",
     "target_snapshot",
     "provider",
@@ -138,6 +162,14 @@ class EvolutionUnsupportedSchemaError(EvolutionStoreError):
             f"unsupported evolution record at {path}: "
             f"schema_version={schema_version!r}"
         )
+
+
+@dataclass(slots=True)
+class EvaluationLease:
+    evolution_id: str
+    descriptor: int
+    workspace_root: Path
+    active: bool = True
 
 
 class EvolutionTransaction:
@@ -207,6 +239,37 @@ class EvolutionTransaction:
             episode,
             expected_status,
         )
+
+    def reclaim_evaluation_owner(
+        self,
+        episode: EpisodeRecord,
+        *,
+        previous_owner_token: str,
+    ) -> EpisodeRecord:
+        self._require_active()
+        current = self.load_evaluation_episode(episode.version)
+        if current.status != "RESERVED" or current.owner_token != previous_owner_token:
+            raise EvolutionConflictError("evaluation owner reclaim lost its race")
+        if (
+            episode.owner_token == previous_owner_token
+            or episode.previous_owner_sha256
+            != hashlib.sha256(previous_owner_token.encode("utf-8")).hexdigest()
+            or episode.owner_reclaimed_at is None
+        ):
+            raise EvolutionConflictError("evaluation owner reclaim audit is invalid")
+        for field in _EPISODE_IMMUTABLE_FIELDS:
+            if field in {"owner_token", "previous_owner_sha256", "owner_reclaimed_at"}:
+                continue
+            if getattr(episode, field) != getattr(current, field):
+                raise EvolutionConflictError(f"evaluation reclaim changed {field}")
+        candidate, payload = self.store._prepare_model(episode, EpisodeRecord)
+        self.store._write_json_atomic(
+            self.store._managed_path(
+                candidate.evolution_id, "evaluations", f"{candidate.version}.json"
+            ),
+            payload,
+        )
+        return candidate
 
     def transition_episode(
         self,
@@ -334,6 +397,7 @@ class EvolutionStore:
         self.root = workspace.resolve(_STORE_PATH, must_exist=False)
         self.root.mkdir(parents=True, exist_ok=True)
         self.root = workspace.resolve(_STORE_PATH, must_exist=True)
+        self._active_evaluation_leases: dict[int, EvaluationLease] = {}
 
     @contextmanager
     def transaction(self, evolution_id: str) -> Iterator[EvolutionTransaction]:
@@ -348,8 +412,88 @@ class EvolutionStore:
             finally:
                 transaction._active = False
 
+    @contextmanager
+    def evaluation_lease(self, evolution_id: str) -> Iterator[EvaluationLease]:
+        """Hold the cross-process fresh-evaluation execution lease."""
+
+        task_dir = self._task_dir(evolution_id)
+        path = self.workspace.resolve(
+            self.workspace.relative(task_dir / ".evaluation.lease"),
+            must_exist=False,
+        )
+        lease_flags = os.O_CREAT | os.O_RDWR | int(getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, lease_flags, 0o600)
+        lease = EvaluationLease(
+            evolution_id=evolution_id,
+            descriptor=descriptor,
+            workspace_root=self.workspace.root,
+        )
+        try:
+            if os.name == "posix":
+                try:
+                    _ADVISORY_LOCK_API.flock(
+                        descriptor,
+                        _ADVISORY_LOCK_API.LOCK_EX | _ADVISORY_LOCK_API.LOCK_NB,
+                    )
+                except OSError as exc:
+                    raise EvolutionLockError(
+                        "fresh evaluation is leased by another process"
+                    ) from exc
+            elif os.name == "nt":  # pragma: no cover - Windows CI only
+                try:
+                    _ADVISORY_LOCK_API.locking(
+                        descriptor, _ADVISORY_LOCK_API.LK_NBLCK, 1
+                    )
+                except OSError as exc:
+                    raise EvolutionLockError(
+                        "fresh evaluation is leased by another process"
+                    ) from exc
+            self._active_evaluation_leases[id(lease)] = lease
+            yield lease
+        finally:
+            self._active_evaluation_leases.pop(id(lease), None)
+            lease.active = False
+            try:
+                if os.name == "posix":
+                    _ADVISORY_LOCK_API.flock(descriptor, _ADVISORY_LOCK_API.LOCK_UN)
+                elif os.name == "nt":  # pragma: no cover
+                    _ADVISORY_LOCK_API.locking(descriptor, _ADVISORY_LOCK_API.LK_UNLCK, 1)
+            finally:
+                os.close(descriptor)
+
+    def has_active_evaluation_lease(
+        self,
+        lease: EvaluationLease,
+        evolution_id: str,
+    ) -> bool:
+        """Verify that this store issued and still holds the exact lease object."""
+
+        if (
+            not lease.active
+            or lease.evolution_id != evolution_id
+            or lease.workspace_root != self.workspace.root
+            or self._active_evaluation_leases.get(id(lease)) is not lease
+        ):
+            return False
+        try:
+            descriptor_stat = os.fstat(lease.descriptor)
+            lease_path = self._task_dir(evolution_id) / ".evaluation.lease"
+            path_stat = os.lstat(lease_path)
+        except OSError:
+            return False
+        return (
+            not stat.S_ISLNK(path_stat.st_mode)
+            and descriptor_stat.st_dev == path_stat.st_dev
+            and descriptor_stat.st_ino == path_stat.st_ino
+        )
+
     def create_task(self, task: EvolutionTask) -> EvolutionTask:
         """Create a new revision-zero task without replacing an existing task."""
+        created_event = EvolutionTaskCreated(
+            evolution_id=task.evolution_id,
+            goal_summary=task.goal[:240],
+        )
+        task.event_outbox = [created_event.model_dump(mode="json")]
         validated, payload = self._prepare_model(task, EvolutionTask)
         if validated.revision != 0:
             raise ValueError("new evolution tasks must start at revision 0")
@@ -471,6 +615,26 @@ class EvolutionStore:
             records.append((raw, decoded))
         return records
 
+    def flush_event_outbox(self, evolution_id: str) -> None:
+        """Idempotently materialize every durable event intent into the journal."""
+
+        task = self.load_task(evolution_id)
+        payloads = list(task.event_outbox)
+        for index in range(1, len(task.episode_ids) + 1):
+            payloads.extend(self.load_episode(evolution_id, f"v{index:03d}").event_outbox)
+        for index in range(1, len(task.evaluation_episode_ids) + 1):
+            payloads.extend(
+                self.load_evaluation_episode(
+                    evolution_id, f"v{index:03d}"
+                ).event_outbox
+            )
+        events = [parse_event(payload) for payload in payloads]
+        self.append_events(
+            evolution_id,
+            events,
+            idempotency_scope="durable-outbox",
+        )
+
     @staticmethod
     def event_scope(record: object) -> str:
         """Stable mutation identity used to suppress crash/retry event duplicates."""
@@ -534,6 +698,11 @@ class EvolutionStore:
         updated_data = current.model_dump(mode="python")
         for field in _TASK_MUTABLE_FIELDS:
             updated_data[field] = getattr(candidate, field)
+        transition_events = self._task_transition_events(current, candidate)
+        updated_data["event_outbox"] = self._merge_outbox(
+            current.event_outbox,
+            transition_events,
+        )
         updated_data["revision"] = current.revision + 1
         updated_data["updated_at"] = utc_now()
         updated = EvolutionTask.model_validate(updated_data)
@@ -543,6 +712,123 @@ class EvolutionStore:
             payload,
         )
         return updated
+
+    @staticmethod
+    def _merge_outbox(
+        existing: list[dict[str, Any]],
+        events: list[RuntimeEvent],
+    ) -> list[dict[str, Any]]:
+        merged = list(existing)
+        identities = {
+            EvolutionStore._outbox_identity(item)
+            for item in merged
+        }
+        for event in events:
+            payload = event.model_dump(mode="json")
+            identity = EvolutionStore._outbox_identity(payload)
+            if identity not in identities:
+                merged.append(payload)
+                identities.add(identity)
+        return merged
+
+    @staticmethod
+    def _outbox_identity(payload: dict[str, Any]) -> str:
+        stable = dict(payload)
+        stable.pop("timestamp", None)
+        stable.pop("session_id", None)
+        stable.pop("run_id", None)
+        return hashlib.sha256(
+            json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _episode_event_kwargs(self, episode: EpisodeRecord) -> dict[str, Any]:
+        return {
+            "evolution_id": episode.evolution_id,
+            "episode_version": episode.version,
+            "episode_id": episode.episode_id,
+            "execution_mode": episode.execution_mode,
+        }
+
+    def _task_transition_events(
+        self, current: EvolutionTask, candidate: EvolutionTask
+    ) -> list[RuntimeEvent]:
+        events: list[RuntimeEvent] = []
+        evolution_id = current.evolution_id
+        if candidate.current_version != current.current_version and candidate.current_version:
+            episode = self.load_episode(evolution_id, candidate.current_version)
+            kwargs = self._episode_event_kwargs(episode)
+            if current.current_version is not None:
+                events.append(EvolutionIterationStarted(**kwargs))
+            events.append(EvolutionEpisodeStarted(**kwargs))
+        if (
+            candidate.current_evaluation_version != current.current_evaluation_version
+            and candidate.current_evaluation_version
+        ):
+            episode = self.load_evaluation_episode(
+                evolution_id, candidate.current_evaluation_version
+            )
+            kwargs = self._episode_event_kwargs(episode)
+            events.extend([EvolutionIterationStarted(**kwargs), EvolutionEpisodeStarted(**kwargs)])
+        for feedback_id in candidate.feedback_ids[len(current.feedback_ids):]:
+            feedback = self.load_feedback(evolution_id, feedback_id)
+            episode = self.load_episode(evolution_id, feedback.episode_version)
+            events.append(
+                ExpertFeedbackRecorded(
+                    **self._episode_event_kwargs(episode),
+                    feedback_id=feedback.feedback_id,
+                    result_sha256=feedback.result_sha256,
+                    scores={
+                        "scientific_correctness": feedback.scores.scientific_correctness,
+                        "evidence_sufficiency": feedback.scores.evidence_sufficiency,
+                        "novelty": feedback.scores.novelty,
+                        "actionability": feedback.scores.actionability,
+                        "overall": feedback.scores.overall,
+                    },
+                )
+            )
+        for compilation_id in candidate.compilation_ids[len(current.compilation_ids):]:
+            compilation = self.load_compilation(evolution_id, compilation_id)
+            if compilation.episode_version is None:
+                raise EvolutionConflictError("linked compilation has no episode version")
+            episode = self.load_episode(evolution_id, compilation.episode_version)
+            events.append(ExpertFeedbackCompiled(**self._episode_event_kwargs(episode)))
+        for revision_id in candidate.revision_ids[len(current.revision_ids):]:
+            revision = self.load_revision(evolution_id, revision_id)
+            episode = self.load_episode(evolution_id, revision.source_version)
+            events.append(RevisionPlanConfirmed(**self._episode_event_kwargs(episode)))
+        for comparison_id in candidate.comparison_ids[len(current.comparison_ids):]:
+            comparison = self.load_comparison(evolution_id, comparison_id)
+            episode = self.load_episode(evolution_id, comparison.current_version)
+            events.append(EvolutionComparisonCompleted(**self._episode_event_kwargs(episode)))
+        if len(candidate.experience_ids) > len(current.experience_ids):
+            events.append(ExperienceStateChanged(evolution_id=evolution_id))
+        if candidate.status == "ACCEPTED" and current.status != "ACCEPTED":
+            if candidate.accepted_version is None:
+                raise EvolutionConflictError("accepted task has no accepted version")
+            accepted_episode = self.load_episode(
+                evolution_id, candidate.accepted_version
+            )
+            events.append(
+                EvolutionTaskAccepted(
+                    **self._episode_event_kwargs(accepted_episode),
+                    task_revision=current.revision + 1,
+                )
+            )
+        if candidate.status == "STOPPED" and current.status != "STOPPED":
+            events.append(
+                EvolutionTaskStopped(
+                    evolution_id=evolution_id,
+                    task_revision=current.revision + 1,
+                )
+            )
+        if current.status in {"ACCEPTED", "STOPPED", "BLOCKED", "BUDGET_EXHAUSTED"} and candidate.status not in {"ACCEPTED", "STOPPED", "BLOCKED", "BUDGET_EXHAUSTED"}:
+            events.append(
+                EvolutionTaskReopened(
+                    evolution_id=evolution_id,
+                    task_revision=current.revision + 1,
+                )
+            )
+        return events
 
     def write_episode(self, episode: EpisodeRecord) -> Path:
         """Persist an immutable episode record under its monotonic version."""
@@ -615,6 +901,14 @@ class EvolutionStore:
                 raise EvolutionConflictError(
                     f"immutable evaluation field differs: {field}"
                 )
+        episode = episode.model_copy(
+            update={
+                "event_outbox": self._merge_outbox(
+                    current.event_outbox,
+                    self._episode_transition_events(current, episode),
+                )
+            }
+        )
         candidate, payload = self._prepare_model(episode, EpisodeRecord)
         if current.status != expected_status:
             raise EvolutionConflictError(
@@ -682,6 +976,14 @@ class EvolutionStore:
                     "immutable episode execution snapshot differs from stored "
                     f"record for {episode.evolution_id}/{episode.version}: {field}"
                 )
+        episode = episode.model_copy(
+            update={
+                "event_outbox": self._merge_outbox(
+                    current.event_outbox,
+                    self._episode_transition_events(current, episode),
+                )
+            }
+        )
         candidate, payload = self._prepare_model(episode, EpisodeRecord)
         if current.status != expected_status:
             raise EvolutionConflictError(
@@ -744,6 +1046,27 @@ class EvolutionStore:
             payload,
         )
         return candidate
+
+    def _episode_transition_events(
+        self,
+        current: EpisodeRecord,
+        candidate: EpisodeRecord,
+    ) -> list[RuntimeEvent]:
+        kwargs = self._episode_event_kwargs(candidate)
+        if current.status == candidate.status:
+            return []
+        if candidate.status == "RUNNING":
+            return [EvolutionEpisodeStarted(**kwargs)]
+        if candidate.status == "COMPLETED":
+            return [EvolutionEpisodeCompleted(**kwargs)]
+        if candidate.status == "FAILED":
+            return [
+                EvolutionEpisodeFailed(
+                    **kwargs,
+                    error_summary=(candidate.error or "")[:500],
+                )
+            ]
+        return []
 
     def load_feedback(
         self,

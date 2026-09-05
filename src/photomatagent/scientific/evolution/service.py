@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
+import re
+import stat
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +16,7 @@ from typing import Any, Generic, TypeVar, cast
 from photomatagent.runtime.events import (
     EvolutionComparisonCompleted,
     EvolutionEpisodeCompleted,
+    EvolutionEpisodeFailed,
     EvolutionEpisodeStarted,
     EvolutionIterationStarted,
     EvolutionTaskAccepted,
@@ -57,6 +61,7 @@ from photomatagent.scientific.evolution.models import (
 from photomatagent.scientific.evolution.rubric import assess_hard_caps
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
+    EvaluationLease,
     EvolutionStore,
     EvolutionTransaction,
 )
@@ -75,6 +80,7 @@ _EPISODE_COMPLETION_OUTPUT_FIELDS = frozenset(
         "cost",
         "acceptance_results",
         "error",
+        "event_outbox",
     }
 )
 _EPISODE_COMPLETION_IDENTITY_FIELDS = tuple(
@@ -83,6 +89,8 @@ _EPISODE_COMPLETION_IDENTITY_FIELDS = tuple(
     if field not in _EPISODE_COMPLETION_OUTPUT_FIELDS
 )
 _USER_CANCELLATION_ERROR = "Cancelled by user via evolution CLI."
+_WINDOWS_PATH_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>;,)}\]]+")
+_POSIX_PATH_IN_TEXT = re.compile(r"(?<![:/A-Za-z0-9_])/(?:[^\s\"'<>;,)}\]]+)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +392,8 @@ class EvolutionService:
             EvolutionComparisonCompleted(
                 evolution_id=evolution_id,
                 episode_version=current.version,
+                episode_id=current.episode_id,
+                execution_mode=current.execution_mode,
             ),
         )
         if persisted_experience is not None:
@@ -442,6 +452,8 @@ class EvolutionService:
                         EvolutionEpisodeCompleted(
                             evolution_id=evolution_id,
                             episode_version=episode.version,
+                            episode_id=episode.episode_id,
+                            execution_mode=episode.execution_mode,
                         ),
                     ),
                 )
@@ -525,8 +537,27 @@ class EvolutionService:
         tool_surface_fingerprint: Sha256 | None = None,
         capability_fingerprint: Sha256 | None = None,
         data_source_fingerprints: dict[str, Sha256] | None = None,
+        lease: EvaluationLease | None = None,
+        reclaim_reserved_owner: bool = False,
     ) -> FreshEvaluationClaim:
         """Atomically reserve a history-free Episode using a frozen strategy."""
+
+        if lease is None:
+            with self.store.evaluation_lease(evolution_id) as acquired:
+                return self.claim_fresh_evaluation(
+                    evolution_id,
+                    strategy_id=strategy_id,
+                    owner_token=owner_token,
+                    provider=provider,
+                    model=model,
+                    tool_surface_fingerprint=tool_surface_fingerprint,
+                    capability_fingerprint=capability_fingerprint,
+                    data_source_fingerprints=data_source_fingerprints,
+                    lease=acquired,
+                    reclaim_reserved_owner=reclaim_reserved_owner,
+                )
+        if not self.store.has_active_evaluation_lease(lease, evolution_id):
+            raise EvolutionOperationConflict("fresh evaluation requires its active lease")
 
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
@@ -541,8 +572,25 @@ class EvolutionService:
                 )
                 if current.status in {"RESERVED", "RUNNING"}:
                     if current.owner_token != owner_token:
-                        raise EvolutionOperationConflict(
-                            "active evaluation is owned by another invocation"
+                        if (
+                            current.status != "RESERVED"
+                            or not reclaim_reserved_owner
+                            or current.owner_token is None
+                        ):
+                            raise EvolutionOperationConflict(
+                                "active evaluation is owned by another invocation"
+                            )
+                        current = transaction.reclaim_evaluation_owner(
+                            current.model_copy(
+                                update={
+                                    "owner_token": owner_token,
+                                    "previous_owner_sha256": hashlib.sha256(
+                                        current.owner_token.encode("utf-8")
+                                    ).hexdigest(),
+                                    "owner_reclaimed_at": utc_now(),
+                                }
+                            ),
+                            previous_owner_token=current.owner_token,
                         )
                     self._validate_fresh_reservation(
                         current,
@@ -568,6 +616,9 @@ class EvolutionService:
                 f".photomatagent/evaluation-workspaces/{evolution_id}/"
                 f"{version}_{episode_id}"
             )
+            workspace_device, workspace_inode, workspace_fingerprint = (
+                self._evaluation_workspace_identity(workspace_path, create=True)
+            )
             episode = EpisodeRecord(
                 evolution_id=evolution_id,
                 episode_id=episode_id,
@@ -582,6 +633,9 @@ class EvolutionService:
                 strategy_sha256=strategy.strategy_sha256,
                 strategy_cutoff_at=strategy.cutoff_at,
                 evaluation_workspace_path=workspace_path,
+                evaluation_workspace_device=workspace_device,
+                evaluation_workspace_inode=workspace_inode,
+                evaluation_workspace_fingerprint=workspace_fingerprint,
                 task_snapshot={
                     "evolution_id": task.evolution_id,
                     "goal": task.goal,
@@ -606,6 +660,20 @@ class EvolutionService:
                     raise EvolutionOperationConflict(
                         "orphan fresh-evaluation record is not safely adoptable"
                     )
+                if existing.owner_token != owner_token:
+                    previous_owner = existing.owner_token
+                    existing = transaction.reclaim_evaluation_owner(
+                        existing.model_copy(
+                            update={
+                                "owner_token": owner_token,
+                                "previous_owner_sha256": hashlib.sha256(
+                                    previous_owner.encode("utf-8")
+                                ).hexdigest(),
+                                "owner_reclaimed_at": utc_now(),
+                            }
+                        ),
+                        previous_owner_token=previous_owner,
+                    )
                 self._validate_fresh_reservation(
                     existing,
                     task,
@@ -615,7 +683,7 @@ class EvolutionService:
                     tool_surface_fingerprint=tool_surface_fingerprint,
                     capability_fingerprint=capability_fingerprint,
                     data_source_fingerprints=data_source_fingerprints or {},
-                    owner_token=existing.owner_token,
+                    owner_token=owner_token,
                 )
                 persisted = existing
             self._prepare_evaluation_workspace(persisted, task, strategy)
@@ -640,7 +708,7 @@ class EvolutionService:
                 task=task,
                 strategy=strategy,
                 episode=persisted,
-                owner_token=cast(str, persisted.owner_token),
+                owner_token=owner_token,
                 events=self._reservation_events(persisted, False),
             )
 
@@ -909,6 +977,8 @@ class EvolutionService:
         event = EvolutionEpisodeStarted(
             evolution_id=evolution_id,
             episode_version=version,
+            episode_id=saved.episode_id,
+            execution_mode=saved.execution_mode,
         )
         return MutationResult(saved, (event,))
 
@@ -953,6 +1023,8 @@ class EvolutionService:
                 EvolutionEpisodeStarted(
                     evolution_id=evolution_id,
                     episode_version=version,
+                    episode_id=saved.episode_id,
+                    execution_mode=saved.execution_mode,
                 ),
             ),
         )
@@ -985,6 +1057,8 @@ class EvolutionService:
                 EvolutionEpisodeCompleted(
                     evolution_id=evolution_id,
                     episode_version=version,
+                    episode_id=saved.episode_id,
+                    execution_mode=saved.execution_mode,
                 ),
             ),
         )
@@ -1014,7 +1088,18 @@ class EvolutionService:
                 ),
                 expected_status=existing.status,
             )
-        return MutationResult(saved)
+        return MutationResult(
+            saved,
+            (
+                EvolutionEpisodeFailed(
+                    evolution_id=evolution_id,
+                    episode_version=version,
+                    episode_id=saved.episode_id,
+                    execution_mode=saved.execution_mode,
+                    error_summary=bounded_summary(error),
+                ),
+            ),
+        )
 
     def complete_episode(
         self,
@@ -1060,6 +1145,8 @@ class EvolutionService:
         event = EvolutionEpisodeCompleted(
             evolution_id=evolution_id,
             episode_version=version,
+            episode_id=saved_episode.episode_id,
+            execution_mode=saved_episode.execution_mode,
         )
         return MutationResult(saved_episode, (event,))
 
@@ -1168,6 +1255,8 @@ class EvolutionService:
                     EvolutionEpisodeCompleted(
                         evolution_id=evolution_id,
                         episode_version=episode.version,
+                        episode_id=episode.episode_id,
+                        execution_mode=episode.execution_mode,
                     ),
                 )
             else:
@@ -1280,6 +1369,8 @@ class EvolutionService:
         event = ExpertFeedbackRecorded(
             evolution_id=evolution_id,
             episode_version=version,
+            episode_id=episode.episode_id,
+            execution_mode=episode.execution_mode,
             feedback_id=persisted.feedback_id,
             result_sha256=result_sha256,
             scores={
@@ -1452,6 +1543,8 @@ class EvolutionService:
         event = ExpertFeedbackCompiled(
             evolution_id=evolution_id,
             episode_version=persisted.episode_version,
+            episode_id=episode.episode_id,
+            execution_mode=episode.execution_mode,
         )
         return MutationResult(persisted, (event,))
 
@@ -1574,9 +1667,12 @@ class EvolutionService:
                 raise InvalidEvolutionTransition(
                     "revision cannot reconcile with current task state"
                 )
+        source_episode = self.store.load_episode(evolution_id, persisted.source_version)
         event = RevisionPlanConfirmed(
             evolution_id=evolution_id,
             episode_version=persisted.source_version,
+            episode_id=source_episode.episode_id,
+            execution_mode=source_episode.execution_mode,
         )
         return MutationResult(persisted, (event,))
 
@@ -1741,6 +1837,9 @@ class EvolutionService:
         event = EvolutionTaskAccepted(
             evolution_id=evolution_id,
             episode_version=version,
+            episode_id=episode.episode_id,
+            execution_mode=episode.execution_mode,
+            task_revision=saved.revision,
         )
         return MutationResult(saved, (event,))
 
@@ -1762,7 +1861,12 @@ class EvolutionService:
             )
         return MutationResult(
             saved,
-            (EvolutionTaskStopped(evolution_id=evolution_id),),
+            (
+                EvolutionTaskStopped(
+                    evolution_id=evolution_id,
+                    task_revision=saved.revision,
+                ),
+            ),
         )
 
     def reopen(self, evolution_id: str) -> MutationResult[EvolutionTask]:
@@ -1794,7 +1898,12 @@ class EvolutionService:
             )
         return MutationResult(
             saved,
-            (EvolutionTaskReopened(evolution_id=evolution_id),),
+            (
+                EvolutionTaskReopened(
+                    evolution_id=evolution_id,
+                    task_revision=saved.revision,
+                ),
+            ),
         )
 
     async def publish(
@@ -1808,10 +1917,11 @@ class EvolutionService:
         if isinstance(result, MutationResult):
             evolution_id = getattr(result.entity, "evolution_id", None)
             if isinstance(evolution_id, str):
+                self.store.flush_event_outbox(evolution_id)
                 self.store.append_events(
                     evolution_id,
                     materialized,
-                    idempotency_scope=self.store.event_scope(result.entity),
+                    idempotency_scope="durable-outbox",
                 )
         if self.event_sink is None:
             return
@@ -2082,8 +2192,8 @@ class EvolutionService:
             )
         return strategy
 
-    @staticmethod
     def _validate_fresh_reservation(
+        self,
         episode: EpisodeRecord,
         task: EvolutionTask,
         strategy: StrategyVersion,
@@ -2095,6 +2205,12 @@ class EvolutionService:
         data_source_fingerprints: dict[str, Sha256],
         owner_token: str,
     ) -> None:
+        if episode.evaluation_workspace_path is None:
+            raise EvolutionOperationConflict("evaluation workspace provenance is missing")
+        device, inode, fingerprint = self._evaluation_workspace_identity(
+            episode.evaluation_workspace_path,
+            create=False,
+        )
         expected_snapshot = {
             "evolution_id": task.evolution_id,
             "goal": task.goal,
@@ -2117,6 +2233,9 @@ class EvolutionService:
                 f".photomatagent/evaluation-workspaces/{task.evolution_id}/"
                 f"{episode.version}_{episode.episode_id}"
             )
+            or episode.evaluation_workspace_device != device
+            or episode.evaluation_workspace_inode != inode
+            or episode.evaluation_workspace_fingerprint != fingerprint
             or episode.parent_version != task.last_completed_version
             or episode.task_snapshot != expected_snapshot
             or episode.target_snapshot != TargetSnapshot.model_validate(task.target)
@@ -2130,6 +2249,55 @@ class EvolutionService:
                 "mismatched durable fresh-evaluation reservation"
             )
 
+    def _evaluation_workspace_identity(
+        self,
+        relative: str,
+        *,
+        create: bool,
+    ) -> tuple[int, int, Sha256]:
+        candidate = self.store.workspace.root / relative
+        cursor = self.store.workspace.root
+        for part in Path(relative).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise EvolutionOperationConflict(
+                    "evaluation workspace cannot traverse a symbolic link"
+                )
+        if create:
+            candidate.mkdir(parents=True, exist_ok=True)
+        try:
+            metadata = os.lstat(candidate)
+        except OSError as exc:
+            raise EvolutionOperationConflict(
+                "evaluation workspace identity is unavailable"
+            ) from exc
+        if not stat.S_ISDIR(metadata.st_mode) or candidate.resolve() != candidate.absolute():
+            raise EvolutionOperationConflict(
+                "evaluation workspace is not an exact real directory"
+            )
+        fingerprint = hashlib.sha256(
+            f"{metadata.st_dev}:{metadata.st_ino}:{relative}".encode("utf-8")
+        ).hexdigest()
+        return metadata.st_dev, metadata.st_ino, cast(Sha256, fingerprint)
+
+    def validate_evaluation_workspace(self, episode: EpisodeRecord) -> Path:
+        if episode.evaluation_workspace_path is None:
+            raise EvolutionOperationConflict("evaluation workspace provenance is missing")
+        identity = self._evaluation_workspace_identity(
+            episode.evaluation_workspace_path,
+            create=False,
+        )
+        if identity != (
+            episode.evaluation_workspace_device,
+            episode.evaluation_workspace_inode,
+            episode.evaluation_workspace_fingerprint,
+        ):
+            raise EvolutionOperationConflict("evaluation workspace identity changed")
+        return self.store.workspace.resolve(
+            episode.evaluation_workspace_path,
+            must_exist=True,
+        )
+
     def _prepare_evaluation_workspace(
         self,
         episode: EpisodeRecord,
@@ -2138,13 +2306,10 @@ class EvolutionService:
     ) -> None:
         if episode.evaluation_workspace_path is None:
             raise EvolutionOperationConflict("evaluation workspace provenance is missing")
-        cursor = self.store.workspace.root
-        for part in Path(episode.evaluation_workspace_path).parts:
-            cursor = cursor / part
-            if cursor.is_symlink():
-                raise EvolutionOperationConflict(
-                    "evaluation workspace cannot traverse a symbolic link"
-                )
+        self._evaluation_workspace_identity(
+            episode.evaluation_workspace_path,
+            create=False,
+        )
         root = self.store.workspace.resolve(
             episode.evaluation_workspace_path,
             must_exist=False,
@@ -2190,7 +2355,11 @@ class EvolutionService:
 
         if isinstance(value, dict):
             return {
-                str(key): self._sanitize_export_value(item)
+                str(key): (
+                    "[REDACTED]"
+                    if str(key).lower() in {"owner_token", "lease_token"}
+                    else self._sanitize_export_value(item)
+                )
                 for key, item in value.items()
             }
         if isinstance(value, list):
@@ -2199,6 +2368,14 @@ class EvolutionService:
             return [self._sanitize_export_value(item) for item in value]
         if not isinstance(value, str):
             return value
+        def replace_path(match: re.Match[str]) -> str:
+            return self._sanitize_absolute_path(match.group(0))
+
+        value = _WINDOWS_PATH_IN_TEXT.sub(replace_path, value)
+        value = _POSIX_PATH_IN_TEXT.sub(replace_path, value)
+        return value
+
+    def _sanitize_absolute_path(self, value: str) -> str:
         windows_absolute = (
             len(value) >= 3
             and value[0].isalpha()
@@ -2241,6 +2418,9 @@ class EvolutionService:
                     "runtime_session_id", "event_log_path", "execution_mode", "strategy_id",
                     "strategy_arm", "strategy_sha256", "strategy_cutoff_at",
                     "evaluation_workspace_path", "scientific_state_path", "provider", "model",
+                    "evaluation_workspace_device", "evaluation_workspace_inode",
+                    "evaluation_workspace_fingerprint", "previous_owner_sha256",
+                    "owner_reclaimed_at",
                     "tool_surface_fingerprint", "capability_fingerprint", "data_source_fingerprints",
                     "artifact", "cost", "started_at", "completed_at", "created_at",
                     "acceptance_results", "task_snapshot", "target_snapshot",
@@ -2323,6 +2503,7 @@ class EvolutionService:
         *,
         include_content: bool,
     ) -> list[dict[str, object]]:
+        self.store.flush_event_outbox(evolution_id)
         exported: list[dict[str, object]] = []
         for line_number, (source, envelope) in enumerate(
             self.store.read_event_journal(evolution_id), start=1
@@ -2477,6 +2658,7 @@ class EvolutionService:
             (
                 field
                 for field in EpisodeRecord.model_fields
+                if field != "event_outbox"
                 if existing_payload[field] != candidate_payload[field]
             ),
             None,
@@ -2755,6 +2937,8 @@ class EvolutionService:
             EvolutionIterationStarted(
                 evolution_id=episode.evolution_id,
                 episode_version=episode.version,
+                episode_id=episode.episode_id,
+                execution_mode=episode.execution_mode,
             ),
         )
 

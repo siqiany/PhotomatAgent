@@ -39,7 +39,7 @@ def create_default_registry(
     evaluation_isolation: bool = False,
 ) -> ToolRegistry:
     boundary = workspace if isinstance(workspace, Workspace) else Workspace(workspace or Path.cwd())
-    registry = ToolRegistry(evaluation_isolated=evaluation_isolation)
+    registry = ToolRegistry()
     safe_tools = [
         EchoTool(),
         CalculatorTool(),

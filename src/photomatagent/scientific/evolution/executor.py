@@ -16,6 +16,13 @@ from photomatagent.logging.event_logger import EventLogger
 from photomatagent.redaction import redact_text
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
+from photomatagent.runtime.permissions import (
+    AllowAllPolicy,
+    DenyAllPolicy,
+    PolicyRule,
+    SwitchablePermissionPolicy,
+    default_permission_policy,
+)
 from photomatagent.scientific.evolution.artifacts import (
     EpisodeArtifactCollector,
     materialize_primary_result,
@@ -32,10 +39,11 @@ from photomatagent.scientific.evolution.models import (
 )
 from photomatagent.scientific.evolution.revision import format_revision_instruction
 from photomatagent.scientific.evolution.service import (
+    EvolutionOperationConflict,
     EvolutionService,
     MutationResult,
 )
-from photomatagent.scientific.evolution.store import EvolutionStore
+from photomatagent.scientific.evolution.store import EvaluationLease, EvolutionStore
 from photomatagent.scientific.loop import (
     ScientificJudge,
     ScientificLoopConfig,
@@ -43,7 +51,15 @@ from photomatagent.scientific.loop import (
     ScientificLoopSummary,
 )
 from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.backends.mock import MockBackend
 from photomatagent.workspace import Workspace
+from photomatagent.tools.bridges import ToolCallBridge, ToolDescribeTool, ToolSearchTool
+from photomatagent.tools.calculator import CalculatorTool
+from photomatagent.tools.echo import EchoTool
+from photomatagent.tools.mock_calculation import MockCalculationTool
+from photomatagent.tools.registry import ToolRegistry
+from photomatagent.tools.scientific_state_inspect import ScientificStateInspectTool
+from photomatagent.tools.surface import ToolCatalog
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _REVISION_INSTRUCTION_MAX_CHARS = 12_000
@@ -257,31 +273,79 @@ class ScientificEpisodeExecutor:
         owner_token: str | None,
     ) -> None:
         if episode.execution_mode == "FRESH_EVALUATION":
+            if type(runtime) is not AgentRuntime:
+                raise ValueError("fresh runtime implementation is not trusted")
+            if type(runtime.workspace) is not Workspace:
+                raise ValueError("fresh runtime workspace implementation is not trusted")
+            if type(runtime._tools) is not ToolRegistry:
+                raise ValueError("fresh runtime registry implementation is not trusted")
             if episode.evaluation_workspace_path is None:
                 raise ValueError("fresh evaluation workspace provenance is missing")
-            expected_workspace = self.store.workspace.resolve(
-                episode.evaluation_workspace_path,
-                must_exist=True,
-            )
+            expected_workspace = self.service.validate_evaluation_workspace(episode)
             if runtime.workspace.root != expected_workspace:
                 raise ValueError("fresh runtime must use its isolated evaluation workspace")
-            if not runtime._tools.evaluation_isolated:
-                raise ValueError("fresh runtime requires an evaluation-isolated registry")
-            allowed_tools = {
-                "echo",
-                "calculator",
-                "scientific_state_inspect",
-                "mock.run_calculation",
-                "tool_search",
-                "tool_describe",
-                "tool_call",
+            expected_tools = {
+                "echo": EchoTool,
+                "calculator": CalculatorTool,
+                "scientific_state_inspect": ScientificStateInspectTool,
+                "mock.run_calculation": MockCalculationTool,
+                "tool_search": ToolSearchTool,
+                "tool_describe": ToolDescribeTool,
+                "tool_call": ToolCallBridge,
             }
-            exposed = {tool.name for tool in runtime._tools.list_tools()}
-            forbidden = sorted(exposed - allowed_tools)
-            if forbidden:
+            actual_tools = {tool.name: tool for tool in runtime._tools.list_tools()}
+            if set(actual_tools) != set(expected_tools) or any(
+                type(actual_tools[name]) is not expected
+                for name, expected in expected_tools.items()
+            ):
                 raise ValueError(
-                    "fresh runtime contains non-isolated tools: " + ", ".join(forbidden)
+                    "fresh runtime tool implementations are not the trusted allowlist"
                 )
+            state_tool = actual_tools["scientific_state_inspect"]
+            if state_tool._state is not runtime.scientific_state:  # type: ignore[attr-defined]
+                raise ValueError("fresh state tool is not bound to the runtime state")
+            mock_tool = actual_tools["mock.run_calculation"]
+            if type(mock_tool.backend) is not MockBackend:  # type: ignore[attr-defined]
+                raise ValueError("fresh mock tool backend is not trusted")
+            search_tool = actual_tools["tool_search"]
+            describe_tool = actual_tools["tool_describe"]
+            if (
+                type(search_tool.catalog) is not ToolCatalog  # type: ignore[attr-defined]
+                or search_tool.catalog is not describe_tool.catalog  # type: ignore[attr-defined]
+                or search_tool.catalog._registry is not runtime._tools  # type: ignore[attr-defined]
+            ):
+                raise ValueError("fresh tool catalog binding is not trusted")
+            policy = runtime.permission_policy
+            if type(policy) is not SwitchablePermissionPolicy:
+                raise ValueError("fresh runtime permission wrapper is not trusted")
+            if policy._settings is not None or policy._session_allow_all:  # type: ignore[attr-defined]
+                raise ValueError("fresh runtime cannot inherit approval settings")
+            base = policy._base  # type: ignore[attr-defined]
+            if type(base) is PolicyRule:
+                expected_policy = default_permission_policy()
+                if (
+                    base._rules != expected_policy._rules  # type: ignore[attr-defined]
+                    or base._default != expected_policy._default  # type: ignore[attr-defined]
+                ):
+                    raise ValueError("fresh runtime permission rules were modified")
+            elif type(base) not in {AllowAllPolicy, DenyAllPolicy}:
+                raise ValueError("fresh runtime base permission policy is not trusted")
+            if type(base) is PolicyRule:
+                from photomatagent.cli.prompt import CLIApprovalHandler
+
+                handler = runtime._approval_handler
+                if handler is None or type(handler) is not CLIApprovalHandler:
+                    raise ValueError("fresh ask approval handler is not trusted")
+            elif runtime._approval_handler is not None:
+                raise ValueError("fresh non-interactive policy has an approval handler")
+            if not runtime._fresh_approval:
+                raise ValueError("fresh runtime approval isolation is disabled")
+            expected_approval_root = expected_workspace / (
+                f".photomatagent/evolution-approvals/{task.evolution_id}/"
+                f"{episode.version}_{episode.episode_id}"
+            )
+            if runtime._application_approval_root != expected_approval_root:
+                raise ValueError("fresh runtime approval namespace is not episode-scoped")
         elif runtime.workspace.root != self.store.workspace.root:
             raise ValueError("runtime and evolution store must use the same workspace")
         if runtime.conversation_state.messages:
@@ -457,10 +521,11 @@ class ScientificEpisodeExecutor:
     ) -> None:
         evolution_id = getattr(result.entity, "evolution_id", None)
         if isinstance(evolution_id, str):
+            self.store.flush_event_outbox(evolution_id)
             self.store.append_events(
                 evolution_id,
                 result.events,
-                idempotency_scope=self.store.event_scope(result.entity),
+                idempotency_scope="durable-outbox",
             )
         for event in result.events:
             if self.event_logger is not None:
@@ -542,12 +607,13 @@ class ScientificEpisodeExecutor:
                         return
                     if owner_token is None:
                         raise ValueError("fresh evaluation requires an owner token")
-                    self.service.fail_evaluation(
+                    failed = self.service.fail_evaluation(
                         task.evolution_id,
                         episode.version,
                         self._bounded_error(error),
                         owner_token=owner_token,
                     )
+                    await self._publish(failed, on_event)
                     return
                 if persisted.status == "COMPLETED":
                     if persisted_task.status == "RUNNING":
@@ -647,8 +713,26 @@ async def run_fresh_evaluation(
     owner_token: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    _lease: EvaluationLease | None = None,
 ) -> EpisodeExecutionResult:
     """Claim and run an isolated evaluation from only task + frozen strategy."""
+
+    if _lease is None:
+        with service.store.evaluation_lease(task.evolution_id) as held_lease:
+            return await run_fresh_evaluation(
+                service=service,
+                task=task,
+                strategy_id=strategy_id,
+                executor=executor,
+                runtime_factory=runtime_factory,
+                config=config,
+                judge=judge,
+                on_event=on_event,
+                owner_token=owner_token,
+                provider=provider,
+                model=model,
+                _lease=held_lease,
+            )
 
     authoritative = service.get(task.evolution_id)
     if (
@@ -665,21 +749,21 @@ async def run_fresh_evaluation(
         owner_token=token,
         provider=provider,
         model=model,
+        lease=_lease,
+        reclaim_reserved_owner=True,
     )
+    service.store.flush_event_outbox(task.evolution_id)
     service.store.append_events(
         task.evolution_id,
         claim.events,
-        idempotency_scope=service.store.event_scope(claim.episode),
+        idempotency_scope="durable-outbox",
     )
     approval_root = Path(".photomatagent/evolution-approvals") / task.evolution_id / (
         f"{claim.episode.version}_{claim.episode.episode_id}"
     )
     if claim.episode.evaluation_workspace_path is None:
         raise ValueError("evaluation workspace provenance is missing")
-    evaluation_workspace = service.store.workspace.resolve(
-        claim.episode.evaluation_workspace_path,
-        must_exist=True,
-    )
+    evaluation_workspace = service.validate_evaluation_workspace(claim.episode)
     try:
         runtime = runtime_factory(
             workspace_root=evaluation_workspace,
@@ -689,6 +773,14 @@ async def run_fresh_evaluation(
         )
         if not isinstance(runtime, AgentRuntime):
             raise TypeError("runtime_factory must return AgentRuntime")
+        if not service.store.has_active_evaluation_lease(
+            _lease,
+            task.evolution_id,
+        ):
+            raise EvolutionOperationConflict(
+                "fresh evaluation lost its execution lease"
+            )
+        service.validate_evaluation_workspace(claim.episode)
         await executor._publish(
             MutationResult(claim.episode, claim.events),
             on_event,
@@ -709,12 +801,13 @@ async def run_fresh_evaluation(
                 claim.episode.version,
             )
             if persisted.status in {"RESERVED", "RUNNING"}:
-                service.fail_evaluation(
+                failed = service.fail_evaluation(
                     task.evolution_id,
                     claim.episode.version,
                     ScientificEpisodeExecutor._bounded_error(exc),
                     owner_token=claim.owner_token,
                 )
+                await executor._publish(failed, on_event)
         except BaseException as recovery_exc:
             exc.add_note(
                 "fresh-evaluation recovery failed: "

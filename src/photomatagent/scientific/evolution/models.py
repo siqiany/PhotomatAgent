@@ -541,6 +541,7 @@ class EvolutionTask(StrictModel):
     strategy_ids: list[ManagedId] = Field(default_factory=list)
     comparison_ids: list[ManagedId] = Field(default_factory=list)
     experience_ids: list[ManagedId] = Field(default_factory=list)
+    event_outbox: list[dict[str, Any]] = Field(default_factory=list)
     created_at: UtcDatetime = Field(default_factory=utc_now, frozen=True)
     updated_at: UtcDatetime = Field(default_factory=utc_now)
 
@@ -581,6 +582,12 @@ class EpisodeRecord(StrictModel):
     strategy_sha256: Sha256 | None = Field(default=None, frozen=True)
     strategy_cutoff_at: UtcDatetime | None = Field(default=None, frozen=True)
     evaluation_workspace_path: str | None = Field(default=None, frozen=True)
+    evaluation_workspace_device: int | None = Field(default=None, frozen=True, ge=0)
+    evaluation_workspace_inode: int | None = Field(default=None, frozen=True, ge=0)
+    evaluation_workspace_fingerprint: Sha256 | None = Field(default=None, frozen=True)
+    previous_owner_sha256: Sha256 | None = None
+    owner_reclaimed_at: UtcDatetime | None = None
+    event_outbox: list[dict[str, Any]] = Field(default_factory=list)
     scientific_state_path: str | None = None
     task_snapshot: FrozenJsonObject = Field(frozen=True)
     target_snapshot: TargetSnapshot = Field(frozen=True)
@@ -612,6 +619,9 @@ class EpisodeRecord(StrictModel):
             or self.strategy_sha256 is None
             or self.strategy_cutoff_at is None
             or self.owner_token is None
+            or self.evaluation_workspace_device is None
+            or self.evaluation_workspace_inode is None
+            or self.evaluation_workspace_fingerprint is None
         ):
             raise ValueError(
                 "fresh evaluation requires owner-bound frozen strategy provenance"
