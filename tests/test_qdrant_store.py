@@ -7,7 +7,6 @@ adapter contract and never start Qdrant local mode or a Docker service.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -84,10 +83,14 @@ class FakeAsyncQdrantClient:
         config = SimpleNamespace(
             metadata=self.collections[collection_name].get("metadata", {}),
             params=self.collections[collection_name].get("params"),
+            on_disk_payload=self.collections[collection_name].get("on_disk_payload"),
+            strict_mode_config=self.collections[collection_name].get("strict_mode_config"),
         )
         return SimpleNamespace(
             config=config,
             payload_schema=self.collections[collection_name].get("payload_schema", {}),
+            on_disk_payload=self.collections[collection_name].get("on_disk_payload"),
+            strict_mode_config=self.collections[collection_name].get("strict_mode_config"),
         )
 
     async def create_payload_index(self, collection_name: str, **kwargs: Any) -> None:
@@ -396,6 +399,37 @@ async def test_resolve_rejects_aliases_pointing_to_different_generations() -> No
     assert exc.value.code == "schema_mismatch"
 
 
+async def test_resolve_rejects_same_suffix_aliases_with_mixed_generation_metadata() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.collections[generation.passages_physical]["metadata"]["model_fingerprint"] = "b" * 64
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    client.alias_update_calls.clear()
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.validate_current_generation(generation.fingerprint)
+    assert exc.value.code in {"model_fingerprint_mismatch", "schema_mismatch"}
+    assert client.alias_update_calls == []
+
+
+async def test_resolve_rejects_generation_control_fingerprint_mismatch() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    control = next(
+        record
+        for record in client.points[generation.documents_physical].values()
+        if record.payload.get("record_type") == "generation"
+    )
+    control.payload["model_fingerprint"] = "b" * 64
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    client.alias_update_calls.clear()
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.validate_current_generation(generation.fingerprint)
+    assert exc.value.code == "model_fingerprint_mismatch"
+    assert client.alias_update_calls == []
+
+
 async def test_ensure_generation_rejects_existing_fingerprint_mismatch() -> None:
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
@@ -459,6 +493,48 @@ async def test_ensure_generation_rejects_non_idf_sparse_schema() -> None:
     fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
     with pytest.raises(QdrantStoreError) as exc:
         await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_ensure_generation_rejects_on_disk_and_strict_mode_mismatch() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.collections[generation.passages_physical]["on_disk_payload"] = False
+    client.collections[generation.passages_physical]["strict_mode_config"] = SimpleNamespace(
+        enabled=False,
+        unindexed_filtering_retrieve=True,
+        unindexed_filtering_update=True,
+    )
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_ensure_generation_rejects_existing_payload_index_type_mismatch() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.collections[generation.passages_physical]["payload_schema"] = {
+        "workspace_id": SimpleNamespace(data_type="integer")
+    }
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_ensure_generation_does_not_swallow_untyped_existing_index_error() -> None:
+    client = FakeAsyncQdrantClient()
+
+    async def incompatible_index_error(**kwargs: Any) -> None:
+        raise RuntimeError("already exists but has an incompatible type")
+
+    client.create_payload_index = incompatible_index_error  # type: ignore[method-assign]
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
     assert exc.value.code == "schema_mismatch"
 
 
@@ -532,6 +608,24 @@ async def test_document_operations_filter_workspace_and_revision() -> None:
     assert client.payload_calls[-1]["payload"] == {"ingest_state": "superseded"}
 
 
+async def test_revision_mutations_require_workspace_scope() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    with pytest.raises(TypeError):
+        await store.count_revision("doc-1", "a" * 64, IngestState.READY)
+    with pytest.raises(TypeError):
+        await store.set_revision_state("doc-1", "a" * 64, IngestState.READY)
+    with pytest.raises(TypeError):
+        await store.delete_other_revisions("doc-1", "a" * 64)
+    with pytest.raises(TypeError):
+        await store.delete_document_passages("doc-1")
+    with pytest.raises(ValueError):
+        await store.count_revision(
+            "doc-1", "a" * 64, IngestState.READY, workspace_id=None  # type: ignore[arg-type]
+        )
+
+
 async def test_snapshot_files_and_manifest_are_written_atomically(tmp_path: Path) -> None:
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
@@ -549,22 +643,65 @@ async def test_snapshot_files_and_manifest_are_written_atomically(tmp_path: Path
     assert len(on_disk["files"]) == 2
 
 
-async def test_snapshot_download_uses_qdrant_async_stream_when_no_adapter_method(
+@dataclass
+class _FakeSnapshotResponse:
+    status_code: int
+    chunks: tuple[bytes, ...]
+
+    async def aiter_bytes(self, chunk_size: int = 65536):
+        del chunk_size
+        for chunk in self.chunks:
+            yield chunk
+
+
+class _FakeSnapshotTransport:
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
+        self.calls: list[dict[str, Any]] = []
+
+    async def get(self, url: str, *, headers: dict[str, str], timeout: int) -> _FakeSnapshotResponse:
+        self.calls.append({"url": url, "headers": headers, "timeout": timeout})
+        return _FakeSnapshotResponse(self.status_code, (b"stream", b"ed"))
+
+
+async def test_snapshot_download_uses_documented_rest_stream_when_no_adapter_method(
     tmp_path: Path,
 ) -> None:
     client = FakeAsyncQdrantClient()
     client.download_snapshot = None  # type: ignore[method-assign]
-    stream = SimpleNamespace(
-        snapshots_api=SimpleNamespace(
-            get_snapshot=lambda collection, name: _async_bytes(io.BytesIO(b"streamed"))
-        )
+    transport = _FakeSnapshotTransport()
+    store = QdrantLiteratureStore(
+        client,
+        prefix="photomat_literature",
+        timeout_seconds=17,
+        snapshot_base_url="http://qdrant.test:6333/",
+        snapshot_api_key="secret-value",
+        snapshot_transport=transport,
     )
-    client._client = SimpleNamespace(openapi_client=stream)
-    store = QdrantLiteratureStore(client, prefix="photomat_literature")
     await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
     manifest = await store.create_current_snapshots(tmp_path)
     assert all((tmp_path / item.file_name).read_bytes() == b"streamed" for item in manifest.files)
+    assert len(transport.calls) == 2
+    for call, item in zip(transport.calls, manifest.files):
+        assert call["url"] == (
+            "http://qdrant.test:6333/collections/"
+            f"{item.collection}/snapshots/{item.collection}.snapshot"
+        )
+        assert call["headers"] == {"api-key": "secret-value"}
+        assert call["timeout"] == 17
 
 
-async def _async_bytes(value: io.BytesIO) -> io.BytesIO:
-    return value
+async def test_snapshot_download_rejects_non_success_rest_status(tmp_path: Path) -> None:
+    client = FakeAsyncQdrantClient()
+    client.download_snapshot = None  # type: ignore[method-assign]
+    transport = _FakeSnapshotTransport(status_code=503)
+    store = QdrantLiteratureStore(
+        client,
+        prefix="photomat_literature",
+        snapshot_base_url="http://qdrant.test:6333",
+        snapshot_transport=transport,
+    )
+    await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    with pytest.raises(QdrantStoreError) as exc:
+        await store.create_current_snapshots(tmp_path)
+    assert exc.value.code == "snapshot_download_failed"

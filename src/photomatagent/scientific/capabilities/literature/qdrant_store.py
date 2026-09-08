@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from photomatagent.scientific.capabilities.literature.models import (
     DocumentManifest,
@@ -191,6 +192,9 @@ class QdrantLiteratureStore:
         dimension: int | None = None,
         timeout_seconds: int | None = None,
         sparse_model: str = SPARSE_MODEL,
+        snapshot_base_url: str | None = None,
+        snapshot_api_key: str | None = None,
+        snapshot_transport: Any | None = None,
     ) -> None:
         if not prefix or any(char.isspace() for char in prefix):
             raise ValueError("Qdrant collection prefix must be non-empty and whitespace-free")
@@ -199,6 +203,9 @@ class QdrantLiteratureStore:
         self.dimension = dimension
         self.timeout_seconds = timeout_seconds
         self.sparse_model = sparse_model
+        self.snapshot_base_url = snapshot_base_url.rstrip("/") if snapshot_base_url else None
+        self._snapshot_api_key = snapshot_api_key
+        self._snapshot_transport = snapshot_transport
         self._generations: dict[str, CollectionGeneration] = {}
 
     @classmethod
@@ -223,6 +230,8 @@ class QdrantLiteratureStore:
             prefix=str(getattr(config, "qdrant_collection_prefix", "photomat_literature")),
             dimension=int(getattr(config, "embedding_vector_dim")),
             timeout_seconds=timeout,
+            snapshot_base_url=url,
+            snapshot_api_key=api_key,
         )
         return store
 
@@ -324,105 +333,7 @@ class QdrantLiteratureStore:
             kwargs["vectors_config"] = None
         await self._client.create_collection(**kwargs)
 
-    async def _validate_existing_collection(
-        self,
-        name: str,
-        *,
-        passages: bool,
-        identity: ModelIdentity,
-        fingerprint: str,
-        chunk_schema_version: int,
-    ) -> None:
-        try:
-            info = await self._client.get_collection(name)
-        except Exception as exc:
-            raise QdrantStoreError(
-                "collection_missing", f"collection {name!r} cannot be read"
-            ) from exc
-        metadata = _metadata(info)
-        config = _record_attr(info, "config", None)
-        params = _record_attr(config, "params", None)
-        if not metadata and params is None:
-            raise QdrantStoreError(
-                "schema_mismatch", f"collection {name!r} schema cannot be inspected"
-            )
-        actual_fingerprint = (
-            metadata.get("model_fingerprint")
-            or metadata.get("photomat_model_fingerprint")
-        )
-        if actual_fingerprint and actual_fingerprint != fingerprint:
-            raise QdrantStoreError(
-                "model_fingerprint_mismatch",
-                f"collection {name!r} has a different model fingerprint",
-            )
-        actual_schema = metadata.get("collection_schema_version") or metadata.get(
-            "photomat_collection_schema_version"
-        )
-        actual_chunk = metadata.get("chunk_schema_version") or metadata.get(
-            "photomat_chunk_schema_version"
-        )
-        if actual_schema is not None and int(actual_schema) != COLLECTION_SCHEMA_VERSION:
-            raise QdrantStoreError(
-                "schema_mismatch", f"collection {name!r} has an incompatible schema"
-            )
-        if actual_chunk is not None and int(actual_chunk) != chunk_schema_version:
-            raise QdrantStoreError(
-                "schema_mismatch", f"collection {name!r} has an incompatible chunk schema"
-            )
-        if passages:
-            expected_dimension = identity.dimension if identity.dimension is not None else self.dimension
-            actual_dimension = metadata.get("dense_dimension") or metadata.get(
-                "photomat_dense_dimension"
-            )
-            if (
-                expected_dimension is not None
-                and actual_dimension is not None
-                and int(actual_dimension) != expected_dimension
-            ):
-                raise QdrantStoreError(
-                    "schema_mismatch", f"collection {name!r} has an incompatible vector dimension"
-                )
-        if params is not None:
-            actual_vectors = _record_attr(params, "vectors", None)
-            actual_sparse = _record_attr(params, "sparse_vectors", None)
-            if passages:
-                if not isinstance(actual_vectors, Mapping) or "dense" not in actual_vectors:
-                    raise QdrantStoreError(
-                        "schema_mismatch", f"collection {name!r} is missing named dense vectors"
-                    )
-                dense_config = actual_vectors["dense"]
-                actual_size = _record_attr(dense_config, "size", None)
-                expected_size = identity.dimension if identity.dimension is not None else self.dimension
-                if expected_size is not None and actual_size is not None and int(actual_size) != expected_size:
-                    raise QdrantStoreError(
-                        "schema_mismatch", f"collection {name!r} has an incompatible vector dimension"
-                    )
-                distance = _record_attr(dense_config, "distance", None)
-                if distance is not None and str(_enum_value(distance)).lower() != "cosine":
-                    raise QdrantStoreError(
-                        "schema_mismatch", f"collection {name!r} has an incompatible vector distance"
-                    )
-                if not isinstance(actual_sparse, Mapping) or "sparse_bm25" not in actual_sparse:
-                    raise QdrantStoreError(
-                        "schema_mismatch", f"collection {name!r} is missing sparse BM25 vectors"
-                    )
-                modifier = _record_attr(actual_sparse["sparse_bm25"], "modifier", None)
-                if modifier is not None and str(_enum_value(modifier)).lower() != "idf":
-                    raise QdrantStoreError(
-                        "schema_mismatch", f"collection {name!r} has a non-IDF sparse vector"
-                    )
-            elif actual_vectors not in (None, {}):
-                raise QdrantStoreError(
-                    "schema_mismatch", f"collection {name!r} must be vectorless"
-                )
-            for parameter_name in ("shard_number", "replication_factor"):
-                actual_value = _record_attr(params, parameter_name, None)
-                if actual_value is not None and int(actual_value) != 1:
-                    raise QdrantStoreError(
-                        "schema_mismatch", f"collection {name!r} has incompatible {parameter_name}"
-                    )
-
-    async def _ensure_payload_indexes(self, name: str, *, passages: bool) -> None:
+    def _payload_index_specs(self, *, passages: bool) -> list[tuple[str, Any]]:
         models = _qdrant_models()
         fields: list[tuple[str, Any]] = [
             ("schema_version", models.PayloadSchemaType.KEYWORD),
@@ -469,7 +380,191 @@ class QdrantLiteratureStore:
                     ("last_error", models.PayloadSchemaType.TEXT),
                 ]
             )
+        return fields
+
+    def _validate_payload_schema(self, name: str, info: Any, *, passages: bool) -> None:
+        payload_schema = _record_attr(info, "payload_schema", None)
+        if not isinstance(payload_schema, Mapping) or not payload_schema:
+            return
+        expected = dict(self._payload_index_specs(passages=passages))
+        for field_name, expected_type in expected.items():
+            actual = payload_schema.get(field_name)
+            if actual is None:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"payload index {field_name!r} is missing from {name!r}"
+                )
+            actual_type = _record_attr(actual, "data_type", None)
+            if actual_type is None:
+                actual_type = _record_attr(_record_attr(actual, "params", None), "type", None)
+            if actual_type is None or str(_enum_value(actual_type)).lower() != str(
+                _enum_value(expected_type)
+            ).lower():
+                raise QdrantStoreError(
+                    "schema_mismatch", f"payload index {field_name!r} is incompatible"
+                )
+
+    def _validate_collection_shape(
+        self,
+        name: str,
+        info: Any,
+        *,
+        passages: bool,
+        expected_dimension: int | None = None,
+    ) -> None:
+        metadata = _metadata(info)
+        config = _record_attr(info, "config", None)
+        params = _record_attr(config, "params", None)
+        if not metadata and params is None:
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} schema cannot be inspected"
+            )
+
+        on_disk_payload = _record_attr(params, "on_disk_payload", None)
+        if on_disk_payload is None:
+            on_disk_payload = _record_attr(config, "on_disk_payload", None)
+        if on_disk_payload is None:
+            on_disk_payload = _record_attr(info, "on_disk_payload", None)
+        if on_disk_payload is not None and bool(on_disk_payload) is not True:
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} must keep payload on disk"
+            )
+
+        strict_mode = _record_attr(config, "strict_mode_config", None)
+        if strict_mode is None:
+            strict_mode = _record_attr(info, "strict_mode_config", None)
+        if strict_mode is not None:
+            strict_values = (
+                ("enabled", True),
+                ("unindexed_filtering_retrieve", False),
+                ("unindexed_filtering_update", False),
+            )
+            for field_name, expected_value in strict_values:
+                actual_value = _record_attr(strict_mode, field_name, None)
+                if actual_value is None or bool(actual_value) is not expected_value:
+                    raise QdrantStoreError(
+                        "schema_mismatch", f"collection {name!r} has incompatible strict mode"
+                    )
+
+        self._validate_payload_schema(name, info, passages=passages)
+        if passages:
+            metadata_dimension = metadata.get("dense_dimension") or metadata.get(
+                "photomat_dense_dimension"
+            )
+            if (
+                expected_dimension is not None
+                and metadata_dimension is not None
+                and int(metadata_dimension) != expected_dimension
+            ):
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has an incompatible vector dimension"
+                )
+        if params is None:
+            return
+        actual_vectors = _record_attr(params, "vectors", None)
+        actual_sparse = _record_attr(params, "sparse_vectors", None)
+        if passages:
+            if not isinstance(actual_vectors, Mapping) or "dense" not in actual_vectors:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} is missing named dense vectors"
+                )
+            dense_config = actual_vectors["dense"]
+            actual_size = _record_attr(dense_config, "size", None)
+            if expected_dimension is not None and actual_size is not None and int(actual_size) != expected_dimension:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has an incompatible vector dimension"
+                )
+            distance = _record_attr(dense_config, "distance", None)
+            if distance is not None and str(_enum_value(distance)).lower() != "cosine":
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has an incompatible vector distance"
+                )
+            dense_on_disk = _record_attr(dense_config, "on_disk", None)
+            if dense_on_disk is not None and bool(dense_on_disk) is not True:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} dense vectors must be on disk"
+                )
+            if not isinstance(actual_sparse, Mapping) or "sparse_bm25" not in actual_sparse:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} is missing sparse BM25 vectors"
+                )
+            modifier = _record_attr(actual_sparse["sparse_bm25"], "modifier", None)
+            if modifier is not None and str(_enum_value(modifier)).lower() != "idf":
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has a non-IDF sparse vector"
+                )
+        elif actual_vectors not in (None, {}):
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} must be vectorless"
+            )
+        for parameter_name in ("shard_number", "replication_factor"):
+            actual_value = _record_attr(params, parameter_name, None)
+            if actual_value is not None and int(actual_value) != 1:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has incompatible {parameter_name}"
+                )
+
+    async def _validate_existing_collection(
+        self,
+        name: str,
+        *,
+        passages: bool,
+        identity: ModelIdentity,
+        fingerprint: str,
+        chunk_schema_version: int,
+    ) -> None:
+        try:
+            info = await self._client.get_collection(name)
+        except Exception as exc:
+            raise QdrantStoreError(
+                "collection_missing", f"collection {name!r} cannot be read"
+            ) from exc
+        metadata = _metadata(info)
+        self._validate_collection_shape(
+            name,
+            info,
+            passages=passages,
+            expected_dimension=identity.dimension if identity.dimension is not None else self.dimension,
+        )
+        actual_fingerprint = (
+            metadata.get("model_fingerprint")
+            or metadata.get("photomat_model_fingerprint")
+        )
+        if actual_fingerprint and actual_fingerprint != fingerprint:
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch",
+                f"collection {name!r} has a different model fingerprint",
+            )
+        actual_schema = metadata.get("collection_schema_version") or metadata.get(
+            "photomat_collection_schema_version"
+        )
+        actual_chunk = metadata.get("chunk_schema_version") or metadata.get(
+            "photomat_chunk_schema_version"
+        )
+        if actual_schema is not None and int(actual_schema) != COLLECTION_SCHEMA_VERSION:
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} has an incompatible schema"
+            )
+        if actual_chunk is not None and int(actual_chunk) != chunk_schema_version:
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} has an incompatible chunk schema"
+            )
+
+    async def _ensure_payload_indexes(self, name: str, *, passages: bool) -> None:
+        fields = self._payload_index_specs(passages=passages)
+        existing_schema: Mapping[str, Any] = {}
+        try:
+            info = await self._client.get_collection(name)
+            payload_schema = _record_attr(info, "payload_schema", None)
+            if isinstance(payload_schema, Mapping):
+                existing_schema = payload_schema
+        except Exception:
+            existing_schema = {}
         for field_name, field_schema in fields:
+            if field_name in existing_schema:
+                # _validate_existing_collection already checked the full
+                # inspectable schema.  Skip exact existing indexes instead of
+                # relying on an error string from create_payload_index.
+                continue
             try:
                 await self._client.create_payload_index(
                     collection_name=name,
@@ -479,9 +574,12 @@ class QdrantLiteratureStore:
                     **self._timeout_kwargs(),
                 )
             except Exception as exc:
-                # Existing indexes are idempotent.  A schema conflict, however,
-                # is not safe to hide and is surfaced as a stable error.
-                if "already exists" not in str(exc).lower():
+                status_code = _record_attr(exc, "status_code", None)
+                error_name = type(exc).__name__
+                if status_code != 409 and error_name not in {
+                    "AlreadyExists",
+                    "AlreadyExistsError",
+                }:
                     raise QdrantStoreError(
                         "schema_mismatch", f"payload index {field_name!r} is incompatible"
                     ) from exc
@@ -594,6 +692,12 @@ class QdrantLiteratureStore:
                     "collection_missing", f"collection {physical_name!r} cannot be read"
                 ) from exc
             metadata = _metadata(info)
+            self._validate_collection_shape(
+                physical_name,
+                info,
+                passages=physical_name == generation.passages_physical,
+                expected_dimension=self.dimension,
+            )
             actual_fingerprint = metadata.get("model_fingerprint") or metadata.get(
                 "photomat_model_fingerprint"
             )
@@ -637,6 +741,78 @@ class QdrantLiteratureStore:
         self._generations[generation.documents_physical] = generation
         self._generations[generation.passages_physical] = generation
 
+    async def _validate_generation_control(
+        self,
+        documents_collection: str,
+        fingerprint: str,
+        documents_metadata: Mapping[str, Any],
+        passages_metadata: Mapping[str, Any],
+    ) -> None:
+        if not fingerprint:
+            return
+        retrieve = getattr(self._client, "retrieve", None)
+        if retrieve is None:
+            return
+        control_id = str(uuid.uuid5(GENERATION_POINT_NAMESPACE, fingerprint))
+        try:
+            records = retrieve(
+                collection_name=documents_collection,
+                ids=[control_id],
+                with_payload=True,
+                with_vectors=False,
+                **self._timeout_kwargs(),
+            )
+            if inspect.isawaitable(records):
+                records = await records
+        except Exception:
+            # A client without a readable control point is handled by the
+            # physical metadata checks; do not turn an optional read into a
+            # second mutation or a raw client error.
+            return
+        if not isinstance(records, Sequence) or not records:
+            return
+        control_payload = _payload(records[0])
+        if control_payload.get("record_type") != "generation":
+            raise QdrantStoreError(
+                "schema_mismatch", "current documents collection has invalid generation control metadata"
+            )
+        expected_fingerprint = str(
+            documents_metadata.get("model_fingerprint")
+            or documents_metadata.get("photomat_model_fingerprint")
+            or ""
+        )
+        control_fingerprint = str(control_payload.get("model_fingerprint", ""))
+        if expected_fingerprint and control_fingerprint != expected_fingerprint:
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch", "generation control metadata has a different model fingerprint"
+            )
+        passage_fingerprint = str(
+            passages_metadata.get("model_fingerprint")
+            or passages_metadata.get("photomat_model_fingerprint")
+            or ""
+        )
+        if passage_fingerprint and control_fingerprint != passage_fingerprint:
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch", "generation control metadata does not match both collections"
+            )
+        for metadata_key in ("chunk_schema_version", "sparse_model", "dense_dimension"):
+            control_value = control_payload.get(metadata_key)
+            document_value = documents_metadata.get(metadata_key) or documents_metadata.get(
+                f"photomat_{metadata_key}"
+            )
+            passage_value = passages_metadata.get(metadata_key) or passages_metadata.get(
+                f"photomat_{metadata_key}"
+            )
+            for collection_value in (document_value, passage_value):
+                if (
+                    control_value is not None
+                    and collection_value is not None
+                    and str(control_value) != str(collection_value)
+                ):
+                    raise QdrantStoreError(
+                        "schema_mismatch", "generation control metadata is incompatible with collection metadata"
+                    )
+
     async def resolve_current_generation(self) -> CollectionGeneration | None:
         aliases = await self._alias_map()
         documents = aliases.get(self._documents_alias())
@@ -651,6 +827,101 @@ class QdrantLiteratureStore:
             raise QdrantStoreError(
                 "schema_mismatch", "current aliases point to different generations"
             )
+        try:
+            documents_info = await self._client.get_collection(documents)
+            passages_info = await self._client.get_collection(passages)
+        except Exception as exc:
+            raise QdrantStoreError(
+                "collection_missing", "current physical collections cannot be inspected"
+            ) from exc
+        self._validate_collection_shape(
+            documents,
+            documents_info,
+            passages=False,
+            expected_dimension=self.dimension,
+        )
+        self._validate_collection_shape(
+            passages,
+            passages_info,
+            passages=True,
+            expected_dimension=self.dimension,
+        )
+        documents_metadata = _metadata(documents_info)
+        passages_metadata = _metadata(passages_info)
+        document_fingerprint = str(
+            documents_metadata.get("model_fingerprint")
+            or documents_metadata.get("photomat_model_fingerprint")
+            or ""
+        )
+        passage_fingerprint = str(
+            passages_metadata.get("model_fingerprint")
+            or passages_metadata.get("photomat_model_fingerprint")
+            or ""
+        )
+        suffix = documents.rsplit("_", 1)[-1]
+        for physical_name, physical_fingerprint in (
+            (documents, document_fingerprint),
+            (passages, passage_fingerprint),
+        ):
+            if physical_fingerprint and not self._fingerprint_matches(
+                physical_fingerprint, suffix
+            ):
+                raise QdrantStoreError(
+                    "model_fingerprint_mismatch",
+                    f"collection {physical_name!r} has a different model fingerprint",
+                )
+        if document_fingerprint and passage_fingerprint and not self._fingerprint_matches(
+            document_fingerprint, passage_fingerprint
+        ):
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch",
+                "current aliases point to different model fingerprints",
+            )
+        for metadata_key in (
+            "collection_schema_version",
+            "photomat_collection_schema_version",
+            "chunk_schema_version",
+            "photomat_chunk_schema_version",
+            "sparse_model",
+            "photomat_sparse_model",
+            "dense_dimension",
+            "photomat_dense_dimension",
+        ):
+            document_value = documents_metadata.get(metadata_key)
+            passage_value = passages_metadata.get(metadata_key)
+            if (
+                document_value is not None
+                and passage_value is not None
+                and str(document_value) != str(passage_value)
+            ):
+                raise QdrantStoreError(
+                    "schema_mismatch",
+                    "current aliases have incompatible generation metadata",
+                )
+        for physical_name, physical_metadata in (
+            (documents, documents_metadata),
+            (passages, passages_metadata),
+        ):
+            actual_schema = physical_metadata.get("collection_schema_version") or physical_metadata.get(
+                "photomat_collection_schema_version"
+            )
+            if actual_schema is not None and int(actual_schema) != COLLECTION_SCHEMA_VERSION:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {physical_name!r} has an incompatible schema"
+                )
+            actual_sparse_model = physical_metadata.get("sparse_model") or physical_metadata.get(
+                "photomat_sparse_model"
+            )
+            if actual_sparse_model is not None and str(actual_sparse_model) != self.sparse_model:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {physical_name!r} has an incompatible sparse model"
+                )
+        await self._validate_generation_control(
+            documents,
+            document_fingerprint,
+            documents_metadata,
+            passages_metadata,
+        )
         known_documents = self._generations.get(documents)
         known_passages = self._generations.get(passages)
         if (
@@ -663,16 +934,7 @@ class QdrantLiteratureStore:
                 "current aliases point to different model fingerprints",
             )
         if documents not in self._generations or passages not in self._generations:
-            try:
-                info = await self._client.get_collection(documents)
-                metadata = _metadata(info)
-            except Exception:
-                metadata = {}
-            fingerprint = str(
-                metadata.get("model_fingerprint")
-                or metadata.get("photomat_model_fingerprint")
-                or documents.rsplit("_", 1)[-1]
-            )
+            fingerprint = document_fingerprint or passage_fingerprint or suffix
             generation = CollectionGeneration(
                 fingerprint=fingerprint,
                 documents_physical=documents,
@@ -744,12 +1006,14 @@ class QdrantLiteratureStore:
     def _passage_filter(
         self,
         *,
-        workspace_id: str | None = None,
+        workspace_id: str,
         document_id: str | None = None,
         document_revision: str | None = None,
         ingest_state: IngestState | None = None,
         revision_except: str | None = None,
     ) -> Any:
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
         models = _qdrant_models()
         extra: list[Any] = []
         if revision_except is not None:
@@ -887,7 +1151,7 @@ class QdrantLiteratureStore:
         revision: str,
         state: IngestState,
         *,
-        workspace_id: str | None = None,
+        workspace_id: str,
     ) -> int:
         generation = await self._current_or_error()
         result = await self._client.count(
@@ -909,7 +1173,7 @@ class QdrantLiteratureStore:
         revision: str,
         state: IngestState,
         *,
-        workspace_id: str | None = None,
+        workspace_id: str,
     ) -> None:
         generation = await self._current_or_error()
         await self._client.set_payload(
@@ -929,7 +1193,7 @@ class QdrantLiteratureStore:
         document_id: str,
         keep_revision: str,
         *,
-        workspace_id: str | None = None,
+        workspace_id: str,
     ) -> None:
         generation = await self._current_or_error()
         await self._client.delete(
@@ -944,7 +1208,7 @@ class QdrantLiteratureStore:
         )
 
     async def delete_document_passages(
-        self, document_id: str, *, workspace_id: str | None = None
+        self, document_id: str, *, workspace_id: str
     ) -> None:
         generation = await self._current_or_error()
         await self._client.delete(
@@ -1132,63 +1396,91 @@ class QdrantLiteratureStore:
         destination: Path,
     ) -> None:
         method = getattr(self._client, "download_snapshot", None)
-        if method is None:
-            # qdrant-client 1.19 exposes download through its generated async
-            # snapshots API rather than the high-level client.  Keep that
-            # detail private to this adapter and retain a simple injected
-            # ``download_snapshot`` hook for hermetic tests.
-            remote = getattr(self._client, "_client", None)
-            api = getattr(getattr(remote, "openapi_client", None), "snapshots_api", None)
-            method = getattr(api, "get_snapshot", None)
-            if method is None:
-                raise QdrantStoreError(
-                    "snapshot_download_failed",
-                    "the configured Qdrant client does not expose snapshot download",
-                )
-            result = method(collection_name, snapshot_name)
+        if method is not None:
+            try:
+                result = method(collection_name, snapshot_name)
+            except TypeError:
+                result = method(collection_name, snapshot_name, destination)
             if inspect.isawaitable(result):
                 result = await result
             if isinstance(result, (bytes, bytearray)):
                 destination.write_bytes(bytes(result))
                 return
-            read = getattr(result, "read", None)
-            if read is not None:
-                content = read()
-                if inspect.isawaitable(content):
-                    content = await content
-                if isinstance(content, (bytes, bytearray)):
-                    destination.write_bytes(bytes(content))
+            if isinstance(result, str):
+                source = Path(result)
+                if source.is_file():
+                    destination.write_bytes(source.read_bytes())
+                    return
+            if isinstance(result, Path):
+                if result.is_file():
+                    destination.write_bytes(result.read_bytes())
                     return
             content = _record_attr(result, "content", None)
             if isinstance(content, (bytes, bytearray)):
                 destination.write_bytes(bytes(content))
                 return
+            if destination.is_file():
+                return
             raise QdrantStoreError(
                 "snapshot_download_failed", f"snapshot {snapshot_name!r} was not downloaded"
             )
-        try:
-            result = method(collection_name, snapshot_name)
-        except TypeError:
-            result = method(collection_name, snapshot_name, destination)
-        if inspect.isawaitable(result):
-            result = await result
-        if isinstance(result, (bytes, bytearray)):
-            destination.write_bytes(bytes(result))
+
+        if self.snapshot_base_url is None:
+            raise QdrantStoreError(
+                "snapshot_download_failed",
+                "Qdrant REST snapshot base URL is not configured",
+            )
+        url = (
+            f"{self.snapshot_base_url}/collections/{quote(collection_name, safe='')}"
+            f"/snapshots/{quote(snapshot_name, safe='')}"
+        )
+        headers = (
+            {"api-key": self._snapshot_api_key}
+            if self._snapshot_api_key
+            else {}
+        )
+        timeout = self.timeout_seconds if self.timeout_seconds is not None else 20
+        transport = self._snapshot_transport
+        if transport is None:
+            try:
+                import httpx
+            except ImportError as exc:  # pragma: no cover - optional capability path
+                raise QdrantStoreError(
+                    "snapshot_download_failed", "httpx is required for REST snapshot download"
+                ) from exc
+            async with httpx.AsyncClient(timeout=timeout) as http:
+                async with http.stream("GET", url, headers=headers) as response:
+                    await self._write_snapshot_response(response, destination, snapshot_name)
             return
-        if isinstance(result, str):
-            source = Path(result)
-            if source.is_file():
-                destination.write_bytes(source.read_bytes())
-                return
-        if isinstance(result, Path):
-            if result.is_file():
-                destination.write_bytes(result.read_bytes())
-                return
-        content = _record_attr(result, "content", None)
+        get = getattr(transport, "get", None)
+        if get is None:
+            raise QdrantStoreError(
+                "snapshot_download_failed", "snapshot transport does not expose GET"
+            )
+        response = get(url, headers=headers, timeout=timeout)
+        if inspect.isawaitable(response):
+            response = await response
+        await self._write_snapshot_response(response, destination, snapshot_name)
+
+    async def _write_snapshot_response(
+        self, response: Any, destination: Path, snapshot_name: str
+    ) -> None:
+        status_code = _record_attr(response, "status_code", None)
+        if status_code is None or not 200 <= int(status_code) < 300:
+            raise QdrantStoreError(
+                "snapshot_download_failed",
+                f"snapshot {snapshot_name!r} returned an invalid HTTP status",
+            )
+        aiter_bytes = getattr(response, "aiter_bytes", None)
+        if aiter_bytes is not None:
+            with destination.open("wb") as handle:
+                async for chunk in aiter_bytes(1024 * 1024):
+                    if isinstance(chunk, (bytes, bytearray)):
+                        handle.write(bytes(chunk))
+            return
+        content = _record_attr(response, "content", None)
         if isinstance(content, (bytes, bytearray)):
             destination.write_bytes(bytes(content))
-            return
-        if destination.is_file():
             return
         raise QdrantStoreError(
             "snapshot_download_failed", f"snapshot {snapshot_name!r} was not downloaded"
