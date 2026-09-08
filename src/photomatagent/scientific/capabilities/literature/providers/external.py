@@ -24,19 +24,16 @@ def _is_retryable(exc: BaseException) -> bool:
     if status is not None:
         return status == 408 or status == 429 or 500 <= status <= 599
     # SDK and HTTP transport exception types differ between compatible clients.
-    # Transport failures are identified without importing an optional HTTP
-    # package at module import time.  RuntimeError is included because the
-    # OpenAI SDK's test/fake transports commonly use it for connection errors.
-    if isinstance(exc, (OSError, TimeoutError, ConnectionError, RuntimeError)):
+    # Use concrete transport/timeout bases and exception names only; a generic
+    # application RuntimeError must not become retryable by accident.
+    if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
         return True
-    exception_name = type(exc).__name__.casefold()
-    exception_module = type(exc).__module__.casefold()
-    return (
-        exception_module.startswith(("httpx", "openai"))
-        or any(
-            marker in exception_name
-            for marker in ("transport", "connection", "timeout")
-        )
+    exception_names = " ".join(
+        cls.__name__ for cls in type(exc).__mro__
+    ).casefold()
+    return any(
+        marker in exception_names
+        for marker in ("transport", "connection", "connect", "timeout")
     )
 
 
@@ -217,11 +214,12 @@ class CohereCompatibleRerankerProvider:
             )
         if not passages or top_n == 0:
             return []
+        requested_top_n = min(top_n, len(passages))
         payload = {
             "model": self._model_name,
             "query": query,
             "documents": list(passages),
-            "top_n": top_n,
+            "top_n": requested_top_n,
         }
         try:
             response = await self._transport().post(
@@ -288,7 +286,7 @@ class CohereCompatibleRerankerProvider:
             seen.add(index)
             results.append(RerankScore(index=index, score=numeric_score))
         results.sort(key=lambda item: (-item.score, item.index))
-        return results
+        return results[:requested_top_n]
 
 
 __all__ = [

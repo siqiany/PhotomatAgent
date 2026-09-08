@@ -233,6 +233,15 @@ def test_openai_embedding_does_not_retry_non_retryable_status():
     assert len(client.embeddings.calls) == 1
 
 
+def test_openai_embedding_does_not_retry_plain_runtime_error():
+    client = _FakeOpenAIClient([RuntimeError("application bug")])
+    provider = OpenAICompatibleEmbeddingProvider("embedding-test", 2, client=client)
+    with pytest.raises(RagProviderError) as exc:
+        asyncio.run(provider.embed_documents(["one"]))
+    assert exc.value.code == "embedding_request_failed"
+    assert len(client.embeddings.calls) == 1
+
+
 class _FakeHTTPResponse:
     status_code = 200
 
@@ -281,9 +290,32 @@ def test_cohere_reranker_posts_bounded_payload_and_validates_results():
         "model": "rerank-test",
         "query": "query",
         "documents": ["one", "two"],
-        "top_n": 10,
+        "top_n": 2,
     }
     assert "secret-value" not in str(transport.calls[0]["json"])
+
+
+def test_cohere_reranker_clamps_top_n_and_response_size():
+    transport = _FakeHTTPTransport(
+        _FakeHTTPResponse(
+            {
+                "results": [
+                    {"index": 0, "relevance_score": 0.8},
+                    {"index": 1, "relevance_score": 0.2},
+                ]
+            }
+        )
+    )
+    provider = CohereCompatibleRerankerProvider(
+        "rerank-test",
+        "https://rerank.test/v1",
+        "secret-value",
+        transport=transport,
+    )
+    scores = asyncio.run(provider.rerank("query", ["one", "two"], top_n=1))
+    assert len(scores) == 1
+    assert scores[0] == RerankScore(index=0, score=0.8)
+    assert transport.calls[0]["json"]["top_n"] == 1
 
 
 def test_cohere_reranker_accepts_mapping_transport_response():
