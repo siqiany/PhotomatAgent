@@ -93,3 +93,57 @@ The repository-wide suite was also attempted with `./.venv/bin/pytest -q -x`:
 `kdotpy` is not installed (`external_solver_unavailable` is returned before
 the test's legacy `requires` assertion). This failure is outside Task 6 and no
 K·p files were changed.
+
+## Task 6 fix round — evaluator and live-contract gaps
+
+This round closes the review findings without broadening production authority:
+
+- The fixture evaluator requests `top_k=10` once per judgment, computes
+  Recall@5 from ranks 1–5, and computes MRR@10 from ranks 1–10.  A rank-8
+  regression judgment is included and asserts Recall@5 = 0 while MRR@10 = 1/8.
+- The frozen fixture contains 22 synthetic judgments, each with explicit
+  `fixture_author` and `license` metadata.  The evaluation test routes all 22
+  through the actual `LiteratureRetriever` with a deterministic fake embedder,
+  reranker, and store.  Its asserted metrics are Recall@5 = 1.0, MRR@10 =
+  1.0, no-result rate = 2/22, provenance completeness = 1.0, duplicate rate =
+  0.0, and `passed = true`.
+- Gated live coverage now exercises dense-only and sparse-only RRF candidates,
+  indexed year/source-path filters, rejection of an unindexed expensive filter
+  under strict mode, document update/delete, and persistence across an actual
+  `docker compose -f compose.qdrant.yaml restart qdrant`.  Teardown and all
+  points remain under one UUID-bearing `photomat_test_` prefix; no current
+  production aliases are inspected or modified.
+- Every gated startup (including `PHOTOMATAGENT_QDRANT_TEST_URL` overrides)
+  checks `client.info().version == "1.18.2"` and fails clearly on mismatch.
+  Restart health and reconnect polling are bounded to 45 seconds.
+
+RED evidence for this round:
+
+```text
+./.venv/bin/pytest -q tests/test_rag_evaluation.py -k rank_boundary
+failed before the evaluator fix: the fixture retriever was called with
+top_k=5, so the regression assertion observed [5] instead of [10].
+```
+
+GREEN evidence after the fixes:
+
+```text
+./.venv/bin/pytest -q tests/test_rag_evaluation.py
+6 passed
+
+./.venv/bin/pytest -q tests/test_rag_evaluation.py tests/test_benchmark_qdrant_rag.py tests/test_qdrant_rag_integration.py tests/test_rag_cli.py tests/test_qdrant_store.py tests/test_rag_ingestion.py tests/test_rag_retrieval.py tests/test_literature_rag.py
+100 passed, 9 skipped
+
+./.venv/bin/mypy src/photomatagent/cli/rag.py scripts/benchmark_qdrant_rag.py tests/test_rag_evaluation.py tests/test_qdrant_rag_integration.py tests/test_benchmark_qdrant_rag.py
+Success: no issues found in 5 source files
+
+git diff --check
+passed
+```
+
+Docker remains unavailable in this WSL environment (`docker --version`:
+`/bin/bash: docker: command not found`).  Consequently the nine live tests,
+including update/delete, restart persistence, strict-filter rejection, and the
+exact server-version check against a real endpoint, remain explicitly skipped
+or unverified locally.  No local-mode Qdrant replacement was used, and no
+real papers, external providers, or production collections were touched.

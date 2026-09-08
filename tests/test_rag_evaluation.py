@@ -39,11 +39,12 @@ class _FixtureRetriever:
     def __init__(self, rows_by_query: dict[str, list[dict[str, Any]]]) -> None:
         self.rows_by_query = rows_by_query
         self.queries: list[str] = []
+        self.top_ks: list[int] = []
 
     async def search(self, query: str, *, workspace_id: str, top_k: int) -> Any:
         assert workspace_id == "fixture-workspace"
-        assert top_k == 5
         self.queries.append(query)
+        self.top_ks.append(top_k)
         return SimpleNamespace(
             passages=tuple(self.rows_by_query.get(query, ())),
             diagnostics=SimpleNamespace(
@@ -68,6 +69,8 @@ def test_fixture_has_twenty_authored_judgments_and_required_fields() -> None:
         and item["query"].strip()
         and isinstance(item.get("relevant_passage_ids"), list)
         and isinstance(item.get("category"), str)
+        and item.get("fixture_author") == "PhotomatAgent Task 6 synthetic authors"
+        and item.get("license") == "CC0-1.0 synthetic text"
         for item in rows
     )
 
@@ -104,6 +107,118 @@ def test_fixture_evaluation_reports_quality_metrics_and_label() -> None:
     assert report["provenance_completeness"] == pytest.approx(1.0)
     assert report["passed"] is True
     assert retriever.queries == ["first", "second"]
+    assert retriever.top_ks == [10, 10]
+
+
+def test_fixture_evaluation_requests_ten_results_for_mrr_but_scores_recall_at_five() -> None:
+    from photomatagent.cli.rag import evaluate_retrieval_fixture
+
+    ranked = [_passage(f"p-distractor-{index}") for index in range(7)]
+    ranked.append(_passage("p-rank-eight"))
+    retriever = _FixtureRetriever({"rank-eight": ranked})
+    report = asyncio.run(
+        evaluate_retrieval_fixture(
+            retriever,
+            [
+                {
+                    "query": "rank-eight",
+                    "relevant_passage_ids": ["p-rank-eight"],
+                    "category": "rank-boundary",
+                }
+            ],
+            workspace_id="fixture-workspace",
+        )
+    )
+
+    assert retriever.top_ks == [10]
+    assert report["recall_at_5"] == pytest.approx(0.0)
+    assert report["mrr_at_10"] == pytest.approx(1 / 8)
+
+
+def test_all_fixture_judgments_run_through_real_retriever_orchestration() -> None:
+    from photomatagent.scientific.capabilities.literature.qdrant_store import SearchCandidate
+    from photomatagent.scientific.capabilities.literature.retrieval import LiteratureRetriever
+    from photomatagent.cli.rag import evaluate_retrieval_fixture
+
+    judgments = _fixture_rows()
+
+    class _CompleteFixtureStore:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def hybrid_candidates(
+            self, query: str, dense: list[float], *, workspace_id: str, limit: int
+        ) -> list[SearchCandidate]:
+            del dense, workspace_id, limit
+            self.queries.append(query)
+            judgment = next(item for item in judgments if item["query"] == query)
+            candidates: list[SearchCandidate] = []
+            for rank, passage_id in enumerate(judgment["relevant_passage_ids"]):
+                passage = _passage(str(passage_id))
+                candidates.append(
+                    SearchCandidate(
+                        passage_id=str(passage_id),
+                        score=1.0 - rank * 0.01,
+                        payload={
+                            **passage,
+                            "record_type": "passage",
+                            "workspace_id": "fixture-workspace",
+                            "ingest_state": "ready",
+                        },
+                    )
+                )
+            return candidates
+
+        async def dense_candidates(self, *args: Any, **kwargs: Any) -> list[SearchCandidate]:
+            return await self.hybrid_candidates(
+                str(args[0]) if args else "",
+                [],
+                workspace_id=str(kwargs.get("workspace_id", "")),
+                limit=int(kwargs.get("limit", 10)),
+            )
+
+        async def sparse_candidates(self, *args: Any, **kwargs: Any) -> list[SearchCandidate]:
+            return await self.hybrid_candidates(
+                str(args[0]) if args else "",
+                [],
+                workspace_id=str(kwargs.get("workspace_id", "")),
+                limit=int(kwargs.get("limit", 10)),
+            )
+
+        async def retrieve_passages(self, workspace_id: str, passage_ids: list[str]) -> list[Any]:
+            del workspace_id, passage_ids
+            return []
+
+    class _DeterministicEmbedder:
+        async def embed_query(self, query: str) -> list[float]:
+            del query
+            return [1.0] + [0.0] * 7
+
+    class _DisabledReranker:
+        async def rerank(self, query: str, passages: list[str], *, top_n: int) -> list[Any]:
+            del query, passages, top_n
+            return []
+
+    store = _CompleteFixtureStore()
+    retriever = LiteratureRetriever(store, _DeterministicEmbedder(), _DisabledReranker())
+    report = asyncio.run(
+        evaluate_retrieval_fixture(
+            retriever,
+            judgments,
+            workspace_id="fixture-workspace",
+        )
+    )
+
+    assert report["queries"] == 22
+    assert report["relevant_queries"] == 20
+    assert report["fixture_authors"] == ["PhotomatAgent Task 6 synthetic authors"]
+    assert report["fixture_licenses"] == ["CC0-1.0 synthetic text"]
+    assert len(store.queries) == 22
+    assert report["recall_at_5"] >= 0.90
+    assert report["no_result_rate"] == pytest.approx(2 / 22)
+    assert report["provenance_completeness"] == pytest.approx(1.0)
+    assert report["duplicate_rate"] == pytest.approx(0.0)
+    assert report["passed"] is True
 
 
 def test_fixture_evaluation_fails_thresholds_for_duplicate_and_missing_provenance() -> None:

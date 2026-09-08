@@ -157,6 +157,10 @@ def _load_evaluation_fixture(path: Path) -> list[dict[str, Any]]:
             or not all(isinstance(item, str) and item for item in relevant)
             or not isinstance(category, str)
             or not category.strip()
+            or not isinstance(raw.get("fixture_author"), str)
+            or not raw["fixture_author"].strip()
+            or not isinstance(raw.get("license"), str)
+            or not raw["license"].strip()
         ):
             raise ValueError(f"frozen RAG evaluation row {index} is malformed")
         judgments.append(
@@ -164,6 +168,8 @@ def _load_evaluation_fixture(path: Path) -> list[dict[str, Any]]:
                 "query": query,
                 "relevant_passage_ids": list(dict.fromkeys(relevant)),
                 "category": category,
+                "fixture_author": raw["fixture_author"],
+                "license": raw["license"],
             }
         )
     return judgments
@@ -249,7 +255,10 @@ async def evaluate_retrieval_fixture(
             result = await retriever.search(
                 query,
                 workspace_id=workspace_id,
-                top_k=5,
+                # Fetch ten once: Recall@5 is computed from the first five,
+                # while MRR@10 must be able to observe a relevant hit at
+                # ranks 6–10.
+                top_k=10,
             )
         except Exception as exc:
             code = getattr(exc, "code", None) or type(exc).__name__.casefold()
@@ -265,17 +274,21 @@ async def evaluate_retrieval_fixture(
                 }
             )
             continue
-        passages = list(_evaluation_value(result, "passages", ()) or ())[:5]
+        passages = list(_evaluation_value(result, "passages", ()) or ())[:10]
         if not passages:
             no_result_queries += 1
         ids = [_evaluation_passage_id(item) for item in passages]
         first_relevant_rank: int | None = None
         if relevant_ids:
             relevant_queries += 1
-            for rank, passage_id in enumerate(ids, start=1):
-                if passage_id in relevant_ids:
-                    first_relevant_rank = rank
-                    break
+            first_relevant_rank = next(
+                (
+                    rank
+                    for rank, passage_id in enumerate(ids, start=1)
+                    if passage_id in relevant_ids
+                ),
+                None,
+            )
             if first_relevant_rank is not None and first_relevant_rank <= 5:
                 recall_hits += 1
             if first_relevant_rank is not None and first_relevant_rank <= 10:
@@ -334,10 +347,26 @@ async def evaluate_retrieval_fixture(
         "duplicate_rate": duplicate_rate,
         "provenance_completeness": provenance_completeness,
     }
+    fixture_authors = sorted(
+        {
+            str(judgment.get("fixture_author", "")).strip()
+            for judgment in judgments
+            if str(judgment.get("fixture_author", "")).strip()
+        }
+    )
+    fixture_licenses = sorted(
+        {
+            str(judgment.get("license", "")).strip()
+            for judgment in judgments
+            if str(judgment.get("license", "")).strip()
+        }
+    )
     return {
         "label": "fixture-specific",
         "fixture_specific": True,
         "corpus_wide_claim": False,
+        "fixture_authors": fixture_authors,
+        "fixture_licenses": fixture_licenses,
         "queries": len(judgments),
         "relevant_queries": relevant_queries,
         "returned_results": returned_count,

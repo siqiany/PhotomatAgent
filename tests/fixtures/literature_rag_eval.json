@@ -2,111 +2,155 @@
   {
     "query": "HgTe quantum dot detector responsivity at 80 K",
     "relevant_passage_ids": ["fixture-hgte-performance"],
-    "category": "cross_lingual_numeric"
+    "category": "cross_lingual_numeric",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "HgTe 量子点探测器在 80 K 的响应率是多少？",
     "relevant_passage_ids": ["fixture-hgte-performance"],
-    "category": "cross_lingual_numeric"
+    "category": "cross_lingual_numeric",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "What wavelength band is used by the mid-wave infrared device?",
     "relevant_passage_ids": ["fixture-mwir-band"],
-    "category": "wavelength_band"
+    "category": "wavelength_band",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "中波红外 MWIR 器件的工作波段是什么？",
     "relevant_passage_ids": ["fixture-mwir-band"],
-    "category": "abbreviation"
+    "category": "abbreviation",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "How is detectivity D-star reported in the synthetic detector study?",
     "relevant_passage_ids": ["fixture-dstar-formula"],
-    "category": "formula"
+    "category": "formula",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "D* 比探测率的公式包含哪些量？",
     "relevant_passage_ids": ["fixture-dstar-formula"],
-    "category": "formula"
+    "category": "formula",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "Find the dark current density in nA per square micrometre.",
     "relevant_passage_ids": ["fixture-dark-current"],
-    "category": "unit"
+    "category": "unit",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "暗电流密度 nA μm−2 的数值是多少？",
     "relevant_passage_ids": ["fixture-dark-current"],
-    "category": "cross_lingual_unit"
+    "category": "cross_lingual_unit",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "Which passage describes a 3.5 micrometre peak response?",
     "relevant_passage_ids": ["fixture-hgte-performance"],
-    "category": "unit_synonym"
+    "category": "unit_synonym",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "Locate the 3.5 μm peak wavelength measurement.",
     "relevant_passage_ids": ["fixture-hgte-performance"],
-    "category": "unicode_unit"
+    "category": "unicode_unit",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "What band gap was measured for the lead sulfide nanocrystal film?",
     "relevant_passage_ids": ["fixture-pbs-bandgap"],
-    "category": "metadata"
+    "category": "metadata",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "PbS 纳米晶薄膜的带隙是多少 eV？",
     "relevant_passage_ids": ["fixture-pbs-bandgap"],
-    "category": "cross_lingual_numeric"
+    "category": "cross_lingual_numeric",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "Search for photoconductive gain rather than responsivity.",
     "relevant_passage_ids": ["fixture-photoconductive-gain"],
-    "category": "synonym"
+    "category": "synonym",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "光电导增益和光电流放大描述在哪一段？",
     "relevant_passage_ids": ["fixture-photoconductive-gain"],
-    "category": "cross_lingual_synonym"
+    "category": "cross_lingual_synonym",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "Which paper reports a 12 ms response time?",
     "relevant_passage_ids": ["fixture-response-time"],
-    "category": "time_unit"
+    "category": "time_unit",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "响应时间为 12 ms 的器件性能段落。",
     "relevant_passage_ids": ["fixture-response-time"],
-    "category": "cross_lingual_unit"
+    "category": "cross_lingual_unit",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "Give the external quantum efficiency at 2.0 micrometres.",
     "relevant_passage_ids": ["fixture-eqe"],
-    "category": "abbreviation_numeric"
+    "category": "abbreviation_numeric",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "2.0 μm 处的外量子效率 EQE 是多少？",
     "relevant_passage_ids": ["fixture-eqe"],
-    "category": "cross_lingual_abbreviation"
+    "category": "cross_lingual_abbreviation",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "An unrelated question about medieval architecture",
     "relevant_passage_ids": [],
-    "category": "irrelevant"
+    "category": "irrelevant",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "与红外探测器无关的中世纪建筑问题",
     "relevant_passage_ids": [],
-    "category": "irrelevant_cross_lingual"
+    "category": "irrelevant_cross_lingual",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "What temperature condition accompanies the HgTe measurement?",
     "relevant_passage_ids": ["fixture-hgte-performance"],
-    "category": "metadata_condition"
+    "category": "metadata_condition",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   },
   {
     "query": "HgTe 性能测量对应的温度条件是什么？",
     "relevant_passage_ids": ["fixture-hgte-performance"],
-    "category": "cross_lingual_condition"
+    "category": "cross_lingual_condition",
+    "fixture_author": "PhotomatAgent Task 6 synthetic authors",
+    "license": "CC0-1.0 synthetic text"
   }
 ]

@@ -8,12 +8,16 @@ running and a disposable integration collection is acceptable.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+import subprocess
+import time
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote
 
@@ -35,6 +39,7 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
 
 INTEGRATION_ENV = "PHOTOMATAGENT_RUN_QDRANT_INTEGRATION"
 QDRANT_URL_ENV = "PHOTOMATAGENT_QDRANT_TEST_URL"
+EXPECTED_QDRANT_VERSION = "1.18.2"
 TEST_WORKSPACE_ID = "photomat-qdrant-fixture-workspace"
 IDENTITY = ModelIdentity(
     provider="fixture",
@@ -58,6 +63,21 @@ def _safe_test_prefix(value: str) -> str:
 def test_integration_prefix_must_be_explicitly_safe() -> None:
     with pytest.raises(RuntimeError, match="photomat_test_"):
         _safe_test_prefix("photomat_literature")
+
+
+def _assert_pinned_server_version(info: Any) -> str:
+    version = str(getattr(info, "version", "") or "").strip()
+    if version != EXPECTED_QDRANT_VERSION:
+        raise AssertionError(
+            f"Qdrant integration requires server {EXPECTED_QDRANT_VERSION}; "
+            f"endpoint reported {version or '<missing>'}"
+        )
+    return version
+
+
+def test_integration_requires_the_pinned_qdrant_server_version() -> None:
+    with pytest.raises(AssertionError, match=r"requires server 1\.18\.2"):
+        _assert_pinned_server_version(SimpleNamespace(version="1.19.0"))
 
 
 def _vector(axis: int, magnitude: float = 1.0) -> tuple[float, ...]:
@@ -106,6 +126,7 @@ def _point(
     ingest_state: IngestState = IngestState.READY,
     workspace_id: str = TEST_WORKSPACE_ID,
     chunk_index: int = 0,
+    year: int = 2026,
 ) -> PassagePoint:
     document_id = document_id_for(workspace_id, relative_path)
     revision = _sha(text + relative_path)
@@ -122,7 +143,7 @@ def _point(
         text=text,
         title=f"Synthetic {Path(relative_path).stem}",
         authors=("PhotomatAgent fixture authors",),
-        year=2026,
+        year=year,
         section="Results",
         heading_path="Results / Synthetic fixture",
         page_start=1,
@@ -158,6 +179,11 @@ async def real_store() -> Any:
             f"Qdrant Docker gate unavailable at {url}: "
             f"{type(exc).__name__}: {str(exc)[:240]}"
         )
+    try:
+        _assert_pinned_server_version(await client.info())
+    except Exception:
+        await client.close()
+        raise
     store = QdrantLiteratureStore(
         client,
         prefix=prefix,
@@ -171,14 +197,15 @@ async def real_store() -> Any:
     finally:
         # Only remove collections created under this UUID-bearing safety
         # prefix.  Never inspect or delete the user's current aliases.
+        cleanup_client = store._client
         try:
-            collections = await client.get_collections()
+            collections = await cleanup_client.get_collections()
             for descriptor in getattr(collections, "collections", ()):
                 name = str(getattr(descriptor, "name", ""))
                 if name.startswith(prefix + "_"):
-                    await client.delete_collection(name)
+                    await cleanup_client.delete_collection(name)
         finally:
-            await client.close()
+            await cleanup_client.close()
 
 
 @pytest.mark.asyncio
@@ -282,6 +309,134 @@ async def test_dense_sparse_rrf_and_filters(real_store: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rrf_has_dense_and_sparse_contributions_and_indexed_filters(
+    real_store: Any,
+) -> None:
+    generation = await real_store.resolve_current_generation()
+    assert generation is not None
+    dense_only = _point(
+        generation,
+        relative_path="synthetic/dense-only.pdf",
+        text="semantic detector material property",
+        axis=0,
+        year=2024,
+    )
+    sparse_only = _point(
+        generation,
+        relative_path="synthetic/sparse-only.pdf",
+        text="rarelexicaltoken spectral marker",
+        axis=1,
+        year=2025,
+    )
+    filter_match = _point(
+        generation,
+        relative_path="synthetic/filter-match.pdf",
+        text="metadata filter target",
+        axis=0,
+        year=2024,
+    )
+    filter_miss = _point(
+        generation,
+        relative_path="synthetic/filter-miss.pdf",
+        text="metadata filter distractor",
+        axis=0,
+        year=2025,
+    )
+    await real_store.upsert_passages(
+        [dense_only, sparse_only, filter_match, filter_miss],
+        batch_size=2,
+        workspace_id=TEST_WORKSPACE_ID,
+    )
+
+    dense_ids = {
+        candidate.passage_id
+        for candidate in await real_store.dense_candidates(
+            _vector(0), workspace_id=TEST_WORKSPACE_ID, limit=2
+        )
+    }
+    sparse_ids = {
+        candidate.passage_id
+        for candidate in await real_store.sparse_candidates(
+            "rarelexicaltoken", workspace_id=TEST_WORKSPACE_ID, limit=2
+        )
+    }
+    assert dense_only.passage_id in dense_ids
+    assert sparse_only.passage_id in sparse_ids
+    assert dense_only.passage_id not in sparse_ids
+    assert sparse_only.passage_id not in dense_ids
+
+    fused_ids = {
+        candidate.passage_id
+        for candidate in await real_store.hybrid_candidates(
+            "rarelexicaltoken",
+            _vector(0),
+            workspace_id=TEST_WORKSPACE_ID,
+            limit=4,
+        )
+    }
+    assert {dense_only.passage_id, sparse_only.passage_id} <= fused_ids
+
+    from qdrant_client import models
+
+    indexed_filter = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="workspace_id",
+                match=models.MatchValue(value=TEST_WORKSPACE_ID),
+            ),
+            models.FieldCondition(
+                key="record_type",
+                match=models.MatchValue(value="passage"),
+            ),
+            models.FieldCondition(
+                key="ingest_state",
+                match=models.MatchValue(value=IngestState.READY.value),
+            ),
+            models.FieldCondition(
+                key="year",
+                match=models.MatchValue(value=2024),
+            ),
+            models.FieldCondition(
+                key="relative_source_path",
+                match=models.MatchValue(value="synthetic/filter-match.pdf"),
+            ),
+        ]
+    )
+    filtered = await real_store._client.query_points(
+        collection_name=generation.passages_alias,
+        query=list(_vector(0)),
+        using="dense",
+        query_filter=indexed_filter,
+        limit=10,
+        with_payload=True,
+        with_vectors=False,
+    )
+    filtered_ids = {item.id for item in filtered.points}
+    assert filtered_ids == {filter_match.passage_id}
+
+    unindexed_filter = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="unindexed_expensive_filter",
+                match=models.MatchValue(value="x"),
+            )
+        ]
+    )
+    with pytest.raises(Exception) as error:
+        await real_store._client.query_points(
+            collection_name=generation.passages_alias,
+            query=list(_vector(0)),
+            using="dense",
+            query_filter=unindexed_filter,
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+    detail = str(error.value).casefold()
+    assert "index" in detail or getattr(error.value, "status_code", None) == 400
+
+
+@pytest.mark.asyncio
 async def test_staged_points_are_not_visible(real_store: Any) -> None:
     generation = await real_store.resolve_current_generation()
     assert generation is not None
@@ -308,6 +463,166 @@ async def test_staged_points_are_not_visible(real_store: Any) -> None:
     )
     after = await real_store.dense_candidates(
         _vector(2), workspace_id=TEST_WORKSPACE_ID, limit=5
+    )
+    assert point.passage_id in {candidate.passage_id for candidate in after}
+
+
+@pytest.mark.asyncio
+async def test_document_update_and_delete(real_store: Any) -> None:
+    generation = await real_store.resolve_current_generation()
+    assert generation is not None
+    old_text = "Version one of the synthetic update/delete document."
+    old_manifest = _manifest(
+        generation,
+        relative_path="synthetic/update-delete.pdf",
+        text=old_text,
+    )
+    old_point = _point(
+        generation,
+        relative_path="synthetic/update-delete.pdf",
+        text=old_text,
+        axis=5,
+    )
+    await real_store.upsert_document(old_manifest)
+    await real_store.upsert_passages(
+        [old_point], batch_size=1, workspace_id=TEST_WORKSPACE_ID
+    )
+
+    new_text = "Version two of the synthetic update/delete document."
+    new_manifest = replace(
+        old_manifest,
+        content_sha256=_sha(new_text),
+        chunk_count=1,
+        indexed_at=datetime.now(timezone.utc),
+    )
+    new_point = _point(
+        generation,
+        relative_path="synthetic/update-delete.pdf",
+        text=new_text,
+        axis=6,
+    )
+    await real_store.delete_document_passages(
+        old_manifest.document_id,
+        workspace_id=TEST_WORKSPACE_ID,
+    )
+    await real_store.upsert_document(new_manifest)
+    await real_store.upsert_passages(
+        [new_point], batch_size=1, workspace_id=TEST_WORKSPACE_ID
+    )
+    manifests = await real_store.list_document_manifests(TEST_WORKSPACE_ID)
+    assert manifests[old_manifest.document_id].content_sha256 == _sha(new_text)
+    current = await real_store.dense_candidates(
+        _vector(6), workspace_id=TEST_WORKSPACE_ID, limit=5
+    )
+    assert new_point.passage_id in {candidate.passage_id for candidate in current}
+    assert old_point.passage_id not in {candidate.passage_id for candidate in current}
+
+    # The store deliberately has no broad delete API.  The integration test
+    # exercises the exact, workspace-owned document point through Qdrant's
+    # typed client operation and proves both document and passages are gone.
+    from qdrant_client import models
+
+    await real_store._client.delete(
+        collection_name=generation.documents_alias,
+        points_selector=models.PointIdsList(points=[old_manifest.document_id]),
+        wait=True,
+    )
+    await real_store.delete_document_passages(
+        old_manifest.document_id,
+        workspace_id=TEST_WORKSPACE_ID,
+    )
+    assert await real_store._client.retrieve(
+        collection_name=generation.documents_alias,
+        ids=[old_manifest.document_id],
+        with_payload=True,
+        with_vectors=False,
+    ) == []
+    assert await real_store.dense_candidates(
+        _vector(6), workspace_id=TEST_WORKSPACE_ID, limit=5
+    ) == []
+
+
+def _restart_compose_service(repo_root: Path) -> None:
+    try:
+        completed = subprocess.run(
+            ["docker", "compose", "-f", "compose.qdrant.yaml", "restart", "qdrant"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("docker executable is unavailable") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(
+            "pinned Compose Qdrant restart failed: " + detail[:400]
+        )
+
+
+async def _reconnect_after_restart(url: str) -> Any:
+    from qdrant_client import AsyncQdrantClient
+
+    deadline = time.monotonic() + 45.0
+    last_error = ""
+    while time.monotonic() < deadline:
+        client = AsyncQdrantClient(url=url, timeout=2, prefer_grpc=False)
+        try:
+            info = await client.info()
+            _assert_pinned_server_version(info)
+            return client
+        except AssertionError:
+            # A reachable but unpinned endpoint is a contract failure, not a
+            # transient health-check failure.  Surface the exact version
+            # mismatch immediately instead of retrying for the full bound.
+            await client.close()
+            raise
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            await client.close()
+            await asyncio.sleep(0.5)
+    raise RuntimeError(
+        f"Qdrant did not become healthy after restart: {last_error}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_qdrant_restart_preserves_test_point(real_store: Any) -> None:
+    generation = await real_store.resolve_current_generation()
+    assert generation is not None
+    point = _point(
+        generation,
+        relative_path="synthetic/restart-persistence.pdf",
+        text="This synthetic point must survive the Qdrant service restart.",
+        axis=7,
+    )
+    await real_store.upsert_passages(
+        [point], batch_size=1, workspace_id=TEST_WORKSPACE_ID
+    )
+    before = await real_store.dense_candidates(
+        _vector(7), workspace_id=TEST_WORKSPACE_ID, limit=5
+    )
+    assert point.passage_id in {candidate.passage_id for candidate in before}
+
+    repo_root = Path(__file__).resolve().parents[1]
+    url = os.environ.get(QDRANT_URL_ENV, "http://127.0.0.1:6333").strip()
+    try:
+        await asyncio.to_thread(_restart_compose_service, repo_root)
+    except RuntimeError as exc:
+        if "docker executable is unavailable" in str(exc):
+            pytest.skip(str(exc))
+        raise
+    reconnected = await _reconnect_after_restart(url)
+    old_client = real_store._client
+    real_store._client = reconnected
+    await old_client.close()
+
+    resolved = await real_store.resolve_current_generation()
+    assert resolved is not None
+    assert resolved.fingerprint == generation.fingerprint
+    after = await real_store.dense_candidates(
+        _vector(7), workspace_id=TEST_WORKSPACE_ID, limit=5
     )
     assert point.passage_id in {candidate.passage_id for candidate in after}
 
