@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from functools import lru_cache
 from math import isfinite
 from typing import Any
 
@@ -19,22 +20,36 @@ def _status_code(exc: BaseException) -> int | None:
     return status if isinstance(status, int) else None
 
 
+@lru_cache(maxsize=1)
+def _retryable_exception_types() -> tuple[type[BaseException], ...]:
+    """Return explicitly supported transport/timeout exception classes."""
+    types: list[type[BaseException]] = [OSError, TimeoutError, ConnectionError]
+    try:
+        import httpx
+    except ImportError:
+        pass
+    else:
+        for name in ("TransportError", "TimeoutException"):
+            candidate = getattr(httpx, name, None)
+            if isinstance(candidate, type) and issubclass(candidate, BaseException):
+                types.append(candidate)
+    try:
+        import openai
+    except ImportError:
+        pass
+    else:
+        for name in ("APIConnectionError", "APITimeoutError"):
+            candidate = getattr(openai, name, None)
+            if isinstance(candidate, type) and issubclass(candidate, BaseException):
+                types.append(candidate)
+    return tuple(dict.fromkeys(types))
+
+
 def _is_retryable(exc: BaseException) -> bool:
     status = _status_code(exc)
     if status is not None:
         return status == 408 or status == 429 or 500 <= status <= 599
-    # SDK and HTTP transport exception types differ between compatible clients.
-    # Use concrete transport/timeout bases and exception names only; a generic
-    # application RuntimeError must not become retryable by accident.
-    if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
-        return True
-    exception_names = " ".join(
-        cls.__name__ for cls in type(exc).__mro__
-    ).casefold()
-    return any(
-        marker in exception_names
-        for marker in ("transport", "connection", "connect", "timeout")
-    )
+    return isinstance(exc, _retryable_exception_types())
 
 
 def _response_data(response: Any) -> Any:

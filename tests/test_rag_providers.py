@@ -208,7 +208,7 @@ def test_openai_embedding_restores_response_order_and_batches():
 
 
 def test_openai_embedding_retries_only_retryable_failures():
-    class TransportError(Exception):
+    class TransportError(OSError):
         pass
 
     client = _FakeOpenAIClient(
@@ -235,6 +235,23 @@ def test_openai_embedding_does_not_retry_non_retryable_status():
 
 def test_openai_embedding_does_not_retry_plain_runtime_error():
     client = _FakeOpenAIClient([RuntimeError("application bug")])
+    provider = OpenAICompatibleEmbeddingProvider("embedding-test", 2, client=client)
+    with pytest.raises(RagProviderError) as exc:
+        asyncio.run(provider.embed_documents(["one"]))
+    assert exc.value.code == "embedding_request_failed"
+    assert len(client.embeddings.calls) == 1
+
+
+def test_openai_embedding_does_not_retry_name_only_transport_exception():
+    class TransportNamedApplicationError(Exception):
+        pass
+
+    client = _FakeOpenAIClient(
+        [
+            TransportNamedApplicationError("application failure"),
+            SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[1, 2])]),
+        ]
+    )
     provider = OpenAICompatibleEmbeddingProvider("embedding-test", 2, client=client)
     with pytest.raises(RagProviderError) as exc:
         asyncio.run(provider.embed_documents(["one"]))
