@@ -17,6 +17,10 @@ import pytest
 from photomatagent.scientific.capabilities.literature.qdrant_store import (
     SearchCandidate,
 )
+from photomatagent.scientific.capabilities.literature.models import (
+    IngestState,
+    PassagePoint,
+)
 from photomatagent.scientific.capabilities.literature.retrieval import (
     LiteratureRetriever,
     RagRetrievalError,
@@ -272,6 +276,62 @@ async def test_dedupe_prefers_score_then_newest_indexed_revision() -> None:
     assert result.passages[0].passage_id == "p-newest"
 
 
+def _passage_point_for_tie_break(
+    *, passage_id: str, revision: str, indexed_at: datetime
+) -> PassagePoint:
+    return PassagePoint(
+        schema_version=1,
+        record_type="passage",
+        workspace_id="ws",
+        document_id="doc",
+        document_revision=revision,
+        ingest_state=IngestState.READY,
+        passage_id=passage_id,
+        chunk_index=0,
+        text="same passage text",
+        title="HgTe detector",
+        authors=("Author",),
+        year=2024,
+        section="Results",
+        heading_path="Results",
+        page_start=1,
+        page_end=1,
+        previous_passage_id=None,
+        next_passage_id=None,
+        relative_source_path="papers/hgte.pdf",
+        model_fingerprint="f" * 64,
+        normalized_text_sha256=_hash("same passage text"),
+        indexed_at=indexed_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_equal_rrf_scores_prefer_newer_persisted_revision_timestamp() -> None:
+    old_point = _passage_point_for_tie_break(
+        passage_id="old",
+        revision="a" * 64,
+        indexed_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    new_point = _passage_point_for_tie_break(
+        passage_id="new",
+        revision="b" * 64,
+        indexed_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+    store = FakeStore(
+        [
+            SearchCandidate(old_point.passage_id, 0.5, old_point.to_payload()),
+            SearchCandidate(new_point.passage_id, 0.5, new_point.to_payload()),
+        ]
+    )
+
+    result = await LiteratureRetriever(store, FakeEmbedder(), DisabledReranker()).search(
+        "query", workspace_id="ws", top_k=1
+    )
+
+    assert result.passages[0].passage_id == "new"
+    assert result.passages[0].document_revision == "b" * 64
+
+
 @pytest.mark.asyncio
 async def test_reranker_is_bounded_and_invalid_indexes_degrade() -> None:
     store = FakeStore(candidate_fixture(60))
@@ -332,4 +392,40 @@ async def test_neighbor_context_is_one_bounded_call_and_isolated() -> None:
     assert store.neighbor_calls[0] == ("ws", ["before", "after"])
     assert len(result.passages[0].context_before) == 9
     assert result.passages[0].context_before.endswith("long")
+    assert result.passages[0].context_after == ""
+
+
+@pytest.mark.asyncio
+async def test_expand_radius_above_one_is_rejected_before_neighbor_fetch() -> None:
+    store = FakeStore()
+
+    with pytest.raises(ValueError, match="expand_radius"):
+        await LiteratureRetriever(store, FakeEmbedder(), DisabledReranker()).search(
+            "query", workspace_id="ws", top_k=1, expand_radius=2
+        )
+
+    assert store.neighbor_calls == []
+
+
+@pytest.mark.asyncio
+async def test_expand_radius_zero_skips_neighbor_fetch() -> None:
+    center = candidate_fixture(1)[0]
+    center = SearchCandidate(
+        passage_id="center",
+        score=1.0,
+        payload={
+            **center.payload,
+            "passage_id": "center",
+            "previous_passage_id": "before",
+            "next_passage_id": "after",
+        },
+    )
+    store = FakeStore([center])
+
+    result = await LiteratureRetriever(store, FakeEmbedder(), DisabledReranker()).search(
+        "query", workspace_id="ws", top_k=1, expand_radius=0
+    )
+
+    assert store.neighbor_calls == []
+    assert result.passages[0].context_before == ""
     assert result.passages[0].context_after == ""

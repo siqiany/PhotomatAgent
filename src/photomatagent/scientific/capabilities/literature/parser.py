@@ -207,6 +207,9 @@ def passage_points_for(
                 relative_source_path=relative_path,
                 model_fingerprint=model_fingerprint,
                 normalized_text_sha256=_normalized_text_sha256(passage.text),
+                # PaperRecord owns one ingestion timestamp, so every passage
+                # in this revision receives the same UTC value.
+                indexed_at=paper.indexed_at,
             )
         )
     return points

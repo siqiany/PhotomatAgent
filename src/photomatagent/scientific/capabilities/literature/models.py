@@ -153,6 +153,9 @@ class PassagePoint:
     limitations: tuple[str, ...] = ()
     dense: tuple[float, ...] = ()
     normalized_text_sha256: str = ""
+    # One timestamp is shared by every passage in a document revision.  It is
+    # additive so legacy payloads without the field can still be read.
+    indexed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_relative_source_path(self.relative_source_path)
@@ -166,6 +169,11 @@ class PassagePoint:
         object.__setattr__(self, "authors", tuple(self.authors))
         object.__setattr__(self, "limitations", tuple(self.limitations))
         object.__setattr__(self, "dense", tuple(float(value) for value in self.dense))
+        if self.indexed_at is not None:
+            indexed_at = self.indexed_at
+            if indexed_at.tzinfo is None:
+                indexed_at = indexed_at.replace(tzinfo=timezone.utc)
+            object.__setattr__(self, "indexed_at", indexed_at.astimezone(timezone.utc))
 
     def to_payload(self) -> dict[str, Any]:
         """Return the payload fields independent of the Qdrant vector."""
@@ -193,6 +201,7 @@ class PassagePoint:
             "limitations": list(self.limitations),
             "chunk_index": self.chunk_index,
             "normalized_text_sha256": self.normalized_text_sha256,
+            "indexed_at": self.indexed_at,
         }
 
 

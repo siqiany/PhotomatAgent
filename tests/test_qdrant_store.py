@@ -841,6 +841,24 @@ async def test_retrieve_passages_uses_bounded_server_side_workspace_ready_filter
     assert id_conditions[0].has_id == [f"passage-{i}" for i in range(50)]
 
 
+async def test_retrieve_passages_parses_indexed_at_from_payload() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    indexed_at = datetime(2025, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
+    base_point = _passage(model_fingerprint=generation.fingerprint)
+    point = PassagePoint(**{**base_point.__dict__, "indexed_at": indexed_at})
+    await store.upsert_passages([point], batch_size=1)
+    client.points[generation.passages_alias][point.passage_id].payload[
+        "indexed_at"
+    ] = indexed_at.isoformat()
+
+    retrieved = await store.retrieve_passages("workspace-a", [point.passage_id])
+
+    assert len(retrieved) == 1
+    assert retrieved[0].indexed_at == indexed_at
+
+
 async def test_revision_mutations_require_workspace_scope() -> None:
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_literature")

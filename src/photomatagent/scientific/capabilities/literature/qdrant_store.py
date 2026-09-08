@@ -1661,6 +1661,7 @@ class QdrantLiteratureStore:
                 limitations=tuple(str(item) for item in payload.get("limitations", [])),
                 dense=tuple(float(value) for value in dense),
                 normalized_text_sha256=str(payload.get("normalized_text_sha256", "")),
+                indexed_at=_datetime_value(payload.get("indexed_at")),
             )
         except (KeyError, TypeError, ValueError):
             return None

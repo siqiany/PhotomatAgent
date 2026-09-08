@@ -24,7 +24,6 @@ MAX_CANDIDATES = 50
 MIN_TOP_K = 1
 MAX_TOP_K = 10
 MAX_NEIGHBOR_IDS = 50
-MAX_NEIGHBOR_RADIUS = 50
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -263,8 +262,8 @@ class LiteratureRetriever:
             raise ValueError("workspace_id must be a non-empty string")
         if type(top_k) is not int or not MIN_TOP_K <= top_k <= MAX_TOP_K:
             raise ValueError("top_k must be between 1 and 10")
-        if type(expand_radius) is not int or expand_radius < 0:
-            raise ValueError("expand_radius must be non-negative")
+        if type(expand_radius) is not int or expand_radius not in (0, 1):
+            raise ValueError("expand_radius must be 0 or 1")
         if type(context_chars) is not int or context_chars < 0:
             raise ValueError("context_chars must be non-negative")
 
@@ -421,7 +420,7 @@ class LiteratureRetriever:
         if not rows or expand_radius <= 0 or context_chars == 0:
             return contexts
 
-        radius = min(expand_radius, MAX_NEIGHBOR_RADIUS)
+        radius = expand_radius
         requested_ids: list[str] = []
         requested_set: set[str] = set()
         # Candidate payloads are used only to discover already-known links.

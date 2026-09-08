@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -671,3 +671,24 @@ def test_passage_points_use_revision_ids_and_uuid_neighbours() -> None:
     assert points[0].next_passage_id == points[1].passage_id
     assert points[1].previous_passage_id == points[0].passage_id
     assert points[0].relative_source_path == "papers/paper.pdf"
+
+
+def test_passage_points_persist_one_revision_indexed_at_timestamp() -> None:
+    paper, chunks = _passages("first", "second")
+    indexed_at = datetime(2025, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
+    paper = PaperRecord(**{**paper.model_dump(), "indexed_at": indexed_at})
+
+    points = passage_points_for(
+        paper,
+        chunks,
+        WORKSPACE,
+        "papers/paper.pdf",
+        FINGERPRINT,
+        FINGERPRINT,
+    )
+
+    assert [point.indexed_at for point in points] == [indexed_at, indexed_at]
+    assert [point.to_payload()["indexed_at"] for point in points] == [
+        indexed_at,
+        indexed_at,
+    ]
