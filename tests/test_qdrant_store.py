@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,7 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
     CollectionGeneration,
     DocumentManifest,
     DocumentStatus,
+    GENERATION_POINT_NAMESPACE,
     IngestState,
     PassagePoint,
     QdrantLiteratureStore,
@@ -80,21 +82,43 @@ class FakeAsyncQdrantClient:
     async def get_collection(self, collection_name: str) -> SimpleNamespace:
         if collection_name not in self.collections:
             raise RuntimeError("missing collection")
+        stored = self.collections[collection_name]
+        params = stored.get("params")
+        if params is None and any(
+            key in stored
+            for key in (
+                "vectors_config",
+                "sparse_vectors_config",
+                "shard_number",
+                "replication_factor",
+                "on_disk_payload",
+            )
+        ):
+            params = SimpleNamespace(
+                vectors=stored.get("vectors_config"),
+                sparse_vectors=stored.get("sparse_vectors_config"),
+                shard_number=stored.get("shard_number"),
+                replication_factor=stored.get("replication_factor"),
+                on_disk_payload=stored.get("on_disk_payload"),
+            )
         config = SimpleNamespace(
-            metadata=self.collections[collection_name].get("metadata", {}),
-            params=self.collections[collection_name].get("params"),
-            on_disk_payload=self.collections[collection_name].get("on_disk_payload"),
-            strict_mode_config=self.collections[collection_name].get("strict_mode_config"),
+            metadata=stored.get("metadata", {}),
+            params=params,
+            on_disk_payload=stored.get("on_disk_payload"),
+            strict_mode_config=stored.get("strict_mode_config"),
         )
         return SimpleNamespace(
             config=config,
-            payload_schema=self.collections[collection_name].get("payload_schema", {}),
-            on_disk_payload=self.collections[collection_name].get("on_disk_payload"),
-            strict_mode_config=self.collections[collection_name].get("strict_mode_config"),
+            payload_schema=stored.get("payload_schema", {}),
+            on_disk_payload=stored.get("on_disk_payload"),
+            strict_mode_config=stored.get("strict_mode_config"),
         )
 
     async def create_payload_index(self, collection_name: str, **kwargs: Any) -> None:
         self.collections[collection_name].setdefault("payload_indexes", []).append(kwargs)
+        self.collections[collection_name].setdefault("payload_schema", {})[
+            kwargs["field_name"]
+        ] = SimpleNamespace(data_type=kwargs["field_schema"])
 
     async def update_collection_aliases(self, actions: list[Any], **kwargs: Any) -> bool:
         self.alias_update_calls.append(actions)
@@ -349,6 +373,20 @@ async def test_switch_current_generation_uses_one_atomic_alias_request() -> None
         client.collections[target] = dict(client.collections[source])
         client.collections[target]["metadata"] = dict(client.collections[source]["metadata"])
         client.collections[target]["metadata"]["model_fingerprint"] = "b" * 64
+    client.points[second.documents_physical] = {
+        str(uuid.uuid5(GENERATION_POINT_NAMESPACE, second.fingerprint)): _record(
+            "control",
+            {
+                "record_type": "generation",
+                "model_fingerprint": second.fingerprint,
+                "chunk_schema_version": 1,
+                "sparse_model": "qdrant/bm25",
+                "dense_dimension": 384,
+                "documents_physical": second.documents_physical,
+                "passages_physical": second.passages_physical,
+            },
+        )
+    }
     await store.switch_current_generation(second)
     assert len(client.alias_update_calls) == 1
     assert client.aliases[second.documents_alias] == second.documents_physical
@@ -430,6 +468,67 @@ async def test_resolve_rejects_generation_control_fingerprint_mismatch() -> None
     assert client.alias_update_calls == []
 
 
+async def test_resolve_fails_closed_when_generation_control_is_missing() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.points[generation.documents_physical].clear()
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.validate_current_generation(generation.fingerprint)
+    assert exc.value.code == "control_point_missing"
+
+
+async def test_resolve_does_not_hide_generation_control_read_failure() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+
+    async def fail_retrieve(**kwargs: Any) -> list[Any]:
+        raise RuntimeError("network unavailable")
+
+    client.retrieve = fail_retrieve  # type: ignore[method-assign]
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.validate_current_generation(generation.fingerprint)
+    assert exc.value.code == "control_point_unavailable"
+
+
+async def test_generation_control_must_bind_both_physical_collection_names() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    control = next(
+        record
+        for record in client.points[generation.documents_physical].values()
+        if record.payload.get("record_type") == "generation"
+    )
+    control.payload["documents_physical"] = generation.documents_physical
+    control.payload["passages_physical"] = "photomat_literature_passages_wrong"
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.validate_current_generation(generation.fingerprint)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_switch_current_generation_uses_paired_control_validation() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    control = next(
+        record
+        for record in client.points[generation.documents_physical].values()
+        if record.payload.get("record_type") == "generation"
+    )
+    control.payload["documents_physical"] = generation.documents_physical
+    control.payload["passages_physical"] = "photomat_literature_passages_wrong"
+    client.alias_update_calls.clear()
+    with pytest.raises(QdrantStoreError) as exc:
+        await store.switch_current_generation(generation)
+    assert exc.value.code == "schema_mismatch"
+    assert client.alias_update_calls == []
+
+
 async def test_ensure_generation_rejects_existing_fingerprint_mismatch() -> None:
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
@@ -472,9 +571,29 @@ async def test_ensure_generation_rejects_uninspectable_existing_collection() -> 
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
     generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
     client.collections[generation.documents_physical]["metadata"] = {}
-    client.collections[generation.documents_physical].pop("params", None)
+    for field in (
+        "params",
+        "vectors_config",
+        "sparse_vectors_config",
+        "shard_number",
+        "replication_factor",
+        "on_disk_payload",
+        "strict_mode_config",
+        "payload_schema",
+    ):
+        client.collections[generation.documents_physical].pop(field, None)
     client.collections[generation.passages_physical]["metadata"] = {}
-    client.collections[generation.passages_physical].pop("params", None)
+    for field in (
+        "params",
+        "vectors_config",
+        "sparse_vectors_config",
+        "shard_number",
+        "replication_factor",
+        "on_disk_payload",
+        "strict_mode_config",
+        "payload_schema",
+    ):
+        client.collections[generation.passages_physical].pop(field, None)
     fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
     with pytest.raises(QdrantStoreError) as exc:
         await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
@@ -512,6 +631,30 @@ async def test_ensure_generation_rejects_on_disk_and_strict_mode_mismatch() -> N
     assert exc.value.code == "schema_mismatch"
 
 
+@pytest.mark.parametrize("missing_field", ["on_disk_payload", "strict_mode_config", "payload_schema"])
+async def test_existing_collection_missing_contract_schema_fails_closed(missing_field: str) -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.collections[generation.passages_physical].pop(missing_field, None)
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_existing_passage_collection_missing_dense_dimension_fails_closed() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.collections[generation.passages_physical]["metadata"].pop("dense_dimension")
+    client.collections[generation.passages_physical]["metadata"].pop("photomat_dense_dimension")
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
 async def test_ensure_generation_rejects_existing_payload_index_type_mismatch() -> None:
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
@@ -532,6 +675,41 @@ async def test_ensure_generation_does_not_swallow_untyped_existing_index_error()
         raise RuntimeError("already exists but has an incompatible type")
 
     client.create_payload_index = incompatible_index_error  # type: ignore[method-assign]
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_ensure_generation_does_not_accept_unverified_typed_409_index_error() -> None:
+    client = FakeAsyncQdrantClient()
+
+    class ConflictError(RuntimeError):
+        status_code = 409
+
+    async def conflict(**kwargs: Any) -> None:
+        raise ConflictError("conflict")
+
+    client.create_payload_index = conflict  # type: ignore[method-assign]
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_ensure_generation_rejects_typed_409_index_with_wrong_actual_type() -> None:
+    client = FakeAsyncQdrantClient()
+
+    class ConflictError(RuntimeError):
+        status_code = 409
+
+    async def conflict(**kwargs: Any) -> None:
+        client.collections[kwargs["collection_name"]].setdefault("payload_schema", {})[
+            kwargs["field_name"]
+        ] = SimpleNamespace(data_type="integer")
+        raise ConflictError("conflict")
+
+    client.create_payload_index = conflict  # type: ignore[method-assign]
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
     with pytest.raises(QdrantStoreError) as exc:
         await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
@@ -606,6 +784,27 @@ async def test_document_operations_filter_workspace_and_revision() -> None:
     assert values["document_revision"] == "a" * 64
     await store.set_revision_state("doc-1", "a" * 64, IngestState.SUPERSEDED, workspace_id="workspace-a")
     assert client.payload_calls[-1]["payload"] == {"ingest_state": "superseded"}
+
+
+async def test_retrieve_passages_uses_bounded_server_side_workspace_ready_filter() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    await store.retrieve_passages("workspace-a", [f"passage-{i}" for i in range(100)])
+    call = client.query_calls[-1]
+    assert call["kind"] == "scroll"
+    assert call["limit"] == 50
+    filt = call["scroll_filter"]
+    field_conditions = [condition for condition in filt.must if hasattr(condition, "key")]
+    values = {condition.key: condition.match.value for condition in field_conditions}
+    assert values == {
+        "workspace_id": "workspace-a",
+        "record_type": "passage",
+        "ingest_state": "ready",
+    }
+    id_conditions = [condition for condition in filt.must if hasattr(condition, "has_id")]
+    assert len(id_conditions) == 1
+    assert id_conditions[0].has_id == [f"passage-{i}" for i in range(50)]
 
 
 async def test_revision_mutations_require_workspace_scope() -> None:

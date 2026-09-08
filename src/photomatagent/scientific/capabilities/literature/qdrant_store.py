@@ -270,17 +270,18 @@ class QdrantLiteratureStore:
     ) -> dict[str, Any]:
         # Keep flat keys as well as the namespaced object: Qdrant versions and
         # fake clients expose collection metadata in slightly different shapes.
+        dimension = identity.dimension if identity.dimension is not None else self.dimension
         return {
             "photomat_collection_schema_version": COLLECTION_SCHEMA_VERSION,
             "photomat_chunk_schema_version": chunk_schema_version,
             "photomat_model_fingerprint": fingerprint,
             "photomat_sparse_model": self.sparse_model,
-            "photomat_dense_dimension": identity.dimension,
+            "photomat_dense_dimension": dimension,
             "collection_schema_version": COLLECTION_SCHEMA_VERSION,
             "chunk_schema_version": chunk_schema_version,
             "model_fingerprint": fingerprint,
             "sparse_model": self.sparse_model,
-            "dense_dimension": identity.dimension,
+            "dense_dimension": dimension,
         }
 
     async def _create_collection(
@@ -382,23 +383,33 @@ class QdrantLiteratureStore:
             )
         return fields
 
+    def _payload_index_type(self, info: Any, field_name: str) -> Any:
+        payload_schema = _record_attr(info, "payload_schema", None)
+        if not isinstance(payload_schema, Mapping):
+            return None
+        actual = payload_schema.get(field_name)
+        if actual is None:
+            return None
+        actual_type = _record_attr(actual, "data_type", None)
+        if actual_type is None:
+            actual_type = _record_attr(_record_attr(actual, "params", None), "type", None)
+        return actual_type
+
+    def _payload_index_matches(self, info: Any, field_name: str, expected_type: Any) -> bool:
+        actual_type = self._payload_index_type(info, field_name)
+        return actual_type is not None and str(_enum_value(actual_type)).lower() == str(
+            _enum_value(expected_type)
+        ).lower()
+
     def _validate_payload_schema(self, name: str, info: Any, *, passages: bool) -> None:
         payload_schema = _record_attr(info, "payload_schema", None)
         if not isinstance(payload_schema, Mapping) or not payload_schema:
-            return
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} payload indexes cannot be inspected"
+            )
         expected = dict(self._payload_index_specs(passages=passages))
         for field_name, expected_type in expected.items():
-            actual = payload_schema.get(field_name)
-            if actual is None:
-                raise QdrantStoreError(
-                    "schema_mismatch", f"payload index {field_name!r} is missing from {name!r}"
-                )
-            actual_type = _record_attr(actual, "data_type", None)
-            if actual_type is None:
-                actual_type = _record_attr(_record_attr(actual, "params", None), "type", None)
-            if actual_type is None or str(_enum_value(actual_type)).lower() != str(
-                _enum_value(expected_type)
-            ).lower():
+            if not self._payload_index_matches(info, field_name, expected_type):
                 raise QdrantStoreError(
                     "schema_mismatch", f"payload index {field_name!r} is incompatible"
                 )
@@ -414,7 +425,27 @@ class QdrantLiteratureStore:
         metadata = _metadata(info)
         config = _record_attr(info, "config", None)
         params = _record_attr(config, "params", None)
-        if not metadata and params is None:
+        required_metadata = (
+            "collection_schema_version",
+            "chunk_schema_version",
+            "model_fingerprint",
+            "sparse_model",
+        )
+        for metadata_key in required_metadata:
+            metadata_value = metadata.get(metadata_key)
+            if metadata_value is None or metadata_value == "":
+                metadata_value = metadata.get(f"photomat_{metadata_key}")
+            if metadata_value is None or metadata_value == "":
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} metadata cannot be inspected"
+                )
+        if passages and metadata.get("dense_dimension") is None and metadata.get(
+            "photomat_dense_dimension"
+        ) is None:
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} vector dimension metadata is missing"
+            )
+        if params is None:
             raise QdrantStoreError(
                 "schema_mismatch", f"collection {name!r} schema cannot be inspected"
             )
@@ -424,7 +455,7 @@ class QdrantLiteratureStore:
             on_disk_payload = _record_attr(config, "on_disk_payload", None)
         if on_disk_payload is None:
             on_disk_payload = _record_attr(info, "on_disk_payload", None)
-        if on_disk_payload is not None and bool(on_disk_payload) is not True:
+        if on_disk_payload is None or bool(on_disk_payload) is not True:
             raise QdrantStoreError(
                 "schema_mismatch", f"collection {name!r} must keep payload on disk"
             )
@@ -432,18 +463,21 @@ class QdrantLiteratureStore:
         strict_mode = _record_attr(config, "strict_mode_config", None)
         if strict_mode is None:
             strict_mode = _record_attr(info, "strict_mode_config", None)
-        if strict_mode is not None:
-            strict_values = (
-                ("enabled", True),
-                ("unindexed_filtering_retrieve", False),
-                ("unindexed_filtering_update", False),
+        if strict_mode is None:
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} strict mode cannot be inspected"
             )
-            for field_name, expected_value in strict_values:
-                actual_value = _record_attr(strict_mode, field_name, None)
-                if actual_value is None or bool(actual_value) is not expected_value:
-                    raise QdrantStoreError(
-                        "schema_mismatch", f"collection {name!r} has incompatible strict mode"
-                    )
+        strict_values = (
+            ("enabled", True),
+            ("unindexed_filtering_retrieve", False),
+            ("unindexed_filtering_update", False),
+        )
+        for field_name, expected_value in strict_values:
+            actual_value = _record_attr(strict_mode, field_name, None)
+            if actual_value is None or bool(actual_value) is not expected_value:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has incompatible strict mode"
+                )
 
         self._validate_payload_schema(name, info, passages=passages)
         if passages:
@@ -458,8 +492,6 @@ class QdrantLiteratureStore:
                 raise QdrantStoreError(
                     "schema_mismatch", f"collection {name!r} has an incompatible vector dimension"
                 )
-        if params is None:
-            return
         actual_vectors = _record_attr(params, "vectors", None)
         actual_sparse = _record_attr(params, "sparse_vectors", None)
         if passages:
@@ -479,7 +511,7 @@ class QdrantLiteratureStore:
                     "schema_mismatch", f"collection {name!r} has an incompatible vector distance"
                 )
             dense_on_disk = _record_attr(dense_config, "on_disk", None)
-            if dense_on_disk is not None and bool(dense_on_disk) is not True:
+            if dense_on_disk is None or bool(dense_on_disk) is not True:
                 raise QdrantStoreError(
                     "schema_mismatch", f"collection {name!r} dense vectors must be on disk"
                 )
@@ -488,7 +520,7 @@ class QdrantLiteratureStore:
                     "schema_mismatch", f"collection {name!r} is missing sparse BM25 vectors"
                 )
             modifier = _record_attr(actual_sparse["sparse_bm25"], "modifier", None)
-            if modifier is not None and str(_enum_value(modifier)).lower() != "idf":
+            if modifier is None or str(_enum_value(modifier)).lower() != "idf":
                 raise QdrantStoreError(
                     "schema_mismatch", f"collection {name!r} has a non-IDF sparse vector"
                 )
@@ -498,7 +530,7 @@ class QdrantLiteratureStore:
             )
         for parameter_name in ("shard_number", "replication_factor"):
             actual_value = _record_attr(params, parameter_name, None)
-            if actual_value is not None and int(actual_value) != 1:
+            if actual_value is None or int(actual_value) != 1:
                 raise QdrantStoreError(
                     "schema_mismatch", f"collection {name!r} has incompatible {parameter_name}"
                 )
@@ -557,8 +589,10 @@ class QdrantLiteratureStore:
             payload_schema = _record_attr(info, "payload_schema", None)
             if isinstance(payload_schema, Mapping):
                 existing_schema = payload_schema
-        except Exception:
-            existing_schema = {}
+        except Exception as exc:
+            raise QdrantStoreError(
+                "schema_mismatch", f"collection {name!r} payload indexes cannot be inspected"
+            ) from exc
         for field_name, field_schema in fields:
             if field_name in existing_schema:
                 # _validate_existing_collection already checked the full
@@ -580,6 +614,16 @@ class QdrantLiteratureStore:
                     "AlreadyExists",
                     "AlreadyExistsError",
                 }:
+                    raise QdrantStoreError(
+                        "schema_mismatch", f"payload index {field_name!r} is incompatible"
+                    ) from exc
+                try:
+                    info = await self._client.get_collection(name)
+                except Exception as inspect_exc:
+                    raise QdrantStoreError(
+                        "schema_mismatch", f"payload index {field_name!r} cannot be inspected"
+                    ) from inspect_exc
+                if not self._payload_index_matches(info, field_name, field_schema):
                     raise QdrantStoreError(
                         "schema_mismatch", f"payload index {field_name!r} is incompatible"
                     ) from exc
@@ -644,7 +688,9 @@ class QdrantLiteratureStore:
             "model_fingerprint": fingerprint,
             "chunk_schema_version": chunk_schema_version,
             "sparse_model": self.sparse_model,
-            "dense_dimension": identity.dimension,
+            "dense_dimension": identity.dimension if identity.dimension is not None else self.dimension,
+            "documents_physical": documents,
+            "passages_physical": passages,
         }
         await self._client.upsert(
             collection_name=documents,
@@ -684,6 +730,7 @@ class QdrantLiteratureStore:
             generation.passages_physical
         ):
             raise QdrantStoreError("collection_missing", "generation collections do not both exist")
+        pair_metadata: dict[str, dict[str, Any]] = {}
         for physical_name in (generation.documents_physical, generation.passages_physical):
             try:
                 info = await self._client.get_collection(physical_name)
@@ -692,6 +739,7 @@ class QdrantLiteratureStore:
                     "collection_missing", f"collection {physical_name!r} cannot be read"
                 ) from exc
             metadata = _metadata(info)
+            pair_metadata[physical_name] = metadata
             self._validate_collection_shape(
                 physical_name,
                 info,
@@ -711,6 +759,13 @@ class QdrantLiteratureStore:
                     "model_fingerprint_mismatch",
                     f"collection {physical_name!r} does not match the requested generation",
                 )
+        await self._validate_generation_control(
+            generation.documents_physical,
+            generation.passages_physical,
+            generation.fingerprint,
+            pair_metadata[generation.documents_physical],
+            pair_metadata[generation.passages_physical],
+        )
         models = _qdrant_models()
         aliases = await self._alias_map()
         desired = (
@@ -744,15 +799,20 @@ class QdrantLiteratureStore:
     async def _validate_generation_control(
         self,
         documents_collection: str,
+        passages_collection: str,
         fingerprint: str,
         documents_metadata: Mapping[str, Any],
         passages_metadata: Mapping[str, Any],
     ) -> None:
-        if not fingerprint:
-            return
+        if _FINGERPRINT_RE.fullmatch(fingerprint) is None:
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch", "generation control requires a complete fingerprint"
+            )
         retrieve = getattr(self._client, "retrieve", None)
         if retrieve is None:
-            return
+            raise QdrantStoreError(
+                "control_point_unavailable", "generation control point cannot be read"
+            )
         control_id = str(uuid.uuid5(GENERATION_POINT_NAMESPACE, fingerprint))
         try:
             records = retrieve(
@@ -764,17 +824,34 @@ class QdrantLiteratureStore:
             )
             if inspect.isawaitable(records):
                 records = await records
-        except Exception:
-            # A client without a readable control point is handled by the
-            # physical metadata checks; do not turn an optional read into a
-            # second mutation or a raw client error.
-            return
+        except Exception as exc:
+            raise QdrantStoreError(
+                "control_point_unavailable", "generation control point could not be read"
+            ) from exc
         if not isinstance(records, Sequence) or not records:
-            return
+            raise QdrantStoreError(
+                "control_point_missing", "generation control point is missing"
+            )
         control_payload = _payload(records[0])
         if control_payload.get("record_type") != "generation":
             raise QdrantStoreError(
                 "schema_mismatch", "current documents collection has invalid generation control metadata"
+            )
+        control_documents = str(control_payload.get("documents_physical", ""))
+        control_passages = str(control_payload.get("passages_physical", ""))
+        if control_documents != documents_collection or control_passages != passages_collection:
+            raise QdrantStoreError(
+                "schema_mismatch", "generation control metadata does not bind the current pair"
+            )
+        required_control_fields = (
+            "model_fingerprint",
+            "chunk_schema_version",
+            "sparse_model",
+            "dense_dimension",
+        )
+        if any(control_payload.get(field_name) is None for field_name in required_control_fields):
+            raise QdrantStoreError(
+                "schema_mismatch", "generation control metadata is incomplete"
             )
         expected_fingerprint = str(
             documents_metadata.get("model_fingerprint")
@@ -782,7 +859,13 @@ class QdrantLiteratureStore:
             or ""
         )
         control_fingerprint = str(control_payload.get("model_fingerprint", ""))
-        if expected_fingerprint and control_fingerprint != expected_fingerprint:
+        if _FINGERPRINT_RE.fullmatch(control_fingerprint) is None:
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch", "generation control metadata has an incomplete fingerprint"
+            )
+        if control_fingerprint != fingerprint or (
+            expected_fingerprint and control_fingerprint != expected_fingerprint
+        ):
             raise QdrantStoreError(
                 "model_fingerprint_mismatch", "generation control metadata has a different model fingerprint"
             )
@@ -918,6 +1001,7 @@ class QdrantLiteratureStore:
                 )
         await self._validate_generation_control(
             documents,
+            passages,
             document_fingerprint,
             documents_metadata,
             passages_metadata,
@@ -1011,13 +1095,14 @@ class QdrantLiteratureStore:
         document_revision: str | None = None,
         ingest_state: IngestState | None = None,
         revision_except: str | None = None,
+        extra: Sequence[Any] = (),
     ) -> Any:
         if not isinstance(workspace_id, str) or not workspace_id.strip():
             raise ValueError("workspace_id must be a non-empty string")
         models = _qdrant_models()
-        extra: list[Any] = []
+        revision_conditions: list[Any] = []
         if revision_except is not None:
-            extra.append(
+            revision_conditions.append(
                 models.FieldCondition(
                     key="document_revision",
                     match=models.MatchExcept(except_=[revision_except]),
@@ -1029,7 +1114,7 @@ class QdrantLiteratureStore:
             document_id=document_id,
             document_revision=document_revision,
             ingest_state=ingest_state,
-            extra=extra,
+            extra=(*extra, *revision_conditions),
         )
 
     async def list_document_manifests(self, workspace_id: str) -> dict[str, DocumentManifest]:
@@ -1368,13 +1453,25 @@ class QdrantLiteratureStore:
         if not passage_ids:
             return []
         generation = await self._current_or_error()
-        records = await self._client.retrieve(
+        bounded_ids = list(dict.fromkeys(passage_ids))[:MAX_CANDIDATES]
+        models = _qdrant_models()
+        records_result = await self._client.scroll(
             collection_name=generation.passages_alias,
-            ids=list(passage_ids),
+            scroll_filter=self._passage_filter(
+                workspace_id=workspace_id,
+                ingest_state=IngestState.READY,
+                extra=(models.HasIdCondition(has_id=bounded_ids),),
+            ),
+            limit=len(bounded_ids),
+            offset=None,
             with_payload=True,
             with_vectors=True,
             **self._timeout_kwargs(),
         )
+        if isinstance(records_result, tuple):
+            records = records_result[0]
+        else:
+            records = _record_attr(records_result, "points", [])
         result: list[PassagePoint] = []
         for record in records:
             payload = _payload(record)
