@@ -127,6 +127,7 @@ def _point(
     workspace_id: str = TEST_WORKSPACE_ID,
     chunk_index: int = 0,
     year: int = 2026,
+    dense: tuple[float, ...] | None = None,
 ) -> PassagePoint:
     document_id = document_id_for(workspace_id, relative_path)
     revision = _sha(text + relative_path)
@@ -153,7 +154,7 @@ def _point(
         relative_source_path=relative_path,
         model_fingerprint=generation.fingerprint,
         limitations=("Synthetic authored text; not copied from a paper.",),
-        dense=_vector(axis),
+        dense=_vector(axis) if dense is None else dense,
         normalized_text_sha256=_sha(" ".join(text.split()).casefold()),
         indexed_at=datetime.now(timezone.utc),
     )
@@ -314,19 +315,38 @@ async def test_rrf_has_dense_and_sparse_contributions_and_indexed_filters(
 ) -> None:
     generation = await real_store.resolve_current_generation()
     assert generation is not None
-    dense_only = _point(
+    # The route-specific candidates deliberately have different dense scores:
+    # the dense route's order must not depend on vector ties.  Only one point
+    # contains the query token, so the sparse route has a controlled winner.
+    dense_strong_sparse_weak = _point(
         generation,
-        relative_path="synthetic/dense-only.pdf",
-        text="semantic detector material property",
+        relative_path="synthetic/rrf-dense-strong.pdf",
+        text="semantic detector material property without lexical signal",
         axis=0,
         year=2024,
+        dense=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     )
-    sparse_only = _point(
+    sparse_strong_dense_weak = _point(
         generation,
-        relative_path="synthetic/sparse-only.pdf",
-        text="rarelexicaltoken spectral marker",
+        relative_path="synthetic/rrf-sparse-strong.pdf",
+        text="rrf_unique_signal_91827 spectral marker",
         axis=1,
         year=2025,
+        dense=(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+    dense_mid = _point(
+        generation,
+        relative_path="synthetic/rrf-dense-mid.pdf",
+        text="semantic distractor with no query token",
+        axis=1,
+        dense=(0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+    dense_weak = _point(
+        generation,
+        relative_path="synthetic/rrf-dense-weak.pdf",
+        text="another semantic distractor with no query token",
+        axis=0,
+        dense=(0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     )
     filter_match = _point(
         generation,
@@ -334,6 +354,7 @@ async def test_rrf_has_dense_and_sparse_contributions_and_indexed_filters(
         text="metadata filter target",
         axis=0,
         year=2024,
+        dense=(-0.2, 0.9799, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     )
     filter_miss = _point(
         generation,
@@ -341,40 +362,68 @@ async def test_rrf_has_dense_and_sparse_contributions_and_indexed_filters(
         text="metadata filter distractor",
         axis=0,
         year=2025,
+        dense=(-0.4, 0.9165, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+    irrelevant = _point(
+        generation,
+        relative_path="synthetic/rrf-irrelevant.pdf",
+        text="irrelevant control with no query token",
+        axis=2,
+        dense=(-0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     )
     await real_store.upsert_passages(
-        [dense_only, sparse_only, filter_match, filter_miss],
+        [
+            dense_strong_sparse_weak,
+            sparse_strong_dense_weak,
+            dense_mid,
+            dense_weak,
+            filter_match,
+            filter_miss,
+            irrelevant,
+        ],
         batch_size=2,
         workspace_id=TEST_WORKSPACE_ID,
     )
 
-    dense_ids = {
+    dense_ids = [
         candidate.passage_id
         for candidate in await real_store.dense_candidates(
-            _vector(0), workspace_id=TEST_WORKSPACE_ID, limit=2
+            _vector(0), workspace_id=TEST_WORKSPACE_ID, limit=4
         )
-    }
-    sparse_ids = {
+    ]
+    assert dense_ids == [
+        dense_strong_sparse_weak.passage_id,
+        dense_mid.passage_id,
+        dense_weak.passage_id,
+        sparse_strong_dense_weak.passage_id,
+    ]
+    sparse_ids = [
         candidate.passage_id
         for candidate in await real_store.sparse_candidates(
-            "rarelexicaltoken", workspace_id=TEST_WORKSPACE_ID, limit=2
+            "rrf_unique_signal_91827", workspace_id=TEST_WORKSPACE_ID, limit=2
         )
-    }
-    assert dense_only.passage_id in dense_ids
-    assert sparse_only.passage_id in sparse_ids
-    assert dense_only.passage_id not in sparse_ids
-    assert sparse_only.passage_id not in dense_ids
+    ]
+    assert sparse_ids
+    assert sparse_ids[0] == sparse_strong_dense_weak.passage_id
+    assert dense_strong_sparse_weak.passage_id not in sparse_ids
 
-    fused_ids = {
+    # Two results are intentionally fewer than the seven indexed points.  A
+    # dense-only implementation would return dense_mid instead of the sparse
+    # winner; a sparse-only implementation would omit the dense winner.
+    fused_ids = [
         candidate.passage_id
         for candidate in await real_store.hybrid_candidates(
-            "rarelexicaltoken",
+            "rrf_unique_signal_91827",
             _vector(0),
             workspace_id=TEST_WORKSPACE_ID,
-            limit=4,
+            limit=2,
         )
+    ]
+    assert len(fused_ids) == 2
+    assert set(fused_ids) == {
+        dense_strong_sparse_weak.passage_id,
+        sparse_strong_dense_weak.passage_id,
     }
-    assert {dense_only.passage_id, sparse_only.passage_id} <= fused_ids
 
     from qdrant_client import models
 

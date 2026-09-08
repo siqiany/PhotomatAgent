@@ -147,3 +147,34 @@ including update/delete, restart persistence, strict-filter rejection, and the
 exact server-version check against a real endpoint, remain explicitly skipped
 or unverified locally.  No local-mode Qdrant replacement was used, and no
 real papers, external providers, or production collections were touched.
+
+## Task 6 fix round 2 — non-tautological RRF coverage
+
+The live RRF/filter test now indexes seven ready points under the test-owned
+workspace and requests a fused `limit=2`.  Dense vectors have seven distinct
+cosine similarities, so dense-only ordering is deterministic.  Exactly one
+point contains the unique sparse query token: the dense-strong/sparse-weak
+candidate and the orthogonal sparse-strong/dense-weak candidate must both be
+returned, while the five distractors must be excluded.  The assertions are
+therefore sensitive to a single-route implementation rather than merely
+checking membership in a result set as large as the corpus.  Existing
+workspace/ready filtering and indexed year/source-path and strict-mode checks
+remain in the same gated test.
+
+Verification for this round:
+
+```text
+./.venv/bin/pytest -q tests/test_rag_evaluation.py tests/test_benchmark_qdrant_rag.py tests/test_qdrant_rag_integration.py tests/test_rag_cli.py tests/test_qdrant_store.py tests/test_rag_ingestion.py tests/test_rag_retrieval.py tests/test_literature_rag.py
+100 passed, 9 skipped
+
+./.venv/bin/mypy tests/test_qdrant_rag_integration.py
+Success: no issues found in 1 source file
+
+git diff --check
+passed
+```
+
+The nine skips are still the explicit Docker-gated tests.  Docker remains
+unavailable locally (`docker --version` reports `/bin/bash: docker: command
+not found`), so the strengthened live RRF ordering and filter contract is
+recorded as unverified rather than claimed green against a real Qdrant.
