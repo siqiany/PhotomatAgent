@@ -1,7 +1,8 @@
 """PDF -> DoclingDocument -> structured chunks.
 
 The parser is deliberately thin: it only converts one PDF into paper/chunk
-records with provenance. Embedding and storage happen in ``index.py``.
+records with provenance. Embedding and storage happen in the ingestion and
+Qdrant service layers.
 """
 
 from __future__ import annotations

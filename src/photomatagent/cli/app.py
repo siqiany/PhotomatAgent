@@ -17,6 +17,7 @@ from rich.table import Table
 from photomatagent import __version__
 from photomatagent.cli.chat import run_chat
 from photomatagent.cli.evolve import evolve_app
+from photomatagent.cli.rag import rag_app
 from photomatagent.cli.render import print_skill_list
 from photomatagent.config import DotEnvConfig, read_preferred_config, resolve_llm_config
 from photomatagent.experiments.compare import compare_summaries
@@ -60,6 +61,7 @@ app = typer.Typer(
 )
 console = Console()
 app.add_typer(evolve_app, name="evolve")
+app.add_typer(rag_app, name="rag")
 
 
 @app.callback(invoke_without_command=True)

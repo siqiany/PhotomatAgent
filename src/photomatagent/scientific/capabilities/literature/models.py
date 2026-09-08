@@ -237,7 +237,7 @@ class PassageRecord(BaseModel):
     next_chunk_id: str = ""
 
     def to_retrieval_row(self) -> dict[str, Any]:
-        """Flat dict for LanceDB inserts (lists serialised as JSON)."""
+        """Flat compatibility mapping for passage conversion."""
         import json
 
         return {

@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,35 +35,122 @@ def _version(name: str) -> str:
         return ""
 
 
+@dataclass(frozen=True)
+class LiteratureServices:
+    """Application services shared by model tools and the direct CLI.
+
+    The object intentionally contains narrow service interfaces rather than a
+    Qdrant client.  Qdrant stays an internal implementation detail of the
+    ingestion/retrieval services and can be replaced with fakes in tests.
+    """
+
+    ingestion: Any
+    retriever: Any
+    store: Any
+    workspace_id: str
+
+
+def build_literature_services(
+    config: ScientificConfig,
+    workspace: Workspace,
+    *,
+    store: Any | None = None,
+    embedder: Any | None = None,
+    reranker: Any | None = None,
+) -> LiteratureServices:
+    """Build the one shared literature application-service graph lazily."""
+    from photomatagent.scientific.capabilities.literature.ingestion import (
+        LiteratureIngestionService,
+    )
+    from photomatagent.scientific.capabilities.literature.providers.factory import (
+        build_embedding_provider,
+        build_reranker_provider,
+    )
+    from photomatagent.scientific.capabilities.literature.qdrant_store import (
+        QdrantLiteratureStore,
+        workspace_id_for,
+    )
+    from photomatagent.scientific.capabilities.literature.retrieval import (
+        LiteratureRetriever,
+    )
+
+    effective_store = (
+        store if store is not None else QdrantLiteratureStore.from_config(config)
+    )
+    effective_embedder = (
+        embedder if embedder is not None else build_embedding_provider(config)
+    )
+    effective_reranker = (
+        reranker if reranker is not None else build_reranker_provider(config)
+    )
+    workspace_id = workspace_id_for(workspace.root.resolve())
+    return LiteratureServices(
+        ingestion=LiteratureIngestionService(
+            effective_store,
+            effective_embedder,
+            batch_size=config.rag_batch_size,
+        ),
+        retriever=LiteratureRetriever(
+            effective_store,
+            effective_embedder,
+            effective_reranker,
+        ),
+        store=effective_store,
+        workspace_id=workspace_id,
+    )
+
+
+def _service_value(services: Any, name: str, default: Any = None) -> Any:
+    if isinstance(services, dict):
+        return services.get(name, default)
+    return getattr(services, name, default)
+
+
+def _error_code(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return "qdrant_unreachable"
+    return type(exc).__name__.casefold() or "literature_error"
+
+
+def _error_result(exc: BaseException, *, operation: str) -> ScientificToolResult:
+    """Convert typed service failures to a bounded, secret-free tool result."""
+    code = _error_code(exc)
+    message = str(getattr(exc, "message", "") or "")
+    if not message:
+        message = f"{operation} failed"
+    # Do not echo URLs, credentials, tracebacks, or unbounded provider output.
+    message = re.sub(r"(?i)(api[_ -]?key|token|secret|password)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", message)
+    message = _clean(message, 320)
+    return ScientificToolResult(
+        output=f"{code}: {message}",
+        is_error=True,
+        data={"error": code},
+    )
+
+
 class LiteratureProbe(CapabilityPack):
     name = "literature"
     description = (
-        "Literature search and reading (arXiv + local PDFs) plus the local "
-        "Literature RAG index (docling + LanceDB + hybrid retrieval)."
+        "Literature search and reading (arXiv + local PDFs) plus the "
+        "Qdrant-backed literature RAG services."
     )
 
     def probe(self) -> ProbeResult:
-        missing = []
-        try:
-            import arxiv  # noqa: F401
-        except ImportError:
-            missing.append("arxiv")
-        try:
-            import pypdf  # noqa: F401
-        except ImportError:
-            missing.append("pypdf")
-        try:
-            import docling  # noqa: F401
-        except ImportError:
-            missing.append("docling")
-        try:
-            import lancedb  # noqa: F401
-        except ImportError:
-            missing.append("lancedb")
-        try:
-            import sentence_transformers  # noqa: F401
-        except ImportError:
-            missing.append("sentence_transformers")
+        """Run bounded, read-only checks without loading local models."""
+        missing: list[str] = []
+        for module_name in ("arxiv", "pypdf", "docling", "qdrant_client", "sentence_transformers"):
+            try:
+                __import__(module_name)
+            except ImportError:
+                missing.append(module_name)
+            except Exception:
+                return ProbeResult(
+                    status=CapabilityStatus.ERROR,
+                    detail=f"dependency import failed: {module_name}",
+                )
         if missing:
             return ProbeResult(
                 status=CapabilityStatus.MISSING_DEPENDENCY,
@@ -71,12 +159,82 @@ class LiteratureProbe(CapabilityPack):
                     "(extra: photomatagent[literature])"
                 ),
             )
+
+        if not self._config.qdrant_url.strip():
+            return ProbeResult(
+                status=CapabilityStatus.UNCONFIGURED,
+                detail="qdrant_url is not configured",
+            )
+        if (
+            self._config.embedding_provider != "local"
+            or self._config.reranker_provider not in {"local", "disabled"}
+        ) and not self._config.rag_allow_external:
+            return ProbeResult(
+                status=CapabilityStatus.UNCONFIGURED,
+                detail="external RAG provider configured but explicit authorization is disabled",
+            )
+
+        try:
+            source_root = self._workspace.resolve(
+                self._config.literature_root, must_exist=False
+            )
+        except Exception:
+            return ProbeResult(
+                status=CapabilityStatus.UNCONFIGURED,
+                detail="literature source root is outside the workspace",
+            )
+        if not source_root.is_dir():
+            return ProbeResult(
+                status=CapabilityStatus.UNCONFIGURED,
+                detail="literature source root is missing",
+            )
+
+        try:
+            # The sync client is used only for a short, read-only health check.
+            # Cap the probe timeout so startup never waits for the full ingest
+            # timeout and never creates collections or loads model weights.
+            from qdrant_client import QdrantClient
+
+            api_key = __import__("os").environ.get(self._config.qdrant_api_key_env, "").strip()
+            client = QdrantClient(
+                url=self._config.qdrant_url,
+                api_key=api_key or None,
+                timeout=min(self._config.qdrant_timeout_seconds, 2),
+                prefer_grpc=False,
+            )
+            client.get_collections()
+            aliases = getattr(client, "get_collection_aliases", None)
+            if aliases is not None:
+                aliases()
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()
+        except ImportError:
+            return ProbeResult(
+                status=CapabilityStatus.MISSING_DEPENDENCY,
+                detail="missing: qdrant_client (extra: photomatagent[literature])",
+            )
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code in {401, 403}:
+                code = "qdrant_auth_failed"
+            else:
+                code = "qdrant_unreachable"
+            return ProbeResult(
+                status=CapabilityStatus.ERROR,
+                detail=f"{code}: Qdrant health check failed",
+                version=f"qdrant-client={_version('qdrant-client')}",
+            )
+
         return ProbeResult(
             status=CapabilityStatus.AVAILABLE,
-            detail="arxiv + pypdf + docling + lancedb + sentence-transformers available",
+            detail=(
+                "arxiv + pypdf + docling + qdrant-client + "
+                "sentence-transformers available; source root and Qdrant ready"
+            ),
             version=(
                 f"arxiv={_version('arxiv')}; pypdf={_version('pypdf')}; "
-                f"docling={_version('docling')}; lancedb={_version('lancedb')}; "
+                f"docling={_version('docling')}; qdrant-client={_version('qdrant-client')}; "
                 f"sentence-transformers={_version('sentence-transformers')}"
             ),
         )
@@ -109,8 +267,112 @@ def _papers_dir(workspace: Workspace) -> Path:
 def _clean(text: str, limit: int) -> str:
     cleaned = re.sub(r"\s+", " ", text).strip()
     if len(cleaned) > limit:
-        cleaned = cleaned[:limit] + "...[truncated]"
+        marker = "...[truncated]"
+        if limit <= len(marker):
+            return marker[: max(0, limit)]
+        cleaned = cleaned[: limit - len(marker)] + marker
     return cleaned
+
+
+def _workspace_id(workspace: Workspace) -> str:
+    from photomatagent.scientific.capabilities.literature.qdrant_store import (
+        workspace_id_for,
+    )
+
+    return workspace_id_for(workspace.root.resolve())
+
+
+def _record_value(record: Any, name: str, default: Any = None) -> Any:
+    if isinstance(record, dict):
+        return record.get(name, default)
+    return getattr(record, name, default)
+
+
+def _stats_payload(stats: Any) -> dict[str, Any]:
+    """Render only the bounded ingestion progress contract."""
+    get = lambda name, default=None: _record_value(stats, name, default)
+    errors = [
+        _clean(str(error), 320)
+        for error in list(get("errors", ()) or ())[:20]
+    ]
+    return {
+        "run_id": str(get("run_id", "")),
+        "discovered": int(get("discovered", 0) or 0),
+        "unchanged": int(get("unchanged", 0) or 0),
+        "indexed": int(get("indexed", 0) or 0),
+        "failed": int(get("failed", 0) or 0),
+        "deleted": int(get("deleted", 0) or 0),
+        "chunks": int(get("chunks", 0) or 0),
+        "staged_cleanup": int(get("staged_cleanup", 0) or 0),
+        "next_cursor": get("next_cursor"),
+        "complete": bool(get("complete", False)),
+        "retryable": bool(get("retryable", False)),
+        "errors": errors,
+    }
+
+
+def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
+    """Convert a Qdrant passage point to the stable public read contract."""
+    text = str(_record_value(record, "text", "") or "")
+    if text_limit is not None:
+        text = _clean(text, text_limit)
+    authors = _record_value(record, "authors", ()) or ()
+    if isinstance(authors, str):
+        authors = [authors]
+    limitations = _record_value(record, "limitations", ()) or ()
+    if isinstance(limitations, str):
+        limitations = [limitations]
+    page = _record_value(record, "page", _record_value(record, "page_start"))
+    return {
+        "passage_id": str(_record_value(record, "passage_id", "") or ""),
+        "paper_id": str(
+            _record_value(record, "paper_id", _record_value(record, "document_id", ""))
+            or ""
+        ),
+        "title": _clean(str(_record_value(record, "title", "") or ""), 300),
+        "authors": [str(author) for author in list(authors)[:20]],
+        "year": _record_value(record, "year"),
+        "section": _clean(str(_record_value(record, "section", "") or ""), 160),
+        "page": page,
+        "heading_path": _clean(
+            str(_record_value(record, "heading_path", "") or ""), 300
+        ),
+        "previous_chunk_id": str(
+            _record_value(
+                record,
+                "previous_chunk_id",
+                _record_value(record, "previous_passage_id", "") or "",
+            )
+            or ""
+        ),
+        "next_chunk_id": str(
+            _record_value(
+                record,
+                "next_chunk_id",
+                _record_value(record, "next_passage_id", "") or "",
+            )
+            or ""
+        ),
+        "text": text,
+        "source": _clean(
+            str(
+                _record_value(
+                    record,
+                    "source",
+                    _record_value(
+                        record,
+                        "relative_source_path",
+                        _record_value(record, "file_name", ""),
+                    ),
+                )
+                or ""
+            ),
+            300,
+        ),
+        "limitations": [
+            _clean(str(limitation), 240) for limitation in list(limitations)[:8]
+        ],
+    }
 
 
 class LiteratureSearchArxivTool(Tool):
@@ -382,25 +644,21 @@ class LiteratureReadPaperTool(Tool):
 
 def _resolve_literature_root(config: ScientificConfig, workspace: Workspace) -> Path:
     """Absolute literature PDF root: configured value or workspace-relative."""
-    return workspace.resolve(config.literature_root)
-
-
-def _resolve_index_dir(config: ScientificConfig, workspace: Workspace) -> Path:
-    return workspace.resolve(config.literature_index_dir, must_exist=False)
+    return workspace.resolve(config.literature_root, must_exist=False)
 
 
 class LiteratureIndexPapersTool(Tool):
     name = "literature.index_papers"
     description = (
-        "Parse PDFs under a directory with docling, embed them, and build or "
-        "incrementally update the local LanceDB index. Idempotent: unchanged "
-        "PDFs are skipped by content hash. Returns indexed/skipped counts and "
-        "the database location."
+        "Parse PDFs under a workspace directory, embed them, and incrementally "
+        "update the Qdrant literature collection. Returns bounded progress "
+        "statistics and a resumable cursor."
     )
     short_description = "Build/update the local literature RAG index from PDFs."
     exposure = ToolExposure.DEFERRED
+    cost_class = "EXPENSIVE"
     namespace = "literature"
-    source = "lancedb"
+    source = "qdrant"
     tags = ("literature", "rag", "index", "docling")
     input_schema = {
         "type": "object",
@@ -412,55 +670,54 @@ class LiteratureIndexPapersTool(Tool):
                     "configured literature root (PHOTOMATAGENT_LITERATURE_DIR)."
                 ),
             },
+            "run_id": {"type": "string"},
+            "resume_cursor": {"type": "string"},
+            "max_documents": {"type": "integer", "minimum": 1, "maximum": 20},
         },
     }
 
-    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        config: ScientificConfig,
+        workspace: Workspace,
+        services: Any | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
+        self._services = services
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
-        from photomatagent.scientific.capabilities.literature.index import (
-            LiteratureIndex,
-        )
-
         raw_directory = str(arguments.get("directory") or "")
         try:
             root = (
-                self._workspace.resolve(raw_directory)
+                self._workspace.resolve(raw_directory, must_exist=False)
                 if raw_directory
                 else _resolve_literature_root(self._config, self._workspace)
             )
-            index_dir = _resolve_index_dir(self._config, self._workspace)
         except Exception as exc:
-            return ScientificToolResult(
-                output=f"literature path is not authorized: {exc}",
-                is_error=True,
-                data={"error": "outside_workspace"},
-            )
-        index = LiteratureIndex(
-            index_dir,
-            embedding_model=self._config.embedding_model,
-            vector_dim=self._config.embedding_vector_dim,
-        )
+            return _error_result(exc, operation="literature plan")
         try:
-            with index.locked():
-                stats = index.index_directory(root)
-        except FileNotFoundError as exc:
-            return ScientificToolResult(
-                output=str(exc),
-                is_error=True,
-                data={"error": "literature_root_not_found", "directory": str(root)},
+            services = (
+                self._services
+                if self._services is not None
+                else build_literature_services(self._config, self._workspace)
             )
-        payload = {
-            "indexed": stats["indexed"],
-            "skipped": stats["skipped"],
-            "failed": stats["failed"],
-            "removed": stats["removed"],
-            "chunks": stats["chunks"],
-            "db_location": stats["db_location"],
-            "errors": stats["errors"][:5],
-        }
+            ingestion = _service_value(services, "ingestion")
+            if ingestion is None:
+                raise RuntimeError("literature ingestion service is unavailable")
+            plan = await ingestion.plan(root, self._workspace)
+            stats = await ingestion.index_batch(
+                plan,
+                run_id=str(arguments.get("run_id") or "") or None,
+                resume_cursor=str(arguments.get("resume_cursor") or "") or None,
+                max_documents=min(
+                    int(arguments.get("max_documents", self._config.rag_tool_max_documents)),
+                    20,
+                ),
+            )
+        except Exception as exc:
+            return _error_result(exc, operation="literature index")
+        payload = _stats_payload(stats)
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data=payload,
@@ -477,7 +734,7 @@ class LiteratureSearchPassagesTool(Tool):
     short_description = "Hybrid RAG search for passages in local papers."
     exposure = ToolExposure.DEFERRED
     namespace = "literature"
-    source = "lancedb"
+    source = "qdrant"
     tags = ("literature", "rag", "search", "hybrid")
     input_schema = {
         "type": "object",
@@ -488,64 +745,114 @@ class LiteratureSearchPassagesTool(Tool):
         "required": ["query"],
     }
 
-    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        config: ScientificConfig,
+        workspace: Workspace,
+        services: Any | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
+        self._services = services
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
-        from photomatagent.scientific.capabilities.literature.index import (
-            LiteratureIndex,
-        )
-        from photomatagent.scientific.capabilities.literature.retrieval import (
-            Retriever,
-        )
-
-        index = LiteratureIndex(
-            _resolve_index_dir(self._config, self._workspace),
-            embedding_model=self._config.embedding_model,
-            vector_dim=self._config.embedding_vector_dim,
-        )
-        if index.count_passages() == 0:
-            return ScientificToolResult(
-                output=(
-                    "literature index is empty; run literature.index_papers "
-                    "first (or set PHOTOMATAGENT_LITERATURE_DIR)"
-                ),
-                is_error=True,
-                data={"error": "empty_index", "db_location": str(index.index_dir)},
-            )
         query = str(arguments["query"])
         top_k = min(
             int(arguments.get("top_k", self._config.literature_search_top_k)), 10
         )
-        retriever = Retriever(index, reranker_model=self._config.reranker_model)
         try:
-            results = retriever.hybrid_search(query, top_k=top_k)
+            services = (
+                self._services
+                if self._services is not None
+                else build_literature_services(self._config, self._workspace)
+            )
+            retriever = _service_value(services, "retriever")
+            if retriever is None:
+                raise RuntimeError("literature retriever service is unavailable")
+            result = await retriever.search(
+                query,
+                workspace_id=str(
+                    _service_value(
+                        services,
+                        "workspace_id",
+                        _workspace_id(self._workspace),
+                    )
+                ),
+                top_k=top_k,
+            )
         except Exception as exc:
-            return ScientificToolResult(
-                output=f"literature search failed: {type(exc).__name__}: {exc}",
-                is_error=True,
-                data={"error": type(exc).__name__},
-            )
-        rows = []
-        for result in results:
-            rows.append(
-                {
-                    "paper_id": result["paper_id"],
-                    "title": result["title"],
-                    "passage": _clean(
-                        result["passage"], self._config.literature_passage_chars
+            return _error_result(exc, operation="literature search")
+        rows: list[dict[str, Any]] = []
+        for passage in list(_record_value(result, "passages", ()) or ())[:10]:
+            row = {
+                "passage_id": str(_record_value(passage, "passage_id", "")),
+                "paper_id": str(
+                    _record_value(
+                        passage,
+                        "paper_id",
+                        _record_value(passage, "document_id", ""),
+                    )
+                ),
+                "title": _clean(str(_record_value(passage, "title", "")), 300),
+                "passage": _clean(
+                    str(
+                        _record_value(
+                            passage,
+                            "passage",
+                            _record_value(passage, "text", ""),
+                        )
                     ),
-                    "section": result["section"],
-                    "page": result["page"],
-                    "score": round(float(result["score"]), 4),
-                    "source": result["source"],
-                    "passage_id": result["passage_id"],
-                    "context_before": _clean(result.get("context_before", ""), 300),
-                    "context_after": _clean(result.get("context_after", ""), 300),
-                }
-            )
-        payload = {"query": query, "count": len(rows), "results": rows}
+                    self._config.literature_passage_chars,
+                ),
+                "section": _clean(str(_record_value(passage, "section", "")), 160),
+                "page": _record_value(
+                    passage,
+                    "page",
+                    _record_value(passage, "page_start", None),
+                ),
+                "score": round(float(_record_value(passage, "score", 0.0)), 4),
+                "source": _clean(
+                    str(
+                        _record_value(
+                            passage,
+                            "source",
+                            _record_value(
+                                passage,
+                                "relative_source_path",
+                                _record_value(passage, "file_name", ""),
+                            ),
+                        )
+                    ),
+                    300,
+                ),
+                "context_before": _clean(
+                    str(_record_value(passage, "context_before", "")), 300
+                ),
+                "context_after": _clean(
+                    str(_record_value(passage, "context_after", "")), 300
+                ),
+            }
+            rows.append(row)
+        diagnostics_obj = _record_value(result, "diagnostics", None)
+        diagnostics = {
+            "mode": str(_record_value(diagnostics_obj, "mode", "unknown")),
+            "candidate_count": int(
+                _record_value(diagnostics_obj, "candidate_count", 0)
+            ),
+            "reranked": bool(_record_value(diagnostics_obj, "reranked", False)),
+            "degraded_reasons": [
+                _clean(str(reason), 160)
+                for reason in list(
+                    _record_value(diagnostics_obj, "degraded_reasons", ()) or ()
+                )[:8]
+            ],
+        }
+        payload = {
+            "query": _clean(query, 600),
+            "count": len(rows),
+            "results": rows,
+            "diagnostics": diagnostics,
+        }
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data=payload,
@@ -561,7 +868,7 @@ class LiteratureReadPassageTool(Tool):
     short_description = "Read one indexed passage by passage_id."
     exposure = ToolExposure.DEFERRED
     namespace = "literature"
-    source = "lancedb"
+    source = "qdrant"
     tags = ("literature", "rag", "read")
     input_schema = {
         "type": "object",
@@ -571,44 +878,46 @@ class LiteratureReadPassageTool(Tool):
         "required": ["passage_id"],
     }
 
-    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        config: ScientificConfig,
+        workspace: Workspace,
+        services: Any | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
+        self._services = services
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
-        from photomatagent.scientific.capabilities.literature.index import (
-            LiteratureIndex,
-        )
-
         passage_id = str(arguments["passage_id"])
-        index = LiteratureIndex(
-            _resolve_index_dir(self._config, self._workspace),
-            embedding_model=self._config.embedding_model,
-            vector_dim=self._config.embedding_vector_dim,
-        )
-        row = index.get_passage(passage_id)
-        if row is None:
-            return ScientificToolResult(
-                output=f"passage not found: {passage_id}",
-                is_error=True,
-                data={"error": "not_found", "passage_id": passage_id},
+        try:
+            services = (
+                self._services
+                if self._services is not None
+                else build_literature_services(self._config, self._workspace)
             )
-        payload = {
-            "passage_id": row["passage_id"],
-            "paper_id": row["paper_id"],
-            "title": row["title"],
-            "authors": row.get("authors", []),
-            "year": row.get("year"),
-            "section": row.get("section", ""),
-            "page": row.get("page"),
-            "heading_path": row.get("heading_path", ""),
-            "previous_chunk_id": row.get("previous_chunk_id", ""),
-            "next_chunk_id": row.get("next_chunk_id", ""),
-            "text": row.get("text", ""),
-            "source": row.get("file_name", ""),
-        }
+            store = _service_value(services, "store")
+            if store is None:
+                raise RuntimeError("literature store service is unavailable")
+            rows = await store.retrieve_passages(
+                str(_service_value(services, "workspace_id", _workspace_id(self._workspace))),
+                [passage_id],
+            )
+        except Exception as exc:
+            return _error_result(exc, operation="literature read")
+        if not rows:
+            return ScientificToolResult(
+                output=f"passage_not_found: passage not found: {_clean(passage_id, 160)}",
+                is_error=True,
+                data={"error": "passage_not_found", "passage_id": passage_id},
+            )
+        row = rows[0]
+        payload = _passage_payload(
+            row, text_limit=self._config.literature_max_chars
+        )
+        output_payload = dict(payload)
         return ScientificToolResult(
-            output=json.dumps(payload, ensure_ascii=False),
+            output=json.dumps(output_payload, ensure_ascii=False),
             data=payload,
         )
 
@@ -645,51 +954,74 @@ class LiteratureExtractEvidenceTool(Tool):
         "required": ["passages"],
     }
 
-    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        config: ScientificConfig,
+        workspace: Workspace,
+        services: Any | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
+        self._services = services
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         from photomatagent.scientific.capabilities.literature.evidence import (
             extract_evidence_from_passages,
         )
-        from photomatagent.scientific.capabilities.literature.index import (
-            LiteratureIndex,
-        )
 
         passages = list(arguments.get("passages") or [])
-        index = LiteratureIndex(
-            _resolve_index_dir(self._config, self._workspace),
-            embedding_model=self._config.embedding_model,
-            vector_dim=self._config.embedding_vector_dim,
-        )
         resolved: list[dict[str, Any]] = []
+        try:
+            services = (
+                self._services
+                if self._services is not None
+                else build_literature_services(self._config, self._workspace)
+            )
+        except Exception as exc:
+            return _error_result(exc, operation="literature evidence")
         for item in passages:
             if not isinstance(item, dict):
                 continue
             passage_id = item.get("passage_id")
             if passage_id:
-                row = index.get_passage(str(passage_id))
-                if row is None:
+                try:
+                    store = _service_value(services, "store")
+                    if store is None:
+                        raise RuntimeError("literature store service is unavailable")
+                    rows = await store.retrieve_passages(
+                        str(_service_value(services, "workspace_id", _workspace_id(self._workspace))),
+                        [str(passage_id)],
+                    )
+                except Exception as exc:
+                    return _error_result(exc, operation="literature evidence")
+                if not rows:
                     resolved.append(
                         {
                             "text": "",
-                            "error": f"passage not found: {passage_id}",
+                            "error": f"passage_not_found: {passage_id}",
                         }
                     )
                     continue
+                row = rows[0]
+                row_data = _passage_payload(row, text_limit=None)
                 resolved.append(
                     {
-                        "text": row.get("text", ""),
-                        "page": row.get("page"),
+                        "text": _clean(
+                            str(row_data.get("text", "")),
+                            self._config.literature_max_chars,
+                        ),
+                        "page": row_data.get("page"),
                         "passage_id": passage_id,
-                        "source": row.get("file_name", ""),
+                        "source": row_data.get("source", ""),
                     }
                 )
             else:
                 resolved.append(
                     {
-                        "text": str(item.get("text") or ""),
+                        "text": _clean(
+                            str(item.get("text") or ""),
+                            self._config.literature_max_chars,
+                        ),
                         "page": item.get("page"),
                         "source": str(item.get("source") or ""),
                     }
@@ -708,7 +1040,7 @@ class LiteratureExtractEvidenceTool(Tool):
             }
             for item in evidence
         ]
-        payload = {"count": len(rows), "evidence": rows}
+        payload = {"count": len(rows), "evidence": rows[:100]}
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data=payload,

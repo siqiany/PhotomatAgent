@@ -110,3 +110,20 @@ def test_structure_pack_tools_are_deferred(tmp_path):
         "structure.convert",
     }
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in structure_tools)
+
+
+def test_literature_tools_remain_deferred_when_qdrant_is_unavailable(tmp_path):
+    from photomatagent.scientific.capabilities.literature import literature_pack
+    from photomatagent.tools.exposure import ToolExposure
+
+    pack = literature_pack(
+        ScientificConfig.from_environment(workspace=tmp_path), Workspace(tmp_path)
+    )
+    names = {tool.name for tool in pack.tools()}
+    assert {
+        "literature.index_papers",
+        "literature.search_passages",
+        "literature.read_passage",
+        "literature.extract_evidence",
+    } <= names
+    assert all(tool.exposure is ToolExposure.DEFERRED for tool in pack.tools())
