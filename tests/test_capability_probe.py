@@ -73,7 +73,7 @@ def test_existing_env_wins_over_workspace_dotenv(tmp_path, monkeypatch):
 
 
 def test_embedding_vector_dimension_from_environment(tmp_path, monkeypatch):
-    monkeypatch.setenv("PHOTOMATAGENT_EMBEDDING_VECTOR_DIM", "768")
+    monkeypatch.setenv("PHOTOMATAGENT_RAG_EMBEDDING_VECTOR_DIM", "768")
     config = ScientificConfig.from_environment(workspace=tmp_path)
     assert config.embedding_vector_dim == 768
 
