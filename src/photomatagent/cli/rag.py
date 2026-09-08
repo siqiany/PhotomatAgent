@@ -104,6 +104,256 @@ def _stats_dict(stats: Any) -> dict[str, Any]:
     }
 
 
+def _service_value(services: Any, name: str, default: Any = None) -> Any:
+    if isinstance(services, dict):
+        return services.get(name, default)
+    return getattr(services, name, default)
+
+
+def _evaluation_fixture_path() -> Path:
+    """Locate the repository-owned, synthetic evaluation judgments.
+
+    The fixture is deliberately kept outside the installed package: it is an
+    authored quality gate, not application data and never contains copied
+    paper text.  An environment override is useful for CI packaging checks,
+    while the repository path remains the default for normal development.
+    """
+    configured = os.environ.get("PHOTOMATAGENT_RAG_EVAL_FIXTURE", "").strip()
+    candidates = [
+        Path(configured) if configured else None,
+        Path("tests/fixtures/literature_rag_eval.json"),
+        Path(__file__).resolve().parents[3]
+        / "tests"
+        / "fixtures"
+        / "literature_rag_eval.json",
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "frozen RAG evaluation fixture is unavailable; expected "
+        "tests/fixtures/literature_rag_eval.json"
+    )
+
+
+def _load_evaluation_fixture(path: Path) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("frozen RAG evaluation fixture is not valid JSON") from exc
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("frozen RAG evaluation fixture must be a non-empty array")
+    judgments: list[dict[str, Any]] = []
+    for index, raw in enumerate(payload):
+        if not isinstance(raw, dict):
+            raise ValueError(f"frozen RAG evaluation row {index} is not an object")
+        query = raw.get("query")
+        relevant = raw.get("relevant_passage_ids")
+        category = raw.get("category")
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or not isinstance(relevant, list)
+            or not all(isinstance(item, str) and item for item in relevant)
+            or not isinstance(category, str)
+            or not category.strip()
+        ):
+            raise ValueError(f"frozen RAG evaluation row {index} is malformed")
+        judgments.append(
+            {
+                "query": query,
+                "relevant_passage_ids": list(dict.fromkeys(relevant)),
+                "category": category,
+            }
+        )
+    return judgments
+
+
+def _evaluation_value(item: Any, name: str, default: Any = None) -> Any:
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
+def _evaluation_passage_id(item: Any) -> str:
+    return str(_evaluation_value(item, "passage_id", "") or "")
+
+
+def _evaluation_text(item: Any) -> str:
+    value = _evaluation_value(item, "text", None)
+    if value is None:
+        value = _evaluation_value(item, "passage", "")
+    return str(value or "")
+
+
+def _evaluation_provenance_complete(item: Any) -> bool:
+    passage_id = _evaluation_passage_id(item)
+    document_id = _evaluation_value(item, "document_id", None) or _evaluation_value(
+        item, "paper_id", None
+    )
+    source = _evaluation_value(item, "relative_source_path", None) or _evaluation_value(
+        item, "source", None
+    )
+    page = _evaluation_value(item, "page", None)
+    if page is None:
+        page = _evaluation_value(item, "page_start", None)
+    return bool(
+        passage_id.strip()
+        and str(document_id or "").strip()
+        and _evaluation_text(item).strip()
+        and str(source or "").strip()
+        and page is not None
+    )
+
+
+def _evaluation_duplicate_key(item: Any) -> tuple[str, str] | None:
+    document_id = _evaluation_value(item, "document_id", None) or _evaluation_value(
+        item, "paper_id", None
+    )
+    text = " ".join(_evaluation_text(item).split()).casefold()
+    if not str(document_id or "").strip() or not text:
+        return None
+    return str(document_id), text
+
+
+async def evaluate_retrieval_fixture(
+    retriever: Any,
+    judgments: list[dict[str, Any]],
+    *,
+    workspace_id: str,
+) -> dict[str, Any]:
+    """Run the frozen synthetic judgments and return a bounded quality report.
+
+    The report is intentionally fixture-specific.  It is a deterministic
+    regression signal for retrieval wiring and provenance, not an estimate of
+    quality over an arbitrary literature corpus.
+    """
+    if not judgments:
+        raise ValueError("at least one evaluation judgment is required")
+    recall_hits = 0
+    reciprocal_rank_sum = 0.0
+    relevant_queries = 0
+    no_result_queries = 0
+    returned_count = 0
+    duplicate_count = 0
+    complete_provenance_count = 0
+    backend_errors: list[str] = []
+    per_query: list[dict[str, Any]] = []
+
+    for judgment in judgments:
+        query = str(judgment["query"])
+        relevant_ids = {
+            str(item) for item in judgment.get("relevant_passage_ids", ()) if str(item)
+        }
+        try:
+            result = await retriever.search(
+                query,
+                workspace_id=workspace_id,
+                top_k=5,
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", None) or type(exc).__name__.casefold()
+            backend_errors.append(str(code)[:160])
+            no_result_queries += 1
+            per_query.append(
+                {
+                    "query": query,
+                    "category": str(judgment.get("category", "")),
+                    "result_count": 0,
+                    "first_relevant_rank": None,
+                    "error": str(code)[:160],
+                }
+            )
+            continue
+        passages = list(_evaluation_value(result, "passages", ()) or ())[:5]
+        if not passages:
+            no_result_queries += 1
+        ids = [_evaluation_passage_id(item) for item in passages]
+        first_relevant_rank: int | None = None
+        if relevant_ids:
+            relevant_queries += 1
+            for rank, passage_id in enumerate(ids, start=1):
+                if passage_id in relevant_ids:
+                    first_relevant_rank = rank
+                    break
+            if first_relevant_rank is not None and first_relevant_rank <= 5:
+                recall_hits += 1
+            if first_relevant_rank is not None and first_relevant_rank <= 10:
+                reciprocal_rank_sum += 1.0 / first_relevant_rank
+
+        seen_keys: set[tuple[str, str]] = set()
+        for item in passages:
+            returned_count += 1
+            if _evaluation_provenance_complete(item):
+                complete_provenance_count += 1
+            duplicate_key = _evaluation_duplicate_key(item)
+            if duplicate_key is not None:
+                if duplicate_key in seen_keys:
+                    duplicate_count += 1
+                seen_keys.add(duplicate_key)
+        per_query.append(
+            {
+                "query": query,
+                "category": str(judgment.get("category", "")),
+                "result_count": len(passages),
+                "first_relevant_rank": first_relevant_rank,
+            }
+        )
+
+    recall_at_5 = recall_hits / relevant_queries if relevant_queries else 1.0
+    mrr_at_10 = reciprocal_rank_sum / relevant_queries if relevant_queries else 0.0
+    no_result_rate = no_result_queries / len(judgments)
+    duplicate_rate = duplicate_count / returned_count if returned_count else 0.0
+    provenance_completeness = (
+        complete_provenance_count / returned_count if returned_count else 1.0
+    )
+    thresholds = {
+        "recall_at_5": {
+            "minimum": 0.90,
+            "actual": recall_at_5,
+            "passed": recall_at_5 >= 0.90,
+        },
+        "provenance_completeness": {
+            "minimum": 1.0,
+            "actual": provenance_completeness,
+            "passed": provenance_completeness >= 1.0,
+        },
+        "duplicate_rate": {
+            "maximum": 0.0,
+            "actual": duplicate_rate,
+            "passed": duplicate_rate <= 0.0,
+        },
+    }
+    passed = not backend_errors and all(
+        bool(item["passed"]) for item in thresholds.values()
+    )
+    metrics = {
+        "recall_at_5": recall_at_5,
+        "mrr_at_10": mrr_at_10,
+        "no_result_rate": no_result_rate,
+        "duplicate_rate": duplicate_rate,
+        "provenance_completeness": provenance_completeness,
+    }
+    return {
+        "label": "fixture-specific",
+        "fixture_specific": True,
+        "corpus_wide_claim": False,
+        "queries": len(judgments),
+        "relevant_queries": relevant_queries,
+        "returned_results": returned_count,
+        "metrics": metrics,
+        "recall_at_5": recall_at_5,
+        "mrr_at_10": mrr_at_10,
+        "no_result_rate": no_result_rate,
+        "duplicate_rate": duplicate_rate,
+        "provenance_completeness": provenance_completeness,
+        "backend_errors": list(dict.fromkeys(backend_errors))[:20],
+        "thresholds": thresholds,
+        "passed": passed,
+        "per_query": per_query,
+    }
+
+
 def _directory(boundary: Workspace, directory: Path | None, config: ScientificConfig) -> Path:
     value = directory if directory is not None else Path(config.literature_root)
     return boundary.resolve(str(value), must_exist=False)
@@ -301,11 +551,48 @@ def rag_read(
 
 @rag_app.command("evaluate")
 def rag_evaluate(
+    fixture: Path | None = typer.Option(
+        None,
+        "--fixture",
+        help="Optional path to a compatible synthetic judgment fixture.",
+    ),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
 ) -> None:
-    """Run the frozen retrieval evaluation when its fixture is available."""
-    del workspace
-    print(json.dumps({"status": "not_configured", "message": "evaluation fixture is provided by the integration task"}, ensure_ascii=False))
+    """Run the frozen, fixture-specific retrieval quality evaluation."""
+    boundary = _workspace(workspace)
+    config = _config(workspace)
+    try:
+        fixture_path = (
+            boundary.resolve(str(fixture), must_exist=True)
+            if fixture is not None
+            else _evaluation_fixture_path()
+        )
+        judgments = _load_evaluation_fixture(fixture_path)
+        services = build_literature_services(config, boundary)
+        retriever = _service_value(services, "retriever")
+        workspace_id = str(
+            _service_value(
+                services,
+                "workspace_id",
+                getattr(services, "workspace_id", ""),
+            )
+            or ""
+        )
+        if retriever is None or not workspace_id:
+            raise RuntimeError("literature retriever service is unavailable")
+        report = asyncio.run(
+            evaluate_retrieval_fixture(
+                retriever,
+                judgments,
+                workspace_id=workspace_id,
+            )
+        )
+    except Exception as exc:
+        _print_error(exc)
+        raise typer.Exit(code=1) from exc
+    print(json.dumps(report, ensure_ascii=False))
+    if not bool(report.get("passed", False)):
+        raise typer.Exit(code=1)
 
 
 @rag_app.command("snapshot")
