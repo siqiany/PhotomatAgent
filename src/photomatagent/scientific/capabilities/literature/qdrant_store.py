@@ -49,6 +49,7 @@ COLLECTION_SCHEMA_VERSION = 1
 SPARSE_MODEL = "qdrant/bm25"
 MAX_CANDIDATES = 50
 GENERATION_POINT_NAMESPACE = uuid.UUID("b3a8b72d-b7d1-4e31-8589-14cb5132f0a0")
+INGESTION_RUN_POINT_NAMESPACE = uuid.UUID("0c8fc0cc-e4c1-45aa-b5d8-d4dbf5a4d19c")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -367,6 +368,10 @@ class QdrantLiteratureStore:
             fields.extend(
                 [
                     ("document_id", models.PayloadSchemaType.KEYWORD),
+                    ("run_id", models.PayloadSchemaType.KEYWORD),
+                    ("generation_fingerprint", models.PayloadSchemaType.KEYWORD),
+                    ("relative_root", models.PayloadSchemaType.KEYWORD),
+                    ("cursor", models.PayloadSchemaType.KEYWORD),
                     ("relative_source_path", models.PayloadSchemaType.KEYWORD),
                     ("file_name", models.PayloadSchemaType.KEYWORD),
                     ("content_sha256", models.PayloadSchemaType.KEYWORD),
@@ -379,8 +384,11 @@ class QdrantLiteratureStore:
                     ("model_fingerprint", models.PayloadSchemaType.KEYWORD),
                     ("indexed_at", models.PayloadSchemaType.DATETIME),
                     ("last_error", models.PayloadSchemaType.TEXT),
+                    ("errors", models.PayloadSchemaType.TEXT),
                 ]
             )
+        if passages:
+            fields.append(("normalized_text_sha256", models.PayloadSchemaType.KEYWORD))
         return fields
 
     def _payload_index_type(self, info: Any, field_name: str) -> Any:
@@ -1143,6 +1151,8 @@ class QdrantLiteratureStore:
         )
 
     async def list_document_manifests(self, workspace_id: str) -> dict[str, DocumentManifest]:
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
         generation = await self._current_or_error()
         scroll_filter = self._filter(workspace_id=workspace_id, record_type="document")
         records: list[Any] = []
@@ -1197,6 +1207,8 @@ class QdrantLiteratureStore:
             return None
 
     async def upsert_document(self, manifest: DocumentManifest, *, wait: bool = True) -> None:
+        if not isinstance(manifest.workspace_id, str) or not manifest.workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
         generation = await self._current_or_error()
         if not self._fingerprint_matches(manifest.model_fingerprint, generation.fingerprint):
             raise QdrantStoreError(
@@ -1217,11 +1229,29 @@ class QdrantLiteratureStore:
             **self._timeout_kwargs(),
         )
 
-    async def upsert_passages(self, points: Sequence[PassagePoint], *, batch_size: int) -> None:
+    async def upsert_passages(
+        self,
+        points: Sequence[PassagePoint],
+        *,
+        batch_size: int,
+        workspace_id: str | None = None,
+    ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         if not points:
             return
+        if workspace_id is None:
+            # Older internal callers did not pass the scope explicitly.  Keep
+            # that compatibility only when all points carry one unambiguous
+            # workspace; new ingestion always supplies the keyword.
+            point_workspaces = {point.workspace_id for point in points}
+            if len(point_workspaces) != 1:
+                raise ValueError("workspace_id must be explicit for mixed passage workspaces")
+            workspace_id = next(iter(point_workspaces))
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
+        if any(point.workspace_id != workspace_id for point in points):
+            raise ValueError("passage point workspace does not match workspace_id")
         generation = await self._current_or_error()
         if any(
             not self._fingerprint_matches(point.model_fingerprint, generation.fingerprint)
@@ -1254,6 +1284,168 @@ class QdrantLiteratureStore:
                 wait=True,
                 **self._timeout_kwargs(),
             )
+
+    async def upsert_ingestion_run(self, run: Any, *, wait: bool = True) -> None:
+        """Persist bounded ingestion progress as a vectorless control point."""
+        workspace_id = getattr(run, "workspace_id", None)
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
+        generation = await self._current_or_error()
+        generation_fingerprint = str(getattr(run, "generation_fingerprint", ""))
+        if not _FINGERPRINT_RE.fullmatch(generation_fingerprint):
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch", "ingestion run has an incomplete generation fingerprint"
+            )
+        if not self._fingerprint_matches(generation_fingerprint, generation.fingerprint):
+            raise QdrantStoreError(
+                "model_fingerprint_mismatch", "ingestion run belongs to another collection generation"
+            )
+        stats = getattr(run, "stats", None)
+        if stats is None:
+            raise ValueError("ingestion run stats are required")
+        errors = [str(error)[:512] for error in tuple(getattr(stats, "errors", ()))[-20:]]
+        run_id = str(getattr(run, "run_id", ""))
+        if not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        payload = {
+            "schema_version": COLLECTION_SCHEMA_VERSION,
+            "record_type": "ingestion_run",
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "generation": generation_fingerprint,
+            "generation_fingerprint": generation_fingerprint,
+            "relative_root": str(getattr(run, "relative_root", ".")),
+            "cursor": getattr(run, "cursor", None),
+            "status": str(getattr(run, "status", "running")),
+            "discovered": int(getattr(stats, "discovered", 0)),
+            "unchanged": int(getattr(stats, "unchanged", 0)),
+            "indexed": int(getattr(stats, "indexed", 0)),
+            "failed": int(getattr(stats, "failed", 0)),
+            "deleted": int(getattr(stats, "deleted", 0)),
+            "chunks": int(getattr(stats, "chunks", 0)),
+            "staged_cleanup": int(getattr(stats, "staged_cleanup", 0)),
+            "next_cursor": getattr(stats, "next_cursor", None),
+            "complete": bool(getattr(stats, "complete", False)),
+            "retryable": bool(getattr(stats, "retryable", False)),
+            "errors": errors,
+        }
+        models = _qdrant_models()
+        point_id = str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, f"{workspace_id}:{run_id}"))
+        await self._client.upsert(
+            collection_name=generation.documents_alias,
+            points=[models.PointStruct(id=point_id, vector={}, payload=payload)],
+            wait=wait,
+            **self._timeout_kwargs(),
+        )
+
+    async def get_ingestion_run(self, run_id: str, workspace_id: str) -> Any | None:
+        """Read one workspace-scoped ingestion control point, if present."""
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        generation = await self._current_or_error()
+        point_id = str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, f"{workspace_id}:{run_id}"))
+        records = await self._client.retrieve(
+            collection_name=generation.documents_alias,
+            ids=[point_id],
+            with_payload=True,
+            with_vectors=False,
+            **self._timeout_kwargs(),
+        )
+        if not isinstance(records, Sequence) or not records:
+            return None
+        payload = _payload(records[0])
+        if (
+            payload.get("record_type") != "ingestion_run"
+            or payload.get("workspace_id") != workspace_id
+            or str(payload.get("run_id", "")) != run_id
+            or str(payload.get("generation_fingerprint", payload.get("generation", "")))
+            != generation.fingerprint
+        ):
+            return None
+        from photomatagent.scientific.capabilities.literature.ingestion import (
+            IngestionRunState,
+            IngestionStats,
+        )
+
+        errors_value = payload.get("errors", ())
+        errors: tuple[str, ...]
+        if isinstance(errors_value, str):
+            errors = (errors_value[:512],) if errors_value else ()
+        elif isinstance(errors_value, Sequence):
+            errors = tuple(str(item)[:512] for item in list(errors_value)[-20:])
+        else:
+            errors = ()
+        stats = IngestionStats(
+            run_id=run_id,
+            discovered=int(payload.get("discovered", 0)),
+            unchanged=int(payload.get("unchanged", 0)),
+            indexed=int(payload.get("indexed", 0)),
+            failed=int(payload.get("failed", 0)),
+            deleted=int(payload.get("deleted", 0)),
+            chunks=int(payload.get("chunks", 0)),
+            staged_cleanup=int(payload.get("staged_cleanup", 0)),
+            next_cursor=payload.get("next_cursor"),
+            complete=bool(payload.get("complete", False)),
+            errors=errors,
+            retryable=bool(payload.get("retryable", False)),
+        )
+        return IngestionRunState(
+            run_id=run_id,
+            workspace_id=workspace_id,
+            generation_fingerprint=str(
+                payload.get("generation_fingerprint", payload.get("generation", ""))
+            ),
+            relative_root=str(payload.get("relative_root", ".")),
+            cursor=payload.get("cursor"),
+            status=str(payload.get("status", "running")),
+            stats=stats,
+        )
+
+    async def delete_staged_revisions(
+        self,
+        document_id: str,
+        *,
+        keep_revision: str | None = None,
+        workspace_id: str | None = None,
+    ) -> int:
+        """Delete only staged revisions, returning the exact pre-delete count."""
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
+        generation = await self._current_or_error()
+        extra: tuple[Any, ...] = ()
+        if keep_revision is not None:
+            if _FINGERPRINT_RE.fullmatch(keep_revision) is None:
+                raise ValueError("keep_revision must be a complete SHA-256 fingerprint")
+            models = _qdrant_models()
+            extra = (
+                models.FieldCondition(
+                    key="document_revision",
+                    match=models.MatchExcept(except_=[keep_revision]),
+                ),
+            )
+        query_filter = self._passage_filter(
+            workspace_id=workspace_id,
+            document_id=document_id,
+            ingest_state=IngestState.STAGED,
+            extra=extra,
+        )
+        result = await self._client.count(
+            collection_name=generation.passages_alias,
+            count_filter=query_filter,
+            exact=True,
+            **self._timeout_kwargs(),
+        )
+        count = int(result if isinstance(result, int) else _record_attr(result, "count", 0))
+        if count:
+            await self._client.delete(
+                collection_name=generation.passages_alias,
+                points_selector=query_filter,
+                wait=True,
+                **self._timeout_kwargs(),
+            )
+        return count
 
     async def count_revision(
         self,
@@ -1468,6 +1660,7 @@ class QdrantLiteratureStore:
                 model_fingerprint=str(payload.get("model_fingerprint", "")),
                 limitations=tuple(str(item) for item in payload.get("limitations", [])),
                 dense=tuple(float(value) for value in dense),
+                normalized_text_sha256=str(payload.get("normalized_text_sha256", "")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -1668,6 +1861,7 @@ __all__ = [
     "CollectionGeneration",
     "DocumentManifest",
     "DocumentStatus",
+    "INGESTION_RUN_POINT_NAMESPACE",
     "IngestState",
     "MAX_CANDIDATES",
     "PassagePoint",

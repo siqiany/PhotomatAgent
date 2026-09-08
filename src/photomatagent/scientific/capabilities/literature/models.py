@@ -152,11 +152,14 @@ class PassagePoint:
     model_fingerprint: str
     limitations: tuple[str, ...] = ()
     dense: tuple[float, ...] = ()
+    normalized_text_sha256: str = ""
 
     def __post_init__(self) -> None:
         validate_relative_source_path(self.relative_source_path)
         _validate_sha256(self.document_revision, "document_revision")
         _validate_sha256(self.model_fingerprint, "model_fingerprint")
+        if self.normalized_text_sha256:
+            _validate_sha256(self.normalized_text_sha256, "normalized_text_sha256")
         if self.record_type != "passage":
             raise ValueError("PassagePoint.record_type must be 'passage'")
         object.__setattr__(self, "ingest_state", IngestState(self.ingest_state))
@@ -188,6 +191,8 @@ class PassagePoint:
             "relative_source_path": self.relative_source_path,
             "model_fingerprint": self.model_fingerprint,
             "limitations": list(self.limitations),
+            "chunk_index": self.chunk_index,
+            "normalized_text_sha256": self.normalized_text_sha256,
         }
 
 
