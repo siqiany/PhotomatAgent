@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
 
@@ -48,6 +49,31 @@ def _require_base_url(base_url: str) -> str:
         raise RagProviderError(
             "external_base_url_missing",
             "external provider base URL is not configured",
+        )
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        # Accessing ``port`` validates malformed or out-of-range port values.
+        parsed.port
+    except ValueError as exc:
+        raise RagProviderError(
+            "external_base_url_invalid",
+            "external provider base URL must be a valid absolute HTTP(S) URL",
+        ) from exc
+    if (
+        any(character.isspace() for character in value)
+        or parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or "?" in value
+        or "#" in value
+    ):
+        raise RagProviderError(
+            "external_base_url_invalid",
+            "external provider base URL must be a valid absolute HTTP(S) URL",
         )
     return value
 

@@ -143,6 +143,7 @@ _PROVIDER_UNCONFIGURED_CODES = {
     "external_api_key_env_missing",
     "external_api_key_missing",
     "external_base_url_missing",
+    "external_base_url_invalid",
 }
 
 

@@ -16,6 +16,7 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
 from photomatagent.scientific.capabilities.literature.providers.factory import (
     build_embedding_provider,
 )
+from photomatagent.scientific.capabilities.literature.providers.base import ModelIdentity
 from photomatagent.scientific.capabilities.status import probe_all_capabilities
 from photomatagent.workspace import Workspace
 
@@ -58,10 +59,14 @@ def _patch_probe_client(monkeypatch):
     monkeypatch.setattr(qdrant_client, "QdrantClient", _ProbeClient)
 
 
-def _ready_generation(config: ScientificConfig) -> CollectionGeneration:
-    embedding = build_embedding_provider(config)
+def _ready_generation(
+    config: ScientificConfig, *, identity: ModelIdentity | None = None
+) -> CollectionGeneration:
+    embedding_identity = (
+        identity if identity is not None else build_embedding_provider(config).identity
+    )
     fingerprint = collection_fingerprint(
-        embedding.identity,
+        embedding_identity,
         1,
         prefix=config.qdrant_collection_prefix,
     )
@@ -78,8 +83,15 @@ def _ready_generation(config: ScientificConfig) -> CollectionGeneration:
     )
 
 
-def _patch_probe_store(monkeypatch, config: ScientificConfig, *, error=None, missing=False):
-    generation = _ready_generation(config)
+def _patch_probe_store(
+    monkeypatch,
+    config: ScientificConfig,
+    *,
+    error=None,
+    missing=False,
+    identity: ModelIdentity | None = None,
+):
+    generation = _ready_generation(config, identity=identity)
     calls: list[str] = []
 
     class FakeStore:
@@ -252,6 +264,50 @@ def test_literature_probe_rejects_incomplete_external_provider_config(
     assert result.status.value in {"UNCONFIGURED", "ERROR"}
     assert "available" not in result.detail.casefold()
     assert "missing" in result.detail.casefold() or "base" in result.detail.casefold()
+
+
+@pytest.mark.parametrize("provider", ["embedding", "reranker"])
+def test_literature_probe_rejects_invalid_external_base_url(
+    tmp_path, monkeypatch, provider
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    if provider == "embedding":
+        monkeypatch.setenv("EMBEDDING_KEY", "secret-value")
+        config = ScientificConfig(
+            literature_root="dataset/paper",
+            rag_allow_external=True,
+            embedding_provider="openai_compatible",
+            embedding_model="embedding-test",
+            embedding_vector_dim=384,
+            embedding_base_url="not-a-url",
+            embedding_api_key_env="EMBEDDING_KEY",
+        )
+        identity = ModelIdentity(
+            provider="openai_compatible",
+            model=config.embedding_model,
+            dimension=config.embedding_vector_dim,
+            normalize=False,
+        )
+        _patch_probe_store(monkeypatch, config, identity=identity)
+    else:
+        monkeypatch.setenv("RERANKER_KEY", "secret-value")
+        config = ScientificConfig(
+            literature_root="dataset/paper",
+            rag_allow_external=True,
+            reranker_provider="cohere_compatible",
+            reranker_model="reranker-test",
+            reranker_base_url="not-a-url",
+            reranker_api_key_env="RERANKER_KEY",
+        )
+        _patch_probe_store(monkeypatch, config)
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value in {"UNCONFIGURED", "ERROR"}
+    assert result.status.value != "AVAILABLE"
+    assert "external_base_url_invalid" in result.detail
 
 
 def test_literature_probe_reports_server_version_and_validates_generation(

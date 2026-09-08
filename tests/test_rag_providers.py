@@ -100,6 +100,60 @@ def test_external_factory_rejects_missing_key_without_secret_in_error(
     assert "SECRET_KEY_ENV" not in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        "ftp://embedding.test/v1",
+        "https://user:pass@embedding.test/v1",
+        "https://embedding.test/v1?tenant=one",
+        "https://embedding.test/v1#fragment",
+        "https://",
+    ],
+)
+def test_external_embedding_rejects_invalid_base_url(base_url, monkeypatch):
+    monkeypatch.setenv("EMBEDDING_KEY", "secret-value")
+    config = ScientificConfig(
+        rag_allow_external=True,
+        embedding_provider="openai_compatible",
+        embedding_model="embedding-test",
+        embedding_base_url=base_url,
+        embedding_api_key_env="EMBEDDING_KEY",
+    )
+
+    with pytest.raises(RagProviderError) as exc:
+        build_embedding_provider(config)
+
+    assert exc.value.code == "external_base_url_invalid"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        "ftp://reranker.test/v1",
+        "https://user:pass@reranker.test/v1",
+        "https://reranker.test/v1?tenant=one",
+        "https://reranker.test/v1#fragment",
+        "https://",
+    ],
+)
+def test_external_reranker_rejects_invalid_base_url(base_url, monkeypatch):
+    monkeypatch.setenv("RERANKER_KEY", "secret-value")
+    config = ScientificConfig(
+        rag_allow_external=True,
+        reranker_provider="cohere_compatible",
+        reranker_model="reranker-test",
+        reranker_base_url=base_url,
+        reranker_api_key_env="RERANKER_KEY",
+    )
+
+    with pytest.raises(RagProviderError) as exc:
+        build_reranker_provider(config)
+
+    assert exc.value.code == "external_base_url_invalid"
+
+
 def test_local_embedding_prefixes_and_normalizes_through_thread(monkeypatch):
     calls: list[dict[str, object]] = []
 
