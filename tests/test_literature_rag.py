@@ -242,3 +242,26 @@ def test_evidence_never_guesses_missing_numbers() -> None:
         source="paper_z",
     )
     assert evidence == []
+
+
+@pytest.mark.asyncio
+async def test_extract_evidence_bounds_input_and_state_updates(tmp_path, services) -> None:
+    tool = LiteratureExtractEvidenceTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    )
+    passages = [
+        {
+            "text": "The responsivity was 0.82 A/W at 80 K and 3.5 um. "
+            * 20,
+            "page": index + 1,
+        }
+        for index in range(150)
+    ]
+
+    result = await tool.execute({"passages": passages})
+
+    assert not result.is_error
+    assert len(result.data["evidence"]) <= 100
+    assert len(result.evidence) <= 100
+    assert len(result.state_updates) <= 100
+    assert tool.input_schema["properties"]["passages"]["maxItems"] == 100

@@ -126,13 +126,19 @@ def rag_status(
     """Show Qdrant, alias, provider, and source-root readiness without secrets."""
     boundary = _workspace(workspace)
     config = _config(workspace)
-    result = LiteratureProbe(config, boundary).probe()
+    probe = LiteratureProbe(config, boundary)
+    result = probe.probe()
+    snapshot_method = getattr(probe, "status_snapshot", None)
+    snapshot = snapshot_method() if callable(snapshot_method) else {}
     source_root = boundary.resolve(config.literature_root, must_exist=False)
     table = Table("RAG status", "Value")
     rows = [
         ("Capability", result.status.value),
         ("Detail", result.detail or "—"),
         ("Version", result.version or "—"),
+        ("Qdrant server", snapshot.get("server_version", "unknown")),
+        ("Alias state", snapshot.get("alias_state", "unknown")),
+        ("Generation", snapshot.get("generation_state", "unknown")),
         ("Qdrant URL", config.qdrant_url),
         ("Qdrant API key", "configured (value hidden)" if os.environ.get(config.qdrant_api_key_env) else "not configured"),
         ("Collection prefix", config.qdrant_collection_prefix),

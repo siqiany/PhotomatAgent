@@ -6,10 +6,15 @@ capped so a literature step can never flood model context.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
+import inspect
 import json
+import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +136,68 @@ def _error_result(exc: BaseException, *, operation: str) -> ScientificToolResult
     )
 
 
+_PROBE_TIMEOUT_SECONDS = 2
+_CHUNK_SCHEMA_VERSION = 1
+_PROVIDER_UNCONFIGURED_CODES = {
+    "external_provider_not_allowed",
+    "external_api_key_env_missing",
+    "external_api_key_missing",
+    "external_base_url_missing",
+}
+
+
+def _probe_record_value(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _probe_alias_map(response: Any) -> dict[str, str]:
+    aliases = _probe_record_value(response, "aliases", response)
+    if isinstance(aliases, Mapping):
+        return {str(key): str(value) for key, value in aliases.items()}
+    result: dict[str, str] = {}
+    for alias in list(aliases or ()):
+        alias_name = _probe_record_value(alias, "alias_name")
+        collection_name = _probe_record_value(alias, "collection_name")
+        if alias_name is not None and collection_name is not None:
+            result[str(alias_name)] = str(collection_name)
+    return result
+
+
+def _probe_version(server_version: str = "") -> str:
+    versions = []
+    if server_version:
+        versions.append(f"qdrant-server={server_version}")
+    versions.extend(
+        [
+            f"arxiv={_version('arxiv')}",
+            f"pypdf={_version('pypdf')}",
+            f"docling={_version('docling')}",
+            f"qdrant-client={_version('qdrant-client')}",
+            f"sentence-transformers={_version('sentence-transformers')}",
+        ]
+    )
+    return "; ".join(versions)
+
+
+def _probe_fingerprint_compatible(actual: str, expected: str) -> bool:
+    return actual == expected or (
+        len(actual) == 12 and expected.startswith(actual)
+    ) or (len(expected) == 12 and actual.startswith(expected))
+
+
+def _probe_error_code(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
+    return type(exc).__name__.casefold() or "literature_probe_error"
+
+
+async def _await_probe_close(value: Any) -> None:
+    await value
+
+
 class LiteratureProbe(CapabilityPack):
     name = "literature"
     description = (
@@ -140,6 +207,11 @@ class LiteratureProbe(CapabilityPack):
 
     def probe(self) -> ProbeResult:
         """Run bounded, read-only checks without loading local models."""
+        self._status = {
+            "server_version": "unknown",
+            "alias_state": "not checked",
+            "generation_state": "not checked",
+        }
         missing: list[str] = []
         for module_name in ("arxiv", "pypdf", "docling", "qdrant_client", "sentence_transformers"):
             try:
@@ -165,13 +237,38 @@ class LiteratureProbe(CapabilityPack):
                 status=CapabilityStatus.UNCONFIGURED,
                 detail="qdrant_url is not configured",
             )
-        if (
-            self._config.embedding_provider != "local"
-            or self._config.reranker_provider not in {"local", "disabled"}
-        ) and not self._config.rag_allow_external:
+        if not self._config.embedding_model.strip():
             return ProbeResult(
                 status=CapabilityStatus.UNCONFIGURED,
-                detail="external RAG provider configured but explicit authorization is disabled",
+                detail="embedding_model_missing: embedding model is not configured",
+            )
+        if (
+            self._config.reranker_provider != "disabled"
+            and not self._config.reranker_model.strip()
+        ):
+            return ProbeResult(
+                status=CapabilityStatus.UNCONFIGURED,
+                detail="reranker_model_missing: reranker model is not configured",
+            )
+
+        try:
+            from photomatagent.scientific.capabilities.literature.providers.factory import (
+                build_embedding_provider,
+                build_reranker_provider,
+            )
+
+            embedding = build_embedding_provider(self._config)
+            build_reranker_provider(self._config)
+        except Exception as exc:
+            code = _probe_error_code(exc)
+            status = (
+                CapabilityStatus.UNCONFIGURED
+                if code in _PROVIDER_UNCONFIGURED_CODES
+                else CapabilityStatus.ERROR
+            )
+            return ProbeResult(
+                status=status,
+                detail=f"{code}: RAG provider configuration is not ready",
             )
 
         try:
@@ -189,26 +286,58 @@ class LiteratureProbe(CapabilityPack):
                 detail="literature source root is missing",
             )
 
+        client = None
+        server_version = ""
         try:
             # The sync client is used only for a short, read-only health check.
             # Cap the probe timeout so startup never waits for the full ingest
             # timeout and never creates collections or loads model weights.
             from qdrant_client import QdrantClient
 
-            api_key = __import__("os").environ.get(self._config.qdrant_api_key_env, "").strip()
+            api_key = os.environ.get(self._config.qdrant_api_key_env, "").strip()
             client = QdrantClient(
                 url=self._config.qdrant_url,
                 api_key=api_key or None,
-                timeout=min(self._config.qdrant_timeout_seconds, 2),
+                timeout=min(
+                    self._config.qdrant_timeout_seconds, _PROBE_TIMEOUT_SECONDS
+                ),
                 prefer_grpc=False,
             )
             client.get_collections()
-            aliases = getattr(client, "get_collection_aliases", None)
-            if aliases is not None:
-                aliases()
-            close = getattr(client, "close", None)
-            if close is not None:
-                close()
+            info = client.info()
+            raw_server_version = _probe_record_value(info, "version", "")
+            server_version = str(raw_server_version or "").strip()
+            if not server_version:
+                return ProbeResult(
+                    status=CapabilityStatus.ERROR,
+                    detail="qdrant_server_version_missing: server version is unavailable",
+                    version=_probe_version(),
+                )
+            self._status["server_version"] = server_version
+
+            aliases_method = getattr(client, "get_aliases", None)
+            if aliases_method is None:
+                aliases_method = getattr(client, "get_collection_aliases", None)
+            if aliases_method is None:
+                return ProbeResult(
+                    status=CapabilityStatus.ERROR,
+                    detail="qdrant_aliases_unavailable: aliases cannot be inspected",
+                    version=_probe_version(server_version),
+                )
+            aliases = _probe_alias_map(aliases_method())
+            expected_aliases = {
+                f"{self._config.qdrant_collection_prefix}_documents_current",
+                f"{self._config.qdrant_collection_prefix}_passages_current",
+            }
+            missing_aliases = sorted(expected_aliases - set(aliases))
+            if missing_aliases:
+                self._status["alias_state"] = "missing: " + ", ".join(missing_aliases)
+                return ProbeResult(
+                    status=CapabilityStatus.UNCONFIGURED,
+                    detail="current Qdrant aliases are not configured",
+                    version=_probe_version(server_version),
+                )
+            self._status["alias_state"] = "ready"
         except ImportError:
             return ProbeResult(
                 status=CapabilityStatus.MISSING_DEPENDENCY,
@@ -223,20 +352,119 @@ class LiteratureProbe(CapabilityPack):
             return ProbeResult(
                 status=CapabilityStatus.ERROR,
                 detail=f"{code}: Qdrant health check failed",
-                version=f"qdrant-client={_version('qdrant-client')}",
+                version=_probe_version(server_version),
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                try:
+                    closed = close()
+                    if inspect.isawaitable(closed):
+                        asyncio.run(_await_probe_close(closed))
+                except Exception:
+                    pass
+
+        try:
+            from photomatagent.scientific.capabilities.literature.qdrant_store import (
+                QdrantLiteratureStore,
+                QdrantStoreError,
+                collection_fingerprint,
+            )
+
+            probe_config = dataclass_replace(
+                self._config,
+                qdrant_timeout_seconds=min(
+                    self._config.qdrant_timeout_seconds, _PROBE_TIMEOUT_SECONDS
+                ),
+            )
+            store = QdrantLiteratureStore.from_config(probe_config)
+            expected_fingerprint = collection_fingerprint(
+                embedding.identity,
+                _CHUNK_SCHEMA_VERSION,
+                prefix=self._config.qdrant_collection_prefix,
+                sparse_model=getattr(store, "sparse_model", "qdrant/bm25"),
+            )
+
+            async def validate_generation() -> Any:
+                try:
+                    generation = await store.resolve_current_generation()
+                    if generation is None:
+                        return None
+                    actual_fingerprint = str(
+                        _probe_record_value(generation, "fingerprint", "")
+                    )
+                    if not _probe_fingerprint_compatible(
+                        actual_fingerprint, expected_fingerprint
+                    ):
+                        raise QdrantStoreError(
+                            "model_fingerprint_mismatch",
+                            "current collection fingerprint does not match provider",
+                        )
+                    validate = getattr(store, "validate_current_generation", None)
+                    if validate is None:
+                        raise QdrantStoreError(
+                            "control_point_unavailable",
+                            "current generation validation is unavailable",
+                        )
+                    await validate(expected_fingerprint)
+                    return generation
+                finally:
+                    close_client = getattr(getattr(store, "_client", None), "close", None)
+                    if close_client is not None:
+                        closed_client = close_client()
+                        if inspect.isawaitable(closed_client):
+                            await closed_client
+
+            generation = asyncio.run(validate_generation())
+            if generation is None:
+                self._status["generation_state"] = "missing"
+                return ProbeResult(
+                    status=CapabilityStatus.UNCONFIGURED,
+                    detail="current Qdrant generation is not configured",
+                    version=_probe_version(server_version),
+                )
+            generation_fingerprint = str(
+                _probe_record_value(generation, "fingerprint", "")
+            )
+            self._status["generation_state"] = (
+                f"ready:{generation_fingerprint[:12]}"
+            )
+        except Exception as exc:
+            code = _probe_error_code(exc)
+            if code in {"collection_missing", "control_point_missing"}:
+                status = CapabilityStatus.UNCONFIGURED
+            else:
+                status = CapabilityStatus.ERROR
+            self._status["generation_state"] = f"error:{code}"
+            return ProbeResult(
+                status=status,
+                detail=f"{code}: current Qdrant generation is not ready",
+                version=_probe_version(server_version),
             )
 
         return ProbeResult(
             status=CapabilityStatus.AVAILABLE,
             detail=(
                 "arxiv + pypdf + docling + qdrant-client + "
-                "sentence-transformers available; source root and Qdrant ready"
+                "sentence-transformers available; source root and Qdrant ready; "
+                f"aliases={self._status['alias_state']}; "
+                f"generation={self._status['generation_state']}"
             ),
-            version=(
-                f"arxiv={_version('arxiv')}; pypdf={_version('pypdf')}; "
-                f"docling={_version('docling')}; qdrant-client={_version('qdrant-client')}; "
-                f"sentence-transformers={_version('sentence-transformers')}"
-            ),
+            version=_probe_version(server_version),
+        )
+
+    def status_snapshot(self) -> dict[str, str]:
+        """Return the latest bounded status details for direct CLI rendering."""
+        return dict(
+            getattr(
+                self,
+                "_status",
+                {
+                    "server_version": "unknown",
+                    "alias_state": "not checked",
+                    "generation_state": "not checked",
+                },
+            )
         )
 
     def tools(self) -> list[Tool]:
@@ -254,6 +482,11 @@ class LiteratureProbe(CapabilityPack):
     def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
         self._config = config
         self._workspace = workspace
+        self._status = {
+            "server_version": "unknown",
+            "alias_state": "not checked",
+            "generation_state": "not checked",
+        }
 
 
 def _papers_dir(workspace: Workspace) -> Path:
@@ -373,6 +606,9 @@ def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
             _clean(str(limitation), 240) for limitation in list(limitations)[:8]
         ],
     }
+
+
+MAX_EVIDENCE_ITEMS = 100
 
 
 class LiteratureSearchArxivTool(Tool):
@@ -941,6 +1177,7 @@ class LiteratureExtractEvidenceTool(Tool):
         "properties": {
             "passages": {
                 "type": "array",
+                "maxItems": MAX_EVIDENCE_ITEMS,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -970,6 +1207,7 @@ class LiteratureExtractEvidenceTool(Tool):
         )
 
         passages = list(arguments.get("passages") or [])
+        passages = passages[:MAX_EVIDENCE_ITEMS]
         resolved: list[dict[str, Any]] = []
         try:
             services = (
@@ -1027,6 +1265,7 @@ class LiteratureExtractEvidenceTool(Tool):
                     }
                 )
         evidence = extract_evidence_from_passages(resolved)
+        bounded_evidence = evidence[:MAX_EVIDENCE_ITEMS]
         rows = [
             {
                 "subject": item.subject,
@@ -1038,13 +1277,16 @@ class LiteratureExtractEvidenceTool(Tool):
                 "method": item.method,
                 "summary": item.summary,
             }
-            for item in evidence
+            for item in bounded_evidence
         ]
-        payload = {"count": len(rows), "evidence": rows[:100]}
+        payload = {
+            "count": len(rows),
+            "evidence": rows,
+        }
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
             data=payload,
-            evidence=evidence,
+            evidence=bounded_evidence,
         )
 
 

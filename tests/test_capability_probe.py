@@ -2,11 +2,114 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
+from photomatagent.scientific.capabilities.literature import LiteratureProbe
+from photomatagent.scientific.capabilities.literature.qdrant_store import (
+    CollectionGeneration,
+    QdrantStoreError,
+    collection_fingerprint,
+)
+from photomatagent.scientific.capabilities.literature.providers.factory import (
+    build_embedding_provider,
+)
 from photomatagent.scientific.capabilities.status import probe_all_capabilities
 from photomatagent.workspace import Workspace
+
+
+class _ProbeClient:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def get_collections(self):
+        return SimpleNamespace(collections=[])
+
+    def get_aliases(self):
+        return SimpleNamespace(
+            aliases=[
+                SimpleNamespace(
+                    alias_name="photomat_literature_documents_current",
+                    collection_name="photomat_literature_documents_123456789abc",
+                ),
+                SimpleNamespace(
+                    alias_name="photomat_literature_passages_current",
+                    collection_name="photomat_literature_passages_123456789abc",
+                ),
+            ]
+        )
+
+    def get_collection_aliases(self, *args, **kwargs):
+        del args, kwargs
+        return self.get_aliases()
+
+    def info(self):
+        return SimpleNamespace(version="1.18.2")
+
+    def close(self):
+        return None
+
+
+def _patch_probe_client(monkeypatch):
+    import qdrant_client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", _ProbeClient)
+
+
+def _ready_generation(config: ScientificConfig) -> CollectionGeneration:
+    embedding = build_embedding_provider(config)
+    fingerprint = collection_fingerprint(
+        embedding.identity,
+        1,
+        prefix=config.qdrant_collection_prefix,
+    )
+    return CollectionGeneration(
+        fingerprint=fingerprint,
+        documents_physical=(
+            f"{config.qdrant_collection_prefix}_documents_{fingerprint[:12]}"
+        ),
+        passages_physical=(
+            f"{config.qdrant_collection_prefix}_passages_{fingerprint[:12]}"
+        ),
+        documents_alias=f"{config.qdrant_collection_prefix}_documents_current",
+        passages_alias=f"{config.qdrant_collection_prefix}_passages_current",
+    )
+
+
+def _patch_probe_store(monkeypatch, config: ScientificConfig, *, error=None, missing=False):
+    generation = _ready_generation(config)
+    calls: list[str] = []
+
+    class FakeStore:
+        prefix = config.qdrant_collection_prefix
+        sparse_model = "qdrant/bm25"
+
+        async def resolve_current_generation(self):
+            calls.append("resolve")
+            if error is not None:
+                raise error
+            return None if missing else generation
+
+        async def validate_current_generation(self, expected_fingerprint):
+            calls.append(f"validate:{expected_fingerprint}")
+            if error is not None:
+                raise error
+            assert expected_fingerprint == generation.fingerprint
+
+    class FakeStoreFactory:
+        @classmethod
+        def from_config(cls, config):
+            del config
+            return FakeStore()
+
+    qdrant_store_module = __import__(
+        "photomatagent.scientific.capabilities.literature.qdrant_store",
+        fromlist=["QdrantLiteratureStore"],
+    )
+    monkeypatch.setattr(qdrant_store_module, "QdrantLiteratureStore", FakeStoreFactory)
+    return calls
 
 
 def test_all_probes_report_without_raising(tmp_path):
@@ -127,3 +230,80 @@ def test_literature_tools_remain_deferred_when_qdrant_is_unavailable(tmp_path):
         "literature.extract_evidence",
     } <= names
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in pack.tools())
+
+
+def test_literature_probe_rejects_incomplete_external_provider_config(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(
+        literature_root="dataset/paper",
+        embedding_provider="openai_compatible",
+        embedding_model="embedding-test",
+        embedding_base_url="",
+        embedding_api_key_env="MISSING_EMBEDDING_KEY",
+        rag_allow_external=True,
+    )
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value in {"UNCONFIGURED", "ERROR"}
+    assert "available" not in result.detail.casefold()
+    assert "missing" in result.detail.casefold() or "base" in result.detail.casefold()
+
+
+def test_literature_probe_reports_server_version_and_validates_generation(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    calls = _patch_probe_store(monkeypatch, config)
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value == "AVAILABLE"
+    assert "qdrant-server=1.18.2" in result.version
+    assert "alias" in result.detail.casefold()
+    assert "generation" in result.detail.casefold()
+    assert calls[0] == "resolve"
+    assert any(call.startswith("validate:") for call in calls)
+
+
+def test_literature_probe_marks_missing_alias_generation_unconfigured(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    calls = _patch_probe_store(monkeypatch, config, missing=True)
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value == "UNCONFIGURED"
+    assert "alias" in result.detail.casefold() or "generation" in result.detail.casefold()
+    assert calls == ["resolve"]
+
+
+@pytest.mark.parametrize("error_code", ["schema_mismatch", "model_fingerprint_mismatch"])
+def test_literature_probe_rejects_schema_or_fingerprint_mismatch(
+    tmp_path, monkeypatch, error_code
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(
+        monkeypatch,
+        config,
+        error=QdrantStoreError(error_code, "invalid current generation"),
+    )
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value == "ERROR"
+    assert error_code in result.detail

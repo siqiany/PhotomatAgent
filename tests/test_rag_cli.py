@@ -7,7 +7,9 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from photomatagent.cli.app import app
+from photomatagent.cli import rag as rag_cli
 from photomatagent.cli.commands import ChatCommandRouter
+from photomatagent.scientific.capabilities.base import CapabilityStatus, ProbeResult
 from photomatagent.workspace import Workspace
 
 
@@ -63,3 +65,34 @@ def test_rag_group_defaults_to_status(cli_runner: CliRunner, monkeypatch: pytest
     result = cli_runner.invoke(app, ["rag"])
     assert result.exit_code == 0
     assert "secret-value" not in result.stdout
+
+
+def test_rag_status_shows_server_alias_and_generation_state(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeProbe:
+        def __init__(self, config, workspace) -> None:
+            del config, workspace
+
+        def probe(self) -> ProbeResult:
+            return ProbeResult(
+                status=CapabilityStatus.AVAILABLE,
+                detail="aliases ready; generation ready",
+                version="qdrant-server=1.18.2",
+            )
+
+        def status_snapshot(self) -> dict[str, str]:
+            return {
+                "server_version": "1.18.2",
+                "alias_state": "ready",
+                "generation_state": "ready:123456789abc",
+            }
+
+    monkeypatch.setattr(rag_cli, "LiteratureProbe", FakeProbe)
+    result = cli_runner.invoke(app, ["rag", "status"])
+
+    assert result.exit_code == 0
+    assert "Qdrant server" in result.stdout
+    assert "Alias state" in result.stdout
+    assert "Generation" in result.stdout
+    assert "1.18.2" in result.stdout
