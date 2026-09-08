@@ -484,10 +484,19 @@ class QdrantLiteratureStore:
             metadata_dimension = metadata.get("dense_dimension") or metadata.get(
                 "photomat_dense_dimension"
             )
-            if (
+            if metadata_dimension is None:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} vector dimension metadata is missing"
+                )
+            try:
+                parsed_metadata_dimension = int(metadata_dimension)
+            except (TypeError, ValueError) as exc:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has an unreadable vector dimension"
+                ) from exc
+            if parsed_metadata_dimension < 1 or (
                 expected_dimension is not None
-                and metadata_dimension is not None
-                and int(metadata_dimension) != expected_dimension
+                and parsed_metadata_dimension != expected_dimension
             ):
                 raise QdrantStoreError(
                     "schema_mismatch", f"collection {name!r} has an incompatible vector dimension"
@@ -501,12 +510,28 @@ class QdrantLiteratureStore:
                 )
             dense_config = actual_vectors["dense"]
             actual_size = _record_attr(dense_config, "size", None)
-            if expected_dimension is not None and actual_size is not None and int(actual_size) != expected_dimension:
+            if actual_size is None:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} dense vector size cannot be inspected"
+                )
+            try:
+                parsed_size = int(actual_size)
+            except (TypeError, ValueError) as exc:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} has an unreadable vector dimension"
+                ) from exc
+            if parsed_size < 1 or (
+                expected_dimension is not None and parsed_size != expected_dimension
+            ):
                 raise QdrantStoreError(
                     "schema_mismatch", f"collection {name!r} has an incompatible vector dimension"
                 )
             distance = _record_attr(dense_config, "distance", None)
-            if distance is not None and str(_enum_value(distance)).lower() != "cosine":
+            if distance is None:
+                raise QdrantStoreError(
+                    "schema_mismatch", f"collection {name!r} vector distance cannot be inspected"
+                )
+            if str(_enum_value(distance)).lower() != "cosine":
                 raise QdrantStoreError(
                     "schema_mismatch", f"collection {name!r} has an incompatible vector distance"
                 )

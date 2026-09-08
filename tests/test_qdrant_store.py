@@ -551,6 +551,40 @@ async def test_ensure_generation_rejects_existing_vector_schema_mismatch() -> No
     assert exc.value.code == "schema_mismatch"
 
 
+async def test_ensure_generation_rejects_missing_dense_vector_size() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.collections[generation.passages_physical]["params"] = SimpleNamespace(
+        vectors={"dense": SimpleNamespace(distance="Cosine", on_disk=True)},
+        sparse_vectors={"sparse_bm25": SimpleNamespace(modifier="idf")},
+        shard_number=1,
+        replication_factor=1,
+        on_disk_payload=True,
+    )
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
+async def test_ensure_generation_rejects_missing_dense_vector_distance() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    client.collections[generation.passages_physical]["params"] = SimpleNamespace(
+        vectors={"dense": SimpleNamespace(size=384, on_disk=True)},
+        sparse_vectors={"sparse_bm25": SimpleNamespace(modifier="idf")},
+        shard_number=1,
+        replication_factor=1,
+        on_disk_payload=True,
+    )
+    fresh_store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    with pytest.raises(QdrantStoreError) as exc:
+        await fresh_store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    assert exc.value.code == "schema_mismatch"
+
+
 async def test_ensure_generation_validates_qdrant_vector_schema_when_metadata_is_missing() -> None:
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
