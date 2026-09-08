@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import os
 import re
+import stat
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -144,6 +146,34 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _enumerate_pdf_files(root: Path) -> list[Path]:
+    """Recursively enumerate regular PDFs without suppressing filesystem errors.
+
+    ``Path.rglob`` intentionally suppresses some directory traversal errors,
+    which is unsafe for deletion synchronization: an unreadable nested folder
+    could look like a successfully empty folder.  ``scandir`` lets us fail the
+    complete walk as soon as any child directory/stat operation is denied.
+    """
+    result: list[Path] = []
+
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+        for entry in children:
+            path = Path(entry.path)
+            if entry.is_symlink():
+                continue
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(entry_stat.st_mode):
+                visit(path)
+                continue
+            if stat.S_ISREG(entry_stat.st_mode) and path.suffix == ".pdf":
+                result.append(path)
+
+    visit(root)
+    return result
+
+
 def _redact_error(exc: BaseException, *, relative_path: str = "") -> str:
     message = str(exc).replace("\x00", " ")
     message = _SECRET_RE.sub(lambda match: f"{match.group(1)}=[redacted]", message)
@@ -188,6 +218,17 @@ def _workspace_context(root: Path | str, workspace: Any) -> tuple[Path, str, Pat
     if isinstance(workspace, Path):
         workspace_root = workspace.expanduser().resolve()
         workspace_id = workspace_id_for(workspace_root)
+        candidate = Path(root).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace_root / candidate
+        resolved = candidate.resolve(strict=False)
+        try:
+            relative_root = resolved.relative_to(workspace_root).as_posix() or "."
+        except ValueError as exc:
+            raise RagIngestionError(
+                "source_root_invalid", "source root is outside workspace"
+            ) from exc
+        return resolved, workspace_id, workspace_root, relative_root
     else:
         workspace_id = _require_workspace_id(str(workspace))
     resolved = Path(root).expanduser().resolve(strict=False)
@@ -295,9 +336,7 @@ class LiteratureIngestionService:
         # so a failed/incomplete source walk can never trigger destructive sync.
         discovered: list[tuple[str, Path, str]] = []
         try:
-            for path in resolved_root.rglob("*"):
-                if not path.is_file() or path.is_symlink() or path.suffix != ".pdf":
-                    continue
+            for path in _enumerate_pdf_files(resolved_root):
                 relative_path = _relative_source(path, resolved_root, workspace_root)
                 discovered.append((relative_path, path, _sha256(path)))
         except OSError as exc:
@@ -411,8 +450,15 @@ class LiteratureIngestionService:
             if inspect.isawaitable(existing):
                 existing = await existing
         if existing is not None:
-            if existing.generation_fingerprint != plan.generation.fingerprint:
-                raise RagIngestionError("generation_mismatch", "ingestion run belongs to another generation")
+            if (
+                existing.workspace_id != plan.workspace_id
+                or existing.generation_fingerprint != plan.generation.fingerprint
+                or existing.relative_root != plan.relative_root
+            ):
+                raise RagIngestionError(
+                    "run_context_mismatch",
+                    "ingestion run does not match workspace, generation, or source root",
+                )
             stats = existing.stats
             cursor = resume_cursor if resume_cursor is not None else existing.cursor
             run = replace(existing, cursor=cursor, status="running", stats=replace(stats, next_cursor=cursor, complete=False))
@@ -514,7 +560,7 @@ class LiteratureIngestionService:
         plan: IngestionPlan,
         item: IngestionPlanItem,
         stats: IngestionStats,
-    ) -> IngestionStats:
+    ) -> tuple[IngestionStats, bool]:
         if item.kind is PlanKind.DELETED:
             await self.store.delete_staged_revisions(
                 item.document_id,
@@ -532,11 +578,14 @@ class LiteratureIngestionService:
                     status=DocumentStatus.DELETED,
                 )
             )
-            return _stats_with(
-                stats,
-                cursor=item.relative_source_path,
-                complete=False,
-                deleted_add=1,
+            return (
+                _stats_with(
+                    stats,
+                    cursor=item.relative_source_path,
+                    complete=False,
+                    deleted_add=1,
+                ),
+                False,
             )
 
         path = self._source_path(plan, item)
@@ -609,15 +658,18 @@ class LiteratureIngestionService:
             )
         )
         errors = (cleanup_error,) if cleanup_error else ()
-        return _stats_with(
-            stats,
-            cursor=item.relative_source_path,
-            complete=False,
-            errors=errors,
-            retryable=bool(cleanup_error) or stats.retryable,
-            indexed_add=1,
-            chunks_add=len(points),
-            cleanup_add=cleanup_count,
+        return (
+            _stats_with(
+                stats,
+                cursor=item.relative_source_path,
+                complete=False,
+                errors=errors,
+                retryable=bool(cleanup_error) or stats.retryable,
+                indexed_add=1,
+                chunks_add=len(points),
+                cleanup_add=cleanup_count,
+            ),
+            cleanup_error is not None,
         )
 
     async def index_batch(
@@ -650,21 +702,32 @@ class LiteratureIngestionService:
             candidates = [item for item in candidates if item.relative_source_path > cursor]
         selected = candidates[:limit]
         processed = 0
+        progress_cursor = cursor
+        retry_cursor: str | None = None
+        retry_seen = False
         for item in selected:
             try:
-                stats = await self._process_item(plan, item, stats)
+                stats, retry_item = await self._process_item(plan, item, stats)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 stats = await self._mark_failed(plan, item, exc, stats)
+                retry_item = False
             processed += 1
+            if retry_item:
+                retry_seen = True
+                if retry_cursor is None:
+                    retry_cursor = progress_cursor
+            else:
+                progress_cursor = item.relative_source_path
             next_candidates = [
                 candidate
                 for candidate in candidates
                 if candidate.relative_source_path > item.relative_source_path
             ]
-            complete = not next_candidates
-            stats = replace(stats, complete=complete, next_cursor=None if complete else item.relative_source_path)
+            persisted_cursor = retry_cursor if retry_seen else progress_cursor
+            complete = plan.complete and not next_candidates and not retry_seen
+            stats = replace(stats, next_cursor=None if complete else persisted_cursor)
             run = IngestionRunState(
                 run_id=run_id,
                 workspace_id=plan.workspace_id,
@@ -676,13 +739,19 @@ class LiteratureIngestionService:
             )
             await self._persist_run(run)
 
-        complete = not [item for item in candidates if processed == 0 or item.relative_source_path > (stats.next_cursor or "")]
+        complete = plan.complete and not [
+            item
+            for item in candidates
+            if processed == 0 or item.relative_source_path > (stats.next_cursor or "")
+        ]
         # With no selected work, or after the final selected item, cursor is
         # cleared only when every non-unchanged item has been handled.
-        if not candidates:
+        if retry_seen:
+            complete = False
+        elif not candidates:
             complete = plan.complete
         elif selected and selected[-1].relative_source_path == candidates[-1].relative_source_path:
-            complete = True
+            complete = plan.complete
         elif not selected:
             complete = False
         if complete:

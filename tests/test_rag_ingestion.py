@@ -495,6 +495,167 @@ async def test_qdrant_ingestion_control_point_is_bounded_and_workspace_scoped() 
         await store.get_ingestion_run("run-a", "")
 
 
+async def test_nested_enumeration_failure_is_typed_and_cannot_delete(
+    tmp_path: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    root = tmp_path / "papers"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "paper.pdf").write_bytes(b"paper")
+    real_scandir = os.scandir
+
+    def failing_scandir(path: Any) -> Any:
+        if Path(path) == nested:
+            raise PermissionError("nested enumeration denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(
+        ingestion,
+        "os",
+        SimpleNamespace(scandir=failing_scandir),
+        raising=False,
+    )
+
+    with pytest.raises(RagIngestionError) as exc:
+        await LiteratureIngestionService(store, FakeEmbedder()).plan(root, WORKSPACE)
+
+    assert exc.value.code == "source_enumeration_failed"
+    assert store.delete_calls == []
+
+
+async def test_incomplete_plan_with_non_deleted_work_cannot_be_complete(
+    pdf: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper, chunks = _passages("one")
+    monkeypatch.setattr(ingestion, "parse_pdf", lambda path: (paper, chunks))
+    item = IngestionPlanItem(
+        document_id=document_id_for(WORKSPACE, "paper.pdf"),
+        relative_source_path="paper.pdf",
+        content_sha256=_sha(pdf.read_bytes()),
+        kind=PlanKind.NEW,
+    )
+    plan = IngestionPlan(
+        WORKSPACE,
+        GENERATION,
+        (item,),
+        source_root=pdf.parent,
+        complete=False,
+    )
+
+    result = await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        plan, max_documents=1
+    )
+
+    assert result.indexed == 1
+    assert result.complete is False
+
+
+async def test_cleanup_failure_cursor_retries_same_document_on_resume(
+    tmp_path: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "papers"
+    root.mkdir()
+    first_path = root / "a.pdf"
+    second_path = root / "b.pdf"
+    first_path.write_bytes(b"a")
+    second_path.write_bytes(b"b")
+    paper, chunks = _passages("one")
+    monkeypatch.setattr(ingestion, "parse_pdf", lambda path: (paper, chunks))
+    first_id = document_id_for(WORKSPACE, "a.pdf")
+    items = tuple(
+        IngestionPlanItem(
+            document_id=document_id_for(WORKSPACE, name),
+            relative_source_path=name,
+            content_sha256=_sha((root / name).read_bytes()),
+            kind=PlanKind.CHANGED,
+        )
+        for name in ("a.pdf", "b.pdf")
+    )
+    plan = IngestionPlan(WORKSPACE, GENERATION, items, source_root=root)
+    old_revision = "a" * 64
+    store.ready.add((first_id, old_revision))
+    store.fail_old_revision_cleanup = True
+
+    first_result = await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        plan, run_id="retry-run", max_documents=1
+    )
+    assert first_result.retryable is True
+    assert first_result.next_cursor is None
+
+    store.fail_old_revision_cleanup = False
+    await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        plan, run_id=first_result.run_id, max_documents=2
+    )
+
+    assert (first_id, old_revision) not in store.ready
+
+
+async def test_path_workspace_rejects_source_root_escape(
+    tmp_path: Path, store: FakeStore
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    external_root = tmp_path / "external"
+    workspace_root.mkdir()
+    external_root.mkdir()
+
+    with pytest.raises(RagIngestionError) as exc:
+        await LiteratureIngestionService(store, FakeEmbedder()).plan(
+            external_root, workspace_root
+        )
+
+    assert exc.value.code == "source_root_invalid"
+    assert store.delete_calls == []
+
+
+async def test_resume_rejects_same_run_id_with_different_relative_root(
+    pdf: Path, store: FakeStore
+) -> None:
+    stats = IngestionStats(
+        run_id="context-run",
+        discovered=1,
+        unchanged=0,
+        indexed=0,
+        failed=0,
+        deleted=0,
+        chunks=0,
+        staged_cleanup=0,
+        next_cursor=None,
+        complete=False,
+        errors=(),
+    )
+    store.runs["context-run"] = IngestionRunState(
+        run_id="context-run",
+        workspace_id=WORKSPACE,
+        generation_fingerprint=FINGERPRINT,
+        relative_root="old-root",
+        cursor=None,
+        status="running",
+        stats=stats,
+    )
+    item = IngestionPlanItem(
+        document_id=document_id_for(WORKSPACE, "paper.pdf"),
+        relative_source_path="paper.pdf",
+        content_sha256=_sha(pdf.read_bytes()),
+        kind=PlanKind.NEW,
+    )
+    plan = IngestionPlan(
+        WORKSPACE,
+        GENERATION,
+        (item,),
+        source_root=pdf.parent,
+        relative_root="new-root",
+    )
+
+    with pytest.raises(RagIngestionError) as exc:
+        await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+            plan, run_id="context-run", max_documents=1
+        )
+
+    assert exc.value.code == "run_context_mismatch"
+
+
 def test_passage_points_use_revision_ids_and_uuid_neighbours() -> None:
     paper, chunks = _passages("first", "second")
     points = passage_points_for(
