@@ -11,14 +11,17 @@ after a normal clone or wheel installation without another local repository.
   inverse retriever.
 - Each model directory contains its original training metrics.
 
-The source training inputs are committed under `data/photoelectric_vae/`.
-Rebuild the artifacts from the repository root with:
+The generated candidate table and provenance metadata are committed under
+`data/photoelectric_vae/`. The two raw JARVIS archives are external source
+inputs; download them into `data/photoelectric_vae/training/raw/` before a full
+rebuild. Rebuild the artifacts from the repository root with:
 
 ```bash
 uv run python scripts/vae/build_jarvis_candidates.py
 uv run python scripts/vae/train_inverse_index.py
 uv run python scripts/vae/train_conditional_vae.py --epochs 10
 uv run python scripts/vae/verify_assets.py
+uv run python scripts/vae/verify_assets.py --require-source-archives
 ```
 
 The two raw archives are NIST JARVIS-DFT snapshots distributed under CC BY

@@ -115,6 +115,23 @@ uv run photomatagent chat \
 
 By default, writes, edits, shell commands, and newly registered scientific tools require approval. `--approval auto` bypasses confirmation and should only be used in a trusted workspace.
 
+### Local literature RAG (Qdrant)
+
+The literature extra uses a pinned, local Qdrant service and local embedding/reranking models by default:
+
+```bash
+uv sync --extra literature
+docker compose -f compose.qdrant.yaml up -d
+uv run photomatagent rag status
+uv run photomatagent rag plan --directory dataset/paper
+uv run photomatagent rag index --directory dataset/paper
+uv run photomatagent rag activate --yes
+uv run photomatagent rag search "HgTe detector responsivity at 80 K"
+uv run photomatagent rag evaluate
+```
+
+Qdrant is bound to `127.0.0.1` and stores its database in the named Docker volume `photomat_qdrant_data`; source PDFs remain outside that volume and need their own backup. Planning is read-only; indexing writes only a fingerprinted staging generation, and the explicit `rag activate --yes` gate is required before aliases change (`--bootstrap` is reserved for an intentionally empty first corpus and cannot replace an existing current generation). External embedding/reranking providers require an explicit gate and confirmation because full-text chunks may leave the workspace. Evaluation uses an isolated synthetic collection and the real retriever; if Qdrant/models are unavailable it reports live evaluation unavailable rather than fake quality. The frozen evaluation is fixture-specific and does not claim corpus-wide quality. See [Qdrant RAG operations](docs/qdrant_rag_operations.md) for snapshots, generation/model changes, restore, troubleshooting, and the opt-in hybrid/local capacity benchmark. Performance for 10,000 papers remains unverified until the explicit one-million-point benchmark has run.
+
 ## Common commands
 
 ```bash

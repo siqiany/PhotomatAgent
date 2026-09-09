@@ -1,7 +1,8 @@
 """PDF -> DoclingDocument -> structured chunks.
 
 The parser is deliberately thin: it only converts one PDF into paper/chunk
-records with provenance. Embedding and storage happen in ``index.py``.
+records with provenance. Embedding and storage happen in the ingestion and
+Qdrant service layers.
 """
 
 from __future__ import annotations
@@ -15,6 +16,13 @@ from typing import Any
 from photomatagent.scientific.capabilities.literature.models import (
     PaperRecord,
     PassageRecord,
+    PassagePoint,
+    IngestState,
+    validate_relative_source_path,
+)
+from photomatagent.scientific.capabilities.literature.qdrant_store import (
+    document_id_for,
+    passage_id_for,
 )
 
 _YEAR_RE = re.compile(r"(?:^|[_\s])(\d{4})(?:[_\s]|$)")
@@ -148,3 +156,67 @@ def parse_pdf(pdf_path: Path) -> tuple[PaperRecord, list[PassageRecord]]:
         sha256=_sha256(pdf_path),
     )
     return record, passages
+
+
+def _normalized_text_sha256(text: str) -> str:
+    normalized = " ".join(text.split()).casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def passage_points_for(
+    paper: PaperRecord,
+    passages: list[PassageRecord],
+    workspace_id: str,
+    relative_path: str,
+    revision: str,
+    model_fingerprint: str,
+) -> list[PassagePoint]:
+    """Convert parser chunks into revision-scoped passage points.
+
+    Docling's chunk identifiers are parser-local.  The persisted identifiers
+    instead bind the document, content revision, and chunk position, which
+    makes retries idempotent and prevents an old revision's neighbours from
+    leaking into a new one.
+    """
+    validate_relative_source_path(relative_path)
+    document_id = document_id_for(workspace_id, relative_path)
+    passage_ids = [passage_id_for(document_id, revision, index) for index in range(len(passages))]
+    points: list[PassagePoint] = []
+    for index, passage in enumerate(passages):
+        points.append(
+            PassagePoint(
+                schema_version=1,
+                record_type="passage",
+                workspace_id=workspace_id,
+                document_id=document_id,
+                document_revision=revision,
+                ingest_state=IngestState.STAGED,
+                passage_id=passage_ids[index],
+                chunk_index=index,
+                text=passage.text,
+                title=passage.title or paper.title,
+                authors=tuple(passage.authors or paper.authors),
+                year=passage.year if passage.year is not None else paper.year,
+                section=passage.section,
+                heading_path=passage.heading_path,
+                page_start=passage.page,
+                page_end=passage.page,
+                previous_passage_id=passage_ids[index - 1] if index else None,
+                next_passage_id=(
+                    passage_ids[index + 1] if index + 1 < len(passages) else None
+                ),
+                relative_source_path=relative_path,
+                model_fingerprint=model_fingerprint,
+                normalized_text_sha256=_normalized_text_sha256(passage.text),
+                # PaperRecord owns one ingestion timestamp, so every passage
+                # in this revision receives the same UTC value.
+                indexed_at=paper.indexed_at,
+            )
+        )
+    return points
+
+
+# Descriptive aliases keep the pure conversion contract discoverable for
+# callers that prefer a verb-first name.
+build_passage_points = passage_points_for
+to_passage_points = passage_points_for

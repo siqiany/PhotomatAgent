@@ -776,12 +776,12 @@ def test_status_unknown_without_backend():
     asyncio.run(scenario())
 
 
-def test_collect_downloads_bounded_artifacts(tmp_path):
-    import io
-
-    from ase import Atoms
-    from ase.io import write
-
+def test_collect_downloads_bounded_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        MagusApplication,
+        "_count_traj_frames",
+        staticmethod(lambda _path: 1),
+    )
     backend = FakeSCNetBackend()
     remote = "~/science/magus/job-12345678"
     backend.add_remote_file(remote, "input.yaml", "formulaType: fix\n")
@@ -791,9 +791,7 @@ def test_collect_downloads_bounded_artifacts(tmp_path):
     ))
     backend.add_remote_file(remote, "log.txt", "some log\n")
     backend.add_remote_file(remote, "summary", "symmetry enthalpy formula priFormula\n")
-    buffer = io.BytesIO()
-    write(buffer, Atoms("Al", positions=[[0, 0, 0]], cell=[4, 4, 4]), format="traj")
-    backend.add_remote_file(remote, "results/best.traj", buffer.getvalue())
+    backend.add_remote_file(remote, "results/best.traj", b"synthetic trajectory")
     backend.add_remote_file(remote, "huge.bin", b"y" * 10_000_000)
     app = MagusApplication(backend)
     ref = RemoteJobRef(
@@ -863,6 +861,7 @@ def test_inspect_results_no_fabrication_when_nothing_downloaded(tmp_path):
 def test_generate_candidate_count_uses_traj_frames(tmp_path):
     import io
 
+    pytest.importorskip("ase", reason="MAGUS trajectory inspection requires ASE")
     from ase import Atoms
     from ase.io import write
 
@@ -883,12 +882,12 @@ def test_generate_candidate_count_uses_traj_frames(tmp_path):
     assert report["candidates"][0] == {"artifact": "gen.traj", "frames": 3}
 
 
-def test_search_candidate_count_summary_priority(tmp_path):
-    import io
-
-    from ase import Atoms
-    from ase.io import write
-
+def test_search_candidate_count_summary_priority(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        MagusApplication,
+        "_count_traj_frames",
+        staticmethod(lambda _path: 3),
+    )
     app = MagusApplication()
     out = tmp_path / "res"
     results = out / "results"
@@ -899,37 +898,25 @@ def test_search_candidate_count_summary_priority(tmp_path):
         "  Pbam (55)     None     B12        B12\n",
         encoding="utf-8",
     )
-    buffer = io.BytesIO()
-    write(
-        buffer,
-        [Atoms("B", positions=[[0, 0, 0]], cell=[4, 4, 4]) for _ in range(3)],
-        format="traj",
-    )
-    (results / "best.traj").write_bytes(buffer.getvalue())
+    (results / "best.traj").write_bytes(b"synthetic trajectory")
     report = app.inspect_results(out, operation="search")
     # summary rows (2) win over best.traj frames (3); never summed.
     assert report["candidate_count"] == 2
     assert report["artifact_candidate_counts"] == {"results/best.traj": 3}
 
 
-def test_search_candidate_count_best_traj_fallback(tmp_path):
-    import io
-
-    from ase import Atoms
-    from ase.io import write
-
+def test_search_candidate_count_best_traj_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        MagusApplication,
+        "_count_traj_frames",
+        staticmethod(lambda _path: 3),
+    )
     app = MagusApplication()
     out = tmp_path / "res"
     results = out / "results"
     results.mkdir(parents=True)
-    buffer = io.BytesIO()
-    write(
-        buffer,
-        [Atoms("Al", positions=[[0, 0, 0]], cell=[4, 4, 4]) for _ in range(3)],
-        format="traj",
-    )
-    (results / "best.traj").write_bytes(buffer.getvalue())
-    (results / "good.traj").write_bytes(buffer.getvalue())
+    (results / "best.traj").write_bytes(b"synthetic best trajectory")
+    (results / "good.traj").write_bytes(b"synthetic good trajectory")
     report = app.inspect_results(out, operation="search")
     assert report["candidate_count"] == 3
 

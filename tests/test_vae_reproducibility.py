@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -18,9 +20,18 @@ from photomatagent.scientific.capabilities.generation.tools import (
     VAERetrieveTool,
     _resolve_vae_assets,
 )
-
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_asset_verifier():
+    spec = importlib.util.spec_from_file_location(
+        "photomat_test_verify_assets",
+        REPOSITORY_ROOT / "scripts" / "vae" / "verify_assets.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_packaged_assets_are_default_and_self_contained(monkeypatch):
@@ -54,7 +65,115 @@ def test_asset_manifest_hashes_verify():
         timeout=60,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
-    assert "verified 9 VAE asset files" in completed.stdout
+    assert "verified 7 required VAE asset files" in completed.stdout
+    raw_root = REPOSITORY_ROOT / "data" / "photoelectric_vae" / "training" / "raw"
+    present_count = sum(
+        (raw_root / name).is_file()
+        for name in ("jarvis_dft2d_2022.zip", "jarvis_dft3d_2025.zip")
+    )
+    missing_count = 2 - present_count
+    if present_count:
+        assert (
+            f"verified {present_count} external source archives"
+            in completed.stdout
+        )
+    if missing_count:
+        assert (
+            f"{missing_count} external source archives not present"
+            in completed.stdout
+        )
+
+
+def test_asset_manifest_strict_source_check_matches_local_archive_state():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/vae/verify_assets.py",
+            "--require-source-archives",
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    raw_root = REPOSITORY_ROOT / "data" / "photoelectric_vae" / "training" / "raw"
+    archives_present = all(
+        (raw_root / name).is_file()
+        for name in ("jarvis_dft2d_2022.zip", "jarvis_dft3d_2025.zip")
+    )
+    if archives_present:
+        assert completed.returncode == 0, completed.stderr
+        assert "verified 2 external source archives" in completed.stdout
+    else:
+        assert completed.returncode != 0
+        assert "missing external source archive" in completed.stderr
+
+
+def test_verify_manifest_handles_absent_external_source(tmp_path):
+    verifier = _load_asset_verifier()
+    required = tmp_path / "required.bin"
+    required.write_bytes(b"required")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "path": "required.bin",
+                        "size": required.stat().st_size,
+                        "sha256": hashlib.sha256(b"required").hexdigest(),
+                    },
+                    {
+                        "path": "external.bin",
+                        "availability": "external_source",
+                        "size": 8,
+                        "sha256": hashlib.sha256(b"external").hexdigest(),
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = verifier.verify_manifest(manifest, tmp_path)
+    assert "verified 1 required VAE asset files" in summary
+    assert "1 external source archives not present" in summary
+    with pytest.raises(
+        verifier.AssetVerificationError, match="missing external source"
+    ):
+        verifier.verify_manifest(
+            manifest, tmp_path, require_source_archives=True
+        )
+
+
+def test_verify_manifest_checks_present_external_source(tmp_path):
+    verifier = _load_asset_verifier()
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"external")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "path": "external.bin",
+                        "availability": "external_source",
+                        "size": external.stat().st_size,
+                        "sha256": hashlib.sha256(b"external").hexdigest(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = verifier.verify_manifest(
+        manifest, tmp_path, require_source_archives=True
+    )
+    assert summary == (
+        "verified 0 required VAE asset files; "
+        "verified 1 external source archives"
+    )
 
 
 def test_checkpoint_and_inverse_index_share_training_schema():

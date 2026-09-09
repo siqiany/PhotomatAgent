@@ -25,6 +25,58 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bounded_int_env(
+    name: str, default: int, *, minimum: int, maximum: int
+) -> int:
+    """Read a new strict integer setting and validate its safe bounds."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _first_env(name: str, *aliases: str) -> str | None:
+    """Return the first configured value, retaining compatibility aliases."""
+    for candidate in (name, *aliases):
+        value = os.environ.get(candidate)
+        if value is not None:
+            return value
+    return None
+
+
+def _text_env(name: str, default: str, *aliases: str) -> str:
+    value = _first_env(name, *aliases)
+    if value is None:
+        return default
+    return value.strip() or default
+
+
+def _bounded_int_env_with_aliases(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+    aliases: tuple[str, ...] = (),
+) -> int:
+    """Apply strict parsing while accepting a documented legacy alias."""
+    selected = name
+    if os.environ.get(name) is None:
+        for alias in aliases:
+            if os.environ.get(alias) is not None:
+                selected = alias
+                break
+    return _bounded_int_env(
+        selected, default, minimum=minimum, maximum=maximum
+    )
+
+
 @dataclass(frozen=True)
 class ScientificConfig:
     """Hard limits and integration settings for scientific capabilities."""
@@ -33,12 +85,24 @@ class ScientificConfig:
     materials_max_results: int = 10
     literature_max_papers: int = 5
     literature_max_chars: int = 4000
-    # Literature RAG V1: configurable dataset/index/embedding locations.
+    # Literature RAG / Qdrant configuration.
     literature_root: str = "dataset/paper"
-    literature_index_dir: str = "output/literature_index"
+    qdrant_url: str = "http://127.0.0.1:6333"
+    qdrant_api_key_env: str = "QDRANT_API_KEY"
+    qdrant_collection_prefix: str = "photomat_literature"
+    qdrant_timeout_seconds: int = 20
+    rag_allow_external: bool = False
+    embedding_provider: str = "local"
     embedding_model: str = "intfloat/multilingual-e5-small"
     embedding_vector_dim: int = 384
+    embedding_base_url: str = ""
+    embedding_api_key_env: str = "RAG_EMBEDDING_API_KEY"
+    reranker_provider: str = "local"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    reranker_base_url: str = ""
+    reranker_api_key_env: str = "RAG_RERANK_API_KEY"
+    rag_batch_size: int = 128
+    rag_tool_max_documents: int = 20
     literature_search_top_k: int = 5
     literature_passage_chars: int = 600
     structure_output_dir: str = "output/scientific"
@@ -61,41 +125,115 @@ class ScientificConfig:
             materials_api_key_env=os.environ.get(
                 "PHOTOMATAGENT_MATERIALS_KEY_ENV", "MATERIALS_API_KEY"
             ),
-            materials_max_results=_int_env(
-                "PHOTOMATAGENT_MATERIALS_MAX_RESULTS", 10
+            # These values cap model-visible output.  Keep parsing strict so
+            # a typo cannot silently widen/disable a safety bound.
+            materials_max_results=_bounded_int_env(
+                "PHOTOMATAGENT_MATERIALS_MAX_RESULTS",
+                10,
+                minimum=1,
+                maximum=10,
             ),
-            literature_max_papers=_int_env(
-                "PHOTOMATAGENT_LITERATURE_MAX_PAPERS", 5
+            literature_max_papers=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_MAX_PAPERS",
+                5,
+                minimum=1,
+                maximum=10,
             ),
-            literature_max_chars=_int_env(
-                "PHOTOMATAGENT_LITERATURE_MAX_CHARS", 4000
+            literature_max_chars=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_MAX_CHARS",
+                4000,
+                minimum=200,
+                maximum=20_000,
             ),
             literature_root=os.environ.get(
                 "PHOTOMATAGENT_LITERATURE_DIR", "dataset/paper"
             ).strip()
             or "dataset/paper",
-            literature_index_dir=os.environ.get(
-                "PHOTOMATAGENT_LITERATURE_INDEX_DIR", "output/literature_index"
-            ).strip()
-            or "output/literature_index",
-            embedding_model=os.environ.get(
-                "PHOTOMATAGENT_EMBEDDING_MODEL",
+            qdrant_url=_text_env(
+                "PHOTOMATAGENT_QDRANT_URL", "http://127.0.0.1:6333"
+            ),
+            qdrant_api_key_env=_text_env(
+                "PHOTOMATAGENT_QDRANT_API_KEY_ENV", "QDRANT_API_KEY"
+            ),
+            qdrant_collection_prefix=_text_env(
+                "PHOTOMATAGENT_QDRANT_COLLECTION_PREFIX",
+                "photomat_literature",
+            ),
+            qdrant_timeout_seconds=_bounded_int_env(
+                "PHOTOMATAGENT_QDRANT_TIMEOUT_SECONDS",
+                20,
+                minimum=1,
+                maximum=300,
+            ),
+            rag_allow_external=_boolish(
+                os.environ.get("PHOTOMATAGENT_RAG_ALLOW_EXTERNAL"), False
+            ),
+            embedding_provider=_text_env(
+                "PHOTOMATAGENT_RAG_EMBEDDING_PROVIDER", "local"
+            ),
+            embedding_model=_text_env(
+                "PHOTOMATAGENT_RAG_EMBEDDING_MODEL",
                 "intfloat/multilingual-e5-small",
-            ).strip()
-            or "intfloat/multilingual-e5-small",
-            embedding_vector_dim=_int_env(
-                "PHOTOMATAGENT_EMBEDDING_VECTOR_DIM", 384
+                "PHOTOMATAGENT_EMBEDDING_MODEL",
             ),
-            reranker_model=os.environ.get(
-                "PHOTOMATAGENT_RERANKER_MODEL",
+            embedding_vector_dim=_bounded_int_env_with_aliases(
+                "PHOTOMATAGENT_RAG_EMBEDDING_VECTOR_DIM",
+                384,
+                minimum=1,
+                maximum=8192,
+                aliases=("PHOTOMATAGENT_EMBEDDING_VECTOR_DIM",),
+            ),
+            embedding_base_url=_text_env(
+                "PHOTOMATAGENT_RAG_EMBEDDING_BASE_URL", ""
+            ),
+            embedding_api_key_env=_text_env(
+                "PHOTOMATAGENT_RAG_EMBEDDING_API_KEY_ENV",
+                "RAG_EMBEDDING_API_KEY",
+            ),
+            reranker_provider=_text_env(
+                "PHOTOMATAGENT_RAG_RERANK_PROVIDER",
+                "local",
+                "PHOTOMATAGENT_RAG_RERANKER_PROVIDER",
+            ),
+            reranker_model=_text_env(
+                "PHOTOMATAGENT_RAG_RERANK_MODEL",
                 "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            ).strip()
-            or "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            literature_search_top_k=_int_env(
-                "PHOTOMATAGENT_LITERATURE_TOP_K", 5
+                "PHOTOMATAGENT_RAG_RERANKER_MODEL",
+                "PHOTOMATAGENT_RERANKER_MODEL",
             ),
-            literature_passage_chars=_int_env(
-                "PHOTOMATAGENT_LITERATURE_PASSAGE_CHARS", 600
+            reranker_base_url=_text_env(
+                "PHOTOMATAGENT_RAG_RERANK_BASE_URL",
+                "",
+                "PHOTOMATAGENT_RAG_RERANKER_BASE_URL",
+            ),
+            reranker_api_key_env=_text_env(
+                "PHOTOMATAGENT_RAG_RERANK_API_KEY_ENV",
+                "RAG_RERANK_API_KEY",
+                "PHOTOMATAGENT_RAG_RERANKER_API_KEY_ENV",
+            ),
+            rag_batch_size=_bounded_int_env(
+                "PHOTOMATAGENT_RAG_BATCH_SIZE",
+                128,
+                minimum=16,
+                maximum=512,
+            ),
+            rag_tool_max_documents=_bounded_int_env(
+                "PHOTOMATAGENT_RAG_TOOL_MAX_DOCUMENTS",
+                20,
+                minimum=1,
+                maximum=100,
+            ),
+            literature_search_top_k=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_TOP_K",
+                5,
+                minimum=1,
+                maximum=10,
+            ),
+            literature_passage_chars=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_PASSAGE_CHARS",
+                600,
+                minimum=50,
+                maximum=600,
             ),
             mcp_servers=servers,
         )
