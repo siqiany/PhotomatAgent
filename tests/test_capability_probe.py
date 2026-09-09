@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -225,6 +227,26 @@ def test_structure_pack_tools_are_deferred(tmp_path):
         "structure.convert",
     }
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in structure_tools)
+
+
+def test_effective_mass_reports_typed_missing_dependency(tmp_path, monkeypatch):
+    from photomatagent.scientific.capabilities.electronic import (
+        ElectronicEffectiveMassTool,
+    )
+
+    vasprun = tmp_path / "vasprun.xml"
+    vasprun.write_text("synthetic", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "effmass", None)
+
+    result = asyncio.run(
+        ElectronicEffectiveMassTool(Workspace(tmp_path)).execute(
+            {"path": "vasprun.xml", "carrier": "electron"}
+        )
+    )
+
+    assert result.is_error
+    assert result.data["error"] == "MISSING_DEPENDENCY"
+    assert result.data["dependency"] == "effmass"
 
 
 def test_literature_tools_remain_deferred_when_qdrant_is_unavailable(tmp_path):

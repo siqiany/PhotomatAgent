@@ -111,6 +111,21 @@ class KdotpyRunTool(Tool):
         self._workspace = workspace
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        args = (
+            [str(item) for item in arguments.get("args", [])]
+            if arguments.get("args")
+            else []
+        )
+        config_path = arguments.get("config_path")
+        if config_path:
+            args = [str(config_path)]
+        if not args:
+            return ScientificToolResult(
+                output="kp.run_kdotpy requires 'args' or 'config_path'",
+                is_error=True,
+                data={"error_type": "invalid_input"},
+            )
+
         probe = probe_kdotpy(
             self._workspace.root if self._workspace is not None else None
         )
@@ -141,16 +156,6 @@ class KdotpyRunTool(Tool):
                 ),
                 is_error=True,
                 data={"error_type": "external_solver_unavailable"},
-            )
-        args = [str(item) for item in arguments.get("args", [])] if arguments.get("args") else []
-        config_path = arguments.get("config_path")
-        if config_path:
-            args = [str(config_path)]
-        if not args:
-            return ScientificToolResult(
-                output="kp.run_kdotpy requires 'args' or 'config_path'",
-                is_error=True,
-                data={"error_type": "invalid_input"},
             )
         timeout = min(int(arguments.get("timeout_seconds", 180)), 600)
         workdir = arguments.get("workdir")
