@@ -82,6 +82,15 @@ _REVISION_FIELDS = (
     "journal",
     "relevance_tier",
 )
+_SQL_KEY_WHITESPACE = "char(9)||char(10)||char(11)||char(12)||char(13)||' '"
+_SQL_VALID_KEY = (
+    '"paper_key" IS NOT NULL AND '
+    f'trim(CAST("paper_key" AS TEXT), {_SQL_KEY_WHITESPACE}) <> ""'
+)
+_SQL_INVALID_KEY = (
+    '"paper_key" IS NULL OR '
+    f'trim(CAST("paper_key" AS TEXT), {_SQL_KEY_WHITESPACE}) = ""'
+)
 
 
 class AbstractIngestionError(RuntimeError):
@@ -350,6 +359,12 @@ class SQLiteAbstractReader:
         row = self._connection.execute('SELECT COUNT(*) FROM "papers"').fetchone()
         return int(row[0]) if row is not None else 0
 
+    def count_invalid_keys(self) -> int:
+        row = self._connection.execute(
+            f'SELECT COUNT(*) FROM "papers" WHERE {_SQL_INVALID_KEY}'
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def source_identity(self) -> str:
         """Hash database bytes incrementally for fail-closed resume checks."""
         digest = hashlib.sha256()
@@ -365,7 +380,8 @@ class SQLiteAbstractReader:
             raise ValueError("limit must be positive")
         statement = (
             f'SELECT {self._select_sql()} FROM "papers" '
-            'WHERE "paper_key" > ? ORDER BY "paper_key" LIMIT ?'
+            f'WHERE {_SQL_VALID_KEY} AND "paper_key" > ? '
+            'ORDER BY "paper_key" LIMIT ?'
         )
         try:
             result = self._connection.execute(statement, (cursor or "", int(limit)))
@@ -397,6 +413,7 @@ class AbstractIngestionStats:
     unchanged: int = 0
     failed: int = 0
     skipped_empty: int = 0
+    skipped_invalid_key: int = 0
     passages: int = 0
     next_cursor: str | None = None
     complete: bool = False
@@ -458,6 +475,7 @@ class AbstractIngestionProgress:
     status: str
     complete: bool
     errors: Sequence[str] = field(default_factory=tuple)
+    skipped_invalid_key: int = 0
 
 
 def _generation_fingerprint(generation: Any) -> str:
@@ -608,6 +626,15 @@ class AbstractIngestionService:
         self.generation = SimpleNamespace(fingerprint=fingerprint)
         return self.generation
 
+    async def _invalid_key_count(self) -> int:
+        counter = getattr(self.reader, "count_invalid_keys", None)
+        if not callable(counter):
+            return 0
+        value = counter()
+        if inspect.isawaitable(value):
+            value = await value
+        return int(value)
+
     async def _get_run(self, run_id: str) -> Any | None:
         getter = getattr(self.store, "get_ingestion_run", None)
         if not callable(getter):
@@ -647,7 +674,9 @@ class AbstractIngestionService:
                 "processed",
                 int(getattr(value, "indexed", 0))
                 + int(getattr(value, "unchanged", 0))
-                + int(getattr(value, "failed", 0)),
+                + int(getattr(value, "failed", 0))
+                + int(getattr(value, "skipped_empty", 0))
+                + int(getattr(value, "skipped_invalid_key", 0)),
             )
         )
         return AbstractIngestionStats(
@@ -658,6 +687,7 @@ class AbstractIngestionService:
             unchanged=int(getattr(value, "unchanged", 0)),
             failed=int(getattr(value, "failed", 0)),
             skipped_empty=int(getattr(value, "skipped_empty", 0)),
+            skipped_invalid_key=int(getattr(value, "skipped_invalid_key", 0)),
             passages=passages,
             next_cursor=getattr(value, "next_cursor", None),
             complete=bool(getattr(value, "complete", False)),
@@ -928,6 +958,7 @@ class AbstractIngestionService:
             status=status,
             complete=stats.complete,
             errors=stats.errors,
+            skipped_invalid_key=stats.skipped_invalid_key,
         )
 
     async def index_batch(
@@ -965,9 +996,12 @@ class AbstractIngestionService:
                 return self._progress(run_id, total, None, "complete", replace(stats, complete=True, next_cursor=None))
         else:
             effective_cursor = cursor
+            skipped_invalid_key = await self._invalid_key_count()
             stats = AbstractIngestionStats(
                 run_id=run_id,
                 discovered=total,
+                processed=skipped_invalid_key,
+                skipped_invalid_key=skipped_invalid_key,
                 next_cursor=effective_cursor,
             )
 

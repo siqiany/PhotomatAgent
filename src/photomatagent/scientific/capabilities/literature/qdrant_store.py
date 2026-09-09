@@ -1848,6 +1848,9 @@ class QdrantLiteratureStore:
             payload["source_path"] = source_path
             payload["processed"] = int(getattr(stats, "processed", 0))
             payload["skipped_empty"] = int(getattr(stats, "skipped_empty", 0))
+            payload["skipped_invalid_key"] = int(
+                getattr(stats, "skipped_invalid_key", 0)
+            )
             payload["passages"] = int(
                 getattr(stats, "passages", getattr(stats, "chunks", 0))
             )
@@ -1949,6 +1952,7 @@ class QdrantLiteratureStore:
                 indexed=int(payload.get("indexed", 0)),
                 failed=int(payload.get("failed", 0)),
                 skipped_empty=int(payload.get("skipped_empty", 0)),
+                skipped_invalid_key=int(payload.get("skipped_invalid_key", 0)),
                 passages=int(payload.get("passages", payload.get("chunks", 0))),
                 next_cursor=payload.get("next_cursor"),
                 complete=bool(payload.get("complete", False)),

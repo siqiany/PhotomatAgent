@@ -108,6 +108,64 @@ def test_reader_preserves_raw_keyset_cursor_with_whitespace_key(abstract_db: Pat
     reader.close()
 
 
+@pytest.mark.asyncio
+async def test_invalid_keys_are_counted_once_and_valid_raw_keys_resume(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-keys.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE papers (paper_key TEXT, title TEXT, abstract TEXT)"
+    )
+    connection.executemany(
+        "INSERT INTO papers VALUES (?, ?, ?)",
+        [
+            (None, "Null", "null abstract"),
+            ("", "Empty", "empty abstract"),
+            ("   ", "Whitespace", "whitespace abstract"),
+            (" a", "Leading", "leading abstract"),
+            ("a", "Exact", "exact abstract"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    reader = SQLiteAbstractReader(path, workspace_root=tmp_path)
+    assert reader.count() == 5
+    assert reader.count_invalid_keys() == 3
+    first = reader.fetch_after(None, limit=1)
+    second = reader.fetch_after(first[-1].paper_key, limit=1)
+    assert [row.paper_key for row in first + second] == [" a", "a"]
+
+    store = FakeAbstractStore()
+    embedder = FakeEmbedder()
+    service = AbstractIngestionService(
+        reader,
+        store,
+        embedder,
+        workspace_id="workspace-a",
+        workspace_root=tmp_path,
+        relative_source_path="invalid-keys.sqlite3",
+        generation=store.generation,
+    )
+    first_progress = await service.index_batch(run_id="invalid-run", limit=1)
+    assert first_progress.total == 5
+    assert first_progress.processed == 4
+    assert first_progress.skipped_invalid_key == 3
+    assert first_progress.indexed == 1
+    assert first_progress.cursor == " a"
+    assert first_progress.complete is False
+
+    resumed = await service.index_batch(
+        run_id="invalid-run", cursor=first_progress.cursor, limit=1
+    )
+    assert resumed.complete is True
+    assert resumed.processed == 5
+    assert resumed.skipped_invalid_key == 3
+    assert resumed.indexed == 2
+    assert resumed.cursor is None
+    assert embedder.embedded_document_count == 2
+    reader.close()
+
+
 def test_reader_requires_workspace_root_and_rejects_outside_database(
     abstract_db: Path, tmp_path: Path
 ) -> None:
@@ -367,6 +425,7 @@ async def test_qdrant_run_roundtrip_preserves_abstract_source_context() -> None:
             discovered=3,
             processed=1,
             indexed=1,
+            skipped_invalid_key=2,
             passages=1,
             next_cursor="key-a",
         ),
@@ -379,3 +438,4 @@ async def test_qdrant_run_roundtrip_preserves_abstract_source_context() -> None:
     assert loaded.source_identity == "a" * 64
     assert loaded.source_path == "dataset/abstracts.sqlite3"
     assert loaded.stats.passages == 1
+    assert loaded.stats.skipped_invalid_key == 2
