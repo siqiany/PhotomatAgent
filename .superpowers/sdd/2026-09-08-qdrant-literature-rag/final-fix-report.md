@@ -218,3 +218,41 @@ four MAGUS tests requiring ASE, the unrelated tool-catalog effective-mass
 ranking, two missing JARVIS archives, and two VASP isosurface expectations. No
 RAG-focused test failed. Docker remained unavailable in WSL, so the three
 opt-in live Qdrant gates remain explicitly unexecuted.
+
+## Docker live-validation follow-up
+
+After Docker Desktop WSL integration was enabled, Qdrant `1.18.2` started from
+`compose.qdrant.yaml` and passed its `/healthz` check. The first live run exposed
+three issues that the skipped suite could not reveal:
+
+- Qdrant BM25 may fill a multi-result sparse query with a zero/low-score point;
+  the integration assertion now verifies the controlled token-bearing positive-
+  score winner without treating a non-winning filler as lexical evidence.
+- The generation-switch fixture attempted to activate an empty second
+  generation. It now writes fingerprint-matching READY data before using the
+  ordinary guarded activation path and verifies both alias movement and old
+  physical-generation preservation.
+- `qdrant-client 1.19.0` accepts `**kwargs` in its public snapshot signature but
+  rejects method-level `timeout` internally. Snapshot creation now uses narrow
+  signature capability detection rather than catching and retrying arbitrary
+  `TypeError` exceptions. The regression was RED (`1 failed, 1 passed`) before
+  the adapter change and GREEN (`2 passed`) afterward.
+
+With all live gates enabled together, `tests/test_qdrant_rag_integration.py`
+completed with `13 passed, 23 warnings` in 215.28 seconds. This includes server
+version/schema checks, restart persistence, staged visibility, alias switching,
+snapshot restore, the real 22-judgment `LiteratureRetriever` evaluation, and
+the local-model benchmark gate.
+
+Two disposable capacity runs completed and removed their collections:
+
+- 1,000,000 points, 384 dimensions, 100 hybrid/RRF queries: first query
+  1773.60 ms; subsequent p50 140.72 ms and p95 767.39 ms; server status green.
+- 100,000 points with warmed local embedding and reranking: Qdrant candidate
+  p50 13.98 ms and p95 173.46 ms; end-to-end local p50 75.04 ms and p95
+  118.40 ms; first post-warmup request 231.30 ms; server status green.
+
+The machine-specific JSON reports are stored under
+`user_output/qdrant-benchmark/`. Qdrant was left running with an empty
+collection list; no current production alias or legacy Lance artifact was
+modified.

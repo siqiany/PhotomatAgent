@@ -403,15 +403,19 @@ async def test_rrf_has_dense_and_sparse_contributions_and_indexed_filters(
         dense_weak.passage_id,
         sparse_strong_dense_weak.passage_id,
     ]
-    sparse_ids = [
-        candidate.passage_id
-        for candidate in await real_store.sparse_candidates(
-            "rrf_unique_signal_91827", workspace_id=TEST_WORKSPACE_ID, limit=2
-        )
-    ]
-    assert sparse_ids
-    assert sparse_ids[0] == sparse_strong_dense_weak.passage_id
-    assert dense_strong_sparse_weak.passage_id not in sparse_ids
+    sparse_candidates = await real_store.sparse_candidates(
+        "rrf_unique_signal_91827", workspace_id=TEST_WORKSPACE_ID, limit=2
+    )
+    assert sparse_candidates
+    # Qdrant's BM25 query may return a zero/low-score second candidate when
+    # limit=2.  The contractually meaningful evidence is that the only
+    # token-bearing passage is the controlled top-ranked sparse winner.
+    assert sparse_candidates[0].passage_id == sparse_strong_dense_weak.passage_id
+    assert sparse_candidates[0].score > 0.0
+    assert all(
+        sparse_candidates[0].score >= candidate.score
+        for candidate in sparse_candidates[1:]
+    )
 
     # Two results are intentionally fewer than the seven indexed points.  A
     # dense-only implementation would return dense_mid instead of the sparse
@@ -704,6 +708,26 @@ async def test_alias_pair_switches_to_validated_generation(real_store: Any) -> N
     resolved = await real_store.resolve_current_generation()
     assert resolved == first
     assert second.fingerprint != first.fingerprint
+
+    second_text = "Second generation content is ready for alias activation."
+    second_manifest = _manifest(
+        second,
+        relative_path="synthetic/second-generation.pdf",
+        text=second_text,
+    )
+    second_marker = _point(
+        second,
+        relative_path="synthetic/second-generation.pdf",
+        text=second_text,
+        axis=6,
+    )
+    # ensure_generation selects the new pair as the staging target.  Populate
+    # it with fingerprint-matching ready records before the normal activation
+    # gate; an empty-generation bootstrap must not replace a current pair.
+    await real_store.upsert_document(second_manifest)
+    await real_store.upsert_passages(
+        [second_marker], batch_size=1, workspace_id=TEST_WORKSPACE_ID
+    )
     await real_store.activate_generation(second)
     resolved = await real_store.resolve_current_generation()
     assert resolved == second
@@ -714,10 +738,26 @@ async def test_alias_pair_switches_to_validated_generation(real_store: Any) -> N
     }
     assert alias_map[second.documents_alias] == second.documents_physical
     assert alias_map[second.passages_alias] == second.passages_physical
+    assert alias_map[second.documents_alias] != first.documents_physical
     assert alias_map[second.passages_alias] != first.passages_physical
-    assert await real_store.dense_candidates(
-        _vector(3), workspace_id=TEST_WORKSPACE_ID, limit=5
-    ) == []
+
+    current_ids = {
+        candidate.passage_id
+        for candidate in await real_store.dense_candidates(
+            _vector(6), workspace_id=TEST_WORKSPACE_ID, limit=5
+        )
+    }
+    assert second_marker.passage_id in current_ids
+    assert marker.passage_id not in current_ids
+    first_records = await real_store._client.retrieve(
+        collection_name=first.passages_physical,
+        ids=[marker.passage_id],
+        with_payload=True,
+        with_vectors=False,
+    )
+    assert len(first_records) == 1
+    assert first_records[0].payload["text"] == marker.text
+    assert first_records[0].payload["model_fingerprint"] == first.fingerprint
 
 
 @pytest.mark.asyncio

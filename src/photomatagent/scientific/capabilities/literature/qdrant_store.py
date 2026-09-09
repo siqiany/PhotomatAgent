@@ -398,6 +398,29 @@ class QdrantLiteratureStore:
     def _timeout_kwargs(self) -> dict[str, Any]:
         return {"timeout": self.timeout_seconds} if self.timeout_seconds is not None else {}
 
+    def _method_timeout_kwargs(self, method: Any) -> dict[str, Any]:
+        """Return a timeout only when the target method explicitly supports it.
+
+        qdrant-client 1.19 exposes snapshot operations with ``**kwargs`` for
+        compatibility, but rejects unknown arguments at runtime.  Treating a
+        catch-all ``**kwargs`` as timeout support would therefore still pass
+        an invalid method-level timeout.  Signature inspection keeps this
+        adaptation narrow and avoids retrying arbitrary ``TypeError`` values
+        raised by the client implementation itself.
+        """
+        if self.timeout_seconds is None:
+            return {}
+        try:
+            parameter = inspect.signature(method).parameters.get("timeout")
+        except (TypeError, ValueError):
+            return {}
+        if parameter is None or parameter.kind not in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }:
+            return {}
+        return {"timeout": self.timeout_seconds}
+
     def _metadata_for(
         self,
         fingerprint: str,
@@ -2442,7 +2465,7 @@ class QdrantLiteratureStore:
             snapshot = await self._client.create_snapshot(
                 collection_name=collection_name,
                 wait=True,
-                **self._timeout_kwargs(),
+                **self._method_timeout_kwargs(self._client.create_snapshot),
             )
             snapshot_name = str(_record_attr(snapshot, "name", "snapshot"))
             safe_name = Path(snapshot_name).name

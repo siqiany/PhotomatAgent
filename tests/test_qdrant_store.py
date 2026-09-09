@@ -188,6 +188,35 @@ class FakeAsyncQdrantClient:
         return self._snapshot_bytes[(collection_name, snapshot_name)]
 
 
+class _SnapshotClientWithoutMethodTimeout(FakeAsyncQdrantClient):
+    """Fake the qdrant-client 1.19 snapshot signature."""
+
+    async def create_snapshot(
+        self, collection_name: str, wait: bool = True
+    ) -> _FakeSnapshot:
+        del wait
+        return await FakeAsyncQdrantClient.create_snapshot(self, collection_name)
+
+
+class _SnapshotClientWithMethodTimeout(FakeAsyncQdrantClient):
+    """Fake a client version that exposes a per-call snapshot timeout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_timeouts: list[int | None] = []
+
+    async def create_snapshot(
+        self,
+        collection_name: str,
+        wait: bool = True,
+        *,
+        timeout: int | None = None,
+    ) -> _FakeSnapshot:
+        del wait
+        self.snapshot_timeouts.append(timeout)
+        return await FakeAsyncQdrantClient.create_snapshot(self, collection_name)
+
+
 async def _ensure_active(
     store: QdrantLiteratureStore,
     *,
@@ -1128,6 +1157,33 @@ async def test_snapshot_files_and_manifest_are_written_atomically(tmp_path: Path
         generation.documents_physical,
         generation.passages_physical,
     }
+
+
+@pytest.mark.parametrize(
+    ("client", "expected_timeout"),
+    [
+        (_SnapshotClientWithoutMethodTimeout(), None),
+        (_SnapshotClientWithMethodTimeout(), 17),
+    ],
+    ids=["client-without-snapshot-timeout", "client-with-snapshot-timeout"],
+)
+async def test_snapshot_creation_adapts_to_method_timeout_signature(
+    client: FakeAsyncQdrantClient,
+    expected_timeout: int | None,
+    tmp_path: Path,
+) -> None:
+    store = QdrantLiteratureStore(
+        client,
+        prefix="photomat_test_snapshot_timeout",
+        timeout_seconds=17,
+    )
+    await _ensure_active(store)
+
+    manifest = await store.create_current_snapshots(tmp_path)
+
+    assert len(manifest.files) == 2
+    if isinstance(client, _SnapshotClientWithMethodTimeout):
+        assert client.snapshot_timeouts == [expected_timeout, expected_timeout]
 
 
 async def test_snapshot_restore_validation_checks_pair_and_sample(tmp_path: Path) -> None:
