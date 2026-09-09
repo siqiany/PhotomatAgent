@@ -151,7 +151,9 @@ class AbstractSourceRecord:
     retrieved_at: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "paper_key", _text(self.paper_key))
+        # Keep the exact SQLite ordering key.  Stripping it before persisting
+        # the cursor can make a later raw key unreachable through keyset SQL.
+        object.__setattr__(self, "paper_key", _raw_key(self.paper_key))
         object.__setattr__(self, "title", _text(self.title))
         object.__setattr__(self, "abstract", _text(self.abstract))
         object.__setattr__(self, "authors", _authors(self.authors))
@@ -182,7 +184,7 @@ def abstract_document_id_for(
 ) -> str:
     """Return a stable ID scoped by workspace, source path, and source key."""
     validate_relative_source_path(relative_source_path)
-    key = _text(paper_key)
+    key = _raw_key(paper_key)
     if not key:
         raise ValueError("paper_key must be a non-empty string")
     # Reuse the established document namespace while keeping the SQLite key
@@ -225,11 +227,48 @@ def _value(record: Any, name: str, default: Any = None) -> Any:
     return getattr(record, name, default)
 
 
+def _resolve_workspace_root(value: Any) -> Path:
+    root = value if isinstance(value, (str, Path)) else getattr(value, "root", value)
+    if root is None:
+        raise ValueError("workspace root is required")
+    resolved = Path(root).expanduser().resolve()
+    if not resolved.is_dir():
+        raise ValueError("workspace root is not a directory")
+    return resolved
+
+
+def _path_inside(root: Path, path: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _raw_key(value: Any) -> str:
+    """Convert a SQLite key to text without changing its ordering value."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 class SQLiteAbstractReader:
     """Read the ``papers`` table in SQLite read-only mode using keyset pages."""
 
-    def __init__(self, path: Path | str) -> None:
-        self.path = Path(path).expanduser().resolve()
+    def __init__(
+        self,
+        path: Path | str,
+        workspace_root: Path | str | Any | None = None,
+        *,
+        workspace: Any | None = None,
+    ) -> None:
+        if workspace_root is None:
+            workspace_root = workspace
+        self.workspace_root = _resolve_workspace_root(workspace_root)
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace_root / candidate
+        self.path = candidate.resolve()
+        if not _path_inside(self.workspace_root, self.path):
+            raise ValueError("abstract SQLite database is outside workspace")
         if not self.path.is_file():
             raise ValueError("abstract SQLite database does not exist")
         try:
@@ -441,6 +480,7 @@ class AbstractIngestionService:
         *,
         workspace_id: str | None = None,
         workspace: Any | None = None,
+        workspace_root: Path | str | Any | None = None,
         relative_source_path: str | None = None,
         source_path: str | None = None,
         generation: Any | None = None,
@@ -477,8 +517,9 @@ class AbstractIngestionService:
                     for candidate in remaining
                     if candidate is not embedder_candidate
                 )
+        boundary_root = workspace_root if workspace_root is not None else workspace
         if isinstance(reader, (Path, str)):
-            reader = SQLiteAbstractReader(reader)
+            reader = SQLiteAbstractReader(reader, workspace_root=boundary_root)
         if not isinstance(reader, SQLiteAbstractReader):
             raise TypeError("reader must be a SQLiteAbstractReader or database path")
         if store is None or embedder is None:
@@ -489,6 +530,9 @@ class AbstractIngestionService:
         self.store = store
         self.embedder = embedder
         self.batch_size = min(int(batch_size), MAX_ABSTRACT_BATCH)
+        self.workspace_root = self._resolve_service_workspace_root(
+            boundary_root, reader
+        )
         self.workspace_id = self._resolve_workspace_id(workspace_id, workspace)
         self.relative_source_path = self._resolve_source_path(
             relative_source_path or source_path, workspace
@@ -497,35 +541,34 @@ class AbstractIngestionService:
             generation = SimpleNamespace(fingerprint=generation_fingerprint)
         self.generation = generation
 
+    @staticmethod
+    def _resolve_service_workspace_root(
+        value: Any | None, reader: SQLiteAbstractReader
+    ) -> Path:
+        root = reader.workspace_root if value is None else _resolve_workspace_root(value)
+        if not _path_inside(root, reader.path):
+            raise ValueError("abstract SQLite database is outside workspace")
+        return root
+
     def _resolve_workspace_id(self, workspace_id: str | None, workspace: Any | None) -> str:
         if workspace_id is not None:
             value = str(workspace_id).strip()
             if not value:
                 raise ValueError("workspace_id must be a non-empty string")
             return value
-        root = getattr(workspace, "root", workspace)
-        if isinstance(root, Path):
-            return workspace_id_for(root)
-        if isinstance(root, str) and root.strip():
-            return workspace_id_for(Path(root))
-        # A caller without an explicit workspace still gets deterministic IDs;
-        # production assembly always supplies the workspace identity.
-        return "workspace"
+        return workspace_id_for(self.workspace_root)
 
     def _resolve_source_path(self, value: str | None, workspace: Any | None) -> str:
+        del workspace
+        relative = self.reader.path.relative_to(self.workspace_root).as_posix()
+        validate_relative_source_path(relative)
         if value is not None:
             validate_relative_source_path(value)
+            if value != relative:
+                raise ValueError(
+                    "relative_source_path must identify the SQLite database path"
+                )
             return value
-        root = getattr(workspace, "root", workspace)
-        if root is not None:
-            try:
-                candidate = self.reader.path.relative_to(Path(root).expanduser().resolve())
-                relative = candidate.as_posix()
-                validate_relative_source_path(relative)
-                return relative
-            except (ValueError, OSError):
-                pass
-        relative = self.reader.path.name
         validate_relative_source_path(relative)
         return relative
 
@@ -1005,7 +1048,7 @@ class AbstractIngestionService:
                     stats,
                     failed=stats.failed + 1,
                     processed=stats.processed + 1,
-                    next_cursor=effective_cursor,
+                    next_cursor=progress_cursor,
                     complete=False,
                     retryable=True,
                     errors=_bounded_errors((*stats.errors, diagnostic)),
@@ -1048,7 +1091,7 @@ class AbstractIngestionService:
                     stats,
                     processed=stats.processed + 1,
                     failed=stats.failed + 1,
-                    next_cursor=effective_cursor,
+                    next_cursor=progress_cursor,
                     complete=False,
                     retryable=True,
                     errors=_bounded_errors((*stats.errors, diagnostic)),
@@ -1064,7 +1107,9 @@ class AbstractIngestionService:
 
         failed = stats.retryable
         if failed:
-            next_cursor = effective_cursor
+            # Keep all rows that committed before the failure out of the next
+            # page.  The batch-start cursor would reprocess them on retry.
+            next_cursor = progress_cursor
             status = "retryable"
             complete = False
         elif not rows:

@@ -79,11 +79,48 @@ def _record(**changes: object) -> AbstractSourceRecord:
 
 
 def test_reader_uses_keyset_pagination(abstract_db: Path) -> None:
-    reader = SQLiteAbstractReader(abstract_db)
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
     first = reader.fetch_after(None, limit=2)
     second = reader.fetch_after(first[-1].paper_key, limit=2)
     assert [row.paper_key for row in first] == ["key-a", "key-b"]
     assert [row.paper_key for row in second] == ["key-c"]
+    reader.close()
+
+
+def test_reader_preserves_raw_keyset_cursor_with_whitespace_key(abstract_db: Path) -> None:
+    connection = sqlite3.connect(abstract_db)
+    connection.execute(
+        "INSERT INTO papers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (" a", "Leading", "leading abstract", "Author", 2020, "", "", "", "J", "", ""),
+    )
+    connection.execute(
+        "INSERT INTO papers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("a", "Exact", "exact abstract", "Author", 2020, "", "", "", "J", "", ""),
+    )
+    connection.commit()
+    connection.close()
+
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    first = reader.fetch_after(None, limit=1)
+    second = reader.fetch_after(first[-1].paper_key, limit=1)
+    assert first[0].paper_key == " a"
+    assert second[0].paper_key == "a"
+    reader.close()
+
+
+def test_reader_requires_workspace_root_and_rejects_outside_database(
+    abstract_db: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="workspace root"):
+        SQLiteAbstractReader(abstract_db)
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    with pytest.raises(ValueError, match="outside workspace"):
+        SQLiteAbstractReader(abstract_db, workspace_root=workspace_root)
+
+    reader = SQLiteAbstractReader("abstracts.sqlite3", workspace_root=abstract_db.parent)
+    assert reader.path == abstract_db.resolve()
     reader.close()
 
 
@@ -141,12 +178,16 @@ class FakeAbstractStore:
 class FakeEmbedder:
     identity = SimpleNamespace(dimension=2)
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, fail_after: int | None = None) -> None:
         self.fail = fail
+        self.fail_after = fail_after
         self.embedded_document_count = 0
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        if self.fail:
+        if self.fail or (
+            self.fail_after is not None
+            and self.embedded_document_count >= self.fail_after
+        ):
             raise RuntimeError("embedding unavailable")
         self.embedded_document_count += len(texts)
         return [[float(index), 1.0] for index, _ in enumerate(texts)]
@@ -156,14 +197,48 @@ def _service(abstract_db: Path, *, fail: bool = False) -> tuple[AbstractIngestio
     store = FakeAbstractStore()
     embedder = FakeEmbedder(fail=fail)
     service = AbstractIngestionService(
-        SQLiteAbstractReader(abstract_db),
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
         store,
         embedder,
         workspace_id="workspace-a",
-        relative_source_path="dataset/abstracts.sqlite3",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
         generation=store.generation,
     )
     return service, store, embedder
+
+
+def test_service_rejects_path_disguised_by_relative_source_path(
+    abstract_db: Path, tmp_path: Path
+) -> None:
+    store = FakeAbstractStore()
+    embedder = FakeEmbedder()
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    with pytest.raises(ValueError, match="outside workspace"):
+        AbstractIngestionService(
+            abstract_db,
+            store,
+            embedder,
+            workspace_id="workspace-a",
+            workspace_root=workspace_root,
+            relative_source_path="abstracts.sqlite3",
+            generation=store.generation,
+        )
+
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    with pytest.raises(ValueError, match="identify the SQLite database path"):
+        AbstractIngestionService(
+            reader,
+            store,
+            embedder,
+            workspace_id="workspace-a",
+            workspace_root=abstract_db.parent,
+            relative_source_path="alias.sqlite3",
+            generation=store.generation,
+        )
+    reader.close()
 
 
 @pytest.mark.asyncio
@@ -192,6 +267,46 @@ async def test_failure_keeps_pre_record_cursor(abstract_db: Path) -> None:
     progress = await service.index_batch(run_id="run-a", cursor=None, limit=1)
     assert progress.status == "retryable"
     assert progress.cursor is None
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_persists_cursor_after_skipped_and_committed_rows(
+    abstract_db: Path,
+) -> None:
+    connection = sqlite3.connect(abstract_db)
+    connection.execute("UPDATE papers SET abstract = '' WHERE paper_key = 'key-b'")
+    connection.commit()
+    connection.close()
+
+    store = FakeAbstractStore()
+    embedder = FakeEmbedder(fail_after=1)
+    service = AbstractIngestionService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        embedder,
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+
+    failed = await service.index_batch(run_id="partial-run", limit=3)
+    assert failed.status == "retryable"
+    assert failed.cursor == "key-b"
+    assert failed.indexed == 1
+    assert failed.skipped_empty == 1
+    assert failed.failed == 1
+    assert failed.processed == 3
+
+    embedder.fail_after = None
+    resumed = await service.index_batch(
+        run_id="partial-run", cursor=failed.cursor, limit=1
+    )
+    assert resumed.complete is True
+    assert resumed.indexed == 2
+    assert resumed.skipped_empty == 1
+    assert resumed.processed == 4
+    assert embedder.embedded_document_count == 2
 
 
 @pytest.mark.asyncio
