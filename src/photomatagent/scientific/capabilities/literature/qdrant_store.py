@@ -1760,7 +1760,13 @@ class QdrantLiteratureStore:
                 **self._timeout_kwargs(),
             )
 
-    async def upsert_ingestion_run(self, run: Any, *, wait: bool = True) -> None:
+    async def upsert_ingestion_run(
+        self,
+        run: Any,
+        *,
+        wait: bool = True,
+        source_kind: LiteratureSourceKind | str | None = None,
+    ) -> None:
         """Persist bounded ingestion progress as a vectorless control point."""
         workspace_id = getattr(run, "workspace_id", None)
         if not isinstance(workspace_id, str) or not workspace_id.strip():
@@ -1785,6 +1791,34 @@ class QdrantLiteratureStore:
         run_id = str(getattr(run, "run_id", ""))
         if not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
+        run_source_kind = _source_kind_value(
+            source_kind if source_kind is not None else getattr(run, "source_kind", None)
+        )
+        if source_kind is not None and run_source_kind != _source_kind_value(
+            getattr(run, "source_kind", source_kind)
+        ):
+            raise ValueError("ingestion run source_kind does not match the requested kind")
+        source_identity = str(getattr(run, "source_identity", ""))
+        if run_source_kind == LiteratureSourceKind.ABSTRACT.value:
+            if not _FINGERPRINT_RE.fullmatch(source_identity):
+                raise QdrantStoreError(
+                    "source_identity_invalid",
+                    "abstract ingestion run has an incomplete source identity",
+                )
+        source_path = str(
+            getattr(
+                run,
+                "source_path",
+                getattr(run, "relative_source_path", getattr(run, "relative_root", ".")),
+            )
+        )
+        if run_source_kind == LiteratureSourceKind.ABSTRACT.value:
+            try:
+                validate_relative_source_path(source_path)
+            except ValueError as exc:
+                raise QdrantStoreError(
+                    "source_path_invalid", "abstract ingestion source path is invalid"
+                ) from exc
         payload = {
             "schema_version": COLLECTION_SCHEMA_VERSION,
             "record_type": "ingestion_run",
@@ -1807,8 +1841,21 @@ class QdrantLiteratureStore:
             "retryable": bool(getattr(stats, "retryable", False)),
             "errors": errors,
         }
+        if run_source_kind is not None:
+            payload["source_kind"] = run_source_kind
+        if run_source_kind == LiteratureSourceKind.ABSTRACT.value:
+            payload["source_identity"] = source_identity
+            payload["source_path"] = source_path
+            payload["processed"] = int(getattr(stats, "processed", 0))
+            payload["skipped_empty"] = int(getattr(stats, "skipped_empty", 0))
+            payload["passages"] = int(
+                getattr(stats, "passages", getattr(stats, "chunks", 0))
+            )
         models = _qdrant_models()
-        point_id = str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, f"{workspace_id}:{run_id}"))
+        point_scope = f"{workspace_id}:{run_id}"
+        if run_source_kind is not None:
+            point_scope = f"{workspace_id}:{run_source_kind}:{run_id}"
+        point_id = str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, point_scope))
         await self._client.upsert(
             collection_name=self._ingestion_collection(generation, passages=False),
             points=[models.PointStruct(id=point_id, vector={}, payload=payload)],
@@ -1816,21 +1863,50 @@ class QdrantLiteratureStore:
             **self._timeout_kwargs(),
         )
 
-    async def get_ingestion_run(self, run_id: str, workspace_id: str) -> Any | None:
+    async def get_ingestion_run(
+        self,
+        run_id: str,
+        workspace_id: str,
+        *,
+        source_kind: LiteratureSourceKind | str | None = None,
+    ) -> Any | None:
         """Read one workspace-scoped ingestion control point, if present."""
         if not isinstance(workspace_id, str) or not workspace_id.strip():
             raise ValueError("workspace_id must be a non-empty string")
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
+        requested_source_kind = _source_kind_value(source_kind)
         generation = await self._ingestion_or_error()
-        point_id = str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, f"{workspace_id}:{run_id}"))
-        records = await self._client.retrieve(
-            collection_name=self._ingestion_collection(generation, passages=False),
-            ids=[point_id],
-            with_payload=True,
-            with_vectors=False,
-            **self._timeout_kwargs(),
-        )
+        point_scope = f"{workspace_id}:{run_id}"
+        if requested_source_kind is not None:
+            point_scope = f"{workspace_id}:{requested_source_kind}:{run_id}"
+        point_scopes = [point_scope]
+        # A source-aware run is namespaced to keep abstract and full-text run
+        # IDs independent.  When the caller does not know the source kind,
+        # probe the legacy ID first, then the source-aware IDs for a convenient
+        # read-after-write round trip without weakening workspace checks.
+        if requested_source_kind is None:
+            point_scopes.extend(
+                [
+                    f"{workspace_id}:{LiteratureSourceKind.ABSTRACT.value}:{run_id}",
+                    f"{workspace_id}:{LiteratureSourceKind.FULLTEXT.value}:{run_id}",
+                ]
+            )
+        point_ids = [
+            str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, scope))
+            for scope in dict.fromkeys(point_scopes)
+        ]
+        records: Sequence[Any] = ()
+        for point_id in point_ids:
+            records = await self._client.retrieve(
+                collection_name=self._ingestion_collection(generation, passages=False),
+                ids=[point_id],
+                with_payload=True,
+                with_vectors=False,
+                **self._timeout_kwargs(),
+            )
+            if records:
+                break
         if not isinstance(records, Sequence) or not records:
             return None
         payload = _payload(records[0])
@@ -1840,8 +1916,58 @@ class QdrantLiteratureStore:
             or str(payload.get("run_id", "")) != run_id
             or str(payload.get("generation_fingerprint", payload.get("generation", "")))
             != generation.fingerprint
+            or (
+                requested_source_kind is not None
+                and _source_kind_value(payload.get("source_kind"))
+                != requested_source_kind
+            )
         ):
             return None
+        payload_source_kind = _source_kind_value(payload.get("source_kind"))
+        if payload_source_kind == LiteratureSourceKind.ABSTRACT.value:
+            from photomatagent.scientific.capabilities.literature.abstract_ingestion import (
+                AbstractIngestionRunState,
+                AbstractIngestionStats,
+            )
+
+            errors_value = payload.get("errors", ())
+            if isinstance(errors_value, str):
+                abstract_errors: tuple[str, ...] = (errors_value[:512],) if errors_value else ()
+            elif isinstance(errors_value, Sequence):
+                abstract_errors = tuple(str(item)[:512] for item in list(errors_value)[-20:])
+            else:
+                abstract_errors = ()
+            source_identity = str(payload.get("source_identity", ""))
+            source_path = str(
+                payload.get("source_path", payload.get("relative_root", "."))
+            )
+            abstract_stats = AbstractIngestionStats(
+                run_id=run_id,
+                discovered=int(payload.get("discovered", 0)),
+                processed=int(payload.get("processed", 0)),
+                unchanged=int(payload.get("unchanged", 0)),
+                indexed=int(payload.get("indexed", 0)),
+                failed=int(payload.get("failed", 0)),
+                skipped_empty=int(payload.get("skipped_empty", 0)),
+                passages=int(payload.get("passages", payload.get("chunks", 0))),
+                next_cursor=payload.get("next_cursor"),
+                complete=bool(payload.get("complete", False)),
+                errors=abstract_errors,
+                retryable=bool(payload.get("retryable", False)),
+            )
+            return AbstractIngestionRunState(
+                run_id=run_id,
+                workspace_id=workspace_id,
+                generation_fingerprint=str(
+                    payload.get("generation_fingerprint", payload.get("generation", ""))
+                ),
+                source_identity=source_identity,
+                source_path=source_path,
+                cursor=payload.get("cursor"),
+                status=str(payload.get("status", "running")),
+                stats=abstract_stats,
+                source_kind=LiteratureSourceKind.ABSTRACT,
+            )
         from photomatagent.scientific.capabilities.literature.ingestion import (
             IngestionRunState,
             IngestionStats,
