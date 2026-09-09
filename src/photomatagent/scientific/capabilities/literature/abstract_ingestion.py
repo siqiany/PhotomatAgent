@@ -82,15 +82,8 @@ _REVISION_FIELDS = (
     "journal",
     "relevance_tier",
 )
-_SQL_KEY_WHITESPACE = "char(9)||char(10)||char(11)||char(12)||char(13)||' '"
-_SQL_VALID_KEY = (
-    '"paper_key" IS NOT NULL AND '
-    f'trim(CAST("paper_key" AS TEXT), {_SQL_KEY_WHITESPACE}) <> ""'
-)
-_SQL_INVALID_KEY = (
-    '"paper_key" IS NULL OR '
-    f'trim(CAST("paper_key" AS TEXT), {_SQL_KEY_WHITESPACE}) = ""'
-)
+_SQL_KEY_VALID = 'photomat_abstract_key_valid("paper_key") = 1'
+_SQL_KEY_INVALID = 'photomat_abstract_key_valid("paper_key") = 0'
 
 
 class AbstractIngestionError(RuntimeError):
@@ -259,6 +252,11 @@ def _raw_key(value: Any) -> str:
     return str(value)
 
 
+def _sqlite_key_valid(value: Any) -> int:
+    """Apply Python Unicode whitespace semantics inside SQLite predicates."""
+    return int(bool(_raw_key(value).strip()))
+
+
 class SQLiteAbstractReader:
     """Read the ``papers`` table in SQLite read-only mode using keyset pages."""
 
@@ -284,6 +282,12 @@ class SQLiteAbstractReader:
             uri = "file:" + quote(str(self.path), safe="/:\\") + "?mode=ro"
             self._connection = sqlite3.connect(uri, uri=True)
             self._connection.row_factory = sqlite3.Row
+            self._connection.create_function(
+                "photomat_abstract_key_valid",
+                1,
+                _sqlite_key_valid,
+                deterministic=True,
+            )
             self._columns = self._validate_schema()
         except (OSError, sqlite3.Error, ValueError) as exc:
             try:
@@ -361,7 +365,7 @@ class SQLiteAbstractReader:
 
     def count_invalid_keys(self) -> int:
         row = self._connection.execute(
-            f'SELECT COUNT(*) FROM "papers" WHERE {_SQL_INVALID_KEY}'
+            f'SELECT COUNT(*) FROM "papers" WHERE {_SQL_KEY_INVALID}'
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
@@ -380,7 +384,7 @@ class SQLiteAbstractReader:
             raise ValueError("limit must be positive")
         statement = (
             f'SELECT {self._select_sql()} FROM "papers" '
-            f'WHERE {_SQL_VALID_KEY} AND "paper_key" > ? '
+            f'WHERE {_SQL_KEY_VALID} AND "paper_key" > ? '
             'ORDER BY "paper_key" LIMIT ?'
         )
         try:

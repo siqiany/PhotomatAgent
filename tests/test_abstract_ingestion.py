@@ -121,6 +121,8 @@ async def test_invalid_keys_are_counted_once_and_valid_raw_keys_resume(tmp_path:
             (None, "Null", "null abstract"),
             ("", "Empty", "empty abstract"),
             ("   ", "Whitespace", "whitespace abstract"),
+            ("\u00a0", "No-break space", "nbsp abstract"),
+            ("\u2003", "Em space", "em-space abstract"),
             (" a", "Leading", "leading abstract"),
             ("a", "Exact", "exact abstract"),
         ],
@@ -129,8 +131,8 @@ async def test_invalid_keys_are_counted_once_and_valid_raw_keys_resume(tmp_path:
     connection.close()
 
     reader = SQLiteAbstractReader(path, workspace_root=tmp_path)
-    assert reader.count() == 5
-    assert reader.count_invalid_keys() == 3
+    assert reader.count() == 7
+    assert reader.count_invalid_keys() == 5
     first = reader.fetch_after(None, limit=1)
     second = reader.fetch_after(first[-1].paper_key, limit=1)
     assert [row.paper_key for row in first + second] == [" a", "a"]
@@ -147,9 +149,9 @@ async def test_invalid_keys_are_counted_once_and_valid_raw_keys_resume(tmp_path:
         generation=store.generation,
     )
     first_progress = await service.index_batch(run_id="invalid-run", limit=1)
-    assert first_progress.total == 5
-    assert first_progress.processed == 4
-    assert first_progress.skipped_invalid_key == 3
+    assert first_progress.total == 7
+    assert first_progress.processed == 6
+    assert first_progress.skipped_invalid_key == 5
     assert first_progress.indexed == 1
     assert first_progress.cursor == " a"
     assert first_progress.complete is False
@@ -158,8 +160,8 @@ async def test_invalid_keys_are_counted_once_and_valid_raw_keys_resume(tmp_path:
         run_id="invalid-run", cursor=first_progress.cursor, limit=1
     )
     assert resumed.complete is True
-    assert resumed.processed == 5
-    assert resumed.skipped_invalid_key == 3
+    assert resumed.processed == 7
+    assert resumed.skipped_invalid_key == 5
     assert resumed.indexed == 2
     assert resumed.cursor is None
     assert embedder.embedded_document_count == 2
