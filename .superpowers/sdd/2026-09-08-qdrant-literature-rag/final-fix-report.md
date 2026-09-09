@@ -256,3 +256,10 @@ The machine-specific JSON reports are stored under
 `user_output/qdrant-benchmark/`. Qdrant was left running with an empty
 collection list; no current production alias or legacy Lance artifact was
 modified.
+
+Final verification on commit `255f7a2` completed with `1561 passed, 17
+skipped, 9 failed, 57 warnings` in 600.32 seconds. The failure set is exactly
+the previously documented non-RAG baseline group; no Qdrant or literature-RAG
+test failed. `mypy src`, `uv lock --check --offline`, and `git diff --check`
+also passed. A final host-side check confirmed Qdrant healthy with an empty
+collection list.
