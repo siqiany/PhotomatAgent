@@ -304,23 +304,26 @@ def plot_orbital_isosurface(
         grid["lattice"][1][1] / grid["dims"][1],
         grid["lattice"][2][2] / grid["dims"][2],
     )
+    measure_module: Any = None
     try:
-        from skimage import measure
+        from skimage import measure as skimage_measure
+
+        measure_module = skimage_measure
     except Exception:
         # Optional binary wheels can fail at import time because of an ABI
         # mismatch as well as a missing package. Both cases use the bounded
         # NumPy fallback below.
-        measure = None
+        pass
     fallback_strides: tuple[int, int, int] | None = None
     try:
-        if measure is not None:
+        if measure_module is not None:
             try:
-                vertices, faces, _normals, _values = measure.marching_cubes(
+                vertices, faces, _normals, _values = measure_module.marching_cubes(
                     values, level=threshold, spacing=spacing
                 )
             except Exception:
-                measure = None
-        if measure is None:
+                measure_module = None
+        if measure_module is None:
             surface_values, surface_spacing, fallback_strides = (
                 _bounded_isosurface_grid(values, spacing)
             )
