@@ -263,3 +263,21 @@ the previously documented non-RAG baseline group; no Qdrant or literature-RAG
 test failed. `mypy src`, `uv lock --check --offline`, and `git diff --check`
 also passed. A final host-side check confirmed Qdrant healthy with an empty
 collection list.
+
+## Baseline repair and merge gate
+
+At the user's request, the nine unrelated baseline failures were repaired
+before integration. The corrections cover kdotpy input-validation ordering,
+effective-mass tool discoverability and typed missing-dependency diagnostics,
+ASE-aware MAGUS trajectory tests without losing dependency-independent
+coverage, environment-independent VAE source-archive verification, and a
+bounded NumPy PARCHG isosurface fallback when scikit-image cannot load.
+
+The fallback limits each surface-grid axis to 32 samples while preserving the
+sampled physical spacing; a 96-cubed synthetic field was reduced to 32-cubed
+and extracted in 2.288 seconds on this machine. Three independent read-only
+review passes ended with `READY` and no open P0/P1/P2 finding.
+
+Final full-suite verification on implementation commit `4c76d6e` completed
+green: `1576 passed, 18 skipped, 57 warnings` in 497.32 seconds. `mypy src`
+passed for 233 source files, and the offline lock and diff checks passed.
