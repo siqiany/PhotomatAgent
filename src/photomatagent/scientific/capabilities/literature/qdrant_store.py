@@ -26,6 +26,7 @@ from photomatagent.scientific.capabilities.literature.models import (
     DocumentManifest,
     DocumentStatus,
     IngestState,
+    LiteratureSourceKind,
     PassagePoint,
     validate_relative_source_path,
 )
@@ -242,6 +243,15 @@ def collection_fingerprint(
 
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
+
+
+def _source_kind_value(value: LiteratureSourceKind | str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return LiteratureSourceKind(value).value
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source_kind must be 'fulltext' or 'abstract'") from exc
 
 
 def _record_attr(record: Any, name: str, default: Any = None) -> Any:
@@ -500,6 +510,10 @@ class QdrantLiteratureStore:
             ("schema_version", models.PayloadSchemaType.KEYWORD),
             ("record_type", models.PayloadSchemaType.KEYWORD),
             ("workspace_id", models.PayloadSchemaType.KEYWORD),
+            ("source_kind", models.PayloadSchemaType.KEYWORD),
+            ("source_record_id", models.PayloadSchemaType.KEYWORD),
+            ("doi", models.PayloadSchemaType.KEYWORD),
+            ("relevance_tier", models.PayloadSchemaType.KEYWORD),
         ]
         if passages:
             fields.extend(
@@ -1467,6 +1481,7 @@ class QdrantLiteratureStore:
         document_id: str | None = None,
         document_revision: str | None = None,
         ingest_state: IngestState | None = None,
+        source_kind: LiteratureSourceKind | str | None = None,
         extra: Sequence[Any] = (),
     ) -> Any:
         models = _qdrant_models()
@@ -1477,6 +1492,7 @@ class QdrantLiteratureStore:
             ("document_id", document_id),
             ("document_revision", document_revision),
             ("ingest_state", _enum_value(ingest_state) if ingest_state is not None else None),
+            ("source_kind", _source_kind_value(source_kind)),
         ):
             if value is not None:
                 must.append(models.FieldCondition(key=key, match=models.MatchValue(value=value)))
@@ -1490,6 +1506,7 @@ class QdrantLiteratureStore:
         document_id: str | None = None,
         document_revision: str | None = None,
         ingest_state: IngestState | None = None,
+        source_kind: LiteratureSourceKind | str | None = None,
         revision_except: str | None = None,
         extra: Sequence[Any] = (),
     ) -> Any:
@@ -1510,6 +1527,7 @@ class QdrantLiteratureStore:
             document_id=document_id,
             document_revision=document_revision,
             ingest_state=ingest_state,
+            source_kind=source_kind,
             extra=(*extra, *revision_conditions),
         )
 
@@ -1561,6 +1579,73 @@ class QdrantLiteratureStore:
             if (manifest := self._manifest_from_record(record)) is not None
         }
 
+    async def get_document_manifests(
+        self,
+        workspace_id: str,
+        document_ids: Sequence[str],
+        *,
+        generation: CollectionGeneration | None = None,
+    ) -> dict[str, DocumentManifest]:
+        """Retrieve a bounded set of document manifests by their point IDs.
+
+        Qdrant's point-ID lookup is intentionally used instead of a scroll so
+        an abstract-ingestion batch can compare only the documents it is about
+        to process.  The payload is still checked at this boundary because a
+        fake/legacy client may return records outside the requested workspace
+        or with a different record type.
+        """
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
+        if isinstance(document_ids, (str, bytes, bytearray)):
+            raise TypeError("document_ids must be a sequence of document IDs")
+        requested = list(document_ids)
+        if len(requested) > MAX_CANDIDATES:
+            raise ValueError(
+                f"document_ids cannot contain more than {MAX_CANDIDATES} IDs"
+            )
+        if not requested:
+            return {}
+        if any(not isinstance(document_id, str) or not document_id for document_id in requested):
+            raise ValueError("document_ids must contain non-empty strings")
+        requested_ids = list(dict.fromkeys(requested))
+
+        explicit_generation = generation is not None
+        generation = generation or self._staging_generation
+        if generation is None:
+            generation = await self._current_or_error()
+        if not await self._collection_exists(generation.documents_physical):
+            return {}
+        collection_name = (
+            generation.documents_physical
+            if explicit_generation or self._staging_generation is generation
+            else generation.documents_alias
+        )
+        retrieved = await self._client.retrieve(
+            collection_name=collection_name,
+            ids=requested_ids,
+            with_payload=True,
+            with_vectors=False,
+            **self._timeout_kwargs(),
+        )
+        result: dict[str, DocumentManifest] = {}
+        requested_set = set(requested_ids)
+        for record in self._query_points(retrieved):
+            payload = _payload(record)
+            if (
+                payload.get("workspace_id") != workspace_id
+                or payload.get("record_type") != "document"
+            ):
+                continue
+            payload_document_id = str(
+                payload.get("document_id", _record_attr(record, "id", ""))
+            )
+            if payload_document_id not in requested_set:
+                continue
+            manifest = self._manifest_from_record(record)
+            if manifest is not None and manifest.document_id in requested_set:
+                result[manifest.document_id] = manifest
+        return result
+
     def _manifest_from_record(self, record: Any) -> DocumentManifest | None:
         payload = _payload(record)
         if payload.get("record_type") != "document":
@@ -1583,6 +1668,15 @@ class QdrantLiteratureStore:
                 model_fingerprint=str(payload.get("model_fingerprint", "")),
                 indexed_at=_datetime_value(payload.get("indexed_at")),
                 last_error=str(payload.get("last_error", "")),
+                source_kind=LiteratureSourceKind(
+                    payload.get("source_kind", LiteratureSourceKind.FULLTEXT.value)
+                ),
+                source_record_id=str(payload.get("source_record_id", "")),
+                doi=str(payload.get("doi", "")),
+                pmid=str(payload.get("pmid", "")),
+                pmcid=str(payload.get("pmcid", "")),
+                journal=str(payload.get("journal", "")),
+                relevance_tier=str(payload.get("relevance_tier", "")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -1926,13 +2020,19 @@ class QdrantLiteratureStore:
         return list(result or [])
 
     async def dense_candidates(
-        self, dense: Sequence[float], *, workspace_id: str, limit: int
+        self,
+        dense: Sequence[float],
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+        limit: int,
     ) -> list[SearchCandidate]:
         generation = await self._current_or_error()
         cap = self._limit(limit)
         query_filter = self._passage_filter(
             workspace_id=workspace_id,
             ingest_state=IngestState.READY,
+            source_kind=source_kind,
         )
         response = await self._client.query_points(
             collection_name=generation.passages_alias,
@@ -1947,7 +2047,12 @@ class QdrantLiteratureStore:
         return [self._candidate_from_record(record) for record in self._query_points(response)[:cap]]
 
     async def sparse_candidates(
-        self, query: str, *, workspace_id: str, limit: int
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+        limit: int,
     ) -> list[SearchCandidate]:
         generation = await self._current_or_error()
         cap = self._limit(limit)
@@ -1955,6 +2060,7 @@ class QdrantLiteratureStore:
         query_filter = self._passage_filter(
             workspace_id=workspace_id,
             ingest_state=IngestState.READY,
+            source_kind=source_kind,
         )
         response = await self._client.query_points(
             collection_name=generation.passages_alias,
@@ -1974,6 +2080,7 @@ class QdrantLiteratureStore:
         dense: Sequence[float],
         *,
         workspace_id: str,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
         limit: int,
     ) -> list[SearchCandidate]:
         generation = await self._current_or_error()
@@ -1982,6 +2089,7 @@ class QdrantLiteratureStore:
         query_filter = self._passage_filter(
             workspace_id=workspace_id,
             ingest_state=IngestState.READY,
+            source_kind=source_kind,
         )
         prefetch = [
             models.Prefetch(
@@ -2046,6 +2154,15 @@ class QdrantLiteratureStore:
                 dense=tuple(float(value) for value in dense),
                 normalized_text_sha256=str(payload.get("normalized_text_sha256", "")),
                 indexed_at=_datetime_value(payload.get("indexed_at")),
+                source_kind=LiteratureSourceKind(
+                    payload.get("source_kind", LiteratureSourceKind.FULLTEXT.value)
+                ),
+                source_record_id=str(payload.get("source_record_id", "")),
+                doi=str(payload.get("doi", "")),
+                pmid=str(payload.get("pmid", "")),
+                pmcid=str(payload.get("pmcid", "")),
+                journal=str(payload.get("journal", "")),
+                relevance_tier=str(payload.get("relevance_tier", "")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -2552,6 +2669,7 @@ __all__ = [
     "DocumentStatus",
     "INGESTION_RUN_POINT_NAMESPACE",
     "IngestState",
+    "LiteratureSourceKind",
     "MAX_CANDIDATES",
     "PassagePoint",
     "QdrantLiteratureStore",

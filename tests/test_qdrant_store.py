@@ -33,6 +33,7 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
     passage_id_for,
     workspace_id_for,
 )
+from photomatagent.scientific.capabilities.literature.models import LiteratureSourceKind
 
 
 IDENTITY = ModelIdentity(
@@ -261,6 +262,9 @@ def _passage(
     workspace_id: str = "workspace-a",
     passage_id: str = "passage-1",
     model_fingerprint: str = "f" * 64,
+    source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+    source_record_id: str = "",
+    doi: str = "",
 ) -> PassagePoint:
     return PassagePoint(
         schema_version=1,
@@ -285,7 +289,40 @@ def _passage(
         model_fingerprint=model_fingerprint,
         limitations=("ocr",),
         dense=(0.1, 0.2),
+        source_kind=source_kind,
+        source_record_id=source_record_id,
+        doi=doi,
     )
+
+
+def _filter_value(query_filter: Any, key: str) -> Any:
+    for condition in query_filter.must:
+        if getattr(condition, "key", None) == key:
+            return condition.match.value
+    return None
+
+
+def test_abstract_payload_preserves_source_fields() -> None:
+    point = _passage(source_kind="abstract", source_record_id="key-a", doi="10.1/a")
+    payload = point.to_payload()
+    assert payload["source_kind"] == "abstract"
+    assert payload["source_record_id"] == "key-a"
+    assert payload["doi"] == "10.1/a"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_candidates_filter_source_kind_in_qdrant() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    await _ensure_active(store)
+    await store.hybrid_candidates(
+        "HgTe",
+        [0.1, 0.2],
+        workspace_id="workspace-a",
+        source_kind="fulltext",
+        limit=10,
+    )
+    assert _filter_value(client.query_calls[-1]["query_filter"], "source_kind") == "fulltext"
 
 
 def test_passage_id_changes_only_with_document_revision() -> None:
@@ -501,6 +538,10 @@ async def test_collection_schema_indexes_all_filterable_provenance_fields() -> N
         "model_fingerprint",
         "previous_passage_id",
         "next_passage_id",
+        "source_kind",
+        "source_record_id",
+        "doi",
+        "relevance_tier",
     } <= indexed
 
 
@@ -1019,7 +1060,12 @@ async def test_upsert_passages_is_batched_and_candidate_limit_is_bounded() -> No
     assert query["limit"] == 50
     filt = query["query_filter"]
     values = {condition.key: condition.match.value for condition in filt.must}
-    assert values == {"workspace_id": "workspace-a", "record_type": "passage", "ingest_state": "ready"}
+    assert values == {
+        "workspace_id": "workspace-a",
+        "record_type": "passage",
+        "ingest_state": "ready",
+        "source_kind": "fulltext",
+    }
     assert generation.passages_physical in client.collections
 
 
@@ -1047,7 +1093,12 @@ async def test_sparse_and_hybrid_use_workspace_ready_filters() -> None:
     await store.sparse_candidates("infrared", workspace_id="workspace-a", limit=5)
     sparse_query = client.query_calls[-1]
     sparse_values = {condition.key: condition.match.value for condition in sparse_query["query_filter"].must}
-    assert sparse_values == {"workspace_id": "workspace-a", "record_type": "passage", "ingest_state": "ready"}
+    assert sparse_values == {
+        "workspace_id": "workspace-a",
+        "record_type": "passage",
+        "ingest_state": "ready",
+        "source_kind": "fulltext",
+    }
     await store.hybrid_candidates("infrared", (0.1, 0.2), workspace_id="workspace-a", limit=5)
     hybrid_query = client.query_calls[-1]
     assert len(hybrid_query["prefetch"]) == 2
@@ -1072,6 +1123,33 @@ async def test_document_operations_filter_workspace_and_revision() -> None:
     assert values["document_revision"] == "a" * 64
     await store.set_revision_state("doc-1", "a" * 64, IngestState.SUPERSEDED, workspace_id="workspace-a")
     assert client.payload_calls[-1]["payload"] == {"ingest_state": "superseded"}
+
+
+async def test_get_document_manifests_is_bounded_and_scope_checked() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_literature")
+    generation = await _ensure_active(store)
+    await store.upsert_document(_manifest(model_fingerprint=generation.fingerprint))
+    other = replace(
+        _manifest(model_fingerprint=generation.fingerprint),
+        document_id="doc-other",
+        workspace_id="workspace-b",
+        relative_source_path="dataset/paper/other.pdf",
+    )
+    await store.upsert_document(other)
+
+    manifests = await store.get_document_manifests(
+        "workspace-a", ["doc-1", "doc-other", "missing"]
+    )
+
+    assert set(manifests) == {"doc-1"}
+    retrieve = client.query_calls[-1]
+    assert retrieve["kind"] == "retrieve"
+    assert retrieve["ids"] == ["doc-1", "doc-other", "missing"]
+    with pytest.raises(ValueError, match="more than 50"):
+        await store.get_document_manifests(
+            "workspace-a", [f"doc-{index}" for index in range(51)]
+        )
 
 
 async def test_retrieve_passages_uses_bounded_server_side_workspace_ready_filter() -> None:

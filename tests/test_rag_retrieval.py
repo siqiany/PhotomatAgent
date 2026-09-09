@@ -22,6 +22,7 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
 from photomatagent.scientific.capabilities.literature.providers.base import ModelIdentity
 from photomatagent.scientific.capabilities.literature.models import (
     IngestState,
+    LiteratureSourceKind,
     PassagePoint,
 )
 from photomatagent.scientific.capabilities.literature.retrieval import (
@@ -41,6 +42,7 @@ def candidate_fixture(
     workspace_id: str = "ws",
     document_id: str = "doc",
     text_prefix: str = "passage",
+    source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
 ) -> list[SearchCandidate]:
     candidates: list[SearchCandidate] = []
     for index in range(count):
@@ -66,6 +68,7 @@ def candidate_fixture(
             "next_passage_id": f"p-{index + 1}" if index < count - 1 else None,
             "normalized_text_sha256": _hash(text),
             "indexed_at": datetime(2024, 1, (index % 28) + 1, tzinfo=timezone.utc),
+            "source_kind": source_kind,
         }
         candidates.append(
             SearchCandidate(passage_id=f"p-{index}", score=1.0 / (index + 1), payload=payload)
@@ -134,9 +137,15 @@ class FakeStore:
         self.sparse_error: Exception | None = None
 
     async def hybrid_candidates(
-        self, query: str, dense: list[float], *, workspace_id: str, limit: int
+        self,
+        query: str,
+        dense: list[float],
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind,
+        limit: int,
     ) -> list[SearchCandidate]:
-        del query, dense, workspace_id
+        del query, dense, workspace_id, source_kind
         self.hybrid_queries += 1
         self.hybrid_limit = limit
         if self.hybrid_error is not None:
@@ -144,9 +153,14 @@ class FakeStore:
         return list(self.hybrid_results)
 
     async def dense_candidates(
-        self, dense: list[float], *, workspace_id: str, limit: int
+        self,
+        dense: list[float],
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind,
+        limit: int,
     ) -> list[SearchCandidate]:
-        del dense, workspace_id
+        del dense, workspace_id, source_kind
         self.dense_queries += 1
         self.dense_limit = limit
         if self.dense_error is not None:
@@ -154,9 +168,14 @@ class FakeStore:
         return list(self.dense_results)
 
     async def sparse_candidates(
-        self, query: str, *, workspace_id: str, limit: int
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind,
+        limit: int,
     ) -> list[SearchCandidate]:
-        del query, workspace_id
+        del query, workspace_id, source_kind
         self.sparse_queries += 1
         self.sparse_limit = limit
         if self.sparse_error is not None:
@@ -195,7 +214,7 @@ async def test_retrieval_validates_provider_generation_before_query() -> None:
 
     assert calls == [
         collection_fingerprint(
-            identity, 1, prefix="photomat_test_retrieval", sparse_model="qdrant/bm25"
+            identity, 2, prefix="photomat_test_retrieval", sparse_model="qdrant/bm25"
         )
     ]
 
@@ -268,6 +287,15 @@ async def test_dense_failure_uses_sparse_without_external_fallback() -> None:
     assert store.sparse_queries == 1
     assert store.sparse_limit == 50
     assert store.hybrid_queries == 0
+
+
+@pytest.mark.asyncio
+async def test_retriever_rejects_wrong_source_candidates() -> None:
+    store = FakeStore(candidate_fixture(source_kind=LiteratureSourceKind.ABSTRACT))
+    result = await LiteratureRetriever(
+        store, FakeEmbedder(), DisabledReranker()
+    ).search("HgTe", workspace_id="ws", source_kind="fulltext")
+    assert result.passages == ()
 
 
 @pytest.mark.asyncio
