@@ -96,3 +96,110 @@ def test_rag_status_shows_server_alias_and_generation_state(
     assert "Alias state" in result.stdout
     assert "Generation" in result.stdout
     assert "1.18.2" in result.stdout
+
+
+def test_rag_status_renders_credential_free_qdrant_url_and_connection_state(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv(
+        "PHOTOMATAGENT_QDRANT_URL",
+        "https://user:secret@qdrant.example:6333?token=another-secret",
+    )
+    monkeypatch.setenv("QDRANT_API_KEY", "another-secret")
+
+    class FakeProbe:
+        def __init__(self, config, workspace) -> None:
+            del config, workspace
+
+        def probe(self) -> ProbeResult:
+            return ProbeResult(status=CapabilityStatus.UNCONFIGURED, detail="source missing")
+
+        def status_snapshot(self) -> dict[str, str]:
+            return {
+                "server_version": "1.18.2",
+                "alias_state": "ready",
+                "generation_state": "ready:123456789abc",
+                "tls": "enabled",
+                "auth": "configured (value hidden)",
+            }
+
+    monkeypatch.setattr(rag_cli, "LiteratureProbe", FakeProbe)
+    result = cli_runner.invoke(app, ["rag", "status", "--workspace", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "https://qdrant.example:6333" in result.stdout
+    assert "user:secret" not in result.stdout
+    assert "another-secret" not in result.stdout
+    assert "TLS" in result.stdout
+    assert "Auth" in result.stdout
+
+
+def test_rag_evaluate_reports_live_unavailable_instead_of_fake_quality(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        rag_cli,
+        "build_literature_services",
+        lambda config, workspace: (_ for _ in ()).throw(
+            RuntimeError("qdrant unavailable")
+        ),
+    )
+    result = cli_runner.invoke(app, ["rag", "evaluate", "--workspace", str(tmp_path)])
+
+    assert result.exit_code != 0
+    assert '"live_evaluation": false' in result.stdout
+    assert '"passed": false' in result.stdout
+    assert "qdrant unavailable" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_index_until_complete_stops_after_unresolved_retryable_batch(
+    tmp_path, monkeypatch
+) -> None:
+    calls = 0
+
+    class Ingestion:
+        embedder = object()
+
+        async def plan(self, root, boundary):
+            del root, boundary
+            return object()
+
+        async def index_batch(self, plan, **kwargs):
+            del plan, kwargs
+            nonlocal calls
+            calls += 1
+            return type(
+                "Stats",
+                (),
+                {
+                    "run_id": "retry-run",
+                    "discovered": 1,
+                    "unchanged": 0,
+                    "indexed": 0,
+                    "failed": 1,
+                    "deleted": 0,
+                    "chunks": 0,
+                    "staged_cleanup": 0,
+                    "next_cursor": None,
+                    "complete": False,
+                    "retryable": True,
+                    "errors": ("paper.pdf: failed",),
+                },
+            )()
+
+    class Services:
+        ingestion = Ingestion()
+        store = object()
+
+    result = await rag_cli._index_until_complete(
+        Services(),
+        Workspace(tmp_path),
+        tmp_path,
+        config=rag_cli.ScientificConfig(rag_tool_max_documents=1),
+        run_id="retry-run",
+    )
+
+    assert calls == 1
+    assert result["complete"] is False
+    assert result["retryable"] is True

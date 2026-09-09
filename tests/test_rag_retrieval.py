@@ -16,7 +16,10 @@ import pytest
 
 from photomatagent.scientific.capabilities.literature.qdrant_store import (
     SearchCandidate,
+    QdrantStoreError,
+    collection_fingerprint,
 )
+from photomatagent.scientific.capabilities.literature.providers.base import ModelIdentity
 from photomatagent.scientific.capabilities.literature.models import (
     IngestState,
     PassagePoint,
@@ -163,6 +166,67 @@ class FakeStore:
     async def retrieve_passages(self, workspace_id: str, passage_ids: list[str]) -> list[Any]:
         self.neighbor_calls.append((workspace_id, list(passage_ids)))
         return [self.neighbors[passage_id] for passage_id in passage_ids if passage_id in self.neighbors]
+
+
+@pytest.mark.asyncio
+async def test_retrieval_validates_provider_generation_before_query() -> None:
+    store = FakeStore()
+    store.prefix = "photomat_test_retrieval"
+    store.sparse_model = "qdrant/bm25"
+    identity = ModelIdentity(
+        provider="fixture",
+        model="embedding-v1",
+        dimension=2,
+        document_prefix="",
+        query_prefix="",
+        normalize=False,
+    )
+    embedder = FakeEmbedder()
+    embedder.identity = identity
+    calls: list[str] = []
+
+    async def validate(expected: str) -> None:
+        calls.append(expected)
+
+    store.validate_current_generation = validate  # type: ignore[attr-defined]
+    await LiteratureRetriever(store, embedder, DisabledReranker()).search(
+        "query", workspace_id="ws", top_k=1
+    )
+
+    assert calls == [
+        collection_fingerprint(
+            identity, 1, prefix="photomat_test_retrieval", sparse_model="qdrant/bm25"
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retrieval_propagates_generation_fingerprint_mismatch() -> None:
+    store = FakeStore()
+    store.prefix = "photomat_test_retrieval_mismatch"
+    store.sparse_model = "qdrant/bm25"
+    embedder = FakeEmbedder()
+    embedder.identity = ModelIdentity(
+        provider="fixture",
+        model="embedding-v1",
+        dimension=2,
+        document_prefix="",
+        query_prefix="",
+        normalize=False,
+    )
+
+    async def reject(expected: str) -> None:
+        del expected
+        raise QdrantStoreError(
+            "model_fingerprint_mismatch", "current generation is incompatible"
+        )
+
+    store.validate_current_generation = reject  # type: ignore[attr-defined]
+    with pytest.raises(QdrantStoreError, match="incompatible"):
+        await LiteratureRetriever(store, embedder, DisabledReranker()).search(
+            "query", workspace_id="ws", top_k=1
+        )
+    assert store.hybrid_queries == 0
 
 
 @pytest.mark.asyncio

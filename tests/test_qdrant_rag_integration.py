@@ -35,10 +35,15 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
     document_id_for,
     passage_id_for,
 )
+from photomatagent.scientific.capabilities.config import ScientificConfig
+from photomatagent.workspace import Workspace
 
 
 INTEGRATION_ENV = "PHOTOMATAGENT_RUN_QDRANT_INTEGRATION"
 QDRANT_URL_ENV = "PHOTOMATAGENT_QDRANT_TEST_URL"
+EVAL_INTEGRATION_ENV = "PHOTOMATAGENT_RUN_QDRANT_EVAL_INTEGRATION"
+BENCHMARK_INTEGRATION_ENV = "PHOTOMATAGENT_RUN_QDRANT_BENCHMARK_INTEGRATION"
+BENCHMARK_LOCAL_ENV = "PHOTOMATAGENT_RUN_QDRANT_BENCHMARK_LOCAL"
 EXPECTED_QDRANT_VERSION = "1.18.2"
 TEST_WORKSPACE_ID = "photomat-qdrant-fixture-workspace"
 IDENTITY = ModelIdentity(
@@ -193,7 +198,8 @@ async def real_store() -> Any:
         snapshot_base_url=url,
     )
     try:
-        await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+        generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+        await store.activate_generation(generation, allow_empty_bootstrap=True)
         yield store
     finally:
         # Only remove collections created under this UUID-bearing safety
@@ -696,8 +702,11 @@ async def test_alias_pair_switches_to_validated_generation(real_store: Any) -> N
         chunk_schema_version=1,
     )
     resolved = await real_store.resolve_current_generation()
-    assert resolved == second
+    assert resolved == first
     assert second.fingerprint != first.fingerprint
+    await real_store.activate_generation(second)
+    resolved = await real_store.resolve_current_generation()
+    assert resolved == second
     assert await real_store._client.collection_exists(first.passages_physical)
     aliases = await real_store._client.get_aliases()
     alias_map = {
@@ -766,12 +775,125 @@ async def test_snapshot_download_and_restore_noncurrent(
         )
         assert await real_store._client.collection_exists(restored_name)
 
+    restored_mapping = {
+        generation.documents_physical: f"{real_store.prefix}_restored_documents",
+        generation.passages_physical: f"{real_store.prefix}_restored_passages",
+    }
+    checks = await real_store.validate_restored_snapshot(
+        snapshot_manifest,
+        restored_collections=restored_mapping,
+        sample_passage_id=point.passage_id,
+    )
+    assert checks["aliases_unchanged"] is True
+    assert checks["sample_retrieval"] is True
+    assert set(checks["collections"]) == {
+        generation.documents_physical,
+        generation.passages_physical,
+    }
+
     aliases = await real_store._client.get_aliases()
     alias_map = {
         item.alias_name: item.collection_name for item in aliases.aliases
     }
     assert alias_map[generation.documents_alias] == generation.documents_physical
     assert alias_map[generation.passages_alias] == generation.passages_physical
+
+
+@pytest.mark.asyncio
+async def test_live_fixture_evaluation_uses_real_retriever_and_preserves_aliases(
+    real_store: Any, tmp_path: Path
+) -> None:
+    if os.environ.get(EVAL_INTEGRATION_ENV) != "1":
+        pytest.skip(f"set {EVAL_INTEGRATION_ENV}=1 to run the live 22-judgment evaluation")
+
+    from photomatagent.cli.rag import (
+        _load_evaluation_fixture,
+        evaluate_live_fixture,
+    )
+
+    judgments = _load_evaluation_fixture(
+        Path(__file__).parent / "fixtures" / "literature_rag_eval.json"
+    )
+    url = os.environ.get(QDRANT_URL_ENV, "http://127.0.0.1:6333").strip()
+    before = await real_store._client.get_aliases()
+    before_aliases = {
+        item.alias_name: item.collection_name for item in before.aliases
+    }
+    config = ScientificConfig(qdrant_url=url, embedding_vector_dim=384)
+
+    report = await evaluate_live_fixture(config, Workspace(tmp_path), judgments)
+
+    after = await real_store._client.get_aliases()
+    after_aliases = {
+        item.alias_name: item.collection_name for item in after.aliases
+    }
+    assert report["live_evaluation"] is True
+    assert report["queries"] == 22
+    assert report["passed"] is True
+    assert after_aliases == before_aliases
+
+
+@pytest.mark.asyncio
+async def test_live_benchmark_executes_hybrid_rrf_in_isolated_collection(
+    real_store: Any,
+) -> None:
+    """Exercise the benchmark's real Qdrant path behind an explicit gate.
+
+    The benchmark creates only its own UUID-bearing ``photomat_test_``
+    collection.  ``BENCHMARK_LOCAL_ENV`` additionally attempts model-backed
+    end-to-end retrieval; absent local model assets are reported by the
+    benchmark rather than silently counted as a successful local measurement.
+    """
+    if os.environ.get(BENCHMARK_INTEGRATION_ENV) != "1":
+        pytest.skip(
+            f"set {BENCHMARK_INTEGRATION_ENV}=1 to run the live hybrid benchmark"
+        )
+
+    import importlib.util
+    import sys
+
+    script_path = Path(__file__).parents[1] / "scripts" / "benchmark_qdrant_rag.py"
+    spec = importlib.util.spec_from_file_location("benchmark_qdrant_rag_live_test", script_path)
+    assert spec is not None and spec.loader is not None
+    benchmark = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = benchmark
+    spec.loader.exec_module(benchmark)
+
+    url = os.environ.get(QDRANT_URL_ENV, "http://127.0.0.1:6333").strip()
+    before = await real_store._client.get_aliases()
+    before_aliases = {
+        item.alias_name: item.collection_name for item in before.aliases
+    }
+    measure_local = os.environ.get(BENCHMARK_LOCAL_ENV) == "1"
+    config = benchmark.BenchmarkConfig(
+        points=32,
+        dimension=8,
+        queries=3,
+        batch_size=8,
+        url=url,
+        test_prefix=f"photomat_test_benchmark_{uuid.uuid4().hex}",
+        confirm_write=True,
+        measure_local_retrieval=measure_local,
+        warmup_local_model=measure_local,
+    )
+
+    report = await asyncio.to_thread(benchmark._live_benchmark, config)
+
+    after = await real_store._client.get_aliases()
+    after_aliases = {
+        item.alias_name: item.collection_name for item in after.aliases
+    }
+    hybrid = report["rag_paths"]["hybrid_rrf"]
+    assert hybrid["requested"] is True
+    assert hybrid["executed"] is True
+    assert report["writes_performed"] is True
+    assert after_aliases == before_aliases
+    if measure_local:
+        local = report["rag_paths"]["local_end_to_end"]
+        assert local["requested"] is True
+        assert local["first_request_phase"] == "post_warmup"
+        assert "first_request_p50" in local["latency_ms"]
+        assert "cold_p50" not in local["latency_ms"]
 
 
 __all__ = ["real_store"]

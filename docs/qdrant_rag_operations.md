@@ -59,15 +59,25 @@ All paths are resolved inside the selected workspace. `plan` is read-only;
 uv run photomatagent rag status
 uv run photomatagent rag plan --directory dataset/paper
 uv run photomatagent rag index --directory dataset/paper
+uv run photomatagent rag activate --yes
 uv run photomatagent rag search "HgTe detector responsivity at 80 K" --top-k 5
 uv run photomatagent rag read <passage-id>
 uv run photomatagent rag evaluate
 uv run photomatagent rag snapshot --output .photomatagent/rag/backups/$(date -u +%Y%m%dT%H%M%SZ)
 ```
 
-`rag evaluate` reads the authored synthetic judgment fixture and reports
-Recall@5, MRR@10, no-result rate, duplicate rate, and provenance completeness.
-The output is explicitly labelled `fixture-specific`; it makes no claim about
+`rag plan` does not create collections or write progress. `rag index` builds
+the provider/schema generation in physical staging collections and never
+changes the current aliases. Run the explicit `rag activate --yes` gate only
+after the complete run and retrieval checks pass. An empty first corpus must
+use the additional explicit `rag activate --yes --bootstrap` path; ordinary
+activation rejects empty or unresolved generations. Retrieval validates the
+configured model fingerprint before querying. `rag evaluate` creates a
+unique, disposable synthetic Qdrant prefix and runs every authored judgment
+through `LiteratureRetriever`; it never selects rows from the production
+aliases. If Qdrant or the configured models are unavailable, it reports
+`live_evaluation: false` and exits nonzero rather than presenting fake quality
+metrics. A live report is labelled `fixture-specific` and makes no claim about
 quality over a real corpus. The acceptance thresholds are Recall@5 ≥ 0.90,
 provenance completeness = 1.0, and duplicate rate = 0.0.
 
@@ -88,8 +98,11 @@ evaluation and record the provider/model change in the deployment notes.
 
 Create a snapshot of both physical collections with `rag snapshot`. Verify the
 `snapshot-manifest.json` SHA-256 and size entries before moving the files. The
-manifest binds the files to the generation fingerprint; do not restore a
-snapshot into a collection with a different schema or model fingerprint.
+manifest records server version, schema/fingerprint, physical collection
+names, point and indexed-vector counts, aliases, capacity observations, file
+hashes/sizes, and creation time. Hashing is streamed, so archive size is not
+loaded wholly into memory. Do not restore a snapshot into a collection with a
+different schema or model fingerprint.
 
 Restore each collection to a new, non-current physical name using the Qdrant
 snapshot recovery API (or an equivalent Qdrant client operation), for example:
@@ -99,13 +112,15 @@ POST /collections/<new-documents-name>/snapshots/recover
 {"location":"<Qdrant-server-visible-snapshot-URL>"}
 ```
 
-Repeat for passages, then inspect collection metadata, payload indexes, vector
-dimension, sparse IDF configuration, and generation control metadata. Keep the
-current aliases untouched while validating the restored pair. Switch both
-aliases in one validated alias-update operation only after retrieval and the
-frozen evaluation pass. A scheduler/server `COMPLETED`-style status is not a
-scientific retrieval success signal; validate the actual artifacts and
-provenance.
+Repeat for passages, then use the store restore-validation operation (or an
+equivalent checked procedure) to verify counts, collection metadata, payload
+indexes, vector dimension, sparse IDF configuration, generation control
+metadata, and a sample retrieval. Keep the current aliases untouched while
+validating the restored pair; the manifest aliases must remain unchanged.
+Switch both aliases in one validated alias-update operation only after
+retrieval and the frozen evaluation pass. A scheduler/server `COMPLETED`-style
+status is not a scientific retrieval success signal; validate the actual
+artifacts and provenance.
 
 ## Troubleshooting typed errors
 
@@ -145,14 +160,23 @@ uv run python scripts/benchmark_qdrant_rag.py \
 uv run python scripts/benchmark_qdrant_rag.py \
   --test-prefix photomat_test_capacity_1m \
   --points 1000000 --confirm-write
+uv run python scripts/benchmark_qdrant_rag.py \
+  --test-prefix photomat_test_capacity_local \
+  --points 100000 --confirm-write \
+  --measure-local-retrieval --warmup-local-model
 ```
 
 The live command uses only its own UUID-suffixed collection, never the current
 aliases, and records hardware, server/collection configuration, cold/warm
-candidate p50/p95 latency, and process RSS under
-`user_output/qdrant-benchmark/`. Delete the isolated collection after
-inspection unless `--keep-collection` is explicitly requested. The benchmark
-does not run automatically in pytest. Performance for 10,000 papers is
-unverified until the explicit one-million-point benchmark has actually run;
-do not report a 10,000-paper performance claim from the fixture evaluation or
-from a dry run.
+candidate p50/p95 latency for real Qdrant hybrid/RRF retrieval, and process RSS
+under `user_output/qdrant-benchmark/`. `--measure-local-retrieval` separately
+records end-to-end query embedding plus local reranking; model loading is
+included unless `--warmup-local-model` is requested. The report labels the
+first request as `cold` or `post_warmup` explicitly and calls later samples
+`subsequent`; an unavailable model is reported as unavailable rather than
+replaced with a fake timing. Delete the
+isolated collection after inspection unless `--keep-collection` is explicitly
+requested. The benchmark does not run automatically in pytest. Performance for
+10,000 papers is unverified until the explicit one-million-point benchmark has
+actually run; do not report a 10,000-paper performance claim from the fixture
+evaluation or from a dry run.

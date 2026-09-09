@@ -153,6 +153,57 @@ def _probe_record_value(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+def _probe_capacity_data(value: Any) -> dict[str, int | str]:
+    """Extract bounded server/collection capacity observations when exposed."""
+    data: dict[str, int | str] = {}
+    fields = (
+        "disk_total_bytes",
+        "disk_free_bytes",
+        "disk_available_bytes",
+        "disk_usage_bytes",
+        "storage_limit_bytes",
+        "capacity_bytes",
+    )
+    nested = _probe_record_value(value, "disk", None)
+    for name in fields:
+        raw = _probe_record_value(value, name, _probe_record_value(nested, name, None))
+        if isinstance(raw, bool) or raw is None:
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            data[name] = parsed
+    return data
+
+
+def _probe_capacity_warning(data: Mapping[str, int | str]) -> str:
+    """Return a conservative warning when a service publishes usable limits."""
+    total = next(
+        (
+            int(data[name])
+            for name in ("disk_total_bytes", "storage_limit_bytes", "capacity_bytes")
+            if name in data and int(data[name]) > 0
+        ),
+        None,
+    )
+    free = next(
+        (
+            int(data[name])
+            for name in ("disk_free_bytes", "disk_available_bytes")
+            if name in data
+        ),
+        None,
+    )
+    usage = int(data["disk_usage_bytes"]) if "disk_usage_bytes" in data else None
+    if total is not None and free is not None and free / total <= 0.10:
+        return "disk_free_below_10_percent"
+    if total is not None and usage is not None and usage / total >= 0.90:
+        return "disk_usage_above_90_percent"
+    return ""
+
+
 def _probe_alias_map(response: Any) -> dict[str, str]:
     aliases = _probe_record_value(response, "aliases", response)
     if isinstance(aliases, Mapping):
@@ -210,9 +261,31 @@ class LiteratureProbe(CapabilityPack):
         """Run bounded, read-only checks without loading local models."""
         self._status = {
             "server_version": "unknown",
+            "client_version": _version("qdrant-client") or "unknown",
             "alias_state": "not checked",
             "generation_state": "not checked",
+            "schema": "not checked",
+            "fingerprint": "unknown",
+            "documents": "unknown",
+            "passages": "unknown",
+            "indexed_vectors": "unknown",
+            "collection_status": "unknown",
+            "capacity": "unknown",
+            "capacity_warning": "",
+            "tls": "unknown",
+            "auth": "not configured",
+            "qdrant_url": "",
+            "embedding_provider": "unknown",
+            "reranker_provider": "unknown",
+            "source_root": "unknown",
+            "legacy_artifact": "unknown",
         }
+        legacy_path = self._workspace.root / "output" / "literature_index"
+        self._status["legacy_artifact"] = (
+            "present; not imported or modified"
+            if legacy_path.exists()
+            else "absent; no legacy artifact to migrate"
+        )
         missing: list[str] = []
         for module_name in ("arxiv", "pypdf", "docling", "qdrant_client", "sentence_transformers"):
             try:
@@ -224,15 +297,6 @@ class LiteratureProbe(CapabilityPack):
                     status=CapabilityStatus.ERROR,
                     detail=f"dependency import failed: {module_name}",
                 )
-        if missing:
-            return ProbeResult(
-                status=CapabilityStatus.MISSING_DEPENDENCY,
-                detail=(
-                    f"missing: {', '.join(missing)} "
-                    "(extra: photomatagent[literature])"
-                ),
-            )
-
         if not self._config.qdrant_url.strip():
             return ProbeResult(
                 status=CapabilityStatus.UNCONFIGURED,
@@ -253,204 +317,330 @@ class LiteratureProbe(CapabilityPack):
             )
 
         try:
+            from photomatagent.scientific.capabilities.literature.qdrant_store import (
+                sanitize_qdrant_url,
+                validate_qdrant_url,
+            )
+
+            api_key = os.environ.get(self._config.qdrant_api_key_env, "").strip()
+            self._status["qdrant_url"] = sanitize_qdrant_url(self._config.qdrant_url)
+            self._status["tls"] = (
+                "enabled"
+                if self._config.qdrant_url.lower().startswith("https://")
+                else "disabled"
+            )
+            self._status["auth"] = "configured (value hidden)" if api_key else "not configured"
+            validate_qdrant_url(self._config.qdrant_url, api_key=api_key or None)
+        except Exception as exc:
+            qdrant_url_error = _probe_error_code(exc)
+        else:
+            qdrant_url_error = ""
+
+        try:
             from photomatagent.scientific.capabilities.literature.providers.factory import (
                 build_embedding_provider,
                 build_reranker_provider,
             )
 
             embedding = build_embedding_provider(self._config)
-            build_reranker_provider(self._config)
+            reranker = build_reranker_provider(self._config)
+            self._status["embedding_provider"] = (
+                f"{embedding.identity.provider}/{embedding.identity.model}"
+            )
+            self._status["reranker_provider"] = (
+                f"{reranker.identity.provider}/{reranker.identity.model}"
+            )
+            provider_error = ""
         except Exception as exc:
             code = _probe_error_code(exc)
-            status = (
-                CapabilityStatus.UNCONFIGURED
-                if code in _PROVIDER_UNCONFIGURED_CODES
-                else CapabilityStatus.ERROR
-            )
-            return ProbeResult(
-                status=status,
-                detail=f"{code}: RAG provider configuration is not ready",
-            )
+            provider_error = code
+            embedding = None
+            self._status["embedding_provider"] = f"error:{code}"
+            self._status["reranker_provider"] = "not checked"
 
+        source_root_missing = False
         try:
             source_root = self._workspace.resolve(
                 self._config.literature_root, must_exist=False
             )
         except Exception:
-            return ProbeResult(
-                status=CapabilityStatus.UNCONFIGURED,
-                detail="literature source root is outside the workspace",
-            )
-        if not source_root.is_dir():
-            return ProbeResult(
-                status=CapabilityStatus.UNCONFIGURED,
-                detail="literature source root is missing",
+            source_root = None
+            source_root_missing = True
+            self._status["source_root"] = "outside workspace"
+        else:
+            assert source_root is not None
+            source_root_missing = not source_root.is_dir()
+            self._status["source_root"] = (
+                f"{source_root} ({'ready' if not source_root_missing else 'missing'})"
             )
 
         client = None
+        aliases: dict[str, str] = {}
         server_version = ""
-        try:
-            # The sync client is used only for a short, read-only health check.
-            # Cap the probe timeout so startup never waits for the full ingest
-            # timeout and never creates collections or loads model weights.
-            from qdrant_client import QdrantClient
+        qdrant_error = qdrant_url_error
+        if not qdrant_error:
+            try:
+                # The sync client is used only for a short, read-only health
+                # check.  It never creates collections or loads model weights.
+                from qdrant_client import QdrantClient
 
-            api_key = os.environ.get(self._config.qdrant_api_key_env, "").strip()
-            client = QdrantClient(
-                url=self._config.qdrant_url,
-                api_key=api_key or None,
-                timeout=min(
-                    self._config.qdrant_timeout_seconds, _PROBE_TIMEOUT_SECONDS
-                ),
-                prefer_grpc=False,
-            )
-            client.get_collections()
-            info = client.info()
-            raw_server_version = _probe_record_value(info, "version", "")
-            server_version = str(raw_server_version or "").strip()
-            if not server_version:
-                return ProbeResult(
-                    status=CapabilityStatus.ERROR,
-                    detail="qdrant_server_version_missing: server version is unavailable",
-                    version=_probe_version(),
+                api_key = os.environ.get(self._config.qdrant_api_key_env, "").strip()
+                client = QdrantClient(
+                    url=self._config.qdrant_url,
+                    api_key=api_key or None,
+                    timeout=min(
+                        self._config.qdrant_timeout_seconds, _PROBE_TIMEOUT_SECONDS
+                    ),
+                    prefer_grpc=False,
                 )
-            self._status["server_version"] = server_version
-
-            aliases_method = getattr(client, "get_aliases", None)
-            if aliases_method is None:
-                aliases_method = getattr(client, "get_collection_aliases", None)
-            if aliases_method is None:
-                return ProbeResult(
-                    status=CapabilityStatus.ERROR,
-                    detail="qdrant_aliases_unavailable: aliases cannot be inspected",
-                    version=_probe_version(server_version),
-                )
-            aliases = _probe_alias_map(aliases_method())
-            expected_aliases = {
-                f"{self._config.qdrant_collection_prefix}_documents_current",
-                f"{self._config.qdrant_collection_prefix}_passages_current",
-            }
-            missing_aliases = sorted(expected_aliases - set(aliases))
-            if missing_aliases:
-                self._status["alias_state"] = "missing: " + ", ".join(missing_aliases)
-                return ProbeResult(
-                    status=CapabilityStatus.UNCONFIGURED,
-                    detail="current Qdrant aliases are not configured",
-                    version=_probe_version(server_version),
-                )
-            self._status["alias_state"] = "ready"
-        except ImportError:
-            return ProbeResult(
-                status=CapabilityStatus.MISSING_DEPENDENCY,
-                detail="missing: qdrant_client (extra: photomatagent[literature])",
-            )
-        except Exception as exc:
-            status_code = getattr(exc, "status_code", None)
-            if status_code in {401, 403}:
-                code = "qdrant_auth_failed"
-            else:
-                code = "qdrant_unreachable"
-            return ProbeResult(
-                status=CapabilityStatus.ERROR,
-                detail=f"{code}: Qdrant health check failed",
-                version=_probe_version(server_version),
-            )
-        finally:
-            close = getattr(client, "close", None)
-            if close is not None:
+                # Keep each bounded read independent.  A version endpoint or
+                # collection-health failure must not suppress alias/schema
+                # inspection that can still explain the operator state.
                 try:
-                    closed = close()
-                    if inspect.isawaitable(closed):
-                        asyncio.run(_await_probe_close(closed))
-                except Exception:
-                    pass
+                    client.get_collections()
+                except Exception as exc:
+                    qdrant_error = qdrant_error or _probe_error_code(exc)
 
-        try:
-            from photomatagent.scientific.capabilities.literature.qdrant_store import (
-                QdrantLiteratureStore,
-                QdrantStoreError,
-                collection_fingerprint,
-            )
+                info_method = getattr(client, "info", None)
+                if info_method is None:
+                    qdrant_error = qdrant_error or "qdrant_server_version_missing"
+                else:
+                    try:
+                        info = info_method()
+                        raw_server_version = _probe_record_value(info, "version", "")
+                        server_version = str(raw_server_version or "").strip()
+                        if not server_version:
+                            qdrant_error = qdrant_error or "qdrant_server_version_missing"
+                        else:
+                            self._status["server_version"] = server_version
+                        capacity_data = _probe_capacity_data(info)
+                        if capacity_data:
+                            self._status["capacity"] = ", ".join(
+                                f"{key}={value}" for key, value in sorted(capacity_data.items())
+                            )
+                            capacity_warning = _probe_capacity_warning(capacity_data)
+                            if capacity_warning:
+                                self._status["capacity_warning"] = capacity_warning
+                    except Exception:
+                        qdrant_error = qdrant_error or "qdrant_server_version_unavailable"
 
-            probe_config = dataclass_replace(
-                self._config,
-                qdrant_timeout_seconds=min(
-                    self._config.qdrant_timeout_seconds, _PROBE_TIMEOUT_SECONDS
-                ),
-            )
-            store = QdrantLiteratureStore.from_config(probe_config)
-            expected_fingerprint = collection_fingerprint(
-                embedding.identity,
-                _CHUNK_SCHEMA_VERSION,
-                prefix=self._config.qdrant_collection_prefix,
-                sparse_model=getattr(store, "sparse_model", "qdrant/bm25"),
-            )
+                aliases_method = getattr(client, "get_aliases", None)
+                if aliases_method is None:
+                    aliases_method = getattr(client, "get_collection_aliases", None)
+                if aliases_method is None:
+                    qdrant_error = qdrant_error or "qdrant_aliases_unavailable"
+                else:
+                    try:
+                        aliases = _probe_alias_map(aliases_method())
+                    except Exception as exc:
+                        qdrant_error = qdrant_error or _probe_error_code(exc)
+                    else:
+                        expected_aliases = {
+                            f"{self._config.qdrant_collection_prefix}_documents_current",
+                            f"{self._config.qdrant_collection_prefix}_passages_current",
+                        }
+                        missing_aliases = sorted(expected_aliases - set(aliases))
+                        if missing_aliases:
+                            self._status["alias_state"] = "missing: " + ", ".join(
+                                missing_aliases
+                            )
+                            qdrant_error = qdrant_error or "current_aliases_missing"
+                        else:
+                            self._status["alias_state"] = "ready"
 
-            async def validate_generation() -> Any:
-                try:
-                    generation = await store.resolve_current_generation()
-                    if generation is None:
-                        return None
-                    actual_fingerprint = str(
+                        # Collection metadata is observational only.  Different
+                        # qdrant-client versions expose counts/configuration at
+                        # different nesting levels, so leave unavailable values
+                        # explicitly unknown rather than manufacturing readiness.
+                        for alias_name, collection_name in aliases.items():
+                            if not alias_name.endswith("_current"):
+                                continue
+                            try:
+                                collection_info = client.get_collection(collection_name)
+                            except Exception:
+                                continue
+                            metadata = _probe_record_value(collection_info, "metadata", {})
+                            if not isinstance(metadata, Mapping) or not metadata:
+                                config_info = _probe_record_value(collection_info, "config", None)
+                                metadata = _probe_record_value(config_info, "metadata", {})
+                            if isinstance(metadata, Mapping):
+                                schema = metadata.get("collection_schema_version") or metadata.get(
+                                    "photomat_collection_schema_version"
+                                )
+                                fingerprint = metadata.get("model_fingerprint") or metadata.get(
+                                    "photomat_model_fingerprint"
+                                )
+                                if schema is not None:
+                                    self._status["schema"] = str(schema)
+                                if fingerprint:
+                                    self._status["fingerprint"] = str(fingerprint)
+                            for field_name, status_key in (
+                                ("points_count", "documents" if "documents" in alias_name else "passages"),
+                                ("indexed_vectors_count", "indexed_vectors"),
+                            ):
+                                value = _probe_record_value(collection_info, field_name, None)
+                                if value is not None:
+                                    self._status[status_key] = str(value)
+                            collection_status = _probe_record_value(collection_info, "status", None)
+                            if collection_status is not None:
+                                self._status["collection_status"] = str(collection_status)
+                                normalized_status = str(
+                                    getattr(collection_status, "value", collection_status)
+                                ).casefold()
+                                if normalized_status not in {
+                                    "green",
+                                    "ok",
+                                    "healthy",
+                                    "active",
+                                    "indexed",
+                                }:
+                                    self._status["capacity_warning"] = (
+                                        f"collection_status:{normalized_status}"
+                                    )
+                            capacity = _probe_record_value(collection_info, "disk_usage_bytes", None)
+                            if capacity is not None:
+                                self._status["capacity"] = str(capacity)
+            except ImportError:
+                qdrant_error = "qdrant_dependency_missing"
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                qdrant_error = "qdrant_auth_failed" if status_code in {401, 403} else "qdrant_unreachable"
+            finally:
+                close = getattr(client, "close", None)
+                if close is not None:
+                    try:
+                        closed = close()
+                        if inspect.isawaitable(closed):
+                            asyncio.run(_await_probe_close(closed))
+                    except Exception:
+                        pass
+
+        generation_error = ""
+        generation = None
+        if embedding is None:
+            generation_error = provider_error or "embedding_provider_unavailable"
+            self._status["generation_state"] = "not checked (provider error)"
+        else:
+            try:
+                from photomatagent.scientific.capabilities.literature.qdrant_store import (
+                    QdrantLiteratureStore,
+                    QdrantStoreError,
+                    collection_fingerprint,
+                )
+
+                probe_config = dataclass_replace(
+                    self._config,
+                    qdrant_timeout_seconds=min(
+                        self._config.qdrant_timeout_seconds, _PROBE_TIMEOUT_SECONDS
+                    ),
+                )
+                store = QdrantLiteratureStore.from_config(probe_config)
+                expected_fingerprint = collection_fingerprint(
+                    embedding.identity,
+                    _CHUNK_SCHEMA_VERSION,
+                    prefix=self._config.qdrant_collection_prefix,
+                    sparse_model=getattr(store, "sparse_model", "qdrant/bm25"),
+                )
+
+                async def validate_generation() -> Any:
+                    try:
+                        current = await store.resolve_current_generation()
+                        if current is None:
+                            return None
+                        actual_fingerprint = str(
+                            _probe_record_value(current, "fingerprint", "")
+                        )
+                        if not _probe_fingerprint_compatible(
+                            actual_fingerprint, expected_fingerprint
+                        ):
+                            raise QdrantStoreError(
+                                "model_fingerprint_mismatch",
+                                "current collection fingerprint does not match provider",
+                            )
+                        validate = getattr(store, "validate_current_generation", None)
+                        if validate is None:
+                            raise QdrantStoreError(
+                                "control_point_unavailable",
+                                "current generation validation is unavailable",
+                            )
+                        await validate(expected_fingerprint)
+                        return current
+                    finally:
+                        close_client = getattr(getattr(store, "_client", None), "close", None)
+                        if close_client is not None:
+                            closed_client = close_client()
+                            if inspect.isawaitable(closed_client):
+                                await closed_client
+
+                generation = asyncio.run(validate_generation())
+                if generation is None:
+                    generation_error = "current_generation_missing"
+                    self._status["generation_state"] = "missing"
+                else:
+                    generation_fingerprint = str(
                         _probe_record_value(generation, "fingerprint", "")
                     )
-                    if not _probe_fingerprint_compatible(
-                        actual_fingerprint, expected_fingerprint
-                    ):
-                        raise QdrantStoreError(
-                            "model_fingerprint_mismatch",
-                            "current collection fingerprint does not match provider",
-                        )
-                    validate = getattr(store, "validate_current_generation", None)
-                    if validate is None:
-                        raise QdrantStoreError(
-                            "control_point_unavailable",
-                            "current generation validation is unavailable",
-                        )
-                    await validate(expected_fingerprint)
-                    return generation
-                finally:
-                    close_client = getattr(getattr(store, "_client", None), "close", None)
-                    if close_client is not None:
-                        closed_client = close_client()
-                        if inspect.isawaitable(closed_client):
-                            await closed_client
+                    self._status["generation_state"] = (
+                        f"ready:{generation_fingerprint[:12]}"
+                    )
+                    self._status["fingerprint"] = generation_fingerprint or "unknown"
+            except Exception as exc:
+                generation_error = _probe_error_code(exc)
+                self._status["generation_state"] = f"error:{generation_error}"
 
-            generation = asyncio.run(validate_generation())
-            if generation is None:
-                self._status["generation_state"] = "missing"
-                return ProbeResult(
-                    status=CapabilityStatus.UNCONFIGURED,
-                    detail="current Qdrant generation is not configured",
-                    version=_probe_version(server_version),
-                )
-            generation_fingerprint = str(
-                _probe_record_value(generation, "fingerprint", "")
+        issues: list[str] = []
+        if missing:
+            issues.append(
+                "missing_dependency: " + ", ".join(missing)
             )
-            self._status["generation_state"] = (
-                f"ready:{generation_fingerprint[:12]}"
+        if qdrant_error:
+            issues.append(qdrant_error)
+        if provider_error:
+            issues.append(provider_error)
+        if source_root_missing:
+            issues.append("source_root_missing")
+        if generation_error:
+            issues.append(generation_error)
+        if not issues:
+            result_status = CapabilityStatus.AVAILABLE
+            detail = (
+                "arxiv + pypdf + docling + qdrant-client + sentence-transformers "
+                "available; source root and Qdrant ready"
             )
-        except Exception as exc:
-            code = _probe_error_code(exc)
-            if code in {"collection_missing", "control_point_missing"}:
-                status = CapabilityStatus.UNCONFIGURED
+        else:
+            unconfigured_codes = set(_PROVIDER_UNCONFIGURED_CODES) | {
+                "current_aliases_missing",
+                "current_generation_missing",
+                "source_root_missing",
+                "qdrant_api_key_required",
+                "qdrant_tls_required",
+                "qdrant_url_invalid",
+                "qdrant_url_not_configured",
+                "qdrant_dependency_missing",
+            }
+            if missing:
+                result_status = CapabilityStatus.MISSING_DEPENDENCY
             else:
-                status = CapabilityStatus.ERROR
-            self._status["generation_state"] = f"error:{code}"
-            return ProbeResult(
-                status=status,
-                detail=f"{code}: current Qdrant generation is not ready",
-                version=_probe_version(server_version),
+                result_status = (
+                    CapabilityStatus.UNCONFIGURED
+                    if any(issue in unconfigured_codes for issue in issues)
+                    else CapabilityStatus.ERROR
+                )
+            detail = "; ".join(
+                "source root is missing" if issue == "source_root_missing" else issue
+                for issue in issues
             )
-
+            if missing:
+                detail = (
+                    f"{detail} (extra: photomatagent[literature])"
+                )
+        detail = (
+            f"{detail}; aliases={self._status['alias_state']}; "
+            f"generation={self._status['generation_state']}"
+        )
         return ProbeResult(
-            status=CapabilityStatus.AVAILABLE,
-            detail=(
-                "arxiv + pypdf + docling + qdrant-client + "
-                "sentence-transformers available; source root and Qdrant ready; "
-                f"aliases={self._status['alias_state']}; "
-                f"generation={self._status['generation_state']}"
-            ),
+            status=result_status,
+            detail=detail,
             version=_probe_version(server_version),
         )
 

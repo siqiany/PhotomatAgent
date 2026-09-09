@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
 from typer.testing import CliRunner
@@ -73,6 +74,23 @@ def test_fixture_has_twenty_authored_judgments_and_required_fields() -> None:
         and item.get("license") == "CC0-1.0 synthetic text"
         for item in rows
     )
+
+
+def test_live_fixture_passage_ids_are_stable_qdrant_uuids() -> None:
+    from photomatagent.cli.rag import _fixture_point_ids
+
+    rows = _fixture_rows()
+    ids = _fixture_point_ids(rows, "fixture-workspace")
+
+    assert ids
+    assert set(ids) == {
+        passage_id
+        for row in rows
+        for passage_id in row["relevant_passage_ids"]
+    }
+    assert len(set(ids.values())) == len(ids)
+    for point_id in ids.values():
+        UUID(point_id)
 
 
 def test_fixture_evaluation_reports_quality_metrics_and_label() -> None:

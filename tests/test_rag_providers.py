@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -185,6 +186,48 @@ def test_local_embedding_prefixes_and_normalizes_through_thread(monkeypatch):
     )
     assert asyncio.run(provider.embed_query("hello")) == [1.0, 0.0]
     assert query_calls == [["query: hello"]]
+
+
+def test_local_model_loading_and_inference_stay_off_event_loop_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_loop_thread = threading.get_ident()
+    embedding_threads: list[int] = []
+    reranker_threads: list[int] = []
+
+    class FakeEmbeddingModel:
+        def encode(self, texts, **kwargs):
+            del texts, kwargs
+            embedding_threads.append(threading.get_ident())
+            return [[1.0, 0.0]]
+
+    class FakeCrossEncoder:
+        def predict(self, pairs, **kwargs):
+            del pairs, kwargs
+            reranker_threads.append(threading.get_ident())
+            return [0.5]
+
+    embedding_provider = LocalSentenceTransformerProvider("thread-model", 2)
+    reranker_provider = LocalCrossEncoderProvider("thread-reranker")
+    monkeypatch.setattr(
+        embedding_provider,
+        "_model",
+        lambda: embedding_threads.append(threading.get_ident()) or FakeEmbeddingModel(),
+    )
+    monkeypatch.setattr(
+        reranker_provider,
+        "_model",
+        lambda: reranker_threads.append(threading.get_ident()) or FakeCrossEncoder(),
+    )
+
+    async def run() -> None:
+        await embedding_provider.embed_documents(["one"])
+        await reranker_provider.rerank("query", ["passage"], top_n=1)
+
+    asyncio.run(run())
+
+    assert embedding_threads and all(thread_id != event_loop_thread for thread_id in embedding_threads)
+    assert reranker_threads and all(thread_id != event_loop_thread for thread_id in reranker_threads)
 
 
 def test_local_failure_is_not_replaced_by_an_external_provider(monkeypatch):

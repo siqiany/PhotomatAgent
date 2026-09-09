@@ -14,12 +14,13 @@ import os
 import re
 import tempfile
 import uuid
+import ipaddress
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from photomatagent.scientific.capabilities.literature.models import (
     DocumentManifest,
@@ -51,6 +52,85 @@ MAX_CANDIDATES = 50
 GENERATION_POINT_NAMESPACE = uuid.UUID("b3a8b72d-b7d1-4e31-8589-14cb5132f0a0")
 INGESTION_RUN_POINT_NAMESPACE = uuid.UUID("0c8fc0cc-e4c1-45aa-b5d8-d4dbf5a4d19c")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)\b(api[_ -]?key|access[_ -]?token|authorization|token|password|secret)\b"
+    r"\s*[:=]\s*(?:bearer\s+)?[^\s,;]+"
+)
+_DIAGNOSTIC_BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
+_DIAGNOSTIC_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s,;]+")
+
+
+def _qdrant_loopback(hostname: str) -> bool:
+    host = hostname.strip().lower().strip("[]")
+    if host in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def sanitize_qdrant_url(url: str) -> str:
+    """Return a credential/query-free URL suitable for status output."""
+    value = str(url or "").strip()
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return "[invalid-url]"
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        netloc = host
+        if parsed.port is not None:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunsplit((parsed.scheme.lower(), netloc, parsed.path, "", ""))
+    except ValueError:
+        return "[invalid-url]"
+
+
+def validate_qdrant_url(url: str, *, api_key: str | None = None) -> str:
+    """Validate Qdrant endpoint security and return a safe display URL."""
+    value = str(url or "").strip()
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port  # validates malformed/out-of-range ports
+    except ValueError as exc:
+        raise QdrantStoreError(
+            "qdrant_url_invalid", "Qdrant URL must be an absolute HTTP(S) URL"
+        ) from exc
+    if (
+        any(character.isspace() for character in value)
+        or parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise QdrantStoreError(
+            "qdrant_url_invalid", "Qdrant URL must not contain credentials, query, or fragment"
+        )
+    loopback = _qdrant_loopback(hostname)
+    if not loopback and parsed.scheme.lower() != "https":
+        raise QdrantStoreError(
+            "qdrant_tls_required", "non-loopback Qdrant endpoints require HTTPS"
+        )
+    if not loopback and not str(api_key or "").strip():
+        raise QdrantStoreError(
+            "qdrant_api_key_required", "non-loopback Qdrant endpoints require an API key"
+        )
+    return sanitize_qdrant_url(value)
+
+
+def _sanitize_diagnostic(value: Any) -> str:
+    """Apply store-boundary redaction independent of ingestion callers."""
+    text = str(value).replace("\x00", " ")
+    text = _DIAGNOSTIC_SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=[redacted]", text
+    )
+    text = _DIAGNOSTIC_BEARER_RE.sub("Bearer [redacted]", text)
+    text = _DIAGNOSTIC_PATH_RE.sub("[path]", text)
+    return text[:512]
 
 
 @dataclass(frozen=True)
@@ -82,6 +162,20 @@ class SnapshotManifest:
     generation: CollectionGeneration
     created_at: datetime
     files: tuple[SnapshotFile, ...]
+    server_version: str = "unknown"
+    schema_version: int = COLLECTION_SCHEMA_VERSION
+    fingerprint: str = ""
+    physical_collections: tuple[str, ...] = ()
+    point_counts: dict[str, int | None] = field(default_factory=dict)
+    indexed_vector_counts: dict[str, int | None] = field(default_factory=dict)
+    aliases: dict[str, str] = field(default_factory=dict)
+    capacity: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["created_at"] = self.created_at.isoformat()
+        value["files"] = [asdict(item) for item in self.files]
+        return value
 
 
 class QdrantStoreError(RuntimeError):
@@ -182,6 +276,24 @@ def _metadata(info: Any) -> dict[str, Any]:
     return dict(metadata) if isinstance(metadata, Mapping) else {}
 
 
+def _stream_file_digest(path: Path) -> tuple[str, int]:
+    """Hash a snapshot incrementally so archive size does not bound memory."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def _copy_file_stream(source: Path, destination: Path) -> None:
+    """Copy a snapshot path in bounded blocks rather than reading it all."""
+    with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
+        for block in iter(lambda: source_handle.read(1024 * 1024), b""):
+            destination_handle.write(block)
+
+
 class QdrantLiteratureStore:
     """Narrow asynchronous adapter for versioned literature collections."""
 
@@ -208,6 +320,10 @@ class QdrantLiteratureStore:
         self._snapshot_api_key = snapshot_api_key
         self._snapshot_transport = snapshot_transport
         self._generations: dict[str, CollectionGeneration] = {}
+        # A generation may be built and ingested before it is made visible via
+        # the stable ``*_current`` aliases.  Keep that write target separate
+        # from the read target so a model migration cannot mix vector spaces.
+        self._staging_generation: CollectionGeneration | None = None
 
     @classmethod
     def from_config(cls, config: Any) -> "QdrantLiteratureStore":
@@ -219,6 +335,7 @@ class QdrantLiteratureStore:
         api_key_name = str(getattr(config, "qdrant_api_key_env", "QDRANT_API_KEY"))
         api_key = os.environ.get(api_key_name, "").strip() or None
         url = str(getattr(config, "qdrant_url"))
+        validate_qdrant_url(url, api_key=api_key)
         timeout = int(getattr(config, "qdrant_timeout_seconds", 20))
         client = AsyncQdrantClient(
             url=url,
@@ -247,6 +364,25 @@ class QdrantLiteratureStore:
         return (
             f"{self.prefix}_documents_{suffix}",
             f"{self.prefix}_passages_{suffix}",
+        )
+
+    def expected_generation(
+        self, *, identity: ModelIdentity, chunk_schema_version: int
+    ) -> CollectionGeneration:
+        """Compute the generation identity without reading or mutating Qdrant."""
+        fingerprint = collection_fingerprint(
+            identity,
+            chunk_schema_version,
+            prefix=self.prefix,
+            sparse_model=self.sparse_model,
+        )
+        documents, passages = self._generation_names(fingerprint)
+        return CollectionGeneration(
+            fingerprint=fingerprint,
+            documents_physical=documents,
+            passages_physical=passages,
+            documents_alias=self._documents_alias(),
+            passages_alias=self._passages_alias(),
         )
 
     async def _collection_exists(self, name: str) -> bool:
@@ -664,20 +800,12 @@ class QdrantLiteratureStore:
     async def ensure_generation(
         self, *, identity: ModelIdentity, chunk_schema_version: int
     ) -> CollectionGeneration:
-        fingerprint = collection_fingerprint(
-            identity,
-            chunk_schema_version,
-            prefix=self.prefix,
-            sparse_model=self.sparse_model,
+        generation = self.expected_generation(
+            identity=identity, chunk_schema_version=chunk_schema_version
         )
-        documents, passages = self._generation_names(fingerprint)
-        generation = CollectionGeneration(
-            fingerprint=fingerprint,
-            documents_physical=documents,
-            passages_physical=passages,
-            documents_alias=self._documents_alias(),
-            passages_alias=self._passages_alias(),
-        )
+        fingerprint = generation.fingerprint
+        documents = generation.documents_physical
+        passages = generation.passages_physical
         self._generations[documents] = generation
         self._generations[passages] = generation
         if await self._collection_exists(documents):
@@ -737,8 +865,170 @@ class QdrantLiteratureStore:
             wait=True,
             **self._timeout_kwargs(),
         )
-        await self.switch_current_generation(generation)
+        # Do not switch aliases here.  The caller must explicitly validate the
+        # completed staging generation and call ``activate_generation``.
+        self._staging_generation = generation
         return generation
+
+    async def _validate_generation_ready(self, generation: CollectionGeneration) -> bool:
+        """Reject a staging pair with unresolved document/run failures."""
+        if not await self._collection_exists(generation.documents_physical) or not await self._collection_exists(
+            generation.passages_physical
+        ):
+            raise QdrantStoreError(
+                "collection_missing", "generation collections do not both exist"
+            )
+        scroll = getattr(self._client, "scroll", None)
+        if scroll is None:
+            raise QdrantStoreError(
+                "generation_incomplete", "generation completeness cannot be inspected"
+            )
+        records: list[Any] = []
+        offset: Any = None
+        try:
+            while True:
+                response = scroll(
+                    collection_name=generation.documents_physical,
+                    scroll_filter=None,
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                    **self._timeout_kwargs(),
+                )
+                if inspect.isawaitable(response):
+                    response = await response
+                if isinstance(response, tuple):
+                    page, offset = response
+                else:
+                    page = _record_attr(response, "points", [])
+                    offset = _record_attr(response, "next_page_offset", None)
+                records.extend(page or [])
+                if offset is None:
+                    break
+        except Exception as exc:
+            raise QdrantStoreError(
+                "generation_incomplete", "generation completeness cannot be inspected"
+            ) from exc
+        unresolved: list[str] = []
+        has_ready_passage = False
+        for record in records or ():
+            payload = _payload(record)
+            if payload.get("record_type") in {"document", "ingestion_run"}:
+                point_fingerprint = str(
+                    payload.get("model_fingerprint", payload.get("generation_fingerprint", ""))
+                )
+                if point_fingerprint and not self._fingerprint_matches(
+                    point_fingerprint, generation.fingerprint
+                ):
+                    raise QdrantStoreError(
+                        "model_fingerprint_mismatch",
+                        "generation contains a record from another model fingerprint",
+                    )
+            if payload.get("record_type") == "document" and str(
+                payload.get("status", "")
+            ) in {DocumentStatus.PENDING.value, DocumentStatus.STAGED.value, DocumentStatus.FAILED.value}:
+                unresolved.append(str(payload.get("relative_source_path", "document")))
+            if payload.get("record_type") == "ingestion_run" and (
+                payload.get("complete") is not True
+                or payload.get("retryable") is True
+            ):
+                unresolved.append(str(payload.get("run_id", "ingestion_run")))
+        if unresolved:
+            raise QdrantStoreError(
+                "generation_incomplete",
+                "generation has unresolved ingestion failures",
+            )
+        passage_records: list[Any] = []
+        passage_offset: Any = None
+        try:
+            while True:
+                response = scroll(
+                    collection_name=generation.passages_physical,
+                    scroll_filter=None,
+                    limit=256,
+                    offset=passage_offset,
+                    with_payload=True,
+                    with_vectors=False,
+                    **self._timeout_kwargs(),
+                )
+                if inspect.isawaitable(response):
+                    response = await response
+                if isinstance(response, tuple):
+                    page, passage_offset = response
+                else:
+                    page = _record_attr(response, "points", [])
+                    passage_offset = _record_attr(response, "next_page_offset", None)
+                passage_records.extend(page or [])
+                if passage_offset is None:
+                    break
+        except Exception as exc:
+            raise QdrantStoreError(
+                "generation_incomplete", "passage completeness cannot be inspected"
+            ) from exc
+        unresolved_passages: list[str] = []
+        for record in passage_records:
+            payload = _payload(record)
+            if payload.get("record_type") != "passage":
+                continue
+            point_fingerprint = str(payload.get("model_fingerprint", ""))
+            if point_fingerprint and not self._fingerprint_matches(
+                point_fingerprint, generation.fingerprint
+            ):
+                raise QdrantStoreError(
+                    "model_fingerprint_mismatch",
+                    "generation contains a passage from another model fingerprint",
+                )
+            if payload.get("ingest_state") == IngestState.STAGED.value:
+                unresolved_passages.append(str(payload.get("passage_id", "passage")))
+            if payload.get("ingest_state") == IngestState.READY.value:
+                has_ready_passage = True
+        if unresolved_passages:
+            raise QdrantStoreError(
+                "generation_incomplete",
+                "generation contains unresolved staged passages",
+            )
+        return has_ready_passage
+
+    async def _activation_ready(
+        self,
+        generation: CollectionGeneration,
+        *,
+        allow_empty_bootstrap: bool,
+    ) -> None:
+        has_ready_passage = await self._validate_generation_ready(generation)
+        if not has_ready_passage and not allow_empty_bootstrap:
+            raise QdrantStoreError(
+                "generation_incomplete",
+                "generation has no ready indexed passages; use explicit bootstrap for an empty corpus",
+            )
+
+    async def activate_generation(
+        self,
+        generation: CollectionGeneration,
+        *,
+        allow_empty_bootstrap: bool = False,
+    ) -> None:
+        """Validate and atomically expose a completed staging generation."""
+        await self._activation_ready(
+            generation, allow_empty_bootstrap=allow_empty_bootstrap
+        )
+        try:
+            await self._switch_current_generation(generation)
+        except QdrantStoreError as exc:
+            if exc.code in {"control_point_missing", "control_point_unavailable"}:
+                raise QdrantStoreError(
+                    "generation_incomplete",
+                    "generation control metadata is incomplete",
+                ) from exc
+            raise
+        self._staging_generation = generation
+
+    def select_staging_generation(self, generation: CollectionGeneration) -> None:
+        """Select an already-created physical pair for ingestion writes."""
+        if not isinstance(generation, CollectionGeneration):
+            raise TypeError("generation must be a CollectionGeneration")
+        self._staging_generation = generation
 
     async def _alias_map(self) -> dict[str, str]:
         method = getattr(self._client, "get_aliases", None)
@@ -758,7 +1048,19 @@ class QdrantLiteratureStore:
                 result[str(alias_name)] = str(collection_name)
         return result
 
-    async def switch_current_generation(self, generation: CollectionGeneration) -> None:
+    async def switch_current_generation(
+        self,
+        generation: CollectionGeneration,
+        *,
+        allow_empty_bootstrap: bool = False,
+    ) -> None:
+        """Guarded public alias switch; never bypasses completeness checks."""
+        await self._activation_ready(
+            generation, allow_empty_bootstrap=allow_empty_bootstrap
+        )
+        await self._switch_current_generation(generation)
+
+    async def _switch_current_generation(self, generation: CollectionGeneration) -> None:
         if not await self._collection_exists(generation.documents_physical) or not await self._collection_exists(
             generation.passages_physical
         ):
@@ -1084,6 +1386,29 @@ class QdrantLiteratureStore:
             raise QdrantStoreError("collection_missing", "current collection aliases are not configured")
         return generation
 
+    async def _ingestion_or_error(self) -> CollectionGeneration:
+        """Return the explicit staging target, falling back to current reads."""
+        if self._staging_generation is not None:
+            return self._staging_generation
+        return await self._current_or_error()
+
+    def _ingestion_collection(
+        self, generation: CollectionGeneration, *, passages: bool
+    ) -> str:
+        """Return a physical staging target or a stable current alias.
+
+        Alias switching is the activation boundary.  All writes that happen
+        before activation therefore use physical generation names so an
+        incomplete migration can never mutate the active generation.
+        """
+        if self._staging_generation is generation:
+            return (
+                generation.passages_physical
+                if passages
+                else generation.documents_physical
+            )
+        return generation.passages_alias if passages else generation.documents_alias
+
     @staticmethod
     def _fingerprint_matches(actual: str, expected: str) -> bool:
         return actual == expected or (
@@ -1150,16 +1475,34 @@ class QdrantLiteratureStore:
             extra=(*extra, *revision_conditions),
         )
 
-    async def list_document_manifests(self, workspace_id: str) -> dict[str, DocumentManifest]:
+    async def list_document_manifests(
+        self,
+        workspace_id: str,
+        *,
+        generation: CollectionGeneration | None = None,
+    ) -> dict[str, DocumentManifest]:
         if not isinstance(workspace_id, str) or not workspace_id.strip():
             raise ValueError("workspace_id must be a non-empty string")
-        generation = await self._current_or_error()
+        explicit_generation = generation is not None
+        generation = generation or self._staging_generation
+        if generation is None:
+            generation = await self._current_or_error()
+        # Planning a brand-new generation is intentionally read-only.  A
+        # missing staging collection means there are no prior manifests yet;
+        # it must not be treated as a request to create or activate anything.
+        if not await self._collection_exists(generation.documents_physical):
+            return {}
+        collection_name = (
+            generation.documents_physical
+            if explicit_generation or self._staging_generation is generation
+            else generation.documents_alias
+        )
         scroll_filter = self._filter(workspace_id=workspace_id, record_type="document")
         records: list[Any] = []
         offset: Any = None
         while True:
             result = await self._client.scroll(
-                collection_name=generation.documents_alias,
+                collection_name=collection_name,
                 scroll_filter=scroll_filter,
                 limit=256,
                 offset=offset,
@@ -1209,7 +1552,7 @@ class QdrantLiteratureStore:
     async def upsert_document(self, manifest: DocumentManifest, *, wait: bool = True) -> None:
         if not isinstance(manifest.workspace_id, str) or not manifest.workspace_id.strip():
             raise ValueError("workspace_id must be a non-empty string")
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         if not self._fingerprint_matches(manifest.model_fingerprint, generation.fingerprint):
             raise QdrantStoreError(
                 "model_fingerprint_mismatch",
@@ -1217,7 +1560,7 @@ class QdrantLiteratureStore:
             )
         models = _qdrant_models()
         await self._client.upsert(
-            collection_name=generation.documents_alias,
+            collection_name=self._ingestion_collection(generation, passages=False),
             points=[
                 models.PointStruct(
                     id=manifest.document_id,
@@ -1252,7 +1595,7 @@ class QdrantLiteratureStore:
             raise ValueError("workspace_id must be a non-empty string")
         if any(point.workspace_id != workspace_id for point in points):
             raise ValueError("passage point workspace does not match workspace_id")
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         if any(
             not self._fingerprint_matches(point.model_fingerprint, generation.fingerprint)
             for point in points
@@ -1279,7 +1622,7 @@ class QdrantLiteratureStore:
                 for point in batch
             ]
             await self._client.upsert(
-                collection_name=generation.passages_alias,
+                collection_name=self._ingestion_collection(generation, passages=True),
                 points=qdrant_points,
                 wait=True,
                 **self._timeout_kwargs(),
@@ -1290,7 +1633,7 @@ class QdrantLiteratureStore:
         workspace_id = getattr(run, "workspace_id", None)
         if not isinstance(workspace_id, str) or not workspace_id.strip():
             raise ValueError("workspace_id must be a non-empty string")
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         generation_fingerprint = str(getattr(run, "generation_fingerprint", ""))
         if not _FINGERPRINT_RE.fullmatch(generation_fingerprint):
             raise QdrantStoreError(
@@ -1303,7 +1646,10 @@ class QdrantLiteratureStore:
         stats = getattr(run, "stats", None)
         if stats is None:
             raise ValueError("ingestion run stats are required")
-        errors = [str(error)[:512] for error in tuple(getattr(stats, "errors", ()))[-20:]]
+        errors = [
+            _sanitize_diagnostic(error)
+            for error in tuple(getattr(stats, "errors", ()))[-20:]
+        ]
         run_id = str(getattr(run, "run_id", ""))
         if not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
@@ -1332,7 +1678,7 @@ class QdrantLiteratureStore:
         models = _qdrant_models()
         point_id = str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, f"{workspace_id}:{run_id}"))
         await self._client.upsert(
-            collection_name=generation.documents_alias,
+            collection_name=self._ingestion_collection(generation, passages=False),
             points=[models.PointStruct(id=point_id, vector={}, payload=payload)],
             wait=wait,
             **self._timeout_kwargs(),
@@ -1344,10 +1690,10 @@ class QdrantLiteratureStore:
             raise ValueError("workspace_id must be a non-empty string")
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         point_id = str(uuid.uuid5(INGESTION_RUN_POINT_NAMESPACE, f"{workspace_id}:{run_id}"))
         records = await self._client.retrieve(
-            collection_name=generation.documents_alias,
+            collection_name=self._ingestion_collection(generation, passages=False),
             ids=[point_id],
             with_payload=True,
             with_vectors=False,
@@ -1413,7 +1759,7 @@ class QdrantLiteratureStore:
         """Delete only staged revisions, returning the exact pre-delete count."""
         if not isinstance(workspace_id, str) or not workspace_id.strip():
             raise ValueError("workspace_id must be a non-empty string")
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         extra: tuple[Any, ...] = ()
         if keep_revision is not None:
             if _FINGERPRINT_RE.fullmatch(keep_revision) is None:
@@ -1432,7 +1778,7 @@ class QdrantLiteratureStore:
             extra=extra,
         )
         result = await self._client.count(
-            collection_name=generation.passages_alias,
+            collection_name=self._ingestion_collection(generation, passages=True),
             count_filter=query_filter,
             exact=True,
             **self._timeout_kwargs(),
@@ -1440,7 +1786,7 @@ class QdrantLiteratureStore:
         count = int(result if isinstance(result, int) else _record_attr(result, "count", 0))
         if count:
             await self._client.delete(
-                collection_name=generation.passages_alias,
+                collection_name=self._ingestion_collection(generation, passages=True),
                 points_selector=query_filter,
                 wait=True,
                 **self._timeout_kwargs(),
@@ -1455,9 +1801,9 @@ class QdrantLiteratureStore:
         *,
         workspace_id: str,
     ) -> int:
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         result = await self._client.count(
-            collection_name=generation.passages_alias,
+            collection_name=self._ingestion_collection(generation, passages=True),
             count_filter=self._passage_filter(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -1477,9 +1823,9 @@ class QdrantLiteratureStore:
         *,
         workspace_id: str,
     ) -> None:
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         await self._client.set_payload(
-            collection_name=generation.passages_alias,
+            collection_name=self._ingestion_collection(generation, passages=True),
             payload={"ingest_state": state.value},
             points=self._passage_filter(
                 workspace_id=workspace_id,
@@ -1497,9 +1843,9 @@ class QdrantLiteratureStore:
         *,
         workspace_id: str,
     ) -> None:
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         await self._client.delete(
-            collection_name=generation.passages_alias,
+            collection_name=self._ingestion_collection(generation, passages=True),
             points_selector=self._passage_filter(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -1512,9 +1858,9 @@ class QdrantLiteratureStore:
     async def delete_document_passages(
         self, document_id: str, *, workspace_id: str
     ) -> None:
-        generation = await self._current_or_error()
+        generation = await self._ingestion_or_error()
         await self._client.delete(
-            collection_name=generation.passages_alias,
+            collection_name=self._ingestion_collection(generation, passages=True),
             points_selector=self._passage_filter(
                 workspace_id=workspace_id,
                 document_id=document_id,
@@ -1720,20 +2066,48 @@ class QdrantLiteratureStore:
             if inspect.isawaitable(result):
                 result = await result
             if isinstance(result, (bytes, bytearray)):
-                destination.write_bytes(bytes(result))
+                with destination.open("wb") as handle:
+                    handle.write(result)
                 return
             if isinstance(result, str):
                 source = Path(result)
                 if source.is_file():
-                    destination.write_bytes(source.read_bytes())
+                    _copy_file_stream(source, destination)
                     return
             if isinstance(result, Path):
                 if result.is_file():
-                    destination.write_bytes(result.read_bytes())
+                    _copy_file_stream(result, destination)
                     return
+            aiter_bytes = getattr(result, "aiter_bytes", None)
+            if callable(aiter_bytes):
+                chunks = aiter_bytes(1024 * 1024)
+                if inspect.isawaitable(chunks):
+                    chunks = await chunks
+                with destination.open("wb") as handle:
+                    async for chunk in chunks:
+                        if isinstance(chunk, (bytes, bytearray)):
+                            handle.write(chunk)
+                return
+            iter_bytes = getattr(result, "iter_bytes", None)
+            if callable(iter_bytes):
+                chunks = iter_bytes(1024 * 1024)
+                if inspect.isawaitable(chunks):
+                    chunks = await chunks
+                with destination.open("wb") as handle:
+                    for chunk in chunks:
+                        if isinstance(chunk, (bytes, bytearray)):
+                            handle.write(chunk)
+                return
+            if hasattr(result, "__aiter__"):
+                with destination.open("wb") as handle:
+                    async for chunk in result:
+                        if isinstance(chunk, (bytes, bytearray)):
+                            handle.write(chunk)
+                return
             content = _record_attr(result, "content", None)
             if isinstance(content, (bytes, bytearray)):
-                destination.write_bytes(bytes(content))
+                with destination.open("wb") as handle:
+                    handle.write(content)
                 return
             if destination.is_file():
                 return
@@ -1802,6 +2176,246 @@ class QdrantLiteratureStore:
             "snapshot_download_failed", f"snapshot {snapshot_name!r} was not downloaded"
         )
 
+    async def _snapshot_collection_stats(
+        self, collection_name: str
+    ) -> tuple[int | None, int | None, dict[str, Any]]:
+        points: int | None = None
+        indexed_vectors: int | None = None
+        capacity: dict[str, Any] = {}
+        count = getattr(self._client, "count", None)
+        if count is not None:
+            try:
+                result = count(
+                    collection_name=collection_name,
+                    exact=True,
+                    **self._timeout_kwargs(),
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                raw_count = result if isinstance(result, int) else _record_attr(result, "count", None)
+                if raw_count is not None:
+                    points = int(raw_count)
+            except Exception:
+                points = None
+        get_collection = getattr(self._client, "get_collection", None)
+        if get_collection is not None:
+            try:
+                info = get_collection(collection_name)
+                if inspect.isawaitable(info):
+                    info = await info
+                for source in (info, _record_attr(info, "result", None)):
+                    raw_indexed = _record_attr(source, "indexed_vectors_count", None)
+                    if raw_indexed is not None:
+                        indexed_vectors = int(raw_indexed)
+                        break
+                for field_name in (
+                    "disk_usage_bytes",
+                    "payload_storage_size",
+                    "vector_storage_size",
+                    "segments_count",
+                    "status",
+                ):
+                    raw_value = _record_attr(info, field_name, None)
+                    if raw_value is not None:
+                        capacity[field_name] = _enum_value(raw_value)
+            except Exception:
+                pass
+        return points, indexed_vectors, capacity
+
+    async def validate_restored_snapshot(
+        self,
+        manifest: SnapshotManifest,
+        *,
+        restored_collections: Mapping[str, str],
+        sample_passage_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate a restored, still-unaliased pair against a snapshot.
+
+        Restore is intentionally explicit and non-activating.  The method
+        checks aliases, metadata/control records, counts, and one sample
+        passage (when available) before returning a bounded check report.
+        """
+        if not isinstance(manifest, SnapshotManifest):
+            raise TypeError("manifest must be a SnapshotManifest")
+        expected_aliases = dict(manifest.aliases)
+        actual_aliases = await self._alias_map()
+        # The manifest records the application aliases, but the Qdrant
+        # service may also contain unrelated aliases owned by another
+        # capability.  Compare only the recorded keys; an absent recorded
+        # alias remains observable as ``None`` and is not treated as equal to
+        # an unrelated current alias.
+        expected_relevant = {
+            alias: (collection or None)
+            for alias, collection in expected_aliases.items()
+        }
+        actual_relevant = {
+            alias: actual_aliases.get(alias) for alias in expected_relevant
+        }
+        if expected_relevant and actual_relevant != expected_relevant:
+            raise QdrantStoreError(
+                "snapshot_restore_alias_mismatch",
+                "current aliases changed during snapshot restore",
+            )
+        if set(restored_collections) != set(manifest.physical_collections):
+            raise QdrantStoreError(
+                "snapshot_restore_collections_missing",
+                "restored collection mapping does not cover the snapshot pair",
+            )
+        checks: dict[str, Any] = {
+            "aliases_unchanged": True,
+            "collections": {},
+            "sample_retrieval": False,
+        }
+        restored_names = {
+            source: str(target) for source, target in restored_collections.items()
+        }
+        for source_name, restored_name in restored_names.items():
+            try:
+                info = await self._client.get_collection(restored_name)
+            except Exception as exc:
+                raise QdrantStoreError(
+                    "snapshot_restore_collection_missing",
+                    "restored collection cannot be inspected",
+                ) from exc
+            self._validate_collection_shape(
+                restored_name,
+                info,
+                passages=source_name == manifest.generation.passages_physical,
+                expected_dimension=self.dimension,
+            )
+            metadata = _metadata(info)
+            actual_schema = metadata.get("collection_schema_version") or metadata.get(
+                "photomat_collection_schema_version"
+            )
+            actual_fingerprint = metadata.get("model_fingerprint") or metadata.get(
+                "photomat_model_fingerprint"
+            )
+            schema_version = int(actual_schema) if actual_schema is not None else -1
+            if schema_version != manifest.schema_version:
+                raise QdrantStoreError(
+                    "snapshot_restore_schema_mismatch",
+                    "restored collection schema metadata does not match the manifest",
+                )
+            if not self._fingerprint_matches(
+                str(actual_fingerprint or ""), manifest.fingerprint
+            ):
+                raise QdrantStoreError(
+                    "snapshot_restore_fingerprint_mismatch",
+                    "restored collection fingerprint does not match the manifest",
+                )
+            points, indexed_vectors, capacity = await self._snapshot_collection_stats(
+                restored_name
+            )
+            expected_points = manifest.point_counts.get(source_name)
+            expected_indexed = manifest.indexed_vector_counts.get(source_name)
+            if expected_points is not None and points is None:
+                raise QdrantStoreError(
+                    "snapshot_restore_count_unavailable",
+                    "restored collection point count cannot be verified",
+                )
+            if expected_points is not None and points != expected_points:
+                raise QdrantStoreError(
+                    "snapshot_restore_count_mismatch",
+                    "restored collection point count does not match the manifest",
+                )
+            if expected_indexed is not None and indexed_vectors is None:
+                raise QdrantStoreError(
+                    "snapshot_restore_count_unavailable",
+                    "restored indexed-vector count cannot be verified",
+                )
+            if expected_indexed is not None and indexed_vectors != expected_indexed:
+                raise QdrantStoreError(
+                    "snapshot_restore_count_mismatch",
+                    "restored indexed-vector count does not match the manifest",
+                )
+            checks["collections"][source_name] = {
+                "restored_name": restored_name,
+                "schema_version": schema_version,
+                "fingerprint": str(actual_fingerprint),
+                "points": points,
+                "indexed_vectors": indexed_vectors,
+                "capacity": capacity,
+            }
+
+        documents_source = manifest.generation.documents_physical
+        passages_source = manifest.generation.passages_physical
+        documents_name = restored_names[documents_source]
+        passages_name = restored_names[passages_source]
+        control_id = str(uuid.uuid5(GENERATION_POINT_NAMESPACE, manifest.fingerprint))
+        records = await self._client.retrieve(
+            collection_name=documents_name,
+            ids=[control_id],
+            with_payload=True,
+            with_vectors=False,
+            **self._timeout_kwargs(),
+        )
+        if not isinstance(records, Sequence) or not records:
+            raise QdrantStoreError(
+                "snapshot_restore_control_missing",
+                "restored generation control metadata is missing",
+            )
+        control = _payload(records[0])
+        if control.get("record_type") != "generation" or str(
+            control.get("model_fingerprint", "")
+        ) != manifest.fingerprint:
+            raise QdrantStoreError(
+                "snapshot_restore_control_mismatch",
+                "restored generation control metadata is incompatible",
+            )
+        if control.get("documents_physical") not in {
+            documents_source,
+            documents_name,
+        } or control.get("passages_physical") not in {passages_source, passages_name}:
+            raise QdrantStoreError(
+                "snapshot_restore_control_mismatch",
+                "restored generation control metadata does not bind the pair",
+            )
+
+        sample_id = sample_passage_id
+        if sample_id is None:
+            scroll = getattr(self._client, "scroll", None)
+            if scroll is not None:
+                response = scroll(
+                    collection_name=passages_name,
+                    limit=1,
+                    offset=None,
+                    with_payload=True,
+                    with_vectors=False,
+                    **self._timeout_kwargs(),
+                )
+                if inspect.isawaitable(response):
+                    response = await response
+                page = response[0] if isinstance(response, tuple) else _record_attr(response, "points", [])
+                if page:
+                    sample_id = str(_record_attr(page[0], "id", "")) or None
+        if sample_id:
+            sample = await self._client.retrieve(
+                collection_name=passages_name,
+                ids=[sample_id],
+                with_payload=True,
+                with_vectors=False,
+                **self._timeout_kwargs(),
+            )
+            if not isinstance(sample, Sequence) or not sample:
+                raise QdrantStoreError(
+                    "snapshot_restore_sample_missing",
+                    "restored sample passage cannot be retrieved",
+                )
+            sample_payload = _payload(sample[0])
+            if (
+                sample_payload.get("record_type") != "passage"
+                or str(sample_payload.get("model_fingerprint", ""))
+                != manifest.fingerprint
+                or str(sample_payload.get("ingest_state", ""))
+                != IngestState.READY.value
+            ):
+                raise QdrantStoreError(
+                    "snapshot_restore_sample_mismatch",
+                    "restored sample is not a ready passage from the manifest generation",
+                )
+            checks["sample_retrieval"] = True
+        return checks
+
     async def create_current_snapshots(self, output_dir: Path) -> SnapshotManifest:
         generation = await self._current_or_error()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1826,8 +2440,7 @@ class QdrantLiteratureStore:
             temporary_path = Path(temporary_name)
             try:
                 await self._download_snapshot(collection_name, snapshot_name, temporary_path)
-                digest = hashlib.sha256(temporary_path.read_bytes()).hexdigest()
-                size = temporary_path.stat().st_size
+                digest, size = _stream_file_digest(temporary_path)
                 os.replace(temporary_path, final_path)
                 created.append(
                     SnapshotFile(
@@ -1839,15 +2452,52 @@ class QdrantLiteratureStore:
                 )
             finally:
                 temporary_path.unlink(missing_ok=True)
+        server_version = "unknown"
+        info_method = getattr(self._client, "info", None)
+        if info_method is not None:
+            try:
+                info = info_method()
+                if inspect.isawaitable(info):
+                    info = await info
+                server_version = str(_record_attr(info, "version", "unknown") or "unknown")
+            except Exception:
+                pass
+        point_counts: dict[str, int | None] = {}
+        indexed_vector_counts: dict[str, int | None] = {}
+        capacity: dict[str, Any] = {}
+        for collection_name in (
+            generation.documents_physical,
+            generation.passages_physical,
+        ):
+            points, indexed_vectors, collection_capacity = await self._snapshot_collection_stats(
+                collection_name
+            )
+            point_counts[collection_name] = points
+            indexed_vector_counts[collection_name] = indexed_vectors
+            if collection_capacity:
+                capacity[collection_name] = collection_capacity
+        aliases = await self._alias_map()
         manifest = SnapshotManifest(
             generation=generation,
             created_at=datetime.now(timezone.utc),
             files=tuple(created),
+            server_version=server_version,
+            schema_version=COLLECTION_SCHEMA_VERSION,
+            fingerprint=generation.fingerprint,
+            physical_collections=(
+                generation.documents_physical,
+                generation.passages_physical,
+            ),
+            point_counts=point_counts,
+            indexed_vector_counts=indexed_vector_counts,
+            aliases={
+                generation.documents_alias: aliases.get(generation.documents_alias, ""),
+                generation.passages_alias: aliases.get(generation.passages_alias, ""),
+            },
+            capacity=capacity,
         )
         manifest_path = output_dir / "snapshot-manifest.json"
-        manifest_data = asdict(manifest)
-        manifest_data["created_at"] = manifest.created_at.isoformat()
-        manifest_data["files"] = [asdict(item) for item in manifest.files]
+        manifest_data = manifest.to_dict()
         temporary_manifest = manifest_path.with_name(f".{manifest_path.name}.tmp")
         temporary_manifest.write_text(
             json.dumps(manifest_data, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
@@ -1874,5 +2524,7 @@ __all__ = [
     "collection_fingerprint",
     "document_id_for",
     "passage_id_for",
+    "sanitize_qdrant_url",
+    "validate_qdrant_url",
     "workspace_id_for",
 ]

@@ -3,12 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Sequence
 from functools import lru_cache
 from math import isfinite
 from typing import Any
 
 from .base import ModelIdentity, RagProviderError, RerankScore, validate_vectors
+
+
+async def _to_local_thread(function: Any, *args: Any) -> Any:
+    """Run local model work in a managed worker thread.
+
+    Some Python 3.12 builds do not reliably tear down the implicit asyncio
+    executor at ``asyncio.run`` shutdown.  Installing a bounded executor on
+    the active loop keeps the required ``asyncio.to_thread`` boundary while
+    making CLI/test event loops terminate deterministically.
+    """
+    loop = asyncio.get_running_loop()
+    executor: ThreadPoolExecutor | None = None
+    if getattr(loop, "_default_executor", None) is None:
+        executor = ThreadPoolExecutor(max_workers=4)
+        loop.set_default_executor(executor)
+    try:
+        return await asyncio.to_thread(function, *args)
+    finally:
+        if executor is not None:
+            # Python 3.12's asyncio.run shutdown can wait forever for an
+            # implicit executor after to_thread.  The work item is complete;
+            # enqueue the sentinel without blocking the event loop and detach
+            # this executor before asyncio performs its own shutdown pass.
+            executor.shutdown(wait=False)
+            loop._default_executor = None  # type: ignore[attr-defined]
 
 
 @lru_cache(maxsize=8)
@@ -61,27 +87,24 @@ class LocalSentenceTransformerProvider:
     def _model(self) -> Any:
         return _load_sentence_transformer(self._model_name)
 
-    async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        if not texts:
-            return []
-        prepared = [f"passage: {text}" for text in texts]
-        raw = await asyncio.to_thread(
-            self._model().encode,
+    def _encode(self, prepared: Sequence[str]) -> Any:
+        """Load the model and encode in the same worker invocation."""
+        return self._model().encode(
             prepared,
             batch_size=self._batch_size,
             normalize_embeddings=True,
             convert_to_numpy=True,
         )
+
+    async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        prepared = [f"passage: {text}" for text in texts]
+        raw = await _to_local_thread(self._encode, prepared)
         return validate_vectors(raw, len(texts), self.identity.dimension)
 
     async def embed_query(self, text: str) -> list[float]:
-        raw = await asyncio.to_thread(
-            self._model().encode,
-            [f"query: {text}"],
-            batch_size=self._batch_size,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-        )
+        raw = await _to_local_thread(self._encode, [f"query: {text}"])
         vectors = validate_vectors(raw, 1, self.identity.dimension)
         return vectors[0]
 
@@ -125,6 +148,17 @@ class LocalCrossEncoderProvider:
             return min(configured, token_limit)
         return configured
 
+    def _predict(self, query: str, passages: Sequence[str]) -> Any:
+        """Load the reranker and score pairs in the same worker invocation."""
+        model = self._model()
+        limit = self._text_limit(model)
+        pairs = [(query[:limit], passage[:limit]) for passage in passages]
+        return model.predict(
+            pairs,
+            batch_size=self._batch_size,
+            show_progress_bar=False,
+        )
+
     async def rerank(
         self, query: str, passages: Sequence[str], *, top_n: int
     ) -> list[RerankScore]:
@@ -134,18 +168,7 @@ class LocalCrossEncoderProvider:
             )
         if not passages or top_n == 0:
             return []
-        model = self._model()
-        limit = self._text_limit(model)
-        pairs = [
-            (query[:limit], passage[:limit])
-            for passage in passages
-        ]
-        raw_scores = await asyncio.to_thread(
-            model.predict,
-            pairs,
-            batch_size=self._batch_size,
-            show_progress_bar=False,
-        )
+        raw_scores = await _to_local_thread(self._predict, query, passages)
         try:
             count = len(raw_scores)
         except Exception as exc:

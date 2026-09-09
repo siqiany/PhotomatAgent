@@ -17,6 +17,7 @@ from typing import Any
 
 from photomatagent.scientific.capabilities.literature.qdrant_store import (
     SearchCandidate,
+    collection_fingerprint,
 )
 
 
@@ -243,10 +244,34 @@ def _neighbor_is_compatible(
 class LiteratureRetriever:
     """Orchestrate bounded Qdrant retrieval and optional provider reranking."""
 
-    def __init__(self, store: Any, embedder: Any, reranker: Any) -> None:
+    def __init__(
+        self,
+        store: Any,
+        embedder: Any,
+        reranker: Any,
+        *,
+        chunk_schema_version: int = 1,
+    ) -> None:
         self._store = store
         self._embedder = embedder
         self._reranker = reranker
+        self._chunk_schema_version = chunk_schema_version
+
+    async def _validate_current_generation(self) -> None:
+        """Fail closed before querying vectors from another semantic space."""
+        validate = getattr(self._store, "validate_current_generation", None)
+        identity = getattr(self._embedder, "identity", None)
+        if not callable(validate) or identity is None:
+            return
+        expected = collection_fingerprint(
+            identity,
+            self._chunk_schema_version,
+            prefix=str(getattr(self._store, "prefix", "photomat_literature")),
+            sparse_model=str(getattr(self._store, "sparse_model", "qdrant/bm25")),
+        )
+        result = validate(expected)
+        if hasattr(result, "__await__"):
+            await result
 
     @staticmethod
     def _validate_request(
@@ -270,6 +295,7 @@ class LiteratureRetriever:
     async def _retrieve_candidates(
         self, query: str, *, workspace_id: str
     ) -> tuple[list[tuple[str, float, dict[str, Any]]], str, tuple[str, ...]]:
+        await self._validate_current_generation()
         dense: list[float] | None = None
         try:
             vector = await self._embedder.embed_query(query)

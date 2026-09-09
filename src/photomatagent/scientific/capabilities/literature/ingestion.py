@@ -76,9 +76,15 @@ class IngestionPlanItem:
     relative_source_path: str
     content_sha256: str | None
     kind: PlanKind
+    # Path relative to the immutable plan root.  The persisted source path is
+    # workspace-relative, so path reconstruction must not infer prefixes from
+    # directory basenames.
+    plan_relative_path: str | None = None
 
     def __post_init__(self) -> None:
         validate_relative_source_path(self.relative_source_path)
+        if self.plan_relative_path is not None:
+            validate_relative_source_path(self.plan_relative_path)
         object.__setattr__(self, "kind", PlanKind(self.kind))
 
 
@@ -322,6 +328,20 @@ class LiteratureIngestionService:
         _generation_fingerprint(generation)
         return generation
 
+    async def _expected_generation(self) -> CollectionGeneration:
+        """Compute a provider/schema generation without creating collections."""
+        expected = getattr(self.store, "expected_generation", None)
+        if callable(expected):
+            generation = expected(
+                identity=self.embedder.identity,
+                chunk_schema_version=1,
+            )
+            if inspect.isawaitable(generation):
+                generation = await generation
+            _generation_fingerprint(generation)
+            return generation
+        return await self._generation()
+
     async def plan(self, root: Path | str, workspace: Any) -> IngestionPlan:
         """Build a complete, read-only plan for the current source tree."""
         resolved_root, workspace_id, workspace_root, relative_root = _workspace_context(
@@ -329,7 +349,7 @@ class LiteratureIngestionService:
         )
         if not resolved_root.exists() or not resolved_root.is_dir():
             raise RagIngestionError("source_root_missing", "source root does not exist")
-        generation = await self._generation()
+        generation = await self._expected_generation()
 
         # Enumerate and hash every source file before consulting missing
         # manifests.  Deletion candidates are appended only after this phase,
@@ -344,7 +364,15 @@ class LiteratureIngestionService:
         discovered.sort(key=lambda item: item[0])
 
         try:
-            manifests = await self.store.list_document_manifests(workspace_id)
+            list_manifests = self.store.list_document_manifests
+            try:
+                manifests = await list_manifests(
+                    workspace_id, generation=generation
+                )
+            except TypeError:
+                # Keep compatibility with narrow fake stores used by callers
+                # that have not adopted generation-scoped reads yet.
+                manifests = await list_manifests(workspace_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -352,24 +380,9 @@ class LiteratureIngestionService:
 
         items: list[IngestionPlanItem] = []
         seen_ids: set[str] = set()
-        for relative_path, _path, content_sha256 in discovered:
+        for relative_path, source_path, content_sha256 in discovered:
             document_id = document_id_for(workspace_id, relative_path)
             manifest = manifests.get(document_id)
-            if manifest is None:
-                manifest = next(
-                    (
-                        candidate
-                        for candidate in manifests.values()
-                        if candidate.workspace_id == workspace_id
-                        and candidate.relative_source_path
-                        in {relative_path, f"{resolved_root.name}/{relative_path}"}
-                    ),
-                    None,
-                )
-                if manifest is not None:
-                    relative_path = manifest.relative_source_path
-                    document_id = manifest.document_id
-                    seen_ids.add(manifest.document_id)
             seen_ids.add(document_id)
             items.append(
                 IngestionPlanItem(
@@ -377,6 +390,7 @@ class LiteratureIngestionService:
                     relative_source_path=relative_path,
                     content_sha256=content_sha256,
                     kind=_manifest_kind(manifest, content_sha256),
+                    plan_relative_path=source_path.relative_to(resolved_root).as_posix(),
                 )
             )
         # A successful full enumeration is the safety gate for deletions.
@@ -407,13 +421,19 @@ class LiteratureIngestionService:
         if plan.source_root is None:
             return Path(plan.relative_root) / item.relative_source_path
         root = Path(plan.source_root).resolve()
-        relative_path = item.relative_source_path
-        if plan.relative_root not in {"", "."}:
-            prefix = plan.relative_root.rstrip("/") + "/"
-            if relative_path.startswith(prefix):
-                relative_path = relative_path[len(prefix) :]
-        elif relative_path.startswith(root.name + "/"):
-            relative_path = relative_path[len(root.name) + 1 :]
+        # Plans generated by ``plan`` always carry an explicit path relative
+        # to this root.  For hand-built compatibility plans, the source path
+        # is usable only when the root itself is the plan root (``.``); never
+        # infer or strip a directory basename from a workspace-relative path.
+        if item.plan_relative_path is not None:
+            relative_path = item.plan_relative_path
+        elif plan.relative_root in {"", "."}:
+            relative_path = item.relative_source_path
+        else:
+            raise RagIngestionError(
+                "source_path_invalid",
+                "plan item is missing an explicit plan-root-relative path",
+            )
         candidate = (root / relative_path).resolve()
         if root != candidate and root not in candidate.parents:
             raise RagIngestionError("source_path_invalid", "source path escapes source root")
@@ -601,6 +621,12 @@ class LiteratureIngestionService:
             workspace_id=plan.workspace_id,
         )
         record, passages = parse_pdf(path)
+        # Parsing can be slow enough for a user/editor to replace the source
+        # after the initial plan check.  Re-hash immediately after parsing and
+        # fail before embedding or writing any new passage vectors when the
+        # bytes no longer match the planned revision.
+        if _sha256(path) != revision:
+            raise RagIngestionError("source_changed", "source PDF changed during parsing")
         if not passages:
             raise RagIngestionError("no_passages", "PDF produced no text passages")
         texts = [passage.text for passage in passages]
@@ -687,6 +713,17 @@ class LiteratureIngestionService:
         limit = min(int(max_documents), MAX_BATCH_DOCUMENTS)
         if plan.generation.fingerprint != _generation_fingerprint(plan.generation):
             raise RagIngestionError("generation_invalid", "plan generation is invalid")
+        expected_generation = await self._expected_generation()
+        if expected_generation.fingerprint != plan.generation.fingerprint:
+            raise RagIngestionError(
+                "model_fingerprint_mismatch",
+                "ingestion plan does not match the configured embedding generation",
+            )
+        select_staging = getattr(self.store, "select_staging_generation", None)
+        if callable(select_staging):
+            selected = select_staging(plan.generation)
+            if inspect.isawaitable(selected):
+                await selected
         run_id = run_id or uuid.uuid4().hex
         run, cursor = await self._recover_run(plan, run_id, resume_cursor)
         stats = run.stats
@@ -705,14 +742,19 @@ class LiteratureIngestionService:
         progress_cursor = cursor
         retry_cursor: str | None = None
         retry_seen = False
+        retry_target = candidates[0].relative_source_path if stats.retryable and candidates else None
         for item in selected:
+            was_retryable = stats.retryable
             try:
                 stats, retry_item = await self._process_item(plan, item, stats)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 stats = await self._mark_failed(plan, item, exc, stats)
-                retry_item = False
+                # Preserve the cursor before every unresolved failure.  This
+                # includes a final selected item, which must never make the
+                # run look complete.
+                retry_item = True
             processed += 1
             if retry_item:
                 retry_seen = True
@@ -720,13 +762,24 @@ class LiteratureIngestionService:
                     retry_cursor = progress_cursor
             else:
                 progress_cursor = item.relative_source_path
+                if item.kind is PlanKind.RETRY_FAILED or (
+                    was_retryable and item.relative_source_path == retry_target
+                ):
+                    # A successful retry clears the unresolved retry state;
+                    # cumulative ``failed`` remains an audit counter.
+                    stats = replace(stats, retryable=False)
             next_candidates = [
                 candidate
                 for candidate in candidates
                 if candidate.relative_source_path > item.relative_source_path
             ]
             persisted_cursor = retry_cursor if retry_seen else progress_cursor
-            complete = plan.complete and not next_candidates and not retry_seen
+            complete = (
+                plan.complete
+                and not next_candidates
+                and not retry_seen
+                and not stats.retryable
+            )
             stats = replace(stats, next_cursor=None if complete else persisted_cursor)
             run = IngestionRunState(
                 run_id=run_id,
@@ -746,7 +799,7 @@ class LiteratureIngestionService:
         ]
         # With no selected work, or after the final selected item, cursor is
         # cleared only when every non-unchanged item has been handled.
-        if retry_seen:
+        if retry_seen or stats.retryable:
             complete = False
         elif not candidates:
             complete = plan.complete

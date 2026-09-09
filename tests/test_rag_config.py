@@ -98,3 +98,22 @@ def test_literature_index_dir_is_not_a_rag_configuration_field(tmp_path, monkeyp
     config = ScientificConfig.from_environment(workspace=tmp_path)
     assert "literature_index_dir" not in {item.name for item in fields(config)}
     assert not hasattr(config, "literature_index_dir")
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("PHOTOMATAGENT_MATERIALS_MAX_RESULTS", "not-an-int"),
+        ("PHOTOMATAGENT_MATERIALS_MAX_RESULTS", "0"),
+        ("PHOTOMATAGENT_LITERATURE_MAX_PAPERS", "11"),
+        ("PHOTOMATAGENT_LITERATURE_MAX_CHARS", "199"),
+        ("PHOTOMATAGENT_LITERATURE_TOP_K", "0"),
+        ("PHOTOMATAGENT_LITERATURE_PASSAGE_CHARS", "601"),
+    ],
+)
+def test_model_visible_output_limits_are_strictly_bounded(
+    tmp_path, monkeypatch, env_name, value
+):
+    monkeypatch.setenv(env_name, value)
+    with pytest.raises(ValueError, match=env_name):
+        ScientificConfig.from_environment(workspace=tmp_path)

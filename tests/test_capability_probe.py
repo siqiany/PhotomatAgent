@@ -329,6 +329,24 @@ def test_literature_probe_reports_server_version_and_validates_generation(
     assert any(call.startswith("validate:") for call in calls)
 
 
+def test_literature_probe_keeps_qdrant_checks_when_source_root_is_missing(
+    tmp_path, monkeypatch
+):
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    result = probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert result.status.value == "UNCONFIGURED"
+    assert "source root" in result.detail.casefold()
+    assert snapshot["server_version"] == "1.18.2"
+    assert snapshot["alias_state"] == "ready"
+    assert snapshot["generation_state"].startswith("ready:")
+
+
 def test_literature_probe_marks_missing_alias_generation_unconfigured(
     tmp_path, monkeypatch
 ):
@@ -363,3 +381,76 @@ def test_literature_probe_rejects_schema_or_fingerprint_mismatch(
 
     assert result.status.value == "ERROR"
     assert error_code in result.detail
+
+
+def test_literature_probe_keeps_qdrant_checks_when_optional_dependency_is_missing(
+    tmp_path, monkeypatch
+):
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+    original_import = __import__
+
+    def import_without_docling(name, *args, **kwargs):
+        if name == "docling":
+            raise ImportError("docling unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", import_without_docling)
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    result = probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert result.status.value == "MISSING_DEPENDENCY"
+    assert "docling" in result.detail
+    assert snapshot["server_version"] == "1.18.2"
+    assert snapshot["alias_state"] == "ready"
+
+
+def test_literature_probe_keeps_alias_check_when_server_version_check_fails(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "dataset" / "paper").mkdir(parents=True)
+    class InfoFailClient(_ProbeClient):
+        def info(self):
+            raise RuntimeError("version endpoint unavailable")
+
+    import qdrant_client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", InfoFailClient)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    result = probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert result.status.value == "ERROR"
+    assert snapshot["alias_state"] == "ready"
+
+
+def test_literature_probe_reports_capacity_warning_from_server_health(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "dataset" / "paper").mkdir(parents=True)
+
+    class CapacityClient(_ProbeClient):
+        def info(self):
+            return SimpleNamespace(
+                version="1.18.2",
+                disk_total_bytes=100,
+                disk_free_bytes=5,
+            )
+
+    import qdrant_client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", CapacityClient)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert "disk_free_bytes=5" in snapshot["capacity"]
+    assert snapshot["capacity_warning"] == "disk_free_below_10_percent"

@@ -71,3 +71,26 @@ def test_benchmark_dry_run_writes_report_without_contacting_qdrant(
     assert report["points"] == 32
     assert report["writes_performed"] is False
     assert report["collection_name"].startswith("photomat_test_fixture_")
+
+
+def test_benchmark_local_warmup_report_labels_first_request_without_cold_claim() -> None:
+    benchmark_qdrant_rag = _benchmark_module()
+    config = benchmark_qdrant_rag.BenchmarkConfig(
+        points=8,
+        dimension=8,
+        queries=2,
+        batch_size=2,
+        url="http://127.0.0.1:6333",
+        test_prefix="photomat_test_fixture",
+        measure_local_retrieval=True,
+        warmup_local_model=True,
+    )
+
+    report = benchmark_qdrant_rag._dry_run_report(config)
+    latency = report["rag_paths"]["local_end_to_end"]["latency_ms"]
+
+    assert report["rag_paths"]["local_end_to_end"]["first_request_phase"] == (
+        "post_warmup"
+    )
+    assert "cold_p50" not in latency
+    assert "first_request_p50" in latency

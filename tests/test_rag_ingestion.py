@@ -304,6 +304,68 @@ async def test_embedding_failure_writes_no_passages(
     assert store.documents[item.document_id].status is DocumentStatus.FAILED
 
 
+async def test_final_document_failure_is_not_reported_complete_and_retry_clears_state(
+    pdf: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper, chunks = _passages("one")
+    monkeypatch.setattr(ingestion, "parse_pdf", lambda path: (paper, chunks))
+    item = IngestionPlanItem(
+        document_id=document_id_for(WORKSPACE, "paper.pdf"),
+        relative_source_path="paper.pdf",
+        content_sha256=_sha(pdf.read_bytes()),
+        kind=PlanKind.NEW,
+    )
+    plan = IngestionPlan(WORKSPACE, GENERATION, (item,), source_root=pdf.parent)
+
+    failed = await LiteratureIngestionService(store, FailingEmbedder()).index_batch(
+        plan, run_id="final-failure", max_documents=1
+    )
+
+    assert failed.complete is False
+    assert failed.retryable is True
+    assert failed.next_cursor is None
+
+    retry_plan = IngestionPlan(
+        WORKSPACE,
+        GENERATION,
+        (IngestionPlanItem(**{**item.__dict__, "kind": PlanKind.RETRY_FAILED}),),
+        source_root=pdf.parent,
+    )
+    recovered = await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        retry_plan, run_id="final-failure", max_documents=1
+    )
+
+    assert recovered.complete is True
+    assert recovered.retryable is False
+    assert recovered.next_cursor is None
+
+
+async def test_same_plan_retry_clears_retry_state_after_success(
+    pdf: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper, chunks = _passages("one")
+    monkeypatch.setattr(ingestion, "parse_pdf", lambda path: (paper, chunks))
+    item = IngestionPlanItem(
+        document_id=document_id_for(WORKSPACE, "paper.pdf"),
+        relative_source_path="paper.pdf",
+        content_sha256=_sha(pdf.read_bytes()),
+        kind=PlanKind.NEW,
+    )
+    plan = IngestionPlan(WORKSPACE, GENERATION, (item,), source_root=pdf.parent)
+
+    failed = await LiteratureIngestionService(store, FailingEmbedder()).index_batch(
+        plan, run_id="same-plan-retry", max_documents=1
+    )
+    assert failed.retryable is True
+
+    recovered = await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        plan, run_id=failed.run_id, max_documents=1
+    )
+
+    assert recovered.complete is True
+    assert recovered.retryable is False
+
+
 async def test_resume_cleans_staged_revision_and_retries(
     pdf: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -422,6 +484,60 @@ async def test_workspace_plan_keeps_workspace_relative_source_path(
     assert plan.relative_root == "papers"
 
 
+async def test_index_reconstructs_child_named_like_workspace_without_basename_stripping(
+    tmp_path: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    child = workspace_root / workspace_root.name
+    child.mkdir(parents=True)
+    pdf_path = child / "paper.pdf"
+    pdf_path.write_bytes(b"paper")
+    paper, chunks = _passages("nested child")
+    monkeypatch.setattr(ingestion, "parse_pdf", lambda path: (paper, chunks))
+    monkeypatch.setattr(ingestion, "workspace_id_for", lambda root: WORKSPACE)
+
+    workspace = Workspace(workspace_root)
+    plan = await LiteratureIngestionService(store, FakeEmbedder()).plan(
+        workspace_root, workspace
+    )
+
+    assert plan.items[0].relative_source_path == "workspace/paper.pdf"
+    assert plan.items[0].plan_relative_path == "workspace/paper.pdf"
+    result = await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        plan, max_documents=1
+    )
+    assert result.indexed == 1
+    assert store.documents[plan.items[0].document_id].status is DocumentStatus.READY
+
+
+async def test_index_rehashes_source_after_parsing_before_persisting(
+    pdf: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper, chunks = _passages("one")
+
+    def parse_and_modify(path: Path):
+        path.write_bytes(b"changed while parsing")
+        return paper, chunks
+
+    monkeypatch.setattr(ingestion, "parse_pdf", parse_and_modify)
+    item = IngestionPlanItem(
+        document_id=document_id_for(WORKSPACE, "paper.pdf"),
+        relative_source_path="paper.pdf",
+        content_sha256=_sha(pdf.read_bytes()),
+        kind=PlanKind.NEW,
+    )
+    plan = IngestionPlan(WORKSPACE, GENERATION, (item,), source_root=pdf.parent)
+
+    result = await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        plan, max_documents=1
+    )
+
+    assert result.failed == 1
+    assert result.retryable is True
+    assert store.passage_upserts == []
+    assert store.documents[item.document_id].status is DocumentStatus.FAILED
+
+
 async def test_batch_and_errors_are_bounded_and_cursor_is_persisted(
     tmp_path: Path, store: FakeStore
 ) -> None:
@@ -442,9 +558,11 @@ async def test_batch_and_errors_are_bounded_and_cursor_is_persisted(
 
     assert result.failed == 20
     assert len(result.errors) == 20
-    assert result.next_cursor == "paper-19.pdf"
+    # The cursor stays before the first unresolved item so a retry cannot skip
+    # a failed document, even when that item is the final selected batch entry.
+    assert result.next_cursor is None
     assert result.complete is False
-    assert store.runs[result.run_id].cursor == "paper-19.pdf"
+    assert store.runs[result.run_id].cursor is None
 
 
 async def test_qdrant_ingestion_control_point_is_bounded_and_workspace_scoped() -> None:
@@ -486,7 +604,7 @@ async def test_qdrant_ingestion_control_point_is_bounded_and_workspace_scoped() 
     assert len(loaded.stats.errors) == 20
     payload = next(
         point.payload
-        for point in client.points[generation.documents_alias].values()
+        for point in client.points[generation.documents_physical].values()
         if point.payload.get("record_type") == "ingestion_run"
     )
     assert "text" not in payload

@@ -11,6 +11,7 @@ is never run by pytest or by the normal CLI.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import platform
@@ -76,6 +77,24 @@ def parser() -> argparse.ArgumentParser:
         help="JSON output path (default: user_output/qdrant-benchmark/...).",
     )
     argument_parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    argument_parser.add_argument(
+        "--measure-local-retrieval",
+        action="store_true",
+        help="Also measure query embedding, hybrid retrieval, and local reranking.",
+    )
+    argument_parser.add_argument(
+        "--local-embedding-model",
+        default="intfloat/multilingual-e5-small",
+    )
+    argument_parser.add_argument(
+        "--local-reranker-model",
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    argument_parser.add_argument(
+        "--warmup-local-model",
+        action="store_true",
+        help="Warm local models before timed end-to-end requests.",
+    )
     return argument_parser
 
 
@@ -91,6 +110,10 @@ class BenchmarkConfig:
     keep_collection: bool = False
     output: Path | None = None
     seed: int = DEFAULT_SEED
+    measure_local_retrieval: bool = False
+    local_embedding_model: str = "intfloat/multilingual-e5-small"
+    local_reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    warmup_local_model: bool = False
     collection_name: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -132,6 +155,10 @@ class BenchmarkConfig:
             keep_collection=bool(args.keep_collection),
             output=args.output,
             seed=int(args.seed),
+            measure_local_retrieval=bool(args.measure_local_retrieval),
+            local_embedding_model=str(args.local_embedding_model),
+            local_reranker_model=str(args.local_reranker_model),
+            warmup_local_model=bool(args.warmup_local_model),
         )
 
 
@@ -175,6 +202,10 @@ def _json_safe(value: Any) -> Any:
 
 
 def _dry_run_report(config: BenchmarkConfig) -> dict[str, Any]:
+    from photomatagent.scientific.capabilities.literature.qdrant_store import (
+        sanitize_qdrant_url,
+    )
+
     return {
         "label": "qdrant-capacity-benchmark",
         "dry_run": True,
@@ -183,9 +214,28 @@ def _dry_run_report(config: BenchmarkConfig) -> dict[str, Any]:
         "dimension": config.dimension,
         "queries": config.queries,
         "batch_size": config.batch_size,
-        "url": config.url,
+        "url": sanitize_qdrant_url(config.url),
         "collection_name": config.collection_name,
         "seed": config.seed,
+        "rag_paths": {
+            "hybrid_rrf": {"requested": True, "executed": False},
+            "local_end_to_end": {
+                "requested": config.measure_local_retrieval,
+                "executed": False,
+                "warmup_requested": config.warmup_local_model,
+                "first_request_phase": (
+                    "post_warmup" if config.warmup_local_model else "cold"
+                ),
+                "embedding_model": config.local_embedding_model,
+                "reranker_model": config.local_reranker_model,
+                "latency_ms": {
+                    "first_request_p50": None,
+                    "first_request_p95": None,
+                    "subsequent_p50": None,
+                    "subsequent_p95": None,
+                },
+            },
+        },
         "server_config": None,
         "hardware": {
             "platform": platform.platform(),
@@ -202,6 +252,89 @@ def _dry_run_report(config: BenchmarkConfig) -> dict[str, Any]:
     }
 
 
+def _measure_local_path(
+    client: Any, models: Any, config: BenchmarkConfig, queries: Any
+) -> dict[str, Any]:
+    """Measure query embedding + hybrid Qdrant retrieval + local reranking."""
+    base: dict[str, Any] = {
+        "requested": True,
+        "executed": False,
+        "warmup_requested": config.warmup_local_model,
+        "first_request_phase": (
+            "post_warmup" if config.warmup_local_model else "cold"
+        ),
+        "embedding_model": config.local_embedding_model,
+        "reranker_model": config.local_reranker_model,
+        "latency_ms": {
+            "first_request_p50": None,
+            "first_request_p95": None,
+            "subsequent_p50": None,
+            "subsequent_p95": None,
+        },
+    }
+    try:
+        from photomatagent.scientific.capabilities.literature.providers.local import (
+            LocalCrossEncoderProvider,
+            LocalSentenceTransformerProvider,
+        )
+
+        embedder = LocalSentenceTransformerProvider(
+            config.local_embedding_model, config.dimension
+        )
+        reranker = LocalCrossEncoderProvider(config.local_reranker_model)
+
+        async def run() -> tuple[list[float], list[float]]:
+            query_values = [f"synthetic benchmark query {index}" for index in range(config.queries)]
+
+            async def once(query_text: str) -> float:
+                started = time.perf_counter()
+                dense = await embedder.embed_query(query_text)
+                response = client.query_points(
+                    collection_name=config.collection_name,
+                    prefetch=[
+                        models.Prefetch(query=dense, using="dense", limit=50),
+                        models.Prefetch(
+                            query=models.Document(text=query_text, model="qdrant/bm25"),
+                            using="sparse_bm25",
+                            limit=50,
+                        ),
+                    ],
+                    query=models.FusionQuery(fusion=models.Fusion.RRF),
+                    limit=10,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points = list(getattr(response, "points", ()) or ())
+                passages = [
+                    str(getattr(point, "payload", {}).get("text", ""))
+                    for point in points
+                    if isinstance(getattr(point, "payload", {}), dict)
+                ]
+                await reranker.rerank(query_text, passages, top_n=min(10, len(passages)))
+                return (time.perf_counter() - started) * 1000.0
+
+            if config.warmup_local_model:
+                await embedder.embed_query("synthetic benchmark warmup")
+                await reranker.rerank("synthetic benchmark warmup", ["warmup"], top_n=1)
+            if not query_values:
+                return [], []
+            cold = [await once(query_values[0])]
+            warm = [await once(query_text) for query_text in query_values[1:]]
+            return cold, warm
+
+        cold_ms, warm_ms = asyncio.run(run())
+        base["executed"] = True
+        base["latency_ms"] = {
+            "first_request_p50": _percentile(cold_ms, 0.50),
+            "first_request_p95": _percentile(cold_ms, 0.95),
+            "subsequent_p50": _percentile(warm_ms, 0.50),
+            "subsequent_p95": _percentile(warm_ms, 0.95),
+        }
+    except Exception as exc:
+        base["unavailable_reason"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+    return base
+
+
 def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     try:
         import numpy as np
@@ -211,6 +344,11 @@ def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
 
     api_key_name = os.environ.get("PHOTOMATAGENT_QDRANT_API_KEY_ENV", "QDRANT_API_KEY")
     api_key = os.environ.get(api_key_name, "").strip() or None
+    from photomatagent.scientific.capabilities.literature.qdrant_store import (
+        validate_qdrant_url,
+    )
+
+    safe_url = validate_qdrant_url(config.url, api_key=api_key)
     client = QdrantClient(
         url=config.url,
         api_key=api_key,
@@ -221,11 +359,16 @@ def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     try:
         client.create_collection(
             collection_name=config.collection_name,
-            vectors_config=models.VectorParams(
-                size=config.dimension,
-                distance=models.Distance.COSINE,
-                on_disk=True,
-            ),
+            vectors_config={
+                "dense": models.VectorParams(
+                    size=config.dimension,
+                    distance=models.Distance.COSINE,
+                    on_disk=True,
+                )
+            },
+            sparse_vectors_config={
+                "sparse_bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)
+            },
             shard_number=1,
             replication_factor=1,
             on_disk_payload=True,
@@ -236,7 +379,20 @@ def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
             count = min(config.batch_size, config.points - start)
             vectors = vector_rng.random((count, config.dimension), dtype=np.float32)
             points = [
-                models.PointStruct(id=start + offset, vector=vector.tolist())
+                models.PointStruct(
+                    id=start + offset,
+                    vector={
+                        "dense": vector.tolist(),
+                        "sparse_bm25": models.Document(
+                            text=f"synthetic benchmark passage {start + offset}",
+                            model="qdrant/bm25",
+                        ),
+                    },
+                    payload={
+                        "record_type": "passage",
+                        "text": f"synthetic benchmark passage {start + offset}",
+                    },
+                )
                 for offset, vector in enumerate(vectors)
             ]
             client.upsert(
@@ -248,11 +404,19 @@ def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
         query_rng = np.random.default_rng(config.seed + 1)
         queries = query_rng.random((config.queries, config.dimension), dtype=np.float32)
 
-        def query_once(vector: Any) -> float:
+        def query_once(vector: Any, query_text: str = "benchmark query") -> float:
             started = time.perf_counter()
             client.query_points(
                 collection_name=config.collection_name,
-                query=vector.tolist(),
+                prefetch=[
+                    models.Prefetch(query=vector.tolist(), using="dense", limit=50),
+                    models.Prefetch(
+                        query=models.Document(text=query_text, model="qdrant/bm25"),
+                        using="sparse_bm25",
+                        limit=50,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
                 limit=10,
                 with_payload=False,
                 with_vectors=False,
@@ -265,7 +429,7 @@ def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
         warm_ms = [query_once(vector) for vector in queries[1:]]
         info = client.info()
         collection = client.get_collection(config.collection_name)
-        return {
+        report: dict[str, Any] = {
             "label": "qdrant-capacity-benchmark",
             "dry_run": False,
             "writes_performed": True,
@@ -273,9 +437,31 @@ def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
             "dimension": config.dimension,
             "queries": config.queries,
             "batch_size": config.batch_size,
-            "url": config.url,
+            "url": safe_url,
             "collection_name": config.collection_name,
             "seed": config.seed,
+            "rag_paths": {
+                "hybrid_rrf": {
+                    "requested": True,
+                    "executed": True,
+                    "candidate_limit": 50,
+                    "fusion": "qdrant_rrf",
+                },
+                "local_end_to_end": {
+                    "requested": config.measure_local_retrieval,
+                    "executed": False,
+                    "warmup_requested": config.warmup_local_model,
+                    "first_request_phase": (
+                        "post_warmup" if config.warmup_local_model else "cold"
+                    ),
+                    "latency_ms": {
+                        "first_request_p50": None,
+                        "first_request_p95": None,
+                        "subsequent_p50": None,
+                        "subsequent_p95": None,
+                    },
+                },
+            },
             "server_config": {
                 "server_version": str(getattr(info, "version", "") or ""),
                 "collection": _json_safe(collection),
@@ -292,6 +478,11 @@ def _live_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
                 "warm_p95": _percentile(warm_ms, 0.95),
             },
         }
+        if config.measure_local_retrieval:
+            report["rag_paths"]["local_end_to_end"] = _measure_local_path(
+                client, models, config, queries
+            )
+        return report
     finally:
         if created and not config.keep_collection:
             client.delete_collection(config.collection_name)

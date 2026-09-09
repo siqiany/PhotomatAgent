@@ -125,14 +125,25 @@ class ScientificConfig:
             materials_api_key_env=os.environ.get(
                 "PHOTOMATAGENT_MATERIALS_KEY_ENV", "MATERIALS_API_KEY"
             ),
-            materials_max_results=_int_env(
-                "PHOTOMATAGENT_MATERIALS_MAX_RESULTS", 10
+            # These values cap model-visible output.  Keep parsing strict so
+            # a typo cannot silently widen/disable a safety bound.
+            materials_max_results=_bounded_int_env(
+                "PHOTOMATAGENT_MATERIALS_MAX_RESULTS",
+                10,
+                minimum=1,
+                maximum=10,
             ),
-            literature_max_papers=_int_env(
-                "PHOTOMATAGENT_LITERATURE_MAX_PAPERS", 5
+            literature_max_papers=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_MAX_PAPERS",
+                5,
+                minimum=1,
+                maximum=10,
             ),
-            literature_max_chars=_int_env(
-                "PHOTOMATAGENT_LITERATURE_MAX_CHARS", 4000
+            literature_max_chars=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_MAX_CHARS",
+                4000,
+                minimum=200,
+                maximum=20_000,
             ),
             literature_root=os.environ.get(
                 "PHOTOMATAGENT_LITERATURE_DIR", "dataset/paper"
@@ -212,11 +223,17 @@ class ScientificConfig:
                 minimum=1,
                 maximum=100,
             ),
-            literature_search_top_k=_int_env(
-                "PHOTOMATAGENT_LITERATURE_TOP_K", 5
+            literature_search_top_k=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_TOP_K",
+                5,
+                minimum=1,
+                maximum=10,
             ),
-            literature_passage_chars=_int_env(
-                "PHOTOMATAGENT_LITERATURE_PASSAGE_CHARS", 600
+            literature_passage_chars=_bounded_int_env(
+                "PHOTOMATAGENT_LITERATURE_PASSAGE_CHARS",
+                600,
+                minimum=50,
+                maximum=600,
             ),
             mcp_servers=servers,
         )
