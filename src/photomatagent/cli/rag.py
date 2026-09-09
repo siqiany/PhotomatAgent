@@ -10,6 +10,7 @@ import re
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
@@ -22,8 +23,10 @@ from photomatagent.scientific.capabilities.literature import (
     LiteratureProbe,
     LiteratureReadPassageTool,
     LiteratureSearchPassagesTool,
+    build_abstract_ingestion_service,
     build_literature_services,
 )
+from photomatagent.scientific.capabilities.literature.models import LiteratureSourceKind
 from photomatagent.scientific.capabilities.literature.models import (
     LITERATURE_CHUNK_SCHEMA_VERSION,
 )
@@ -103,18 +106,44 @@ def _stats_dict(stats: Any) -> dict[str, Any]:
             return stats.get(name, default)
         return getattr(stats, name, default)
 
+    complete = bool(get("complete", False))
+    retryable = bool(get("retryable", False))
+    indexed = int(get("indexed", 0) or 0)
+    unchanged = int(get("unchanged", 0) or 0)
+    failed = int(get("failed", 0) or 0)
+    deleted = int(get("deleted", 0) or 0)
+    chunks = int(get("chunks", get("passages", 0)) or 0)
+    processed_value = get("processed", None)
+    processed = (
+        int(processed_value)
+        if processed_value is not None
+        else indexed + unchanged + failed + deleted
+    )
+    skipped_empty = int(get("skipped_empty", 0) or 0)
+    skipped_invalid_key = int(get("skipped_invalid_key", 0) or 0)
+    status = str(
+        get(
+            "status",
+            "complete" if complete else "retryable" if retryable else "running",
+        )
+    )
     return {
         "run_id": str(get("run_id", "")),
         "discovered": int(get("discovered", 0) or 0),
-        "unchanged": int(get("unchanged", 0) or 0),
-        "indexed": int(get("indexed", 0) or 0),
-        "failed": int(get("failed", 0) or 0),
-        "deleted": int(get("deleted", 0) or 0),
-        "chunks": int(get("chunks", 0) or 0),
+        "total": int(get("total", get("discovered", 0)) or 0),
+        "processed": max(0, processed),
+        "unchanged": unchanged,
+        "indexed": indexed,
+        "failed": failed,
+        "deleted": deleted,
+        "skipped": skipped_empty + skipped_invalid_key,
+        "chunks": chunks,
+        "passages": chunks,
         "staged_cleanup": int(get("staged_cleanup", 0) or 0),
         "next_cursor": get("next_cursor"),
-        "complete": bool(get("complete", False)),
-        "retryable": bool(get("retryable", False)),
+        "complete": complete,
+        "retryable": retryable,
+        "status": status,
         "errors": [str(item)[:320] for item in list(get("errors", ()) or ())[:20]],
     }
 
@@ -123,6 +152,157 @@ def _service_value(services: Any, name: str, default: Any = None) -> Any:
     if isinstance(services, dict):
         return services.get(name, default)
     return getattr(services, name, default)
+
+
+def _record_value(record: Any, name: str, default: Any = None) -> Any:
+    if isinstance(record, dict):
+        return record.get(name, default)
+    return getattr(record, name, default)
+
+
+def _progress_delta(
+    stats: Any,
+    previous_total: int | None,
+    *,
+    limit: int,
+) -> tuple[int, int]:
+    """Return a bounded per-call progress delta and the new cumulative value."""
+    explicit = _record_value(stats, "processed", None)
+    if explicit is not None:
+        current = max(0, int(explicit))
+    else:
+        current = max(
+            0,
+            int(_record_value(stats, "indexed", 0) or 0)
+            + int(_record_value(stats, "failed", 0) or 0)
+            + int(_record_value(stats, "deleted", 0) or 0),
+        )
+    if previous_total is None:
+        delta = current
+    else:
+        delta = max(0, current - previous_total)
+    # A service batch is itself the hard boundary.  If a narrow fake or a
+    # legacy stats object does not expose a cumulative processed counter, the
+    # indexed/failed/deleted counters above still provide a conservative one.
+    return min(delta, max(0, int(limit))), current
+
+
+def _progress_row(
+    stats: dict[str, Any],
+    *,
+    processed_this_invocation: int,
+    started_at: float,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """Build one bounded, JSON-safe progress observation for a committed batch."""
+    total = max(0, int(stats.get("total", stats.get("discovered", 0)) or 0))
+    processed = max(0, int(stats.get("processed", 0) or 0))
+    elapsed = max(monotonic() - started_at, 1e-9)
+    rate = processed / elapsed
+    remaining = max(0, total - processed)
+    eta = remaining / rate if rate > 0 else None
+    return {
+        "total": total,
+        "processed": processed,
+        "indexed": max(0, int(stats.get("indexed", 0) or 0)),
+        "unchanged": max(0, int(stats.get("unchanged", 0) or 0)),
+        "failed": max(0, int(stats.get("failed", 0) or 0)),
+        "skipped": max(0, int(stats.get("skipped", 0) or 0)),
+        "passages": max(
+            0,
+            int(stats.get("passages", stats.get("chunks", 0)) or 0),
+        ),
+        "rate": round(rate, 3),
+        "eta": round(eta, 3) if eta is not None else None,
+        "eta_seconds": round(eta, 3) if eta is not None else None,
+        "cursor": stats.get("next_cursor"),
+        "run_id": str(stats.get("run_id", "")),
+        "status": str(status or stats.get("status", "running")),
+        # Useful to callers that need to audit a stop budget without parsing
+        # cumulative counters; this remains a single bounded integer.
+        "processed_this_invocation": max(0, int(processed_this_invocation)),
+    }
+
+
+def _emit_progress(row: dict[str, Any]) -> None:
+    print(json.dumps(row, ensure_ascii=False))
+
+
+class _RagCliError(RuntimeError):
+    """Bounded, stable CLI input/preflight failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
+def _require_resume_run_id(*, resume: bool, run_id: str | None) -> str:
+    if not isinstance(resume, bool):
+        resume = False
+    if not isinstance(run_id, str):
+        run_id = None
+    if resume and not str(run_id or "").strip():
+        raise _RagCliError(
+            "resume_requires_run_id",
+            "--resume requires --run-id; provide the saved stage run ID",
+        )
+    return str(run_id or uuid4().hex)
+
+
+async def _persist_paused_run(
+    store: Any,
+    *,
+    run_id: str,
+    workspace_id: str,
+    source_kind: LiteratureSourceKind | None = None,
+) -> None:
+    """Best-effort status transition after a bounded CLI stop.
+
+    Indexing has already durably committed the batch before this helper runs.
+    Stores without run persistence (including narrow test doubles) are left
+    untouched; a resume still recovers from the committed cursor.
+    """
+    getter = getattr(store, "get_ingestion_run", None)
+    writer = getattr(store, "upsert_ingestion_run", None)
+    if not callable(getter) or not callable(writer):
+        return
+    try:
+        try:
+            record = getter(
+                run_id,
+                workspace_id,
+                source_kind=source_kind,
+            ) if source_kind is not None else getter(run_id, workspace_id)
+        except TypeError:
+            record = getter(run_id, workspace_id)
+        if hasattr(record, "__await__"):
+            record = await record
+        if record is None:
+            return
+        try:
+            paused = dataclass_replace(record, status="paused")
+        except TypeError:
+            paused = record
+            try:
+                setattr(paused, "status", "paused")
+            except Exception:
+                return
+        try:
+            result = (
+                writer(paused, wait=True, source_kind=source_kind)
+                if source_kind is not None
+                else writer(paused, wait=True)
+            )
+        except TypeError:
+            result = writer(paused, wait=True)
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:
+        # The committed cursor remains the source of truth if a status-only
+        # update is unavailable; never turn a successful bounded stop into a
+        # failed import because a diagnostic write was rejected.
+        return
 
 
 def _evaluation_fixture_path() -> Path:
@@ -727,6 +907,17 @@ def rag_status(
         ("Passages", snapshot.get("passages", "unknown")),
         ("Indexed vectors", snapshot.get("indexed_vectors", "unknown")),
         ("Collection status", snapshot.get("collection_status", "unknown")),
+        (
+            "PDF stage",
+            snapshot.get("pdf_stage", snapshot.get("stage_pdf", "unknown")),
+        ),
+        (
+            "Abstract stage",
+            snapshot.get(
+                "abstract_stage",
+                snapshot.get("stage_abstracts", "unknown"),
+            ),
+        ),
         ("Capacity", snapshot.get("capacity", "unknown")),
         ("Capacity warning", snapshot.get("capacity_warning", "none") or "none"),
         ("Qdrant URL", sanitize_qdrant_url(config.qdrant_url)),
@@ -785,7 +976,11 @@ async def _index_until_complete(
     *,
     config: ScientificConfig,
     run_id: str,
+    stop_after: int | None = None,
+    progress: Any | None = None,
 ) -> dict[str, Any]:
+    if stop_after is not None and int(stop_after) < 1:
+        raise ValueError("stop_after must be positive")
     # Indexing owns the physical staging pair.  It intentionally does not
     # activate stable aliases; activation is a separate explicit command.
     store = _service_value(services, "store")
@@ -801,15 +996,79 @@ async def _index_until_complete(
     plan = await services.ingestion.plan(root, boundary)
     cursor: str | None = None
     last: dict[str, Any] = {"run_id": run_id, "complete": False}
+    started_at = monotonic()
+    processed_this_invocation = 0
+    previous_processed: int | None = None
     while True:
+        remaining = None
+        if stop_after is not None:
+            remaining = int(stop_after) - processed_this_invocation
+            if remaining <= 0:
+                last["paused"] = True
+                last["processed_this_invocation"] = processed_this_invocation
+                last["status"] = "paused"
+                if progress is not None:
+                    progress(
+                        _progress_row(
+                            last,
+                            processed_this_invocation=processed_this_invocation,
+                            started_at=started_at,
+                            status="paused",
+                        )
+                    )
+                return last
+        batch_limit = int(config.rag_tool_max_documents)
+        if remaining is not None:
+            batch_limit = min(batch_limit, remaining)
         stats = await services.ingestion.index_batch(
             plan,
             run_id=run_id,
             resume_cursor=cursor,
-            max_documents=config.rag_tool_max_documents,
+            max_documents=batch_limit,
         )
         last = _stats_dict(stats)
         last["run_id"] = run_id
+        batch_processed, previous_processed = _progress_delta(
+            stats,
+            previous_processed,
+            limit=batch_limit,
+        )
+        processed_this_invocation += batch_processed
+        last["processed_this_invocation"] = processed_this_invocation
+
+        budget_reached = (
+            stop_after is not None and processed_this_invocation >= int(stop_after)
+        )
+        if budget_reached and not bool(last.get("complete")) and not bool(
+            last.get("retryable")
+        ):
+            last["paused"] = True
+            last["status"] = "paused"
+            await _persist_paused_run(
+                store,
+                run_id=run_id,
+                workspace_id=str(
+                    _record_value(
+                        plan,
+                        "workspace_id",
+                        _service_value(services, "workspace_id", ""),
+                    )
+                ),
+                source_kind=LiteratureSourceKind.FULLTEXT,
+            )
+        else:
+            last["paused"] = False
+        if progress is not None:
+            progress(
+                _progress_row(
+                    last,
+                    processed_this_invocation=processed_this_invocation,
+                    started_at=started_at,
+                    status=str(last.get("status", "running")),
+                )
+            )
+        if bool(last.get("paused")):
+            return last
         if bool(last.get("complete")):
             return last
         # A failed document is intentionally left at the retry cursor.  Do
@@ -827,14 +1086,22 @@ async def _index_until_complete(
 def rag_index(
     directory: Path | None = typer.Option(None, "--directory"),
     run_id: str | None = typer.Option(None, "--run-id"),
+    resume: bool = typer.Option(False, "--resume", help="Resume the specified run ID."),
+    stop_after: int | None = typer.Option(None, "--stop-after", min=1),
     yes: bool = typer.Option(False, "--yes", help="Confirm external data transfer."),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
 ) -> None:
     """Run bounded ingestion batches until the resumable plan is complete."""
+    if not isinstance(stop_after, int):
+        stop_after = None
     boundary = _workspace(workspace)
     config = _config(workspace)
     root = _directory(boundary, directory, config)
-    effective_run_id = run_id or uuid4().hex
+    try:
+        effective_run_id = _require_resume_run_id(resume=resume, run_id=run_id)
+    except Exception as exc:
+        _print_error(exc)
+        raise typer.Exit(code=1) from exc
     try:
         # The disclosure is intentionally before service construction so a
         # declined confirmation cannot initialize an external client.
@@ -847,6 +1114,8 @@ def rag_index(
                 root,
                 config=config,
                 run_id=effective_run_id,
+                stop_after=stop_after,
+                progress=_emit_progress,
             )
         )
     except KeyboardInterrupt:
@@ -856,7 +1125,200 @@ def rag_index(
         _print_error(exc)
         raise typer.Exit(code=1) from exc
     print(json.dumps(stats, ensure_ascii=False))
-    if not bool(stats.get("complete", False)):
+    if not bool(stats.get("complete", False)) and not bool(stats.get("paused", False)):
+        raise typer.Exit(code=1)
+
+
+def _abstract_stats_dict(progress: Any, *, run_id: str) -> dict[str, Any]:
+    total = int(_record_value(progress, "total", 0) or 0)
+    processed = int(_record_value(progress, "processed", 0) or 0)
+    indexed = int(_record_value(progress, "indexed", 0) or 0)
+    unchanged = int(_record_value(progress, "unchanged", 0) or 0)
+    failed = int(_record_value(progress, "failed", 0) or 0)
+    skipped = int(_record_value(progress, "skipped_empty", 0) or 0) + int(
+        _record_value(progress, "skipped_invalid_key", 0) or 0
+    )
+    passages = int(_record_value(progress, "passages", 0) or 0)
+    complete = bool(_record_value(progress, "complete", False))
+    status = str(
+        _record_value(
+            progress,
+            "status",
+            "complete" if complete else "retryable" if failed else "running",
+        )
+    )
+    return {
+        "run_id": run_id,
+        "total": max(0, total),
+        "discovered": max(0, total),
+        "processed": max(0, processed),
+        "indexed": max(0, indexed),
+        "unchanged": max(0, unchanged),
+        "failed": max(0, failed),
+        "skipped": max(0, skipped),
+        "passages": max(0, passages),
+        "chunks": max(0, passages),
+        "next_cursor": _record_value(progress, "cursor", None),
+        "complete": complete,
+        "retryable": status == "retryable",
+        "status": status,
+        "errors": [
+            str(item)[:320]
+            for item in list(_record_value(progress, "errors", ()) or ())[:20]
+        ],
+    }
+
+
+async def _index_abstracts_until_complete(
+    ingestion: Any,
+    *,
+    run_id: str,
+    config: ScientificConfig,
+    stop_after: int | None = None,
+    progress: Any | None = None,
+    store: Any | None = None,
+) -> dict[str, Any]:
+    if stop_after is not None and int(stop_after) < 1:
+        raise ValueError("stop_after must be positive")
+    started_at = monotonic()
+    cursor: str | None = None
+    processed_this_invocation = 0
+    previous_processed: int | None = None
+    last: dict[str, Any] = {"run_id": run_id, "complete": False}
+    while True:
+        remaining = None
+        if stop_after is not None:
+            remaining = int(stop_after) - processed_this_invocation
+            if remaining <= 0:
+                last["paused"] = True
+                last["status"] = "paused"
+                last["processed_this_invocation"] = processed_this_invocation
+                if progress is not None:
+                    progress(
+                        _progress_row(
+                            last,
+                            processed_this_invocation=processed_this_invocation,
+                            started_at=started_at,
+                            status="paused",
+                        )
+                    )
+                return last
+        batch_limit = int(config.rag_tool_max_documents)
+        if remaining is not None:
+            batch_limit = min(batch_limit, remaining)
+        batch = await ingestion.index_batch(
+            run_id=run_id,
+            cursor=cursor,
+            limit=batch_limit,
+        )
+        last = _abstract_stats_dict(batch, run_id=run_id)
+        batch_processed, previous_processed = _progress_delta(
+            batch,
+            previous_processed,
+            limit=batch_limit,
+        )
+        processed_this_invocation += batch_processed
+        last["processed_this_invocation"] = processed_this_invocation
+        budget_reached = (
+            stop_after is not None and processed_this_invocation >= int(stop_after)
+        )
+        if budget_reached and not bool(last.get("complete")) and not bool(
+            last.get("retryable")
+        ):
+            last["paused"] = True
+            last["status"] = "paused"
+            effective_store = store if store is not None else getattr(ingestion, "store", None)
+            await _persist_paused_run(
+                effective_store,
+                run_id=run_id,
+                workspace_id=str(getattr(ingestion, "workspace_id", "")),
+                source_kind=LiteratureSourceKind.ABSTRACT,
+            )
+        else:
+            last["paused"] = False
+        if progress is not None:
+            progress(
+                _progress_row(
+                    last,
+                    processed_this_invocation=processed_this_invocation,
+                    started_at=started_at,
+                    status=str(last.get("status", "running")),
+                )
+            )
+        if bool(last.get("paused")) or bool(last.get("complete")):
+            return last
+        if bool(last.get("retryable")):
+            return last
+        next_cursor = last.get("next_cursor")
+        if next_cursor == cursor:
+            return last
+        cursor = str(next_cursor) if next_cursor is not None else None
+
+
+def _abstract_database(
+    boundary: Workspace, database: Path | None, config: ScientificConfig
+) -> Path:
+    value = database
+    if value is None:
+        value = Path(config.literature_root) / "abstract" / "abstracts.sqlite3"
+    return boundary.resolve(str(value), must_exist=True)
+
+
+@rag_app.command("index-abstracts")
+def rag_index_abstracts(
+    database: Path | None = typer.Option(None, "--database"),
+    run_id: str | None = typer.Option(None, "--run-id"),
+    resume: bool = typer.Option(False, "--resume", help="Resume the specified run ID."),
+    stop_after: int | None = typer.Option(None, "--stop-after", min=1),
+    yes: bool = typer.Option(False, "--yes", help="Confirm external data transfer."),
+    workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+) -> None:
+    """Index one bounded, resumable batch of abstract records at a time."""
+    if not isinstance(stop_after, int):
+        stop_after = None
+    try:
+        effective_run_id = _require_resume_run_id(resume=resume, run_id=run_id)
+    except Exception as exc:
+        _print_error(exc)
+        raise typer.Exit(code=1) from exc
+    boundary = _workspace(workspace)
+    config = _config(workspace)
+    try:
+        source_database = _abstract_database(boundary, database, config)
+        _confirm_external(config, source_database, yes=yes)
+        # Construct the shared graph first so narrow test doubles and older
+        # callers that only accept the original two build arguments remain
+        # compatible; the database reader is then attached through the
+        # dedicated bounded abstract-stage factory.
+        services = build_literature_services(config, boundary)
+        ingestion = _service_value(services, "abstract_ingestion")
+        if ingestion is None:
+            ingestion = build_abstract_ingestion_service(
+                config,
+                boundary,
+                source_database,
+                services=services,
+            )
+        stats = asyncio.run(
+            _index_abstracts_until_complete(
+                ingestion,
+                run_id=effective_run_id,
+                config=config,
+                stop_after=stop_after,
+                progress=_emit_progress,
+                store=_service_value(services, "store"),
+            )
+        )
+    except KeyboardInterrupt:
+        console.print(
+            f"[yellow]摘要索引已中断；run_id={effective_run_id}，可使用 --run-id {effective_run_id} --resume 恢复。[/]"
+        )
+        raise typer.Exit(code=1) from None
+    except Exception as exc:
+        _print_error(exc)
+        raise typer.Exit(code=1) from exc
+    print(json.dumps(stats, ensure_ascii=False))
+    if not bool(stats.get("complete", False)) and not bool(stats.get("paused", False)):
         raise typer.Exit(code=1)
 
 
@@ -867,6 +1329,26 @@ def rag_activate(
         False,
         "--bootstrap",
         help="Explicitly allow activating an empty generation for a new corpus.",
+    ),
+    require_stage: list[str] = typer.Option(
+        [],
+        "--require-stage",
+        help="Require a completed stage run (pdf or abstracts) before activation.",
+    ),
+    pdf_run_id: str | None = typer.Option(
+        None,
+        "--pdf-run-id",
+        help="Completed PDF-stage run ID used by --require-stage pdf.",
+    ),
+    abstract_run_id: str | None = typer.Option(
+        None,
+        "--abstract-run-id",
+        help="Completed abstract-stage run ID used by --require-stage abstracts.",
+    ),
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help="Run ID when exactly one required stage is supplied.",
     ),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
 ) -> None:
@@ -884,6 +1366,14 @@ def rag_activate(
         embedder = _service_value(services, "ingestion").embedder
 
         async def activate() -> Any:
+            await _validate_required_stages(
+                services,
+                boundary,
+                require_stage,
+                pdf_run_id=pdf_run_id,
+                abstract_run_id=abstract_run_id,
+                run_id=run_id,
+            )
             ensure = getattr(store, "ensure_generation")
             generation = ensure(
                 identity=embedder.identity,
@@ -915,6 +1405,122 @@ def rag_activate(
             ensure_ascii=False,
         )
     )
+
+
+async def _validate_required_stages(
+    services: Any,
+    boundary: Workspace,
+    stages: list[str] | tuple[str, ...] | None,
+    *,
+    pdf_run_id: str | None = None,
+    abstract_run_id: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    """Fail closed unless each explicitly required stage has a complete run.
+
+    The direct CLI intentionally does not scan an unbounded collection of run
+    records.  Callers (including the WSL driver) provide the durable run IDs
+    they want checked, while Qdrant still validates workspace and generation at
+    its run-record boundary.
+    """
+    if not isinstance(stages, (list, tuple)):
+        # Direct Python callers see Typer's ``OptionInfo`` defaults when they
+        # omit newly added keyword options; treat those defaults as empty.
+        requested: list[str] = []
+    else:
+        requested = [str(stage).strip().casefold() for stage in stages]
+    if not requested:
+        return
+    aliases = {"abstract": "abstracts", "fulltext": "pdf", "papers": "pdf"}
+    requested = [aliases.get(stage, stage) for stage in requested]
+    unknown = [stage for stage in requested if stage not in {"pdf", "abstracts"}]
+    if unknown:
+        raise _RagCliError(
+            "stage_invalid",
+            "unknown required stage: " + ", ".join(dict.fromkeys(unknown)),
+        )
+    selected_ids = {
+        "pdf": str(pdf_run_id or "").strip(),
+        "abstracts": str(abstract_run_id or "").strip(),
+    }
+    if len(requested) == 1 and run_id:
+        selected_ids[requested[0]] = str(run_id).strip()
+    workspace_id = str(
+        _service_value(
+            services,
+            "workspace_id",
+            _workspace_id_for_boundary(boundary),
+        )
+    )
+    getter = getattr(_service_value(services, "store"), "get_ingestion_run", None)
+    if not callable(getter):
+        raise _RagCliError(
+            "stage_incomplete",
+            "ingestion run records are unavailable",
+        )
+    for stage in dict.fromkeys(requested):
+        stage_run_id = selected_ids[stage]
+        if not stage_run_id:
+            raise _RagCliError(
+                "stage_incomplete",
+                f"{stage} stage requires an explicit completed run ID",
+            )
+        expected_kind = (
+            LiteratureSourceKind.FULLTEXT
+            if stage == "pdf"
+            else LiteratureSourceKind.ABSTRACT
+        )
+        try:
+            try:
+                record = getter(
+                    stage_run_id,
+                    workspace_id,
+                    source_kind=expected_kind,
+                )
+            except TypeError:
+                record = getter(stage_run_id, workspace_id)
+            if hasattr(record, "__await__"):
+                record = await record
+        except Exception as exc:
+            raise _RagCliError(
+                "stage_incomplete",
+                f"{stage} stage run could not be validated",
+            ) from exc
+        if record is None:
+            raise _RagCliError(
+                "stage_incomplete",
+                f"{stage} stage run is missing or does not match the current generation",
+            )
+        source_kind = _record_value(record, "source_kind", None)
+        try:
+            source_kind = LiteratureSourceKind(source_kind)
+        except (TypeError, ValueError) as exc:
+            raise _RagCliError(
+                "stage_incomplete",
+                f"{stage} stage run has no valid source kind",
+            ) from exc
+        if source_kind is not expected_kind:
+            raise _RagCliError(
+                "stage_incomplete",
+                f"{stage} stage run source kind does not match",
+            )
+        stats = _record_value(record, "stats", record)
+        complete = bool(_record_value(stats, "complete", False))
+        retryable = bool(_record_value(stats, "retryable", False))
+        status = str(_record_value(record, "status", ""))
+        if not complete or retryable or status != "complete":
+            raise _RagCliError(
+                "stage_incomplete",
+                f"{stage} stage run is not complete",
+            )
+
+
+def _workspace_id_for_boundary(boundary: Workspace) -> str:
+    from photomatagent.scientific.capabilities.literature.qdrant_store import (
+        workspace_id_for,
+    )
+
+    return workspace_id_for(boundary.root.resolve())
 
 
 @rag_app.command("search")

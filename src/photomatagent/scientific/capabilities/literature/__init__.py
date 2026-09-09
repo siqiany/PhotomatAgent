@@ -31,6 +31,17 @@ from photomatagent.scientific.capabilities.contracts import (
 from photomatagent.scientific.capabilities.literature.models import (
     LITERATURE_CHUNK_SCHEMA_VERSION,
 )
+from photomatagent.scientific.capabilities.literature.abstract_ingestion import (
+    AbstractIngestionError,
+    AbstractIngestionProgress,
+    AbstractIngestionRunState,
+    AbstractIngestionService,
+    AbstractIngestionStats,
+    AbstractSourceRecord,
+    SQLiteAbstractReader,
+    abstract_document_id_for,
+    canonical_abstract_revision,
+)
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
@@ -56,6 +67,12 @@ class LiteratureServices:
     retriever: Any
     store: Any
     workspace_id: str
+    abstract_ingestion: Any | None = None
+
+    @property
+    def abstracts(self) -> Any | None:
+        """Compatibility alias for the optional abstract-stage service."""
+        return self.abstract_ingestion
 
 
 def build_literature_services(
@@ -65,6 +82,8 @@ def build_literature_services(
     store: Any | None = None,
     embedder: Any | None = None,
     reranker: Any | None = None,
+    abstract_database: Path | str | None = None,
+    database: Path | str | None = None,
 ) -> LiteratureServices:
     """Build the one shared literature application-service graph lazily."""
     from photomatagent.scientific.capabilities.literature.ingestion import (
@@ -92,6 +111,27 @@ def build_literature_services(
         reranker if reranker is not None else build_reranker_provider(config)
     )
     workspace_id = workspace_id_for(workspace.root.resolve())
+    selected_database = abstract_database if abstract_database is not None else database
+    abstract_ingestion: Any | None = None
+    if selected_database is not None:
+        from photomatagent.scientific.capabilities.literature.abstract_ingestion import (
+            AbstractIngestionService,
+            SQLiteAbstractReader,
+        )
+
+        resolved_database = workspace.resolve(str(selected_database), must_exist=True)
+        reader = SQLiteAbstractReader(
+            resolved_database,
+            workspace_root=workspace.root,
+        )
+        abstract_ingestion = AbstractIngestionService(
+            reader,
+            effective_store,
+            effective_embedder,
+            workspace_id=workspace_id,
+            workspace_root=workspace.root,
+            batch_size=config.rag_tool_max_documents,
+        )
     return LiteratureServices(
         ingestion=LiteratureIngestionService(
             effective_store,
@@ -106,6 +146,50 @@ def build_literature_services(
         ),
         store=effective_store,
         workspace_id=workspace_id,
+        abstract_ingestion=abstract_ingestion,
+    )
+
+
+def build_abstract_ingestion_service(
+    config: ScientificConfig,
+    workspace: Workspace,
+    database: Path | str,
+    *,
+    services: LiteratureServices | Any | None = None,
+) -> Any:
+    """Build the bounded SQLite abstract-stage service on the shared graph.
+
+    The database path is always resolved through the workspace boundary before
+    the read-only SQLite reader is opened.  Passing an existing service graph
+    keeps the store/embedder instances shared with the PDF stage.
+    """
+    if services is not None:
+        existing = _service_value(services, "abstract_ingestion")
+        if existing is None:
+            existing = _service_value(services, "abstracts")
+        if existing is not None:
+            return existing
+    selected_services = services or build_literature_services(config, workspace)
+    resolved_database = workspace.resolve(str(database), must_exist=True)
+    from photomatagent.scientific.capabilities.literature.abstract_ingestion import (
+        AbstractIngestionService,
+        SQLiteAbstractReader,
+    )
+
+    reader = SQLiteAbstractReader(resolved_database, workspace_root=workspace.root)
+    return AbstractIngestionService(
+        reader,
+        _service_value(selected_services, "store"),
+        _service_value(selected_services, "ingestion").embedder,
+        workspace_id=str(
+            _service_value(
+                selected_services,
+                "workspace_id",
+                _workspace_id(workspace),
+            )
+        ),
+        workspace_root=workspace.root,
+        batch_size=config.rag_tool_max_documents,
     )
 
 

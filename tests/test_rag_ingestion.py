@@ -25,6 +25,8 @@ from photomatagent.scientific.capabilities.literature.models import (
     DocumentManifest,
     DocumentStatus,
     IngestState,
+    LITERATURE_CHUNK_SCHEMA_VERSION,
+    LiteratureSourceKind,
     PaperRecord,
     PassageRecord,
 )
@@ -288,6 +290,32 @@ async def test_plan_uses_source_aware_chunk_schema_generation(
     await LiteratureIngestionService(store, FakeEmbedder()).plan(root, WORKSPACE)
 
     assert store.expected_generation_versions == [2]
+
+
+async def test_pdf_records_are_explicitly_fulltext_and_source_aware(
+    pdf: Path, store: FakeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paper, chunks = _passages("one")
+    monkeypatch.setattr(ingestion, "parse_pdf", lambda path: (paper, chunks))
+    item = IngestionPlanItem(
+        document_id=document_id_for(WORKSPACE, "paper.pdf"),
+        relative_source_path="paper.pdf",
+        content_sha256=_sha(pdf.read_bytes()),
+        kind=PlanKind.NEW,
+    )
+    plan = IngestionPlan(WORKSPACE, GENERATION, (item,), source_root=pdf.parent)
+
+    result = await LiteratureIngestionService(store, FakeEmbedder()).index_batch(
+        plan, run_id="fulltext-run", max_documents=1
+    )
+
+    assert result.complete is True
+    manifest = store.documents[item.document_id]
+    assert manifest.schema_version == LITERATURE_CHUNK_SCHEMA_VERSION
+    assert manifest.source_kind is LiteratureSourceKind.FULLTEXT
+    point = store.passage_upserts[-1][0]
+    assert point.schema_version == LITERATURE_CHUNK_SCHEMA_VERSION
+    assert point.source_kind is LiteratureSourceKind.FULLTEXT
 
 
 async def test_missing_root_never_deletes_existing_documents(

@@ -26,6 +26,7 @@ from photomatagent.scientific.capabilities.literature.models import (
     DocumentStatus,
     IngestState,
     LITERATURE_CHUNK_SCHEMA_VERSION,
+    LiteratureSourceKind,
     PaperRecord,
     validate_relative_source_path,
 )
@@ -137,6 +138,7 @@ class IngestionRunState:
     cursor: str | None
     status: str
     stats: IngestionStats
+    source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT
 
 
 def _require_workspace_id(workspace_id: str) -> str:
@@ -527,7 +529,7 @@ class LiteratureIngestionService:
         last_error: str = "",
     ) -> DocumentManifest:
         return DocumentManifest(
-            schema_version=1,
+            schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
             record_type="document",
             workspace_id=workspace_id,
             document_id=item.document_id,
@@ -543,6 +545,7 @@ class LiteratureIngestionService:
             model_fingerprint=model_fingerprint,
             indexed_at=datetime.now(timezone.utc) if status is DocumentStatus.READY else None,
             last_error=last_error,
+            source_kind=LiteratureSourceKind.FULLTEXT,
         )
 
     async def _mark_failed(
@@ -642,7 +645,15 @@ class LiteratureIngestionService:
         )
         if len(points) != len(vectors):
             raise RagProviderError("vector_count_mismatch", "embedding count does not match passages")
-        points = [replace(point, dense=tuple(vector)) for point, vector in zip(points, vectors)]
+        points = [
+            replace(
+                point,
+                schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
+                source_kind=LiteratureSourceKind.FULLTEXT,
+                dense=tuple(vector),
+            )
+            for point, vector in zip(points, vectors)
+        ]
         await self.store.upsert_passages(
             points,
             batch_size=self.batch_size,

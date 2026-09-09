@@ -291,6 +291,107 @@ async def test_index_until_complete_uses_source_aware_chunk_schema_generation(tm
     assert versions == [2]
 
 
+@pytest.mark.asyncio
+async def test_index_pauses_after_requested_budget(tmp_path) -> None:
+    rows: list[dict[str, object]] = []
+    calls: list[int] = []
+
+    class Embedder:
+        identity = object()
+
+    class Store:
+        def ensure_generation(self, *, identity, chunk_schema_version):
+            del identity, chunk_schema_version
+            return SimpleNamespace()
+
+    class Ingestion:
+        embedder = Embedder()
+
+        async def plan(self, root, boundary):
+            del root, boundary
+            return SimpleNamespace(items=[object()] * 100)
+
+        async def index_batch(self, plan, **kwargs):
+            del plan
+            requested = int(kwargs["max_documents"])
+            calls.append(requested)
+            processed = sum(calls)
+            return SimpleNamespace(
+                run_id="pdf-run",
+                discovered=100,
+                processed=processed,
+                unchanged=0,
+                indexed=processed,
+                failed=0,
+                deleted=0,
+                chunks=processed,
+                staged_cleanup=0,
+                next_cursor=f"paper-{processed}",
+                complete=False,
+                retryable=False,
+                errors=(),
+            )
+
+    services = SimpleNamespace(ingestion=Ingestion(), store=Store())
+    result = await rag_cli._index_until_complete(
+        services,
+        Workspace(tmp_path),
+        tmp_path,
+        config=rag_cli.ScientificConfig(rag_tool_max_documents=20),
+        run_id="pdf-run",
+        stop_after=25,
+        progress=rows.append,
+    )
+
+    assert result["paused"] is True
+    assert result["processed_this_invocation"] <= 25
+    assert rows
+    assert calls == [20, 5]
+
+
+def test_abstract_resume_requires_run_id(cli_runner: CliRunner, tmp_path) -> None:
+    result = cli_runner.invoke(
+        app,
+        ["rag", "index-abstracts", "--resume", "--workspace", str(tmp_path)],
+    )
+    assert result.exit_code == 1
+    assert "resume_requires_run_id" in result.stdout
+
+
+def test_activate_rejects_incomplete_required_stage(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    class Store:
+        async def get_ingestion_run(self, run_id, workspace_id, **kwargs):
+            del run_id, workspace_id, kwargs
+            return None
+
+    services = SimpleNamespace(
+        store=Store(),
+        ingestion=SimpleNamespace(embedder=SimpleNamespace(identity=object())),
+    )
+    monkeypatch.setattr(rag_cli, "_config", lambda workspace: object())
+    monkeypatch.setattr(
+        rag_cli, "build_literature_services", lambda config, workspace: services
+    )
+    result = cli_runner.invoke(
+        app,
+        [
+            "rag",
+            "activate",
+            "--require-stage",
+            "pdf",
+            "--require-stage",
+            "abstracts",
+            "--yes",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "stage_incomplete" in result.stdout
+
+
 def test_rag_activate_uses_source_aware_chunk_schema_generation(
     tmp_path, monkeypatch
 ) -> None:
