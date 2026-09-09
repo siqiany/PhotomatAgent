@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from photomatagent.scientific.capabilities.literature.models import LiteratureSourceKind
+from photomatagent.scientific.capabilities.literature.models import (
+    LITERATURE_CHUNK_SCHEMA_VERSION,
+    LiteratureSourceKind,
+)
 from photomatagent.scientific.capabilities.literature.qdrant_store import (
     SearchCandidate,
     collection_fingerprint,
@@ -258,6 +261,7 @@ def _neighbor_is_compatible(
     workspace_id: str,
     document_id: str,
     document_revision: str,
+    source_kind: LiteratureSourceKind,
 ) -> bool:
     return (
         str(_ready_neighbor_value(item, "passage_id", "")) == requested_id
@@ -266,6 +270,8 @@ def _neighbor_is_compatible(
         and str(_ready_neighbor_value(item, "document_revision", ""))
         == document_revision
         and _enum_value(_ready_neighbor_value(item, "ingest_state", "")) == "ready"
+        and _source_kind_value(_ready_neighbor_value(item, "source_kind", None))
+        == source_kind.value
     )
 
 
@@ -278,7 +284,7 @@ class LiteratureRetriever:
         embedder: Any,
         reranker: Any,
         *,
-        chunk_schema_version: int = 2,
+        chunk_schema_version: int = LITERATURE_CHUNK_SCHEMA_VERSION,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -527,6 +533,7 @@ class LiteratureRetriever:
         rows: Sequence[tuple[str, float, dict[str, Any], float]],
         *,
         workspace_id: str,
+        source_kind: LiteratureSourceKind,
         expand_radius: int,
         context_chars: int,
     ) -> dict[str, tuple[str, str]]:
@@ -564,7 +571,9 @@ class LiteratureRetriever:
 
         try:
             neighbors = await self._store.retrieve_passages(
-                workspace_id, requested_ids[:MAX_NEIGHBOR_IDS]
+                workspace_id,
+                requested_ids[:MAX_NEIGHBOR_IDS],
+                source_kind=source_kind,
             )
         except Exception:
             return contexts
@@ -583,6 +592,7 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     document_id=document_id,
                     document_revision=revision,
+                    source_kind=source_kind,
                 ):
                     neighbor_map[neighbor_id] = neighbor
 
@@ -603,6 +613,7 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     document_id=document_id,
                     document_revision=revision,
+                    source_kind=source_kind,
                 ):
                     break
                 previous_parts.append(str(_ready_neighbor_value(neighbor, "text", "")))
@@ -622,6 +633,7 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     document_id=document_id,
                     document_revision=revision,
+                    source_kind=source_kind,
                 ):
                     break
                 next_parts.append(str(_ready_neighbor_value(neighbor, "text", "")))
@@ -749,6 +761,7 @@ class LiteratureRetriever:
         contexts = await self._contexts(
             final_rows,
             workspace_id=workspace_id,
+            source_kind=requested_source_kind,
             expand_radius=expand_radius,
             context_chars=context_chars,
         )

@@ -101,6 +101,7 @@ class CancellingEmbedder(FakeEmbedder):
 class FakeStore:
     def __init__(self) -> None:
         self.generation = GENERATION
+        self.expected_generation_versions: list[int] = []
         self.manifests: dict[str, DocumentManifest] = {}
         self.passage_upserts: list[list[Any]] = []
         self.documents: dict[str, DocumentManifest] = {}
@@ -112,6 +113,13 @@ class FakeStore:
         self.fail_old_revision_cleanup = False
 
     async def resolve_current_generation(self) -> CollectionGeneration:
+        return self.generation
+
+    def expected_generation(
+        self, *, identity: Any, chunk_schema_version: int
+    ) -> CollectionGeneration:
+        del identity
+        self.expected_generation_versions.append(chunk_schema_version)
         return self.generation
 
     async def list_document_manifests(self, workspace_id: str) -> dict[str, DocumentManifest]:
@@ -268,6 +276,18 @@ async def test_plan_classifies_new_changed_unchanged_and_deleted(
         PlanKind.DELETED,
         PlanKind.UNCHANGED,
     ]
+
+
+async def test_plan_uses_source_aware_chunk_schema_generation(
+    tmp_path: Path, store: FakeStore
+) -> None:
+    root = tmp_path / "papers"
+    root.mkdir()
+    (root / "paper.pdf").write_bytes(b"paper")
+
+    await LiteratureIngestionService(store, FakeEmbedder()).plan(root, WORKSPACE)
+
+    assert store.expected_generation_versions == [2]
 
 
 async def test_missing_root_never_deletes_existing_documents(

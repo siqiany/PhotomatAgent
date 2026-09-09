@@ -24,6 +24,9 @@ from photomatagent.scientific.capabilities.literature import (
     LiteratureSearchPassagesTool,
     build_literature_services,
 )
+from photomatagent.scientific.capabilities.literature.models import (
+    LITERATURE_CHUNK_SCHEMA_VERSION,
+)
 from photomatagent.workspace import Workspace
 from photomatagent.scientific.capabilities.literature.qdrant_store import (
     sanitize_qdrant_url,
@@ -343,7 +346,10 @@ async def evaluate_live_fixture(
             raise RuntimeError("live literature services are unavailable")
 
         ensure = getattr(store, "ensure_generation")
-        generation = ensure(identity=embedder.identity, chunk_schema_version=1)
+        generation = ensure(
+            identity=embedder.identity,
+            chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
+        )
         if hasattr(generation, "__await__"):
             generation = await generation
         select_staging = getattr(store, "select_staging_generation", None)
@@ -788,7 +794,7 @@ async def _index_until_complete(
     if callable(ensure_generation):
         generation = ensure_generation(
             identity=embedder.identity,
-            chunk_schema_version=1,
+            chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
         )
         if hasattr(generation, "__await__"):
             generation = await generation
@@ -879,7 +885,10 @@ def rag_activate(
 
         async def activate() -> Any:
             ensure = getattr(store, "ensure_generation")
-            generation = ensure(identity=embedder.identity, chunk_schema_version=1)
+            generation = ensure(
+                identity=embedder.identity,
+                chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
+            )
             if hasattr(generation, "__await__"):
                 generation = await generation
             activate_method = getattr(store, "activate_generation")

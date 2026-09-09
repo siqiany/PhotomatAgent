@@ -76,6 +76,11 @@ class LiteratureSourceKind(str, Enum):
     ABSTRACT = "abstract"
 
 
+# Source-aware payloads are a distinct semantic generation from legacy points
+# that predate the ``source_kind`` field.
+LITERATURE_CHUNK_SCHEMA_VERSION = 2
+
+
 @dataclass(frozen=True)
 class DocumentManifest:
     """Vectorless document control record persisted in Qdrant.

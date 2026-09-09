@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner
@@ -235,3 +237,86 @@ async def test_index_until_complete_stops_after_unresolved_retryable_batch(
     assert calls == 1
     assert result["complete"] is False
     assert result["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_index_until_complete_uses_source_aware_chunk_schema_generation(tmp_path) -> None:
+    versions: list[int] = []
+
+    class Embedder:
+        identity = object()
+
+    class Store:
+        def ensure_generation(self, *, identity, chunk_schema_version):
+            del identity
+            versions.append(chunk_schema_version)
+            return SimpleNamespace()
+
+    class Ingestion:
+        embedder = Embedder()
+
+        async def plan(self, root, boundary):
+            del root, boundary
+            return object()
+
+        async def index_batch(self, plan, **kwargs):
+            del plan, kwargs
+            return SimpleNamespace(
+                run_id="run",
+                discovered=0,
+                unchanged=0,
+                indexed=0,
+                failed=0,
+                deleted=0,
+                chunks=0,
+                staged_cleanup=0,
+                next_cursor=None,
+                complete=True,
+                retryable=False,
+                errors=(),
+            )
+
+    class Services:
+        ingestion = Ingestion()
+        store = Store()
+
+    await rag_cli._index_until_complete(
+        Services(),
+        Workspace(tmp_path),
+        tmp_path,
+        config=rag_cli.ScientificConfig(rag_tool_max_documents=1),
+        run_id="run",
+    )
+
+    assert versions == [2]
+
+
+def test_rag_activate_uses_source_aware_chunk_schema_generation(
+    tmp_path, monkeypatch
+) -> None:
+    versions: list[int] = []
+    generation = SimpleNamespace(
+        fingerprint="f" * 64,
+        documents_physical="documents",
+        passages_physical="passages",
+    )
+
+    class Store:
+        def ensure_generation(self, *, identity, chunk_schema_version):
+            del identity
+            versions.append(chunk_schema_version)
+            return generation
+
+        async def activate_generation(self, value, *, allow_empty_bootstrap):
+            assert value is generation
+            assert allow_empty_bootstrap is True
+
+    services = SimpleNamespace(
+        store=Store(), ingestion=SimpleNamespace(embedder=SimpleNamespace(identity=object()))
+    )
+    monkeypatch.setattr(rag_cli, "_config", lambda workspace: object())
+    monkeypatch.setattr(rag_cli, "build_literature_services", lambda config, workspace: services)
+
+    rag_cli.rag_activate(yes=True, bootstrap=True, workspace=tmp_path)
+
+    assert versions == [2]

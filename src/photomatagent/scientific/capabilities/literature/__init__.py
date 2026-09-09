@@ -28,6 +28,9 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
 )
+from photomatagent.scientific.capabilities.literature.models import (
+    LITERATURE_CHUNK_SCHEMA_VERSION,
+)
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
@@ -99,6 +102,7 @@ def build_literature_services(
             effective_store,
             effective_embedder,
             effective_reranker,
+            chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
         ),
         store=effective_store,
         workspace_id=workspace_id,
@@ -137,7 +141,7 @@ def _error_result(exc: BaseException, *, operation: str) -> ScientificToolResult
 
 
 _PROBE_TIMEOUT_SECONDS = 2
-_CHUNK_SCHEMA_VERSION = 1
+_CHUNK_SCHEMA_VERSION = LITERATURE_CHUNK_SCHEMA_VERSION
 _PROVIDER_UNCONFIGURED_CODES = {
     "external_provider_not_allowed",
     "external_api_key_env_missing",

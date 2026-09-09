@@ -25,6 +25,7 @@ from photomatagent.scientific.capabilities.literature.models import (
     DocumentManifest,
     DocumentStatus,
     IngestState,
+    LITERATURE_CHUNK_SCHEMA_VERSION,
     PaperRecord,
     validate_relative_source_path,
 )
@@ -334,7 +335,7 @@ class LiteratureIngestionService:
         if callable(expected):
             generation = expected(
                 identity=self.embedder.identity,
-                chunk_schema_version=1,
+                chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
             )
             if inspect.isawaitable(generation):
                 generation = await generation

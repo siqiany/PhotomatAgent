@@ -8,11 +8,13 @@ from typing import Any
 import pytest
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
+from photomatagent.scientific.capabilities import literature as literature_capability
 from photomatagent.scientific.capabilities.literature import (
     LiteratureExtractEvidenceTool,
     LiteratureIndexPapersTool,
     LiteratureReadPassageTool,
     LiteratureSearchPassagesTool,
+    build_literature_services,
 )
 from photomatagent.scientific.capabilities.literature.evidence import (
     extract_evidence_from_text,
@@ -25,11 +27,38 @@ from photomatagent.scientific.capabilities.literature.retrieval import (
     RetrievalDiagnostics,
     RetrievalResult,
 )
+from photomatagent.scientific.capabilities.literature import retrieval as retrieval_module
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
 
 CONFIG = ScientificConfig()
+
+
+def test_literature_probe_uses_source_aware_generation_version() -> None:
+    assert literature_capability._CHUNK_SCHEMA_VERSION == 2
+
+
+def test_build_literature_services_passes_source_aware_generation_version(
+    tmp_path, monkeypatch
+) -> None:
+    seen: list[int | None] = []
+
+    class CapturingRetriever:
+        def __init__(self, store, embedder, reranker, **kwargs: Any) -> None:
+            del store, embedder, reranker
+            seen.append(kwargs.get("chunk_schema_version"))
+
+    monkeypatch.setattr(retrieval_module, "LiteratureRetriever", CapturingRetriever)
+    build_literature_services(
+        CONFIG,
+        Workspace(tmp_path),
+        store=object(),
+        embedder=object(),
+        reranker=object(),
+    )
+
+    assert seen == [2]
 
 
 class FakeIngestion:

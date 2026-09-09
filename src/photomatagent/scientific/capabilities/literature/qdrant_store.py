@@ -2168,7 +2168,11 @@ class QdrantLiteratureStore:
             return None
 
     async def retrieve_passages(
-        self, workspace_id: str, passage_ids: Sequence[str]
+        self,
+        workspace_id: str,
+        passage_ids: Sequence[str],
+        *,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
     ) -> list[PassagePoint]:
         if not passage_ids:
             return []
@@ -2180,6 +2184,7 @@ class QdrantLiteratureStore:
             scroll_filter=self._passage_filter(
                 workspace_id=workspace_id,
                 ingest_state=IngestState.READY,
+                source_kind=source_kind,
                 extra=(models.HasIdCondition(has_id=bounded_ids),),
             ),
             limit=len(bounded_ids),
@@ -2199,6 +2204,8 @@ class QdrantLiteratureStore:
                 payload.get("workspace_id") != workspace_id
                 or payload.get("record_type") != "passage"
                 or payload.get("ingest_state") != IngestState.READY.value
+                or _source_kind_value(payload.get("source_kind"))
+                != _source_kind_value(source_kind)
             ):
                 continue
             point = self._passage_from_record(record)

@@ -131,6 +131,7 @@ class FakeStore:
         self.dense_queries = 0
         self.sparse_queries = 0
         self.neighbor_calls: list[tuple[str, list[str]]] = []
+        self.neighbor_source_kinds: list[LiteratureSourceKind] = []
         self.neighbors: dict[str, Any] = {}
         self.hybrid_error: Exception | None = None
         self.dense_error: Exception | None = None
@@ -182,8 +183,15 @@ class FakeStore:
             raise self.sparse_error
         return list(self.sparse_results)
 
-    async def retrieve_passages(self, workspace_id: str, passage_ids: list[str]) -> list[Any]:
+    async def retrieve_passages(
+        self,
+        workspace_id: str,
+        passage_ids: list[str],
+        *,
+        source_kind: LiteratureSourceKind,
+    ) -> list[Any]:
         self.neighbor_calls.append((workspace_id, list(passage_ids)))
+        self.neighbor_source_kinds.append(source_kind)
         return [self.neighbors[passage_id] for passage_id in passage_ids if passage_id in self.neighbors]
 
 
@@ -460,6 +468,7 @@ async def test_neighbor_context_is_one_bounded_call_and_isolated() -> None:
             document_id="doc",
             document_revision="a" * 64,
             ingest_state="ready",
+            source_kind=LiteratureSourceKind.FULLTEXT,
             text="before context that is long",
             previous_passage_id=None,
             next_passage_id=None,
@@ -470,6 +479,7 @@ async def test_neighbor_context_is_one_bounded_call_and_isolated() -> None:
             document_id="doc",
             document_revision="a" * 64,
             ingest_state="ready",
+            source_kind=LiteratureSourceKind.FULLTEXT,
             text="must be rejected",
             previous_passage_id=None,
             next_passage_id=None,
@@ -482,9 +492,45 @@ async def test_neighbor_context_is_one_bounded_call_and_isolated() -> None:
 
     assert len(store.neighbor_calls) == 1
     assert store.neighbor_calls[0] == ("ws", ["before", "after"])
+    assert store.neighbor_source_kinds == [LiteratureSourceKind.FULLTEXT]
     assert len(result.passages[0].context_before) == 9
     assert result.passages[0].context_before.endswith("long")
     assert result.passages[0].context_after == ""
+
+
+@pytest.mark.asyncio
+async def test_neighbor_context_is_source_isolated() -> None:
+    center = candidate_fixture(1)[0]
+    center = SearchCandidate(
+        passage_id="center",
+        score=1.0,
+        payload={
+            **center.payload,
+            "passage_id": "center",
+            "previous_passage_id": "abstract-before",
+        },
+    )
+    store = FakeStore([center])
+    store.neighbors = {
+        "abstract-before": SimpleNamespace(
+            passage_id="abstract-before",
+            workspace_id="ws",
+            document_id="doc",
+            document_revision="a" * 64,
+            ingest_state="ready",
+            source_kind=LiteratureSourceKind.ABSTRACT,
+            text="abstract context must not leak",
+            previous_passage_id=None,
+            next_passage_id=None,
+        ),
+    }
+
+    result = await LiteratureRetriever(store, FakeEmbedder(), DisabledReranker()).search(
+        "query", workspace_id="ws", top_k=1, source_kind=LiteratureSourceKind.FULLTEXT
+    )
+
+    assert store.neighbor_source_kinds == [LiteratureSourceKind.FULLTEXT]
+    assert result.passages[0].context_before == ""
 
 
 @pytest.mark.asyncio

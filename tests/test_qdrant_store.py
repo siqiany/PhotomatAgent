@@ -1156,7 +1156,9 @@ async def test_retrieve_passages_uses_bounded_server_side_workspace_ready_filter
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_literature")
     await _ensure_active(store)
-    await store.retrieve_passages("workspace-a", [f"passage-{i}" for i in range(100)])
+    await store.retrieve_passages(
+        "workspace-a", [f"passage-{i}" for i in range(100)], source_kind="fulltext"
+    )
     call = client.query_calls[-1]
     assert call["kind"] == "scroll"
     assert call["limit"] == 50
@@ -1167,6 +1169,7 @@ async def test_retrieve_passages_uses_bounded_server_side_workspace_ready_filter
         "workspace_id": "workspace-a",
         "record_type": "passage",
         "ingest_state": "ready",
+        "source_kind": "fulltext",
     }
     id_conditions = [condition for condition in filt.must if hasattr(condition, "has_id")]
     assert len(id_conditions) == 1
