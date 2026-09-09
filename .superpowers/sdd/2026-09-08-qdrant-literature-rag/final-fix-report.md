@@ -185,5 +185,28 @@ Implementation/tests/docs commit: `d05b593` (`fix: harden qdrant literature
 rag final review`). The report is committed separately because
 `.superpowers/` is intentionally ignored by the repository defaults.
 
-No RAG final-review finding remains open. External Docker/model execution and
-the complete full-suite result are the only unverified conditions listed above.
+At the end of the subagent fix wave, no RAG final-review finding was believed
+open. The subsequent scoped re-review and controller corrections are recorded
+below.
+
+## Scoped re-review addendum
+
+The single scoped re-review of `f98bb76..8ce9072` returned `NOT READY` with two
+valid residuals. Controller-level TDD corrections were applied without opening
+another subagent loop:
+
+- Empty bootstrap previously checked only passage readiness, so it could move
+  existing current aliases to a new empty generation. The new regression test
+  failed first, then passed after bootstrap was restricted to either a service
+  with no current aliases or an idempotent revalidation of the same current
+  pair. A different or partial current pair is rejected before alias mutation.
+- `rag status` previously repeated workspace path resolution after the probe,
+  which discarded otherwise useful Qdrant diagnostics for an outside-workspace
+  source root. The new CLI regression failed first, then passed after status
+  rendering began using the probe's bounded `source_root` state with a guarded
+  compatibility fallback.
+
+Post-correction focused verification: `233 passed, 11 skipped`; `mypy src`,
+`uv lock --check --offline`, and `git diff --check` passed. The root agent reruns
+the complete pytest suite on the final commit and records its exact result in
+the user handoff.

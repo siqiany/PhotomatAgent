@@ -690,7 +690,16 @@ def rag_status(
     result = probe.probe()
     snapshot_method = getattr(probe, "status_snapshot", None)
     snapshot = snapshot_method() if callable(snapshot_method) else {}
-    source_root = boundary.resolve(config.literature_root, must_exist=False)
+    source_state = snapshot.get("source_root")
+    if not source_state or source_state == "unknown":
+        try:
+            source_root = boundary.resolve(config.literature_root, must_exist=False)
+        except Exception:
+            source_state = "outside workspace"
+        else:
+            source_state = (
+                f"{source_root} ({'ready' if source_root.is_dir() else 'missing'})"
+            )
     legacy_path = boundary.root / "output" / "literature_index"
     legacy_state = (
         f"present; not imported or modified ({legacy_path})"
@@ -720,7 +729,7 @@ def rag_status(
         ("Collection prefix", config.qdrant_collection_prefix),
         ("Embedding", snapshot.get("embedding_provider", f"{config.embedding_provider}/{config.embedding_model}")),
         ("Reranker", snapshot.get("reranker_provider", f"{config.reranker_provider}/{config.reranker_model}")),
-        ("Source root", f"{source_root} ({'ready' if source_root.is_dir() else 'missing'})"),
+        ("Source root", source_state),
         ("Legacy artifact", legacy_state),
     ]
     for label, value in rows:

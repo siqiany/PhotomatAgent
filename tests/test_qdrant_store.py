@@ -323,6 +323,32 @@ async def test_empty_generation_requires_explicit_bootstrap_before_activation() 
     assert client.aliases[generation.documents_alias] == generation.documents_physical
 
 
+async def test_empty_bootstrap_cannot_replace_existing_current_generation() -> None:
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_test_bootstrap_replace")
+    current = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=1)
+    await store.upsert_document(_manifest(model_fingerprint=current.fingerprint))
+    await store.upsert_passages(
+        [_passage(model_fingerprint=current.fingerprint)],
+        batch_size=1,
+        workspace_id="workspace-a",
+    )
+    await store.activate_generation(current)
+
+    replacement_identity = replace(IDENTITY, model="local/replacement-model")
+    replacement = await store.ensure_generation(
+        identity=replacement_identity,
+        chunk_schema_version=1,
+    )
+
+    with pytest.raises(QdrantStoreError) as exc:
+        await store.activate_generation(replacement, allow_empty_bootstrap=True)
+
+    assert exc.value.code == "generation_incomplete"
+    assert client.aliases[current.documents_alias] == current.documents_physical
+    assert client.aliases[current.passages_alias] == current.passages_physical
+
+
 async def test_public_switch_cannot_bypass_empty_generation_guard() -> None:
     client = FakeAsyncQdrantClient()
     store = QdrantLiteratureStore(client, prefix="photomat_test_empty_switch")

@@ -997,11 +997,26 @@ class QdrantLiteratureStore:
         allow_empty_bootstrap: bool,
     ) -> None:
         has_ready_passage = await self._validate_generation_ready(generation)
-        if not has_ready_passage and not allow_empty_bootstrap:
-            raise QdrantStoreError(
-                "generation_incomplete",
-                "generation has no ready indexed passages; use explicit bootstrap for an empty corpus",
+        if not has_ready_passage:
+            if not allow_empty_bootstrap:
+                raise QdrantStoreError(
+                    "generation_incomplete",
+                    "generation has no ready indexed passages; use explicit bootstrap for an empty corpus",
+                )
+            aliases = await self._alias_map()
+            current_pair = (
+                aliases.get(generation.documents_alias),
+                aliases.get(generation.passages_alias),
             )
+            target_pair = (
+                generation.documents_physical,
+                generation.passages_physical,
+            )
+            if any(value is not None for value in current_pair) and current_pair != target_pair:
+                raise QdrantStoreError(
+                    "generation_incomplete",
+                    "empty bootstrap is allowed only before current aliases exist",
+                )
 
     async def activate_generation(
         self,

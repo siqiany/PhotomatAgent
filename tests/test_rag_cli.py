@@ -98,6 +98,38 @@ def test_rag_status_shows_server_alias_and_generation_state(
     assert "1.18.2" in result.stdout
 
 
+def test_rag_status_is_fail_soft_for_source_root_outside_workspace(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("PHOTOMATAGENT_LITERATURE_DIR", "/etc")
+
+    class FakeProbe:
+        def __init__(self, config, workspace) -> None:
+            del config, workspace
+
+        def probe(self) -> ProbeResult:
+            return ProbeResult(
+                status=CapabilityStatus.UNCONFIGURED,
+                detail="source_root_missing",
+                version="qdrant-server=1.18.2",
+            )
+
+        def status_snapshot(self) -> dict[str, str]:
+            return {
+                "server_version": "1.18.2",
+                "alias_state": "ready",
+                "generation_state": "ready:123456789abc",
+                "source_root": "outside workspace",
+            }
+
+    monkeypatch.setattr(rag_cli, "LiteratureProbe", FakeProbe)
+    result = cli_runner.invoke(app, ["rag", "status", "--workspace", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "outside workspace" in result.stdout
+    assert "1.18.2" in result.stdout
+
+
 def test_rag_status_renders_credential_free_qdrant_url_and_connection_state(
     cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

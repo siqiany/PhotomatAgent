@@ -71,7 +71,8 @@ the provider/schema generation in physical staging collections and never
 changes the current aliases. Run the explicit `rag activate --yes` gate only
 after the complete run and retrieval checks pass. An empty first corpus must
 use the additional explicit `rag activate --yes --bootstrap` path; ordinary
-activation rejects empty or unresolved generations. Retrieval validates the
+activation rejects empty or unresolved generations, and bootstrap cannot
+replace an existing current generation. Retrieval validates the
 configured model fingerprint before querying. `rag evaluate` creates a
 unique, disposable synthetic Qdrant prefix and runs every authored judgment
 through `LiteratureRetriever`; it never selects rows from the production
