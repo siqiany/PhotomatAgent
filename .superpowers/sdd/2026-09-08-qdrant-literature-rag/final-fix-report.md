@@ -210,3 +210,11 @@ Post-correction focused verification: `233 passed, 11 skipped`; `mypy src`,
 `uv lock --check --offline`, and `git diff --check` passed. The root agent reruns
 the complete pytest suite on the final commit and records its exact result in
 the user handoff.
+
+Final root verification on commit `612fa88` completed with `1559 passed, 17
+skipped, 9 failed, 57 warnings`. The nine failures are the same pre-existing,
+out-of-scope baseline group recorded earlier: unavailable kdotpy behavior,
+four MAGUS tests requiring ASE, the unrelated tool-catalog effective-mass
+ranking, two missing JARVIS archives, and two VASP isosurface expectations. No
+RAG-focused test failed. Docker remained unavailable in WSL, so the three
+opt-in live Qdrant gates remain explicitly unexecuted.
