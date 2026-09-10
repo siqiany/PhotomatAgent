@@ -65,3 +65,31 @@ requirements and IDs. No provider or Qdrant service was started.
 
 The full test suite, real PDF/SQLite corpus, model downloads, live Qdrant,
 external providers, external APIs, and live arXiv were not run.
+
+## Review fix round 1
+
+The review requested executable coverage instead of only source-string and
+stdout assertions. Added a small fake-`uv` subprocess harness that captures
+NUL-delimited argv and verifies:
+
+- spaced workspace/source paths are one argv element;
+- the generated stage ID is visible to the fake CLI before it starts;
+- resume reuses the exact saved ID and missing state fails without invoking
+  the CLI;
+- status forwards both IDs, while activation forwards both IDs and both
+  explicit stage requirements and fails closed when either ID is missing;
+- `--yes` is omitted by default and included only when requested;
+- dry-run neither creates state nor invokes the fake CLI.
+
+These tests pass against the existing driver, so no production behavior change
+was needed for this coverage review. The documentation now states that the
+relative examples assume repository-root cwd and gives an absolute-script-path
+alternative for other cwd.
+
+Review-fix verification:
+
+```text
+UV_CACHE_DIR=/tmp/photomatagent-uv-cache uv run pytest -q tests/test_import_literature_script.py
+# 7 passed in 0.30s
+bash -n scripts/import_literature_qdrant.sh
+```

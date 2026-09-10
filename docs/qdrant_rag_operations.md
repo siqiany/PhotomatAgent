@@ -144,9 +144,11 @@ generation, query, filters, and source coverage; provenance gaps remain gaps.
 
 ## Two-stage import driver
 
-For the local corpus, use the thin WSL driver from any working directory. It
-changes to the repository root and invokes the current project's `uv`
-environment; it does not contain provider logic or call the Qdrant HTTP API.
+For the local corpus, use the thin WSL driver from the repository root (or
+invoke `bash /absolute/path/to/PhomatAgent/scripts/import_literature_qdrant.sh`
+from another working directory). The driver then changes to the repository
+root and invokes the current project's `uv` environment; it does not contain
+provider logic or call the Qdrant HTTP API.
 The default workspace is `/home/shiqiany/AIagent`, with these workspace-relative
 source paths:
 
