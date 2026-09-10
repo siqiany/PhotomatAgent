@@ -50,4 +50,3 @@ Targeted `mypy` over the four changed Python modules passed with no issues.
 - The WSL driver archives an existing stage ID before replacing state. Fresh
   abstract runs forward that prior ID as `--supersede-run-id`; explicit IDs may
   override it, while `--resume` and supersession are mutually exclusive.
-
