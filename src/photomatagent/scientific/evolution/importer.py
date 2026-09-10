@@ -157,7 +157,6 @@ class HistoricalSessionImporter:
 
     @staticmethod
     def _materialize(canonical: Path, payload: bytes, expected_sha: str) -> None:
-        HistoricalSessionImporter._cleanup_temporary_files(canonical)
         if canonical.is_file():
             if canonical.stat().st_size != len(payload) or sha256_file(canonical) != expected_sha:
                 raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
@@ -179,7 +178,6 @@ class HistoricalSessionImporter:
 
     @staticmethod
     def _materialize_from(canonical: Path, source: Path, expected_sha: str) -> None:
-        HistoricalSessionImporter._cleanup_temporary_files(canonical)
         if canonical.is_file():
             if sha256_file(canonical) != expected_sha:
                 raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
@@ -198,12 +196,5 @@ class HistoricalSessionImporter:
                     raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
         finally:
             temporary.unlink(missing_ok=True)
-
-    @staticmethod
-    def _cleanup_temporary_files(canonical: Path) -> None:
-        for candidate in canonical.parent.glob(f".{canonical.name}.importing-*"):
-            if candidate.is_file() or candidate.is_symlink():
-                candidate.unlink(missing_ok=True)
-
 
 __all__ = ["HistoricalSessionImporter", "HistoricalSessionPreview", "preview_historical_session"]

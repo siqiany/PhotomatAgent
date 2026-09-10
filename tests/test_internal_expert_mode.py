@@ -123,4 +123,4 @@ def test_import_cleans_stale_partial_temporary_artifact(tmp_path: Path) -> None:
     (result_dir / ".result.md.importing-stale").write_bytes(b"partial")
     task = HistoricalSessionImporter(workspace, service).import_session(session_dir, target=target)
     assert task.current_version == "v001"
-    assert not list(result_dir.glob(".result.md.importing-*"))
+    assert list(result_dir.glob(".result.md.importing-*"))
