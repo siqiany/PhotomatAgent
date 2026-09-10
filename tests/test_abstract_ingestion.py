@@ -646,6 +646,64 @@ async def test_explicit_supersession_allows_changed_source_path_and_cleans_both_
 
 
 @pytest.mark.asyncio
+async def test_completed_replacement_resume_retries_supersession_after_interruption(
+    abstract_db: Path,
+) -> None:
+    store = FakeAbstractStore()
+    old_service = AbstractIngestionService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+    await old_service.index_batch(run_id="old-run", limit=1)
+    old_service.reader.close()
+
+    class InterruptingService(AbstractIngestionService):
+        mark_attempts = 0
+
+        async def _mark_superseded(self, run: Any, *, new_run_id: str) -> None:
+            self.mark_attempts += 1
+            if self.mark_attempts == 1:
+                raise asyncio.CancelledError
+            await super()._mark_superseded(run, new_run_id=new_run_id)
+
+    replacement = InterruptingService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await replacement.index_batch(
+            run_id="replacement-run",
+            limit=3,
+            supersede_run_id="old-run",
+        )
+    assert store.runs["replacement-run"].stats.complete is True
+    assert store.runs["old-run"].status != "superseded"
+
+    resumed = await replacement.index_batch(
+        run_id="replacement-run",
+        resume=True,
+    )
+
+    assert resumed.complete is True
+    assert replacement.mark_attempts == 2
+    assert store.nonready_cleanup_calls == ["abstracts.sqlite3", "abstracts.sqlite3"]
+    assert store.runs["old-run"].status == "superseded"
+    assert store.runs["old-run"].superseded_by_run_id == "replacement-run"
+    replacement.reader.close()
+
+
+@pytest.mark.asyncio
 async def test_partial_failure_persists_cursor_after_skipped_and_committed_rows(
     abstract_db: Path,
 ) -> None:

@@ -199,6 +199,15 @@ promote_abstract_run() {
   local pending_state_file="$6"
   local pending_source_state_file="$7"
 
+  if [[ -z "$previous_run_id" && -f "$state_file" ]]; then
+    local current_active_run_id=""
+    IFS= read -r current_active_run_id < "$state_file" || true
+    current_active_run_id="$(trim_run_id "$current_active_run_id")"
+    if [[ -n "$current_active_run_id" && "$current_active_run_id" != "$run_id" ]]; then
+      previous_run_id="$current_active_run_id"
+    fi
+  fi
+
   if [[ -n "$previous_run_id" && "$previous_run_id" != "$run_id" ]]; then
     archive_run_id "abstracts" "$previous_run_id"
   fi

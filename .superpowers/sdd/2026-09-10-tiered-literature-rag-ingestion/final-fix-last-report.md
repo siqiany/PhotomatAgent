@@ -18,10 +18,17 @@
   source path. It cleans only source-scoped non-ready artifacts, retains READY
   knowledge, preserves run lineage, and marks the old run superseded only
   after the replacement completes.
+- A completed replacement run now retries source-scoped cleanup and its
+  supersession mark on resume after an interruption; an already superseded old
+  run is a safe no-op.
+- Pending promotion recovers the current active abstract run when the caller
+  has no previous ID, archives a different active ID before replacement, and
+  avoids duplicating that archive when promotion is retried.
 
 ## Verification
 
 - Targeted recovery and changed-source regressions — 2 passed
+- Crash-window regressions — 2 passed
 - Focused retrieval/import/service tests excluding the optional Qdrant
   roundtrip — 57 passed, 1 deselected
 - The complete focused-file invocation reached 57 passed and 1 failure only

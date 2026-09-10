@@ -431,6 +431,63 @@ def test_discard_pending_recovers_failed_supersession_without_touching_active(
     assert state_file.read_text(encoding="utf-8").strip() != "old-abstract-run"
 
 
+def test_pending_promotion_recovers_active_id_and_is_idempotent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("current-active-run\n", encoding="utf-8")
+    source_file = state_dir / "abstracts.source_path"
+    source_file.write_text("abstracts.sqlite3\n", encoding="utf-8")
+    pending_file = state_dir / "abstracts.pending.run_id"
+    pending_file.write_text("pending-run\n", encoding="utf-8")
+    pending_source_file = state_dir / "abstracts.pending.source_path"
+    pending_source_file.write_text("abstracts.sqlite3\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_STATE_FILE", str(state_file))
+
+    first_resume = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "abstracts.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+        "--resume",
+    )
+
+    assert first_resume.returncode == 0, first_resume.stderr
+    assert state_file.read_text(encoding="utf-8") == "pending-run\n"
+    archived = list((state_dir / "archive").glob("abstracts.*"))
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8").strip() == "current-active-run"
+    assert not pending_file.exists()
+    assert not pending_source_file.exists()
+
+    # A retry after active promotion but before pending cleanup must not
+    # archive the same active run a second time.
+    pending_file.write_text("pending-run\n", encoding="utf-8")
+    pending_source_file.write_text("abstracts.sqlite3\n", encoding="utf-8")
+    second_resume = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "abstracts.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+        "--resume",
+    )
+
+    assert second_resume.returncode == 0, second_resume.stderr
+    assert state_file.read_text(encoding="utf-8") == "pending-run\n"
+    assert len(list((state_dir / "archive").glob("abstracts.*"))) == 1
+    assert not pending_file.exists()
+    assert not pending_source_file.exists()
+
+
 def test_supersession_cannot_be_combined_with_resume(
     tmp_path: Path, monkeypatch
 ) -> None:

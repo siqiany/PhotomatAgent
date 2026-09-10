@@ -1242,6 +1242,8 @@ class AbstractIngestionService:
         return None
 
     async def _mark_superseded(self, run: Any, *, new_run_id: str) -> None:
+        if str(_value(run, "status", "")) == "superseded":
+            return
         stats = self._stats_from(
             _value(run, "stats", None),
             str(_value(run, "run_id", "")),
@@ -1350,6 +1352,7 @@ class AbstractIngestionService:
             )
         effective_supersede_id = supersede_run_id or stored_supersede_id or None
         previous_run: Any | None = None
+        was_complete = False
 
         if existing is not None:
             self._validate_existing_run(
@@ -1373,14 +1376,6 @@ class AbstractIngestionService:
                 complete=False,
                 retryable=False,
             )
-            if was_complete:
-                return self._progress(
-                    run_id,
-                    total,
-                    None,
-                    "complete",
-                    replace(stats, complete=True, next_cursor=None),
-                )
         else:
             effective_cursor = cursor
             stats = AbstractIngestionStats(
@@ -1412,6 +1407,15 @@ class AbstractIngestionService:
                     "the previous abstract run has an invalid SQLite source path",
                 )
 
+        if was_complete and previous_run is None:
+            return self._progress(
+                run_id,
+                total,
+                None,
+                "complete",
+                replace(stats, complete=True, next_cursor=None),
+            )
+
         select_staging = getattr(self.store, "select_staging_generation", None)
         if callable(select_staging):
             value = select_staging(generation)
@@ -1431,28 +1435,72 @@ class AbstractIngestionService:
                 supersedes_run_id=effective_supersede_id,
             )
 
-        # This is deliberately before source fetch, embedding, or any document
-        # and passage write.  A cancellation during the first batch leaves a
-        # durable run ID for the driver to resume.
-        await self._persist_run(run_state(stats, "running"))
-
         cleanup_sources: list[str] = []
         if superseded_source_path is not None:
             cleanup_sources.append(superseded_source_path)
         if self.relative_source_path not in cleanup_sources:
             cleanup_sources.append(self.relative_source_path)
-        if previous_run is not None:
+
+        if was_complete:
             cleanup_error: str | None = None
-            for source_path in cleanup_sources:
-                cleanup_error = await self._cleanup_nonready_source(source_path)
-                if cleanup_error is not None:
-                    break
+            if previous_run is not None:
+                for source_path in cleanup_sources:
+                    cleanup_error = await self._cleanup_nonready_source(source_path)
+                    if cleanup_error is not None:
+                        break
             if cleanup_error is not None:
                 stats = replace(
                     stats,
                     complete=False,
                     retryable=True,
                     errors=_bounded_errors((*stats.errors, cleanup_error)),
+                )
+                await self._persist_run(run_state(stats, "retryable"))
+                return self._progress(
+                    run_id, total, stats.next_cursor, "retryable", stats
+                )
+            try:
+                if previous_run is not None:
+                    await self._mark_superseded(previous_run, new_run_id=run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                diagnostic = _redact_error(exc)
+                stats = replace(
+                    stats,
+                    complete=False,
+                    retryable=True,
+                    errors=_bounded_errors((*stats.errors, diagnostic)),
+                )
+                await self._persist_run(run_state(stats, "retryable"))
+                return self._progress(
+                    run_id, total, stats.next_cursor, "retryable", stats
+                )
+            return self._progress(
+                run_id,
+                total,
+                None,
+                "complete",
+                replace(stats, complete=True, next_cursor=None, retryable=False),
+            )
+
+        # This is deliberately before source fetch, embedding, or any document
+        # and passage write.  A cancellation during the first batch leaves a
+        # durable run ID for the driver to resume.
+        await self._persist_run(run_state(stats, "running"))
+
+        if previous_run is not None:
+            batch_cleanup_error: str | None = None
+            for source_path in cleanup_sources:
+                batch_cleanup_error = await self._cleanup_nonready_source(source_path)
+                if batch_cleanup_error is not None:
+                    break
+            if batch_cleanup_error is not None:
+                stats = replace(
+                    stats,
+                    complete=False,
+                    retryable=True,
+                    errors=_bounded_errors((*stats.errors, batch_cleanup_error)),
                 )
                 retryable_run = run_state(stats, "retryable")
                 await self._persist_run(retryable_run)
