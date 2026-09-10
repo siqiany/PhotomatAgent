@@ -24,6 +24,7 @@ STOP_AFTER=""
 RESUME=false
 DRY_RUN=false
 YES=false
+DISCARD_PENDING=false
 SUPERSEDE_RUN_ID=""
 
 usage() {
@@ -43,6 +44,7 @@ Options:
   --run-state-dir PATH       Override local run-state directory
   --stop-after N             Pause after at most N source records (index stages)
   --resume                  Reuse the saved stage run ID (index stages)
+  --discard-pending          Abstracts: remove only a failed pending pointer
   --supersede-run-id ID      Abstracts: explicitly replace a previous run after
                              a changed SQLite source
   --dry-run                 Print shell-escaped argv without starting uv
@@ -309,6 +311,10 @@ while [[ "$#" -gt 0 ]]; do
       RESUME=true
       shift
       ;;
+    --discard-pending)
+      DISCARD_PENDING=true
+      shift
+      ;;
     --supersede-run-id)
       require_option_value "$@"
       SUPERSEDE_RUN_ID="$(trim_run_id "$2")"
@@ -350,6 +356,12 @@ fi
 if [[ "$RESUME" == true ]]; then
   [[ -z "$SUPERSEDE_RUN_ID" ]] || die "--resume cannot be combined with --supersede-run-id"
 fi
+if [[ "$DISCARD_PENDING" == true ]]; then
+  [[ "$STAGE" == "abstracts" ]] || die "--discard-pending is only valid for abstracts"
+  [[ "$RESUME" == false ]] || die "--discard-pending cannot be combined with --resume"
+  [[ -z "$SUPERSEDE_RUN_ID" ]] || die "--discard-pending cannot be combined with --supersede-run-id"
+  [[ -z "$STOP_AFTER" ]] || die "--discard-pending cannot be combined with --stop-after"
+fi
 
 if [[ -n "$RUN_STATE_OVERRIDE" ]]; then
   RUN_STATE_DIR="$RUN_STATE_OVERRIDE"
@@ -361,6 +373,16 @@ ABSTRACTS_STATE_FILE="${RUN_STATE_DIR}/abstracts.run_id"
 ABSTRACTS_SOURCE_PATH_FILE="${RUN_STATE_DIR}/abstracts.source_path"
 ABSTRACTS_PENDING_STATE_FILE="${RUN_STATE_DIR}/abstracts.pending.run_id"
 ABSTRACTS_PENDING_SOURCE_PATH_FILE="${RUN_STATE_DIR}/abstracts.pending.source_path"
+
+if [[ "$DISCARD_PENDING" == true ]]; then
+  if [[ "$DRY_RUN" == true ]]; then
+    printf 'dry-run: would discard only pending abstracts state under %s\n' "$RUN_STATE_DIR"
+  else
+    rm -f -- "$ABSTRACTS_PENDING_STATE_FILE" "$ABSTRACTS_PENDING_SOURCE_PATH_FILE"
+    printf 'discarded pending abstracts state; active run and archive were unchanged\n'
+  fi
+  exit 0
+fi
 
 if [[ "$STAGE" == "pdf" || "$STAGE" == "abstracts" ]]; then
   STATE_FILE="$PDF_STATE_FILE"

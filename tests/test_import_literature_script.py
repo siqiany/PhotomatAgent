@@ -353,6 +353,84 @@ def test_pending_abstract_run_can_resume_and_promote_after_interruption(
     assert "--resume" in argv
 
 
+def test_discard_pending_recovers_failed_supersession_without_touching_active(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("old-abstract-run\n", encoding="utf-8")
+    source_file = state_dir / "abstracts.source_path"
+    source_file.write_text("abstracts.sqlite3\n", encoding="utf-8")
+    archive_dir = state_dir / "archive"
+    archive_dir.mkdir()
+    archive_audit = archive_dir / "abstracts.previous.audit"
+    archive_audit.write_text("keep\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_EXIT_CODE", "17")
+
+    failed = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "abstracts.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+        "--supersede-run-id",
+        "unknown-old-run",
+    )
+    assert failed.returncode == 17
+    pending_file = state_dir / "abstracts.pending.run_id"
+    pending_source_file = state_dir / "abstracts.pending.source_path"
+    pending_id = pending_file.read_text(encoding="utf-8")
+
+    resume_failed = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "abstracts.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+        "--resume",
+    )
+    assert resume_failed.returncode == 17
+    assert pending_file.read_text(encoding="utf-8") == pending_id
+    assert pending_source_file.is_file()
+    assert state_file.read_text(encoding="utf-8") == "old-abstract-run\n"
+    assert source_file.read_text(encoding="utf-8") == "abstracts.sqlite3\n"
+
+    discarded = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--run-state-dir",
+        str(state_dir),
+        "--discard-pending",
+    )
+    assert discarded.returncode == 0, discarded.stderr
+    assert not pending_file.exists()
+    assert not pending_source_file.exists()
+    assert state_file.read_text(encoding="utf-8") == "old-abstract-run\n"
+    assert source_file.read_text(encoding="utf-8") == "abstracts.sqlite3\n"
+    assert archive_audit.read_text(encoding="utf-8") == "keep\n"
+
+    monkeypatch.delenv("FAKE_EXIT_CODE")
+    fresh = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "abstracts.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+    )
+    assert fresh.returncode == 0, fresh.stderr
+    assert state_file.read_text(encoding="utf-8").strip() != "old-abstract-run"
+
+
 def test_supersession_cannot_be_combined_with_resume(
     tmp_path: Path, monkeypatch
 ) -> None:

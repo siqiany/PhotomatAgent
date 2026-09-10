@@ -1132,26 +1132,33 @@ class AbstractIngestionService:
                 "supersede_run_context_mismatch",
                 "the previous abstract run ID does not match",
             )
-        if str(_value(run, "workspace_id", "")) != self.workspace_id:
+        if _value(run, "workspace_id", "") != self.workspace_id:
             raise AbstractIngestionError(
                 "supersede_run_context_mismatch",
                 "the previous abstract run belongs to another workspace",
             )
-        if str(
-            _value(run, "generation_fingerprint", _value(run, "generation", ""))
+        if _value(
+            run, "generation_fingerprint", _value(run, "generation", "")
         ) != generation_fingerprint:
             raise AbstractIngestionError(
                 "supersede_run_context_mismatch",
                 "the previous abstract run belongs to another generation",
             )
-        source_path = str(
-            _value(run, "source_path", _value(run, "relative_source_path", ""))
+        source_path = _value(
+            run, "source_path", _value(run, "relative_source_path", "")
         )
-        if source_path != self.relative_source_path:
+        if not isinstance(source_path, str):
             raise AbstractIngestionError(
                 "supersede_run_context_mismatch",
-                "the previous abstract run belongs to another SQLite source",
+                "the previous abstract run has an invalid SQLite source path",
             )
+        try:
+            validate_relative_source_path(source_path)
+        except ValueError as exc:
+            raise AbstractIngestionError(
+                "supersede_run_context_mismatch",
+                "the previous abstract run has an invalid SQLite source path",
+            ) from exc
 
     async def _resolve_supersede_record(
         self,
@@ -1178,21 +1185,28 @@ class AbstractIngestionService:
             self._supersede_record = record
         return record
 
-    async def _cleanup_nonready_source(self) -> str | None:
-        """Remove only non-ready artifacts for this exact abstract source.
+    async def _cleanup_nonready_source(
+        self, relative_source_path: str | None = None
+    ) -> str | None:
+        """Remove only non-ready artifacts for one abstract source.
 
         The Qdrant adapter owns the filtered deletion.  Narrow fakes or older
         adapters may not expose it; in that case the safe fallback is to leave
         artifacts untouched rather than guessing which ready knowledge is
         absent from the replacement database.
         """
+        source_path = (
+            self.relative_source_path
+            if relative_source_path is None
+            else relative_source_path
+        )
         cleanup = getattr(self.store, "delete_nonready_abstract_artifacts", None)
         if not callable(cleanup):
             return None
         try:
             result = cleanup(
                 workspace_id=self.workspace_id,
-                relative_source_path=self.relative_source_path,
+                relative_source_path=source_path,
             )
             if inspect.isawaitable(result):
                 await result
@@ -1382,6 +1396,21 @@ class AbstractIngestionService:
                 effective_supersede_id,
                 generation_fingerprint,
             )
+        superseded_source_path: str | None = None
+        if previous_run is not None:
+            superseded_source_path = _value(
+                previous_run,
+                "source_path",
+                _value(previous_run, "relative_source_path", ""),
+            )
+            # _validate_supersede_record has already checked this path.  Keep
+            # the type guard here so compatibility run objects cannot widen
+            # the cleanup call after validation.
+            if not isinstance(superseded_source_path, str):
+                raise AbstractIngestionError(
+                    "supersede_run_context_mismatch",
+                    "the previous abstract run has an invalid SQLite source path",
+                )
 
         select_staging = getattr(self.store, "select_staging_generation", None)
         if callable(select_staging):
@@ -1407,8 +1436,17 @@ class AbstractIngestionService:
         # durable run ID for the driver to resume.
         await self._persist_run(run_state(stats, "running"))
 
+        cleanup_sources: list[str] = []
+        if superseded_source_path is not None:
+            cleanup_sources.append(superseded_source_path)
+        if self.relative_source_path not in cleanup_sources:
+            cleanup_sources.append(self.relative_source_path)
         if previous_run is not None:
-            cleanup_error = await self._cleanup_nonready_source()
+            cleanup_error: str | None = None
+            for source_path in cleanup_sources:
+                cleanup_error = await self._cleanup_nonready_source(source_path)
+                if cleanup_error is not None:
+                    break
             if cleanup_error is not None:
                 stats = replace(
                     stats,

@@ -6,6 +6,7 @@ import sqlite3
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 from typing import Any
 
@@ -592,6 +593,56 @@ async def test_changed_database_requires_explicit_supersession_and_preserves_rea
     assert ready_by_key["key-b"] in store.passages
     assert ready_by_key["key-c"] in store.passages
     reader.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_supersession_allows_changed_source_path_and_cleans_both_scopes(
+    abstract_db: Path,
+) -> None:
+    store = FakeAbstractStore()
+    old_service = AbstractIngestionService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+    old_progress = await old_service.index_batch(run_id="old-run", limit=1)
+    assert old_progress.complete is False
+    old_ready = store.passages[0]
+    old_service.reader.close()
+
+    replacement_db = abstract_db.parent / "replacement.sqlite3"
+    shutil.copy2(abstract_db, replacement_db)
+    replacement = AbstractIngestionService(
+        SQLiteAbstractReader(replacement_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="replacement.sqlite3",
+        generation=store.generation,
+    )
+
+    completed = await replacement.index_batch(
+        run_id="replacement-run",
+        limit=3,
+        supersede_run_id="old-run",
+    )
+
+    assert completed.complete is True
+    assert replacement._supersede_record is not None
+    assert store.nonready_cleanup_calls == [
+        "abstracts.sqlite3",
+        "replacement.sqlite3",
+    ]
+    assert store.runs["replacement-run"].supersedes_run_id == "old-run"
+    assert store.runs["old-run"].status == "superseded"
+    assert store.runs["old-run"].superseded_by_run_id == "replacement-run"
+    assert old_ready in store.passages
+    replacement.reader.close()
 
 
 @pytest.mark.asyncio

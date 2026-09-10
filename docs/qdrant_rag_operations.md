@@ -188,7 +188,11 @@ exactly; a changed or unknown path fails closed and requires an explicit
 `abstracts.run_id` is archived and replaced only after the CLI accepts the run
 (complete or bounded pause). A failed validation or interruption therefore
 leaves the prior active ID intact, while the pending ID remains available to
-the next `--resume`. A missing or empty state file is an explicit error for
+the next `--resume`. If the pending run cannot be resumed because its
+supersession precondition is still invalid, pass `abstracts --discard-pending`
+after reviewing the failure. This removes only the two local pending pointer
+files; it does not contact Qdrant, alter the active run, or remove archived
+audit history. A missing or empty state file is an explicit error for
 `--resume` and `activate` (status reports an unsupplied stage). The CLI's
 ingestion record remains the source of truth for its cursor and progress. Each progress line is bounded JSON
 with `total`, `processed`, `indexed`, `unchanged`, `failed`, `skipped`,
@@ -213,7 +217,11 @@ identity once and validates it against the saved run; an unknown `--resume`
 ID is rejected rather than creating an unrelated run.
 
 If the database changed while an old abstract run was incomplete, do not
-resume that run. Start a fresh run and explicitly link the old run:
+resume that run. Start a fresh run and explicitly link the old run. Explicit
+supersession is also the deliberate path for a changed source pathname: the
+CLI validates the old run's workspace, generation, abstract source kind, and
+bounded saved source path before linking it, then scopes cleanup to both the
+old and new paths while retaining READY knowledge:
 
 ```bash
 uv run photomatagent rag index-abstracts \
