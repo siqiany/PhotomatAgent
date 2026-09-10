@@ -82,7 +82,13 @@ def _external_configured(config: ScientificConfig) -> bool:
     }
 
 
-def _confirm_external(config: ScientificConfig, directory: Path, *, yes: bool) -> None:
+def _confirm_external(
+    config: ScientificConfig,
+    directory: Path,
+    *,
+    yes: bool,
+    stage: str = "fulltext",
+) -> None:
     if not _external_configured(config):
         return
     provider_parts = [
@@ -91,7 +97,8 @@ def _confirm_external(config: ScientificConfig, directory: Path, *, yes: bool) -
     ]
     console.print("外部 RAG provider 配置：" + ", ".join(provider_parts))
     console.print(f"数据范围：{directory}")
-    console.print("警告：将发送全文片段到外部服务。")
+    scope = "摘要片段" if stage in {"abstract", "abstracts"} else "全文片段"
+    console.print(f"警告：将发送{scope}到外部服务。")
     if yes:
         return
     # ``typer.confirm(..., abort=True)`` gives non-zero exit status on a
@@ -248,6 +255,131 @@ def _require_resume_run_id(*, resume: bool, run_id: str | None) -> str:
             "--resume requires --run-id; provide the saved stage run ID",
         )
     return str(run_id or uuid4().hex)
+
+
+async def _ensure_staging_generation(
+    store: Any,
+    embedder: Any,
+    *,
+    required: bool = False,
+) -> Any | None:
+    """Ensure and select the physical generation used by a bounded operation.
+
+    Indexing and guarded activation must share the exact staging generation.
+    Selecting it is deliberately separate from alias activation: this helper
+    never changes the stable ``current`` aliases.
+    """
+    ensure = getattr(store, "ensure_generation", None)
+    identity = getattr(embedder, "identity", None)
+    if not callable(ensure) or identity is None:
+        if required:
+            raise _RagCliError(
+                "generation_unavailable",
+                "the literature store cannot prepare a staging generation",
+            )
+        return None
+    generation = ensure(
+        identity=identity,
+        chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
+    )
+    if hasattr(generation, "__await__"):
+        generation = await generation
+    if generation is None:
+        raise _RagCliError(
+            "generation_unavailable",
+            "the literature store returned no staging generation",
+        )
+    select = getattr(store, "select_staging_generation", None)
+    if callable(select):
+        selected = select(generation)
+        if hasattr(selected, "__await__"):
+            await selected
+    return generation
+
+
+async def _lookup_ingestion_run(
+    store: Any,
+    run_id: str,
+    workspace_id: str,
+    *,
+    source_kind: LiteratureSourceKind,
+) -> Any | None:
+    getter = getattr(store, "get_ingestion_run", None)
+    if not callable(getter):
+        return None
+    try:
+        try:
+            record = getter(run_id, workspace_id, source_kind=source_kind)
+        except TypeError:
+            # Narrow fakes and older adapters may not expose source_kind yet;
+            # the record's source_kind is still checked by the caller.
+            record = getter(run_id, workspace_id)
+        if hasattr(record, "__await__"):
+            record = await record
+        return record
+    except Exception:
+        return None
+
+
+async def _validate_resume_run(
+    store: Any,
+    *,
+    run_id: str,
+    workspace_id: str,
+    source_kind: LiteratureSourceKind,
+    generation: Any | None,
+) -> Any:
+    """Validate one explicitly selected run before allowing resume.
+
+    This is intentionally a point lookup, not a list-runs operation.  A
+    resume typo, wrong workspace, source stage, or staging generation must not
+    fall through to the service's new-run creation path.
+    """
+    record = await _lookup_ingestion_run(
+        store,
+        run_id,
+        workspace_id,
+        source_kind=source_kind,
+    )
+    if record is None:
+        raise _RagCliError(
+            "resume_run_missing",
+            f"{source_kind.value} resume run is missing or unavailable: {run_id}",
+        )
+    record_workspace = str(_record_value(record, "workspace_id", ""))
+    if record_workspace != workspace_id:
+        raise _RagCliError(
+            "resume_run_context_mismatch",
+            f"{source_kind.value} resume run belongs to another workspace",
+        )
+    actual_kind = _record_value(record, "source_kind", None)
+    try:
+        actual_kind = LiteratureSourceKind(actual_kind)
+    except (TypeError, ValueError) as exc:
+        raise _RagCliError(
+            "resume_run_context_mismatch",
+            f"{source_kind.value} resume run has no valid source kind",
+        ) from exc
+    if actual_kind is not source_kind:
+        raise _RagCliError(
+            "resume_run_context_mismatch",
+            f"resume run source kind does not match {source_kind.value}",
+        )
+    if generation is not None:
+        expected_fingerprint = str(getattr(generation, "fingerprint", ""))
+        actual_fingerprint = str(
+            _record_value(
+                record,
+                "generation_fingerprint",
+                _record_value(record, "generation", ""),
+            )
+        )
+        if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
+            raise _RagCliError(
+                "resume_run_context_mismatch",
+                f"{source_kind.value} resume run belongs to another generation",
+            )
+    return record
 
 
 async def _persist_paused_run(
@@ -855,6 +987,77 @@ def _directory(boundary: Workspace, directory: Path | None, config: ScientificCo
     return boundary.resolve(str(value), must_exist=False)
 
 
+async def _explicit_stage_statuses(
+    services: Any,
+    boundary: Workspace,
+    *,
+    pdf_run_id: str | None,
+    abstract_run_id: str | None,
+) -> dict[str, str]:
+    """Read at most the explicitly named stage records for ``rag status``.
+
+    Status deliberately has no list-runs fallback.  The stage driver owns the
+    durable run IDs, so these point lookups remain bounded and workspace
+    scoped while still making stage state useful to operators.
+    """
+    workspace_id = str(
+        _service_value(
+            services,
+            "workspace_id",
+            _workspace_id_for_boundary(boundary),
+        )
+    )
+    store = _service_value(services, "store")
+    ingestion_service = _service_value(services, "ingestion")
+    generation = await _ensure_staging_generation(
+        store,
+        getattr(ingestion_service, "embedder", None),
+    )
+    statuses: dict[str, str] = {}
+    requested = (
+        ("pdf", pdf_run_id, LiteratureSourceKind.FULLTEXT),
+        ("abstracts", abstract_run_id, LiteratureSourceKind.ABSTRACT),
+    )
+    for label, run_id, expected_kind in requested:
+        if not str(run_id or "").strip():
+            statuses[label] = "not supplied"
+            continue
+        record = await _lookup_ingestion_run(
+            store,
+            str(run_id).strip(),
+            workspace_id,
+            source_kind=expected_kind,
+        )
+        if record is None:
+            statuses[label] = "missing"
+            continue
+        actual_kind = _record_value(record, "source_kind", None)
+        try:
+            valid_kind = LiteratureSourceKind(actual_kind) is expected_kind
+        except (TypeError, ValueError):
+            valid_kind = False
+        if not valid_kind:
+            statuses[label] = "source-kind mismatch"
+            continue
+        if generation is not None:
+            expected_fingerprint = str(getattr(generation, "fingerprint", ""))
+            actual_fingerprint = str(
+                _record_value(
+                    record,
+                    "generation_fingerprint",
+                    _record_value(record, "generation", ""),
+                )
+            )
+            if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
+                statuses[label] = "generation mismatch"
+                continue
+        stats = _record_value(record, "stats", record)
+        complete = bool(_record_value(stats, "complete", False))
+        status = str(_record_value(record, "status", "running"))
+        statuses[label] = "complete" if complete and status == "complete" else status
+    return statuses
+
+
 @rag_app.callback(invoke_without_command=True)
 def rag_default(
     ctx: typer.Context,
@@ -868,6 +1071,16 @@ def rag_default(
 @rag_app.command("status")
 def rag_status(
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
+    pdf_run_id: str | None = typer.Option(
+        None,
+        "--pdf-run-id",
+        help="Bounded point lookup for the PDF-stage run status.",
+    ),
+    abstract_run_id: str | None = typer.Option(
+        None,
+        "--abstract-run-id",
+        help="Bounded point lookup for the abstract-stage run status.",
+    ),
 ) -> None:
     """Show Qdrant, alias, provider, and source-root readiness without secrets."""
     boundary = _workspace(workspace)
@@ -876,6 +1089,45 @@ def rag_status(
     result = probe.probe()
     snapshot_method = getattr(probe, "status_snapshot", None)
     snapshot = snapshot_method() if callable(snapshot_method) else {}
+    stage_statuses: dict[str, str] = {}
+    if pdf_run_id or abstract_run_id:
+        try:
+            services = build_literature_services(config, boundary)
+            stage_statuses = asyncio.run(
+                _explicit_stage_statuses(
+                    services,
+                    boundary,
+                    pdf_run_id=pdf_run_id,
+                    abstract_run_id=abstract_run_id,
+                )
+            )
+        except Exception as exc:
+            # A status report remains useful when the backend is unavailable;
+            # expose the bounded diagnostic without leaking provider details.
+            message = _safe_message(exc)
+            stage_statuses = {
+                key: f"unavailable: {message}"
+                for key, value in {
+                    "pdf": pdf_run_id,
+                    "abstracts": abstract_run_id,
+                }.items()
+                if value
+            }
+    def snapshot_stage(*keys: str) -> Any:
+        for key in keys:
+            value = snapshot.get(key)
+            if value not in (None, "", "unknown"):
+                return value
+        return "not supplied"
+
+    pdf_stage = stage_statuses.get(
+        "pdf",
+        snapshot_stage("pdf_stage", "stage_pdf"),
+    )
+    abstract_stage = stage_statuses.get(
+        "abstracts",
+        snapshot_stage("abstract_stage", "stage_abstracts"),
+    )
     source_state = snapshot.get("source_root")
     if not source_state or source_state == "unknown":
         try:
@@ -909,14 +1161,11 @@ def rag_status(
         ("Collection status", snapshot.get("collection_status", "unknown")),
         (
             "PDF stage",
-            snapshot.get("pdf_stage", snapshot.get("stage_pdf", "unknown")),
+            pdf_stage,
         ),
         (
             "Abstract stage",
-            snapshot.get(
-                "abstract_stage",
-                snapshot.get("stage_abstracts", "unknown"),
-            ),
+            abstract_stage,
         ),
         ("Capacity", snapshot.get("capacity", "unknown")),
         ("Capacity warning", snapshot.get("capacity_warning", "none") or "none"),
@@ -976,6 +1225,7 @@ async def _index_until_complete(
     *,
     config: ScientificConfig,
     run_id: str,
+    resume: bool = False,
     stop_after: int | None = None,
     progress: Any | None = None,
 ) -> dict[str, Any]:
@@ -985,14 +1235,21 @@ async def _index_until_complete(
     # activate stable aliases; activation is a separate explicit command.
     store = _service_value(services, "store")
     embedder = _service_value(services, "ingestion").embedder
-    ensure_generation = getattr(store, "ensure_generation", None)
-    if callable(ensure_generation):
-        generation = ensure_generation(
-            identity=embedder.identity,
-            chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
+    generation = await _ensure_staging_generation(store, embedder)
+    if resume:
+        await _validate_resume_run(
+            store,
+            run_id=run_id,
+            workspace_id=str(
+                _service_value(
+                    services,
+                    "workspace_id",
+                    _workspace_id_for_boundary(boundary),
+                )
+            ),
+            source_kind=LiteratureSourceKind.FULLTEXT,
+            generation=generation,
         )
-        if hasattr(generation, "__await__"):
-            generation = await generation
     plan = await services.ingestion.plan(root, boundary)
     cursor: str | None = None
     last: dict[str, Any] = {"run_id": run_id, "complete": False}
@@ -1097,8 +1354,12 @@ def rag_index(
     boundary = _workspace(workspace)
     config = _config(workspace)
     root = _directory(boundary, directory, config)
+    resume_requested = resume if isinstance(resume, bool) else False
     try:
-        effective_run_id = _require_resume_run_id(resume=resume, run_id=run_id)
+        effective_run_id = _require_resume_run_id(
+            resume=resume_requested,
+            run_id=run_id,
+        )
     except Exception as exc:
         _print_error(exc)
         raise typer.Exit(code=1) from exc
@@ -1114,6 +1375,7 @@ def rag_index(
                 root,
                 config=config,
                 run_id=effective_run_id,
+                resume=resume_requested,
                 stop_after=stop_after,
                 progress=_emit_progress,
             )
@@ -1174,12 +1436,49 @@ async def _index_abstracts_until_complete(
     *,
     run_id: str,
     config: ScientificConfig,
+    resume: bool = False,
+    generation: Any | None = None,
+    generation_selected: bool = False,
     stop_after: int | None = None,
     progress: Any | None = None,
     store: Any | None = None,
 ) -> dict[str, Any]:
     if stop_after is not None and int(stop_after) < 1:
         raise ValueError("stop_after must be positive")
+    effective_store = store if store is not None else getattr(ingestion, "store", None)
+    supplied_generation = generation is not None
+    if effective_store is not None and generation is None:
+        generation = await _ensure_staging_generation(
+            effective_store,
+            getattr(ingestion, "embedder", None),
+        )
+    if (
+        effective_store is not None
+        and generation is not None
+        and supplied_generation
+        and not generation_selected
+    ):
+        # The service may have been assembled before the generation was
+        # ensured.  Pin it now so its run lookup and writes cannot drift to
+        # the active alias or another staging pair.
+        select = getattr(effective_store, "select_staging_generation", None)
+        if callable(select):
+            selected = select(generation)
+            if hasattr(selected, "__await__"):
+                await selected
+    if generation is not None:
+        try:
+            setattr(ingestion, "generation", generation)
+        except Exception:
+            pass
+    if resume:
+        await _validate_resume_run(
+            effective_store,
+            run_id=run_id,
+            workspace_id=str(getattr(ingestion, "workspace_id", "")),
+            source_kind=LiteratureSourceKind.ABSTRACT,
+            generation=generation,
+        )
     started_at = monotonic()
     cursor: str | None = None
     processed_this_invocation = 0
@@ -1227,7 +1526,6 @@ async def _index_abstracts_until_complete(
         ):
             last["paused"] = True
             last["status"] = "paused"
-            effective_store = store if store is not None else getattr(ingestion, "store", None)
             await _persist_paused_run(
                 effective_store,
                 run_id=run_id,
@@ -1276,8 +1574,12 @@ def rag_index_abstracts(
     """Index one bounded, resumable batch of abstract records at a time."""
     if not isinstance(stop_after, int):
         stop_after = None
+    resume_requested = resume if isinstance(resume, bool) else False
     try:
-        effective_run_id = _require_resume_run_id(resume=resume, run_id=run_id)
+        effective_run_id = _require_resume_run_id(
+            resume=resume_requested,
+            run_id=run_id,
+        )
     except Exception as exc:
         _print_error(exc)
         raise typer.Exit(code=1) from exc
@@ -1285,30 +1587,46 @@ def rag_index_abstracts(
     config = _config(workspace)
     try:
         source_database = _abstract_database(boundary, database, config)
-        _confirm_external(config, source_database, yes=yes)
+        _confirm_external(config, source_database, yes=yes, stage="abstracts")
         # Construct the shared graph first so narrow test doubles and older
         # callers that only accept the original two build arguments remain
-        # compatible; the database reader is then attached through the
-        # dedicated bounded abstract-stage factory.
+        # compatible.  The target generation and abstract reader are then
+        # assembled together inside one bounded async operation.
         services = build_literature_services(config, boundary)
-        ingestion = _service_value(services, "abstract_ingestion")
-        if ingestion is None:
-            ingestion = build_abstract_ingestion_service(
-                config,
-                boundary,
-                source_database,
-                services=services,
+
+        async def index_abstracts() -> dict[str, Any]:
+            store = _service_value(services, "store")
+            pdf_ingestion = _service_value(services, "ingestion")
+            abstract_ingestion = _service_value(services, "abstract_ingestion")
+            if abstract_ingestion is None:
+                abstract_ingestion = _service_value(services, "abstracts")
+            embedder = getattr(
+                abstract_ingestion if abstract_ingestion is not None else pdf_ingestion,
+                "embedder",
+                None,
             )
-        stats = asyncio.run(
-            _index_abstracts_until_complete(
-                ingestion,
+            generation = await _ensure_staging_generation(store, embedder)
+            if abstract_ingestion is None:
+                abstract_ingestion = build_abstract_ingestion_service(
+                    config,
+                    boundary,
+                    source_database,
+                    services=services,
+                    generation=generation,
+                )
+            return await _index_abstracts_until_complete(
+                abstract_ingestion,
                 run_id=effective_run_id,
                 config=config,
+                resume=resume_requested,
+                generation=generation,
+                generation_selected=True,
                 stop_after=stop_after,
                 progress=_emit_progress,
-                store=_service_value(services, "store"),
+                store=store,
             )
-        )
+
+        stats = asyncio.run(index_abstracts())
     except KeyboardInterrupt:
         console.print(
             f"[yellow]摘要索引已中断；run_id={effective_run_id}，可使用 --run-id {effective_run_id} --resume 恢复。[/]"
@@ -1366,6 +1684,10 @@ def rag_activate(
         embedder = _service_value(services, "ingestion").embedder
 
         async def activate() -> Any:
+            # Prepare and select the target physical pair before any run
+            # validation.  Required stage records must be read from the same
+            # generation that will be activated, never from the active alias.
+            generation = await _ensure_staging_generation(store, embedder)
             await _validate_required_stages(
                 services,
                 boundary,
@@ -1373,14 +1695,18 @@ def rag_activate(
                 pdf_run_id=pdf_run_id,
                 abstract_run_id=abstract_run_id,
                 run_id=run_id,
+                generation=generation,
             )
-            ensure = getattr(store, "ensure_generation")
-            generation = ensure(
-                identity=embedder.identity,
-                chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
-            )
-            if hasattr(generation, "__await__"):
-                generation = await generation
+            if generation is None:
+                # Compatibility for narrow test doubles and older adapters;
+                # the production Qdrant store always supplies a generation.
+                ensure = getattr(store, "ensure_generation")
+                generation = ensure(
+                    identity=embedder.identity,
+                    chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
+                )
+                if hasattr(generation, "__await__"):
+                    generation = await generation
             activate_method = getattr(store, "activate_generation")
             result = activate_method(
                 generation,
@@ -1415,6 +1741,7 @@ async def _validate_required_stages(
     pdf_run_id: str | None = None,
     abstract_run_id: str | None = None,
     run_id: str | None = None,
+    generation: Any | None = None,
 ) -> None:
     """Fail closed unless each explicitly required stage has a complete run.
 
@@ -1452,7 +1779,8 @@ async def _validate_required_stages(
             _workspace_id_for_boundary(boundary),
         )
     )
-    getter = getattr(_service_value(services, "store"), "get_ingestion_run", None)
+    store = _service_value(services, "store")
+    getter = getattr(store, "get_ingestion_run", None)
     if not callable(getter):
         raise _RagCliError(
             "stage_incomplete",
@@ -1470,26 +1798,16 @@ async def _validate_required_stages(
             if stage == "pdf"
             else LiteratureSourceKind.ABSTRACT
         )
-        try:
-            try:
-                record = getter(
-                    stage_run_id,
-                    workspace_id,
-                    source_kind=expected_kind,
-                )
-            except TypeError:
-                record = getter(stage_run_id, workspace_id)
-            if hasattr(record, "__await__"):
-                record = await record
-        except Exception as exc:
-            raise _RagCliError(
-                "stage_incomplete",
-                f"{stage} stage run could not be validated",
-            ) from exc
+        record = await _lookup_ingestion_run(
+            store,
+            stage_run_id,
+            workspace_id,
+            source_kind=expected_kind,
+        )
         if record is None:
             raise _RagCliError(
                 "stage_incomplete",
-                f"{stage} stage run is missing or does not match the current generation",
+                f"{stage} stage run could not be validated",
             )
         source_kind = _record_value(record, "source_kind", None)
         try:
@@ -1504,6 +1822,20 @@ async def _validate_required_stages(
                 "stage_incomplete",
                 f"{stage} stage run source kind does not match",
             )
+        if generation is not None:
+            expected_fingerprint = str(getattr(generation, "fingerprint", ""))
+            actual_fingerprint = str(
+                _record_value(
+                    record,
+                    "generation_fingerprint",
+                    _record_value(record, "generation", ""),
+                )
+            )
+            if not expected_fingerprint or actual_fingerprint != expected_fingerprint:
+                raise _RagCliError(
+                    "stage_incomplete",
+                    f"{stage} stage run does not belong to the selected generation",
+                )
         stats = _record_value(record, "stats", record)
         complete = bool(_record_value(stats, "complete", False))
         retryable = bool(_record_value(stats, "retryable", False))

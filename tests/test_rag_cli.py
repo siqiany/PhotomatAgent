@@ -349,6 +349,302 @@ async def test_index_pauses_after_requested_budget(tmp_path) -> None:
     assert calls == [20, 5]
 
 
+@pytest.mark.asyncio
+async def test_index_abstracts_binds_staging_generation_before_first_batch(tmp_path) -> None:
+    generation = SimpleNamespace(fingerprint="a" * 64)
+    selected: list[object] = []
+    ensured: list[int] = []
+
+    class Embedder:
+        identity = object()
+
+    class Store:
+        def ensure_generation(self, *, identity, chunk_schema_version):
+            del identity
+            ensured.append(chunk_schema_version)
+            return generation
+
+        def select_staging_generation(self, value):
+            selected.append(value)
+
+    class Ingestion:
+        embedder = Embedder()
+        generation = None
+
+        async def index_batch(self, **kwargs):
+            del kwargs
+            assert self.generation is generation
+            return SimpleNamespace(
+                run_id="abstract-run",
+                total=1,
+                processed=1,
+                indexed=1,
+                unchanged=0,
+                failed=0,
+                skipped_empty=0,
+                skipped_invalid_key=0,
+                passages=1,
+                cursor=None,
+                complete=True,
+                status="complete",
+                errors=(),
+            )
+
+    ingestion = Ingestion()
+    result = await rag_cli._index_abstracts_until_complete(
+        ingestion,
+        run_id="abstract-run",
+        config=rag_cli.ScientificConfig(rag_tool_max_documents=1),
+        store=Store(),
+    )
+
+    assert result["complete"] is True
+    assert ensured == [2]
+    assert selected == [generation]
+
+
+def test_index_abstracts_resume_rejects_missing_run(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    source_database = tmp_path / "abstracts.sqlite3"
+    source_database.touch()
+    calls: list[str] = []
+    generation = SimpleNamespace(fingerprint="b" * 64)
+
+    class Store:
+        def ensure_generation(self, *, identity, chunk_schema_version):
+            del identity, chunk_schema_version
+            return generation
+
+        def select_staging_generation(self, value):
+            assert value is generation
+
+        async def get_ingestion_run(self, run_id, workspace_id, **kwargs):
+            del run_id, workspace_id, kwargs
+            return None
+
+    class Ingestion:
+        embedder = SimpleNamespace(identity=object())
+        workspace_id = "workspace"
+
+        async def index_batch(self, **kwargs):
+            calls.append(str(kwargs.get("run_id")))
+            return SimpleNamespace(
+                total=0,
+                processed=0,
+                indexed=0,
+                unchanged=0,
+                failed=0,
+                skipped_empty=0,
+                skipped_invalid_key=0,
+                passages=0,
+                cursor=None,
+                complete=True,
+                status="complete",
+                errors=(),
+            )
+
+    services = SimpleNamespace(
+        store=Store(),
+        ingestion=SimpleNamespace(embedder=Ingestion.embedder),
+        abstract_ingestion=Ingestion(),
+        workspace_id="workspace",
+    )
+    monkeypatch.setattr(rag_cli, "_config", lambda workspace: SimpleNamespace(rag_tool_max_documents=1))
+    monkeypatch.setattr(rag_cli, "_abstract_database", lambda boundary, database, config: source_database)
+    monkeypatch.setattr(rag_cli, "_confirm_external", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rag_cli, "build_literature_services", lambda config, workspace: services)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "rag",
+            "index-abstracts",
+            "--resume",
+            "--run-id",
+            "missing-run",
+            "--yes",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "resume_run_missing" in result.stdout
+    assert calls == []
+
+
+def test_activate_validates_required_run_in_selected_generation(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    generation = SimpleNamespace(
+        fingerprint="c" * 64,
+        documents_physical="documents",
+        passages_physical="passages",
+    )
+
+    class Store:
+        selected = None
+
+        def ensure_generation(self, *, identity, chunk_schema_version):
+            del identity
+            assert chunk_schema_version == 2
+            return generation
+
+        def select_staging_generation(self, value):
+            self.selected = value
+
+        async def get_ingestion_run(self, run_id, workspace_id, **kwargs):
+            del run_id, workspace_id, kwargs
+            assert self.selected is generation
+            return SimpleNamespace(
+                source_kind=rag_cli.LiteratureSourceKind.FULLTEXT,
+                status="complete",
+                generation_fingerprint=generation.fingerprint,
+                stats=SimpleNamespace(complete=True, retryable=False),
+            )
+
+        async def activate_generation(self, value, *, allow_empty_bootstrap):
+            assert value is generation
+            assert self.selected is generation
+            del allow_empty_bootstrap
+
+    store = Store()
+    services = SimpleNamespace(
+        store=store,
+        ingestion=SimpleNamespace(embedder=SimpleNamespace(identity=object())),
+        workspace_id="workspace",
+    )
+    monkeypatch.setattr(rag_cli, "_config", lambda workspace: object())
+    monkeypatch.setattr(rag_cli, "build_literature_services", lambda config, workspace: services)
+    result = cli_runner.invoke(
+        app,
+        [
+            "rag",
+            "activate",
+            "--require-stage",
+            "pdf",
+            "--pdf-run-id",
+            "pdf-run",
+            "--yes",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+
+
+def test_rag_status_reports_explicit_stage_runs(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    class FakeProbe:
+        def __init__(self, config, workspace) -> None:
+            del config, workspace
+
+        def probe(self) -> ProbeResult:
+            return ProbeResult(status=CapabilityStatus.AVAILABLE, detail="ready")
+
+        def status_snapshot(self) -> dict[str, str]:
+            return {}
+
+    class Store:
+        async def get_ingestion_run(self, run_id, workspace_id, **kwargs):
+            del run_id, workspace_id
+            return SimpleNamespace(
+                source_kind=kwargs.get("source_kind"),
+                status="complete",
+                stats=SimpleNamespace(complete=True, retryable=False),
+            )
+
+    config = SimpleNamespace(
+        qdrant_url="http://qdrant",
+        qdrant_api_key_env="QDRANT_API_KEY",
+        qdrant_collection_prefix="literature",
+        embedding_provider="local",
+        embedding_model="local",
+        reranker_provider="disabled",
+        reranker_model="",
+        literature_root=tmp_path,
+    )
+    services = SimpleNamespace(store=Store(), workspace_id="workspace")
+    monkeypatch.setattr(rag_cli, "_config", lambda workspace: config)
+    monkeypatch.setattr(rag_cli, "LiteratureProbe", FakeProbe)
+    monkeypatch.setattr(rag_cli, "build_literature_services", lambda config, workspace: services)
+    result = cli_runner.invoke(
+        app,
+        [
+            "rag",
+            "status",
+            "--pdf-run-id",
+            "pdf-run",
+            "--abstract-run-id",
+            "abstract-run",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "PDF stage" in result.stdout
+    assert "Abstract stage" in result.stdout
+    assert result.stdout.count("complete") >= 2
+
+
+def test_rag_status_marks_unidentified_stage_runs_as_not_supplied(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    class FakeProbe:
+        def __init__(self, config, workspace) -> None:
+            del config, workspace
+
+        def probe(self) -> ProbeResult:
+            return ProbeResult(status=CapabilityStatus.AVAILABLE, detail="ready")
+
+        def status_snapshot(self) -> dict[str, str]:
+            return {"pdf_stage": "unknown", "abstract_stage": "unknown"}
+
+    monkeypatch.setattr(rag_cli, "LiteratureProbe", FakeProbe)
+    result = cli_runner.invoke(
+        app,
+        ["rag", "status", "--workspace", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "not supplied" in result.stdout
+    stage_lines = [
+        line
+        for line in result.stdout.splitlines()
+        if "PDF stage" in line or "Abstract stage" in line
+    ]
+    assert stage_lines
+    assert all("unknown" not in line for line in stage_lines)
+
+
+def test_rag_index_abstracts_external_confirmation_is_stage_specific(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("PHOTOMATAGENT_RAG_ALLOW_EXTERNAL", "1")
+    monkeypatch.setenv("PHOTOMATAGENT_RAG_EMBEDDING_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("PHOTOMATAGENT_RAG_EMBEDDING_MODEL", "embedding-test")
+    monkeypatch.setenv("PHOTOMATAGENT_RAG_EMBEDDING_BASE_URL", "https://embed.test/v1")
+    monkeypatch.setenv("PHOTOMATAGENT_RAG_EMBEDDING_API_KEY_ENV", "EMBED_TEST_KEY")
+    monkeypatch.setenv("EMBED_TEST_KEY", "test-key")
+    monkeypatch.setenv("PHOTOMATAGENT_LITERATURE_DIR", str(tmp_path))
+    abstract_dir = tmp_path / "abstract"
+    abstract_dir.mkdir()
+    (abstract_dir / "abstracts.sqlite3").touch()
+
+    result = cli_runner.invoke(
+        app,
+        ["rag", "index-abstracts", "--workspace", str(tmp_path)],
+        input="n\n",
+    )
+
+    assert result.exit_code != 0
+    assert "发送摘要片段" in result.stdout
+
+
 def test_abstract_resume_requires_run_id(cli_runner: CliRunner, tmp_path) -> None:
     result = cli_runner.invoke(
         app,

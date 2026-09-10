@@ -84,6 +84,7 @@ def build_literature_services(
     reranker: Any | None = None,
     abstract_database: Path | str | None = None,
     database: Path | str | None = None,
+    generation: Any | None = None,
 ) -> LiteratureServices:
     """Build the one shared literature application-service graph lazily."""
     from photomatagent.scientific.capabilities.literature.ingestion import (
@@ -130,6 +131,7 @@ def build_literature_services(
             effective_embedder,
             workspace_id=workspace_id,
             workspace_root=workspace.root,
+            generation=generation,
             batch_size=config.rag_tool_max_documents,
         )
     return LiteratureServices(
@@ -156,6 +158,7 @@ def build_abstract_ingestion_service(
     database: Path | str,
     *,
     services: LiteratureServices | Any | None = None,
+    generation: Any | None = None,
 ) -> Any:
     """Build the bounded SQLite abstract-stage service on the shared graph.
 
@@ -168,6 +171,8 @@ def build_abstract_ingestion_service(
         if existing is None:
             existing = _service_value(services, "abstracts")
         if existing is not None:
+            if generation is not None:
+                setattr(existing, "generation", generation)
             return existing
     selected_services = services or build_literature_services(config, workspace)
     resolved_database = workspace.resolve(str(database), must_exist=True)
@@ -189,6 +194,7 @@ def build_abstract_ingestion_service(
             )
         ),
         workspace_root=workspace.root,
+        generation=generation,
         batch_size=config.rag_tool_max_documents,
     )
 
