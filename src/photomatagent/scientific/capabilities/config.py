@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,26 @@ def _bounded_int_env(
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer") from exc
     if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _bounded_float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Read a strict finite float setting and validate its safe bounds."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(value) or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return value
 
@@ -106,6 +127,11 @@ class ScientificConfig:
     literature_search_top_k: int = 5
     literature_passage_chars: int = 600
     structure_output_dir: str = "output/scientific"
+    chgnet_model_name: str = "0.3.0"
+    chgnet_device: str = "cpu"
+    chgnet_max_structures: int = 32
+    chgnet_relax_fmax: float = 0.1
+    chgnet_relax_steps: int = 200
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
 
     @classmethod
@@ -234,6 +260,30 @@ class ScientificConfig:
                 600,
                 minimum=50,
                 maximum=600,
+            ),
+            chgnet_model_name=_text_env(
+                "PHOTOMATAGENT_CHGNET_MODEL_NAME", "0.3.0"
+            ),
+            chgnet_device=_text_env(
+                "PHOTOMATAGENT_CHGNET_DEVICE", "cpu"
+            ),
+            chgnet_max_structures=_bounded_int_env(
+                "PHOTOMATAGENT_CHGNET_MAX_STRUCTURES",
+                32,
+                minimum=1,
+                maximum=32,
+            ),
+            chgnet_relax_fmax=_bounded_float_env(
+                "PHOTOMATAGENT_CHGNET_RELAX_FMAX",
+                0.1,
+                minimum=0.0001,
+                maximum=1.0,
+            ),
+            chgnet_relax_steps=_bounded_int_env(
+                "PHOTOMATAGENT_CHGNET_RELAX_STEPS",
+                200,
+                minimum=1,
+                maximum=200,
             ),
             mcp_servers=servers,
         )
