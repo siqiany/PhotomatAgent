@@ -91,6 +91,25 @@ class HistoricalSessionImporter:
         self.workspace = workspace
         self.service = service
 
+    def find_linked_task(self, runtime_session_id: str) -> EvolutionTask | None:
+        """Find the unique evolution task containing this runtime session."""
+        matches: dict[str, EvolutionTask] = {}
+        for task in self.service.store.list_tasks():
+            upper = int(task.current_version[1:]) if task.current_version else 0
+            for index in range(1, upper + 1):
+                try:
+                    episode = self.service.store.load_episode(task.evolution_id, f"v{index:03d}")
+                except FileNotFoundError:
+                    continue
+                if episode.runtime_session_id == runtime_session_id:
+                    matches[task.evolution_id] = task
+                    break
+        if len(matches) > 1:
+            raise EvolutionOperationConflict(
+                f"runtime session {runtime_session_id} is linked to multiple evolution tasks"
+            )
+        return next(iter(matches.values()), None)
+
     def import_session(
         self,
         source: str | Path,
@@ -109,6 +128,8 @@ class HistoricalSessionImporter:
         evolution_id = "evo_import_" + hashlib.sha256(preview.session_id.encode()).hexdigest()[:32]
         input_sha = self.service._input_hash(resolved_goal, target)
         source_file = self.workspace.resolve(str(artifact_path), must_exist=True) if artifact_path else None
+        if source_file is not None and not source_file.is_file():
+            raise ValueError("artifact_path must name a regular file")
         expected_artifact_sha = sha256_file(source_file) if source_file else hashlib.sha256((preview.final_response + "\n").encode("utf-8")).hexdigest()
         try:
             task = self.service.create_task(
@@ -141,7 +162,11 @@ class HistoricalSessionImporter:
         if episode.execution_mode != "IMPORTED_SESSION" or episode.owner_token != owner:
             raise EvolutionOperationConflict("historical session provenance conflicts with existing import")
         if episode.status == "COMPLETED":
-            if episode.artifact is None or episode.artifact.sha256 != expected_artifact_sha:
+            if episode.artifact is None or not canonical.is_file():
+                raise EvolutionOperationConflict("canonical historical artifact is missing or not a regular file")
+            if (canonical.stat().st_size != episode.artifact.size_bytes
+                    or sha256_file(canonical) != episode.artifact.sha256
+                    or episode.artifact.sha256 != expected_artifact_sha):
                 raise EvolutionOperationConflict("historical session artifact hash conflicts")
             return task
         try:

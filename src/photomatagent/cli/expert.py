@@ -18,6 +18,7 @@ from photomatagent.scientific.evolution.importer import (
     HistoricalSessionImporter,
     preview_historical_session,
 )
+from photomatagent.scientific.evolution.models import EvolutionTask
 from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.store import EvolutionStore
 from photomatagent.scientific.loop import TargetSpec
@@ -45,6 +46,30 @@ class _ExpertPrompt:
 
 async def _ask(session: PromptSessionLike, label: str) -> str:
     return await session.prompt_async(f"[EXPERT MODE | {label}] ")
+
+
+async def _resume_linked(
+    *, task: EvolutionTask, session: PromptSessionLike, output: Console,
+    workspace: Path, compile_runner: Callable[..., Awaitable[object]],
+    iterate_callback: Callable[[str], Awaitable[object]] | None,
+) -> None:
+    status = task.status
+    evolution_id = task.evolution_id
+    version = task.last_completed_version or task.current_version
+    if status == "AWAITING_EXPERT_FEEDBACK" and version is not None:
+        await run_feedback_command(
+            session=_ExpertPrompt(session), output=output, workspace=workspace,
+            evolution_id=evolution_id, version=version,
+        )
+    elif status == "FEEDBACK_RECORDED":
+        choice = (await _ask(session, "已有反馈；立即 compile？[y/N] 或 /cancel")).strip().lower()
+        if choice in {"y", "yes"}:
+            await compile_runner(session=_ExpertPrompt(session), output=output,
+                                 workspace=workspace, evolution_id=evolution_id)
+    elif status == "REVISION_READY":
+        choice = (await _ask(session, "revision confirmed；立即 iterate？[y/N] 或 /cancel")).strip().lower()
+        if choice in {"y", "yes"} and iterate_callback is not None:
+            await iterate_callback(evolution_id)
 
 
 async def run_expert_mode(
@@ -102,6 +127,15 @@ async def run_expert_mode(
 
     try:
         preview = preview_historical_session(boundary, source_path)
+        service = EvolutionService(EvolutionStore(boundary))
+        importer = HistoricalSessionImporter(boundary, service)
+        linked = importer.find_linked_task(preview.session_id)
+        if linked is not None:
+            output.print(f"[EXPERT MODE | RESUMING] {linked.evolution_id} {linked.status}")
+            await _resume_linked(task=linked, session=session, output=output,
+                                 workspace=boundary.root, compile_runner=compile_runner,
+                                 iterate_callback=iterate_callback)
+            return
         output.print(f"[EXPERT MODE | GOAL] {preview.goal}")
         goal_confirmation = (await _ask(session, "确认 goal（y/n）或 /cancel")).strip().lower()
         if goal_confirmation == "/cancel":
@@ -151,8 +185,7 @@ async def run_expert_mode(
             output.print("[EXPERT MODE | CANCELLED] 未确认 target，未写入数据。")
             return
         target = target.model_copy(update={"goal": goal})
-        service = EvolutionService(EvolutionStore(boundary))
-        task = HistoricalSessionImporter(boundary, service).import_session(
+        task = importer.import_session(
             source_path, target=target, goal=goal, artifact_path=artifact_path
         )
         selected_version = task.last_completed_version or task.current_version or "v001"

@@ -12,6 +12,7 @@ from photomatagent.scientific.evolution.importer import (
 )
 from photomatagent.scientific.evolution.models import ExecutionMode
 from photomatagent.scientific.evolution.service import EvolutionService
+from photomatagent.scientific.evolution.service import EvolutionOperationConflict
 from photomatagent.scientific.evolution.store import EvolutionStore
 from photomatagent.scientific.loop import TargetSpec
 from photomatagent.scientific.state import ScientificState
@@ -19,6 +20,7 @@ from photomatagent.sessions.store import save_session_snapshot
 from photomatagent.runtime.state import ConversationState
 from photomatagent.models.types import AssistantMessage
 from photomatagent.workspace import Workspace
+from photomatagent.cli.chat import build_runtime
 from rich.console import Console
 from photomatagent.cli.commands import ChatCommandRouter
 
@@ -85,6 +87,11 @@ def test_import_historical_session_materializes_provenance_bound_v001(tmp_path: 
     ).hexdigest()
     assert service.store.load_scientific_state(task.evolution_id, "v001").model_dump() == original_state.model_dump()
     assert preview.session_id == "session-abc"
+    assert HistoricalSessionImporter(workspace, service).find_linked_task("session-abc") == task
+    canonical = workspace.resolve(f"user_output/{task.evolution_id}/v001/result.md", must_exist=True)
+    canonical.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(EvolutionOperationConflict):
+        HistoricalSessionImporter(workspace, service).import_session(session_dir, target=target)
 
 
 def test_import_retries_after_reservation_interruption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,6 +123,13 @@ def test_import_retries_after_reservation_interruption(tmp_path: Path, monkeypat
     task = importer.import_session(session_dir, target=target)
     assert task.current_version == "v001"
     assert service.store.load_episode(task.evolution_id, "v001").status == "COMPLETED"
+
+
+def test_runtime_logger_sessions_follow_workspace(tmp_path: Path) -> None:
+    runtime, logger = build_runtime(workspace_root=tmp_path, provider="fake")
+    assert runtime.workspace.root == tmp_path.resolve()
+    assert logger is not None
+    assert logger.session_dir.parent == tmp_path.resolve() / ".photomatagent" / "sessions"
 
 
 def test_import_cleans_stale_partial_temporary_artifact(tmp_path: Path) -> None:

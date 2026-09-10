@@ -75,8 +75,12 @@ def build_runtime(
         policy = DenyAllPolicy()
 
     sinks: list[EventSink] = []
+    session_base = (
+        Path(session_dir) if session_dir is not None and Path(session_dir).is_absolute()
+        else workspace.resolve(str(session_dir or ".photomatagent/sessions"), must_exist=False)
+    )
     logger = (
-        EventLogger(session_dir or default_sessions_dir(), session_id=session_id)
+        EventLogger(session_base, session_id=session_id)
         if log_events
         else None
     )
@@ -215,11 +219,16 @@ async def run_chat(
     sessions_dir: Path | str | None = None,
 ) -> None:
     console = Console()
+    workspace = Workspace(workspace_root or Path.cwd())
+    configured_sessions_dir = (
+        Path(sessions_dir) if sessions_dir is not None and Path(sessions_dir).is_absolute()
+        else workspace.resolve(str(sessions_dir or ".photomatagent/sessions"), must_exist=False)
+    )
     prompt_session = make_prompt_session() if goal is None or approval == "ask" else None
     resume_session_dir: Path | None = None
     if resume is not None:
         resume_session_dir, snapshot = _load_resume_snapshot(
-            resume, console, sessions_dir=sessions_dir
+            resume, console, sessions_dir=configured_sessions_dir
         )
     sessions_base = resume_session_dir.parent if resume_session_dir is not None else None
     resumed_session_id = resume_session_dir.name if resume_session_dir is not None else None
@@ -230,7 +239,7 @@ async def run_chat(
         approval=approval,
         max_iterations=max_iterations,
         prompt_session=prompt_session,
-        session_dir=sessions_base or sessions_dir,
+        session_dir=sessions_base or configured_sessions_dir,
         session_id=resumed_session_id,
         log_events=log_events,
     )
