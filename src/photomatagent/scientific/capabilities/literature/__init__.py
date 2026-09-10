@@ -840,6 +840,31 @@ def _strict_public_source_kind(record: Any) -> LiteratureSourceKind | None:
         return None
 
 
+_MAX_PUBLIC_SOURCE_RECORD_ID_CHARS = 300
+
+
+def _public_source_record_id(record: Any) -> str:
+    """Return an opaque source ID byte-for-byte without display normalisation.
+
+    ``source_record_id`` is an authoritative SQLite key, not prose.  In
+    particular, leading, trailing, and repeated whitespace are meaningful and
+    must survive every model-facing boundary.  Keep the public payload bounded
+    by rejecting an oversized ID instead of returning a misleading prefix.
+    """
+    raw_value = _record_value(record, "source_record_id", None)
+    if raw_value is None:
+        return ""
+    if isinstance(raw_value, bytes):
+        value = raw_value.decode("utf-8", errors="replace")
+    else:
+        value = str(raw_value)
+    if len(value) > _MAX_PUBLIC_SOURCE_RECORD_ID_CHARS:
+        raise ValueError(
+            "source_record_id exceeds the public length bound"
+        )
+    return value
+
+
 def _public_limitations(
     record: Any,
     source_kind: LiteratureSourceKind,
@@ -960,9 +985,7 @@ def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
             _clean(str(limitation), 240) for limitation in limitations
         ],
         "source_kind": source_kind.value,
-        "source_record_id": _clean(
-            str(_record_value(record, "source_record_id", "") or ""), 300
-        ),
+        "source_record_id": _public_source_record_id(record),
         "doi": _clean(str(_record_value(record, "doi", "") or ""), 300),
         "pmid": _clean(str(_record_value(record, "pmid", "") or ""), 120),
         "pmcid": _clean(str(_record_value(record, "pmcid", "") or ""), 120),
@@ -974,6 +997,89 @@ def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
 
 
 MAX_EVIDENCE_ITEMS = 100
+
+
+def _enrich_literature_evidence(
+    evidence: list[ScientificEvidence],
+    resolved: list[dict[str, Any]],
+) -> list[ScientificEvidence]:
+    """Carry passage-tier provenance and limitations into extracted evidence."""
+    metadata_by_passage_id = {
+        str(item.get("passage_id") or ""): item
+        for item in resolved
+        if item.get("passage_id")
+    }
+    enriched: list[ScientificEvidence] = []
+    for item in evidence:
+        passage_id = str(item.provenance.get("passage_id") or "")
+        metadata = metadata_by_passage_id.get(passage_id)
+        if metadata is None:
+            enriched.append(item)
+            continue
+        try:
+            source_kind = LiteratureSourceKind(
+                metadata.get("source_kind", LiteratureSourceKind.FULLTEXT.value)
+            )
+        except (TypeError, ValueError):
+            # Passage rows are validated before they enter ``resolved``.  Keep
+            # this defensive branch fail-closed if that contract changes.
+            enriched.append(item)
+            continue
+
+        provenance = dict(item.provenance)
+        provenance.update(
+            {
+                "source_kind": source_kind.value,
+                "source_record_id": metadata.get("source_record_id", ""),
+                "relative_source_path": metadata.get("source", ""),
+            }
+        )
+        for name in (
+            "doi",
+            "pmid",
+            "pmcid",
+            "journal",
+            "relevance_tier",
+        ):
+            value = metadata.get(name, "")
+            if value:
+                provenance[name] = value
+
+        raw_limitations = metadata.get("limitations", ()) or ()
+        if isinstance(raw_limitations, str):
+            source_limitations = [raw_limitations]
+        else:
+            source_limitations = [str(value) for value in raw_limitations]
+        if source_kind is LiteratureSourceKind.ABSTRACT:
+            # Make the evidence limitation explicit even if a legacy abstract
+            # payload omitted one of the source-level limitation fields.
+            source_limitations.extend(("abstract_only", "fulltext_not_checked"))
+        deduplicated_limitations: list[str] = []
+        seen_limitations: set[str] = set()
+        for limitation in source_limitations:
+            key = limitation.casefold()
+            if limitation and key not in seen_limitations:
+                seen_limitations.add(key)
+                deduplicated_limitations.append(limitation)
+
+        limitations = item.limitations
+        if source_kind is LiteratureSourceKind.ABSTRACT:
+            # The generic extractor mentions a source PDF.  For an abstract
+            # passage, retain the verification warning without implying that
+            # a full text was available or inspected.
+            limitations = limitations.replace("source PDF", "source")
+        if deduplicated_limitations:
+            suffix = "; ".join(deduplicated_limitations)
+            limitations = f"{limitations}; {suffix}" if limitations else suffix
+        enriched.append(
+            item.model_copy(
+                update={
+                    "limitations": limitations,
+                    "provenance": provenance,
+                }
+            )
+        )
+    return enriched
 
 
 class LiteratureSearchArxivTool(Tool):
@@ -1428,6 +1534,17 @@ class LiteratureSearchPassagesTool(Tool):
                     data={"error": "source_kind_invalid"},
                 )
             limitations = _public_limitations(passage, passage_source_kind)
+            try:
+                source_record_id = _public_source_record_id(passage)
+            except ValueError:
+                return ScientificToolResult(
+                    output=(
+                        "source_record_id_invalid: retrieved passage source ID "
+                        "exceeds the public length bound"
+                    ),
+                    is_error=True,
+                    data={"error": "source_record_id_invalid"},
+                )
             row = {
                 "passage_id": str(_record_value(passage, "passage_id", "")),
                 "paper_id": str(
@@ -1479,9 +1596,7 @@ class LiteratureSearchPassagesTool(Tool):
                     _clean(str(limitation), 240) for limitation in limitations
                 ],
                 "source_kind": passage_source_kind.value,
-                "source_record_id": _clean(
-                    str(_record_value(passage, "source_record_id", "") or ""), 300
-                ),
+                "source_record_id": source_record_id,
                 "doi": _clean(str(_record_value(passage, "doi", "") or ""), 300),
                 "pmid": _clean(str(_record_value(passage, "pmid", "") or ""), 120),
                 "pmcid": _clean(
@@ -1537,6 +1652,16 @@ class LiteratureReadPassageTool(Tool):
         "type": "object",
         "properties": {
             "passage_id": {"type": "string", "description": "passage_id from literature.search_passages."},
+            "source_kind": {
+                "type": "string",
+                "enum": ["fulltext", "abstract"],
+                "default": "fulltext",
+                "description": (
+                    "Source tier for passage_id: fulltext for local PDF "
+                    "passages or abstract for local abstract passages. Use "
+                    "the same tier returned by literature.search_passages."
+                ),
+            },
         },
         "required": ["passage_id"],
     }
@@ -1553,6 +1678,16 @@ class LiteratureReadPassageTool(Tool):
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         passage_id = str(arguments["passage_id"])
+        raw_source_kind = arguments.get(
+            "source_kind", LiteratureSourceKind.FULLTEXT.value
+        )
+        try:
+            source_kind = LiteratureSourceKind(raw_source_kind)
+        except (TypeError, ValueError):
+            return _error_result(
+                ValueError("source_kind must be 'fulltext' or 'abstract'"),
+                operation="literature read",
+            )
         try:
             services = (
                 self._services
@@ -1565,6 +1700,7 @@ class LiteratureReadPassageTool(Tool):
             rows = await store.retrieve_passages(
                 str(_service_value(services, "workspace_id", _workspace_id(self._workspace))),
                 [passage_id],
+                source_kind=source_kind,
             )
         except Exception as exc:
             return _error_result(exc, operation="literature read")
@@ -1575,9 +1711,41 @@ class LiteratureReadPassageTool(Tool):
                 data={"error": "passage_not_found", "passage_id": passage_id},
             )
         row = rows[0]
-        payload = _passage_payload(
-            row, text_limit=self._config.literature_max_chars
-        )
+        missing_source_kind = object()
+        raw_row_source_kind = _record_value(row, "source_kind", missing_source_kind)
+        row_source_kind = _strict_public_source_kind(row)
+        if row_source_kind is None:
+            # Legacy payloads predate source_kind and remain readable only in
+            # the compatibility-default fulltext tier.  An abstract request
+            # must never be relabeled as fulltext when provenance is missing.
+            if (
+                source_kind is LiteratureSourceKind.ABSTRACT
+                or raw_row_source_kind is not missing_source_kind
+            ):
+                return ScientificToolResult(
+                    output=(
+                        "source_kind_invalid: retrieved passage is missing or "
+                        "has an invalid source_kind"
+                    ),
+                    is_error=True,
+                    data={"error": "source_kind_invalid"},
+                )
+            row_source_kind = source_kind
+        if row_source_kind is not source_kind:
+            return ScientificToolResult(
+                output=(
+                    "source_kind_invalid: retrieved passage source_kind does "
+                    "not match the requested tier"
+                ),
+                is_error=True,
+                data={"error": "source_kind_invalid"},
+            )
+        try:
+            payload = _passage_payload(
+                row, text_limit=self._config.literature_max_chars
+            )
+        except ValueError as exc:
+            return _error_result(exc, operation="literature read")
         output_payload = dict(payload)
         return ScientificToolResult(
             output=json.dumps(output_payload, ensure_ascii=False),
@@ -1614,6 +1782,16 @@ class LiteratureExtractEvidenceTool(Tool):
                     },
                 },
             },
+            "source_kind": {
+                "type": "string",
+                "enum": ["fulltext", "abstract"],
+                "default": "fulltext",
+                "description": (
+                    "Source tier for passage IDs: fulltext for local PDF "
+                    "passages or abstract for local abstract passages. Use "
+                    "the same tier returned by literature.search_passages."
+                ),
+            },
         },
         "required": ["passages"],
     }
@@ -1635,6 +1813,16 @@ class LiteratureExtractEvidenceTool(Tool):
 
         passages = list(arguments.get("passages") or [])
         passages = passages[:MAX_EVIDENCE_ITEMS]
+        raw_source_kind = arguments.get(
+            "source_kind", LiteratureSourceKind.FULLTEXT.value
+        )
+        try:
+            source_kind = LiteratureSourceKind(raw_source_kind)
+        except (TypeError, ValueError):
+            return _error_result(
+                ValueError("source_kind must be 'fulltext' or 'abstract'"),
+                operation="literature evidence",
+            )
         resolved: list[dict[str, Any]] = []
         try:
             services = (
@@ -1656,6 +1844,7 @@ class LiteratureExtractEvidenceTool(Tool):
                     rows = await store.retrieve_passages(
                         str(_service_value(services, "workspace_id", _workspace_id(self._workspace))),
                         [str(passage_id)],
+                        source_kind=source_kind,
                     )
                 except Exception as exc:
                     return _error_result(exc, operation="literature evidence")
@@ -1668,7 +1857,41 @@ class LiteratureExtractEvidenceTool(Tool):
                     )
                     continue
                 row = rows[0]
-                row_data = _passage_payload(row, text_limit=None)
+                missing_source_kind = object()
+                raw_row_source_kind = _record_value(
+                    row, "source_kind", missing_source_kind
+                )
+                row_source_kind = _strict_public_source_kind(row)
+                if row_source_kind is None:
+                    # Keep compatibility for old fulltext payloads, but do
+                    # not let an abstract request manufacture fulltext
+                    # provenance from a missing or malformed source tag.
+                    if (
+                        source_kind is LiteratureSourceKind.ABSTRACT
+                        or raw_row_source_kind is not missing_source_kind
+                    ):
+                        return ScientificToolResult(
+                            output=(
+                                "source_kind_invalid: retrieved passage is "
+                                "missing or has an invalid source_kind"
+                            ),
+                            is_error=True,
+                            data={"error": "source_kind_invalid"},
+                        )
+                    row_source_kind = source_kind
+                if row_source_kind is not source_kind:
+                    return ScientificToolResult(
+                        output=(
+                            "source_kind_invalid: retrieved passage source_kind "
+                            "does not match the requested tier"
+                        ),
+                        is_error=True,
+                        data={"error": "source_kind_invalid"},
+                    )
+                try:
+                    row_data = _passage_payload(row, text_limit=None)
+                except ValueError as exc:
+                    return _error_result(exc, operation="literature evidence")
                 resolved.append(
                     {
                         "text": _clean(
@@ -1678,6 +1901,14 @@ class LiteratureExtractEvidenceTool(Tool):
                         "page": row_data.get("page"),
                         "passage_id": passage_id,
                         "source": row_data.get("source", ""),
+                        "source_kind": row_data.get("source_kind", source_kind.value),
+                        "source_record_id": row_data.get("source_record_id", ""),
+                        "doi": row_data.get("doi", ""),
+                        "pmid": row_data.get("pmid", ""),
+                        "pmcid": row_data.get("pmcid", ""),
+                        "journal": row_data.get("journal", ""),
+                        "relevance_tier": row_data.get("relevance_tier", ""),
+                        "limitations": row_data.get("limitations", []),
                     }
                 )
             else:
@@ -1691,7 +1922,9 @@ class LiteratureExtractEvidenceTool(Tool):
                         "source": str(item.get("source") or ""),
                     }
                 )
-        evidence = extract_evidence_from_passages(resolved)
+        evidence = _enrich_literature_evidence(
+            extract_evidence_from_passages(resolved), resolved
+        )
         bounded_evidence = evidence[:MAX_EVIDENCE_ITEMS]
         rows = [
             {
@@ -1703,6 +1936,10 @@ class LiteratureExtractEvidenceTool(Tool):
                 "source": item.source,
                 "method": item.method,
                 "summary": item.summary,
+                "limitations": item.limitations,
+                "provenance": dict(item.provenance),
+                "source_kind": item.provenance.get("source_kind", ""),
+                "source_record_id": item.provenance.get("source_record_id", ""),
             }
             for item in bounded_evidence
         ]
