@@ -85,7 +85,19 @@ class RetrievedPassage:
     relevance_tier: str = ""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "source_kind", LiteratureSourceKind(self.source_kind))
+        source_kind = LiteratureSourceKind(self.source_kind)
+        object.__setattr__(self, "source_kind", source_kind)
+        raw_limitations = self.limitations or ()
+        limitations = (
+            (raw_limitations,)
+            if isinstance(raw_limitations, str)
+            else tuple(str(item) for item in raw_limitations)
+        )
+        if source_kind is LiteratureSourceKind.ABSTRACT and not any(
+            item.casefold() == "abstract_only" for item in limitations
+        ):
+            limitations += ("abstract_only",)
+        object.__setattr__(self, "limitations", limitations)
 
     @property
     def passage(self) -> str:

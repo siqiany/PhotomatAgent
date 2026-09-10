@@ -307,6 +307,18 @@ async def test_retriever_rejects_wrong_source_candidates() -> None:
 
 
 @pytest.mark.asyncio
+async def test_abstract_retrieval_source_kind_marks_result_abstract_only() -> None:
+    store = FakeStore(candidate_fixture(source_kind=LiteratureSourceKind.ABSTRACT))
+    result = await LiteratureRetriever(
+        store, FakeEmbedder(), DisabledReranker()
+    ).search("HgTe", workspace_id="ws", source_kind=LiteratureSourceKind.ABSTRACT)
+
+    assert result.passages
+    assert result.passages[0].source_kind is LiteratureSourceKind.ABSTRACT
+    assert "abstract_only" in result.passages[0].limitations
+
+
+@pytest.mark.asyncio
 async def test_sparse_failure_uses_dense_only() -> None:
     store = FakeStore()
     store.hybrid_error = RuntimeError("sparse route unavailable")

@@ -30,6 +30,7 @@ from photomatagent.scientific.capabilities.contracts import (
 )
 from photomatagent.scientific.capabilities.literature.models import (
     LITERATURE_CHUNK_SCHEMA_VERSION,
+    LiteratureSourceKind,
 )
 from photomatagent.scientific.capabilities.literature.abstract_ingestion import (
     AbstractIngestionError,
@@ -52,6 +53,16 @@ def _version(name: str) -> str:
         return importlib.metadata.version(name)
     except Exception:
         return ""
+
+
+TIERED_RETRIEVAL_GUIDANCE = (
+    "Search local full-text passages first (source_kind=fulltext). If they do "
+    "not directly support the answer or leave an evidence gap, search local "
+    "abstract passages (source_kind=abstract). Only then, or when the user "
+    "explicitly asks for recent work, call literature.search_arxiv. Abstract "
+    "and arXiv results do not mean full text was inspected. arXiv results are "
+    "not persisted."
+)
 
 
 @dataclass(frozen=True)
@@ -348,7 +359,8 @@ class LiteratureProbe(CapabilityPack):
     name = "literature"
     description = (
         "Literature search and reading (arXiv + local PDFs) plus the "
-        "Qdrant-backed literature RAG services."
+        "Qdrant-backed literature RAG services. "
+        + TIERED_RETRIEVAL_GUIDANCE
     )
 
     def probe(self) -> ProbeResult:
@@ -806,6 +818,33 @@ def _record_value(record: Any, name: str, default: Any = None) -> Any:
     return getattr(record, name, default)
 
 
+def _public_source_kind(
+    record: Any,
+    default: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT,
+) -> LiteratureSourceKind:
+    raw = _record_value(record, "source_kind", default)
+    try:
+        return LiteratureSourceKind(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _public_limitations(
+    record: Any,
+    source_kind: LiteratureSourceKind,
+) -> tuple[str, ...]:
+    raw_limitations = _record_value(record, "limitations", ()) or ()
+    if isinstance(raw_limitations, str):
+        limitations = [raw_limitations]
+    else:
+        limitations = [str(item) for item in list(raw_limitations)]
+    if source_kind is LiteratureSourceKind.ABSTRACT and not any(
+        limitation.casefold() == "abstract_only" for limitation in limitations
+    ):
+        limitations.append("abstract_only")
+    return tuple(limitations[:8])
+
+
 def _stats_payload(stats: Any) -> dict[str, Any]:
     """Render only the bounded ingestion progress contract."""
     get = lambda name, default=None: _record_value(stats, name, default)
@@ -837,9 +876,8 @@ def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
     authors = _record_value(record, "authors", ()) or ()
     if isinstance(authors, str):
         authors = [authors]
-    limitations = _record_value(record, "limitations", ()) or ()
-    if isinstance(limitations, str):
-        limitations = [limitations]
+    source_kind = _public_source_kind(record)
+    limitations = _public_limitations(record, source_kind)
     page = _record_value(record, "page", _record_value(record, "page_start"))
     return {
         "passage_id": str(_record_value(record, "passage_id", "") or ""),
@@ -888,8 +926,19 @@ def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
             300,
         ),
         "limitations": [
-            _clean(str(limitation), 240) for limitation in list(limitations)[:8]
+            _clean(str(limitation), 240) for limitation in limitations
         ],
+        "source_kind": source_kind.value,
+        "source_record_id": _clean(
+            str(_record_value(record, "source_record_id", "") or ""), 300
+        ),
+        "doi": _clean(str(_record_value(record, "doi", "") or ""), 300),
+        "pmid": _clean(str(_record_value(record, "pmid", "") or ""), 120),
+        "pmcid": _clean(str(_record_value(record, "pmcid", "") or ""), 120),
+        "journal": _clean(str(_record_value(record, "journal", "") or ""), 300),
+        "relevance_tier": _clean(
+            str(_record_value(record, "relevance_tier", "") or ""), 120
+        ),
     }
 
 
@@ -900,7 +949,10 @@ class LiteratureSearchArxivTool(Tool):
     name = "literature.search_arxiv"
     description = (
         "Search arXiv for recent papers; returns a strictly limited list of ids, "
-        "titles, authors, dates, and short abstracts."
+        "titles, authors, dates, and short abstracts. This is a separate final "
+        "fallback after local full-text and abstract searches, or when the user "
+        "explicitly asks for recent work. Results are session-only and not "
+        "persisted; they do not mean full text was inspected."
     )
     short_description = "Search arXiv papers by query (strictly limited results)."
     exposure = ToolExposure.DEFERRED
@@ -980,7 +1032,8 @@ class LiteratureSearchLocalTool(Tool):
     name = "literature.search_local"
     description = (
         "Search text of PDF papers in the workspace papers/ directory; returns "
-        "matching files with page-level snippets, strictly limited."
+        "matching files with page-level snippets, strictly limited. "
+        + TIERED_RETRIEVAL_GUIDANCE
     )
     short_description = "Full-text search over local PDF papers (papers/)."
     exposure = ToolExposure.DEFERRED
@@ -1250,9 +1303,11 @@ class LiteratureSearchPassagesTool(Tool):
     description = (
         "Hybrid (dense + keyword) search over the local literature index with "
         "reranking and context expansion. Returns strictly limited passages "
-        "with provenance (paper, title, section, page, score, source file)."
+        "with provenance (paper, title, section, page, score, source file, and "
+        "source kind). "
+        + TIERED_RETRIEVAL_GUIDANCE
     )
-    short_description = "Hybrid RAG search for passages in local papers."
+    short_description = "Hybrid RAG search for local full-text or abstract passages."
     exposure = ToolExposure.DEFERRED
     namespace = "literature"
     source = "qdrant"
@@ -1262,6 +1317,12 @@ class LiteratureSearchPassagesTool(Tool):
         "properties": {
             "query": {"type": "string", "description": "Scientific query, e.g. 'HgTe quantum dot infrared detector responsivity'."},
             "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+            "source_kind": {
+                "type": "string",
+                "enum": ["fulltext", "abstract"],
+                "default": "fulltext",
+                "description": "Retrieval tier: fulltext for local PDF passages or abstract for local abstract passages.",
+            },
         },
         "required": ["query"],
     }
@@ -1281,6 +1342,16 @@ class LiteratureSearchPassagesTool(Tool):
         top_k = min(
             int(arguments.get("top_k", self._config.literature_search_top_k)), 10
         )
+        raw_source_kind = arguments.get(
+            "source_kind", LiteratureSourceKind.FULLTEXT.value
+        )
+        try:
+            source_kind = LiteratureSourceKind(raw_source_kind)
+        except (TypeError, ValueError):
+            return _error_result(
+                ValueError("source_kind must be 'fulltext' or 'abstract'"),
+                operation="literature search",
+            )
         try:
             services = (
                 self._services
@@ -1300,11 +1371,16 @@ class LiteratureSearchPassagesTool(Tool):
                     )
                 ),
                 top_k=top_k,
+                source_kind=source_kind,
             )
         except Exception as exc:
             return _error_result(exc, operation="literature search")
         rows: list[dict[str, Any]] = []
         for passage in list(_record_value(result, "passages", ()) or ())[:10]:
+            passage_source_kind = _public_source_kind(passage, source_kind)
+            if passage_source_kind is not source_kind:
+                continue
+            limitations = _public_limitations(passage, passage_source_kind)
             row = {
                 "passage_id": str(_record_value(passage, "passage_id", "")),
                 "paper_id": str(
@@ -1352,6 +1428,24 @@ class LiteratureSearchPassagesTool(Tool):
                 "context_after": _clean(
                     str(_record_value(passage, "context_after", "")), 300
                 ),
+                "limitations": [
+                    _clean(str(limitation), 240) for limitation in limitations
+                ],
+                "source_kind": passage_source_kind.value,
+                "source_record_id": _clean(
+                    str(_record_value(passage, "source_record_id", "") or ""), 300
+                ),
+                "doi": _clean(str(_record_value(passage, "doi", "") or ""), 300),
+                "pmid": _clean(str(_record_value(passage, "pmid", "") or ""), 120),
+                "pmcid": _clean(
+                    str(_record_value(passage, "pmcid", "") or ""), 120
+                ),
+                "journal": _clean(
+                    str(_record_value(passage, "journal", "") or ""), 300
+                ),
+                "relevance_tier": _clean(
+                    str(_record_value(passage, "relevance_tier", "") or ""), 120
+                ),
             }
             rows.append(row)
         diagnostics_obj = _record_value(result, "diagnostics", None)
@@ -1370,6 +1464,7 @@ class LiteratureSearchPassagesTool(Tool):
         }
         payload = {
             "query": _clean(query, 600),
+            "source_kind": source_kind.value,
             "count": len(rows),
             "results": rows,
             "diagnostics": diagnostics,
