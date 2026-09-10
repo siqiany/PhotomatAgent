@@ -297,6 +297,34 @@ async def _ensure_staging_generation(
     return generation
 
 
+async def _select_expected_generation(store: Any, embedder: Any) -> Any | None:
+    """Select the configured target using only the store's pure calculation.
+
+    This is for read-only status lookups.  Unlike ``_ensure_staging_generation``
+    it never creates collections, payload indexes, or generation metadata.
+    Selecting the target is an in-memory store operation so the subsequent
+    bounded point lookup addresses the expected physical pair.
+    """
+    expected = getattr(store, "expected_generation", None)
+    identity = getattr(embedder, "identity", None)
+    if not callable(expected) or identity is None:
+        return None
+    generation = expected(
+        identity=identity,
+        chunk_schema_version=LITERATURE_CHUNK_SCHEMA_VERSION,
+    )
+    if hasattr(generation, "__await__"):
+        generation = await generation
+    if generation is None:
+        return None
+    select = getattr(store, "select_staging_generation", None)
+    if callable(select):
+        selected = select(generation)
+        if hasattr(selected, "__await__"):
+            await selected
+    return generation
+
+
 async def _lookup_ingestion_run(
     store: Any,
     run_id: str,
@@ -1009,7 +1037,7 @@ async def _explicit_stage_statuses(
     )
     store = _service_value(services, "store")
     ingestion_service = _service_value(services, "ingestion")
-    generation = await _ensure_staging_generation(
+    generation = await _select_expected_generation(
         store,
         getattr(ingestion_service, "embedder", None),
     )

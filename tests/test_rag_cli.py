@@ -591,6 +591,81 @@ def test_rag_status_reports_explicit_stage_runs(
     assert result.stdout.count("complete") >= 2
 
 
+def test_rag_status_stage_lookup_does_not_ensure_generation(
+    cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    generation = SimpleNamespace(fingerprint="d" * 64)
+
+    class FakeProbe:
+        def __init__(self, config, workspace) -> None:
+            del config, workspace
+
+        def probe(self) -> ProbeResult:
+            return ProbeResult(status=CapabilityStatus.AVAILABLE, detail="ready")
+
+        def status_snapshot(self) -> dict[str, str]:
+            return {}
+
+    class Store:
+        selected = None
+
+        def ensure_generation(self, **kwargs):
+            del kwargs
+            raise AssertionError("status must not create or ensure collections")
+
+        def expected_generation(self, *, identity, chunk_schema_version):
+            del identity
+            assert chunk_schema_version == 2
+            return generation
+
+        def select_staging_generation(self, value):
+            self.selected = value
+
+        async def get_ingestion_run(self, run_id, workspace_id, **kwargs):
+            del run_id, workspace_id
+            assert self.selected is generation
+            return SimpleNamespace(
+                source_kind=kwargs.get("source_kind"),
+                generation_fingerprint=generation.fingerprint,
+                status="complete",
+                stats=SimpleNamespace(complete=True, retryable=False),
+            )
+
+    config = SimpleNamespace(
+        qdrant_url="http://qdrant",
+        qdrant_api_key_env="QDRANT_API_KEY",
+        qdrant_collection_prefix="literature",
+        embedding_provider="local",
+        embedding_model="local",
+        reranker_provider="disabled",
+        reranker_model="",
+        literature_root=tmp_path,
+    )
+    store = Store()
+    services = SimpleNamespace(
+        store=store,
+        ingestion=SimpleNamespace(embedder=SimpleNamespace(identity=object())),
+        workspace_id="workspace",
+    )
+    monkeypatch.setattr(rag_cli, "_config", lambda workspace: config)
+    monkeypatch.setattr(rag_cli, "LiteratureProbe", FakeProbe)
+    monkeypatch.setattr(rag_cli, "build_literature_services", lambda config, workspace: services)
+    result = cli_runner.invoke(
+        app,
+        [
+            "rag",
+            "status",
+            "--pdf-run-id",
+            "pdf-run",
+            "--workspace",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "complete" in result.stdout
+
+
 def test_rag_status_marks_unidentified_stage_runs_as_not_supplied(
     cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
