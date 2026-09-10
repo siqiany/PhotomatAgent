@@ -19,6 +19,18 @@ from photomatagent.sessions.store import save_session_snapshot
 from photomatagent.runtime.state import ConversationState
 from photomatagent.models.types import AssistantMessage
 from photomatagent.workspace import Workspace
+from rich.console import Console
+from photomatagent.cli.commands import ChatCommandRouter
+
+
+class _Prompt:
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = iter(answers)
+        self.prompts: list[str] = []
+
+    async def prompt_async(self, message: str) -> str:
+        self.prompts.append(message)
+        return next(self.answers)
 
 
 def test_import_historical_session_materializes_provenance_bound_v001(tmp_path: Path) -> None:
@@ -124,3 +136,32 @@ def test_import_cleans_stale_partial_temporary_artifact(tmp_path: Path) -> None:
     task = HistoricalSessionImporter(workspace, service).import_session(session_dir, target=target)
     assert task.current_version == "v001"
     assert list(result_dir.glob(".result.md.importing-*"))
+
+
+@pytest.mark.asyncio
+async def test_expert_route_imports_scores_and_keeps_chat_state_clean(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path)
+    session_dir = tmp_path / ".photomatagent" / "sessions" / "session-e2e"
+    session_dir.mkdir(parents=True)
+    (session_dir / "events.jsonl").write_text(
+        json.dumps({"kind": "loop_started", "session_id": "session-e2e", "goal": "goal"})
+        + "\n" + json.dumps({"kind": "text_delta", "session_id": "session-e2e", "iteration": 1, "text": "answer"}) + "\n",
+        encoding="utf-8",
+    )
+    target_path = tmp_path / "target.json"
+    target_path.write_text(json.dumps({"goal": "goal", "constraints": [{"property": "x", "operator": "ge", "value": 1}]}), encoding="utf-8")
+    answers = ["y", "y", "target.json", "y", "1", "1", "1", "1", "1", "", "", "", "", "", "", "/submit", "", "y", "n"]
+    prompt = _Prompt(answers)
+    runtime = type("Runtime", (), {"workspace": workspace, "conversation_state": ConversationState(), "session_id": None})()
+    console = Console(record=True)
+    router = ChatCommandRouter(console, runtime, workspace, sessions_dir=session_dir.parent, prompt_session=prompt)
+    await router.execute("/expert session-e2e")
+    service = EvolutionService(EvolutionStore(workspace))
+    task = service.get("evo_import_" + hashlib.sha256(b"session-e2e").hexdigest()[:32])
+    feedback = service.store.list_feedback(task.evolution_id)
+    assert task.current_version == "v001"
+    assert task.status == "FEEDBACK_RECORDED"
+    assert len(feedback) == 1
+    assert feedback[0].result_sha256 == hashlib.sha256(b"answer\n").hexdigest()
+    assert runtime.conversation_state.messages == []
+    assert all(message.startswith("[EXPERT MODE |") for message in prompt.prompts)

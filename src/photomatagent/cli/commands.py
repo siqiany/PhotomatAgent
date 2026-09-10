@@ -90,6 +90,7 @@ COMMANDS = (
         "/evolve [list|status|history|start|feedback|compile|iterate]",
         "管理专家反馈驱动的持久演化任务；feedback/compile 复用当前交互会话",
     ),
+    CommandSpec("/expert [session-id|history]", "在当前或历史 session 中启动内部专家评审向导"),
     CommandSpec("/configure [options]", "配置工作区 LLM（可能交互询问）"),
     CommandSpec("/compact", "压缩较早的工作上下文"),
     CommandSpec("/resume <id|目录|latest>", "回溯加载历史 session，并在其基础上继续追问"),
@@ -162,6 +163,8 @@ class ChatCommandRouter:
             await self._run_cli(["configure", *args])
         elif first_token == "/evolve":
             await self._evolve(args)
+        elif command == "/expert":
+            await self._expert(args)
         elif (
             command.removeprefix("/") in self._CLI_GROUPS
             and command.removeprefix("/") != "evolve"
@@ -240,6 +243,35 @@ class ChatCommandRouter:
             EvolutionStoreError,
         ) as exc:
             self.console.print(f"[red]{redact_text(str(exc))}[/]")
+
+    async def _expert(self, args: list[str]) -> None:
+        """Intercept the complete expert wizard so entries never reach the model."""
+        if len(args) > 1:
+            self.console.print("[EXPERT MODE | ERROR] 用法：/expert [session-id|history]")
+            return
+        if self.prompt_session is None:
+            self.console.print("[EXPERT MODE | ERROR] 当前聊天未提供交互 PromptSession。")
+            return
+        from photomatagent.cli.expert import run_expert_mode
+
+        source = args[0] if args else None
+        try:
+            await run_expert_mode(
+                session=self.prompt_session,
+                output=self.console,
+                workspace=self.workspace.root,
+                source=source,
+                sessions_dir=self.sessions_dir,
+                logger=self.logger,
+                runtime=self.runtime,
+                iterate_callback=self._run_expert_iterate,
+            )
+        except (OSError, UnicodeError, ValueError, ToolExecutionError,
+                EvolutionServiceError, EvolutionStoreError) as exc:
+            self.console.print(f"[EXPERT MODE | ERROR] {redact_text(str(exc))}")
+
+    async def _run_expert_iterate(self, evolution_id: str) -> None:
+        await self._run_cli(["evolve", "iterate", evolution_id])
 
     def _help(self) -> None:
         from rich.table import Table

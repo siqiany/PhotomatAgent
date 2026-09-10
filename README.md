@@ -396,6 +396,12 @@ uv run photomatagent evolve compare <evolution-id> v001 v002
 Strategy ID，并要求交互确认。只有确认后任务才进入 `REVISION_READY`。编译失败时原始
 反馈仍保留，可重跑同一条 `compile` 命令。
 
+交互聊天中也可使用 `/expert` 启动内部专家评审：`/expert` 检查当前 session，
+`/expert <session-id>` 检查历史 session，`/expert history` 列出并选择历史记录。历史
+导入前须确认目标与结果，并提供 workspace 内的 `TargetSpec` JSON；该文件必须至少包含
+一个机器可验证 constraint。向导中的输入不会作为普通聊天消息发送；任何阶段均可输入
+`/cancel`。完成 rubric 后可选择立即 compile，确认 revision plan 后还可选择 iterate。
+
 `evaluate --fresh` 要求 `REVISION_READY`、`--fresh` 和已确认生成的
 `--strategy-id`，因此必须在 `iterate` 之前运行；它保持主任务的修订就绪状态，并使用
 空白科学状态排除该任务的历史反馈、答案和继承证据。之后 `iterate` 才创建 v002 与
