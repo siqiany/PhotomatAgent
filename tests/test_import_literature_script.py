@@ -38,6 +38,9 @@ if [[ -f "$FAKE_COUNT_FILE" ]]; then
 fi
 printf '%s' "$((count + 1))" > "$FAKE_COUNT_FILE"
 : > "$FAKE_INVOKED_FILE"
+if [[ -n "${FAKE_EXIT_CODE:-}" ]]; then
+  exit "$FAKE_EXIT_CODE"
+fi
 """,
         encoding="utf-8",
     )
@@ -181,6 +184,9 @@ def test_fresh_abstract_run_archives_previous_id_and_forwards_supersession(
     state_dir.mkdir()
     state_file = state_dir / "abstracts.run_id"
     state_file.write_text("old-abstract-run\n", encoding="utf-8")
+    (state_dir / "abstracts.source_path").write_text(
+        "database with spaces.sqlite3\n", encoding="utf-8"
+    )
     monkeypatch.setenv("FAKE_STATE_FILE", str(state_file))
 
     result = _run_driver(
@@ -202,6 +208,149 @@ def test_fresh_abstract_run_archives_previous_id_and_forwards_supersession(
     archived = list((state_dir / "archive").glob("abstracts.*"))
     assert len(archived) == 1
     assert archived[0].read_text(encoding="utf-8").strip() == "old-abstract-run"
+
+
+def test_fresh_abstract_changed_source_requires_explicit_supersession(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("old-abstract-run\n", encoding="utf-8")
+    (state_dir / "abstracts.source_path").write_text(
+        "old-database.sqlite3\n", encoding="utf-8"
+    )
+
+    result = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "new-database.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+    )
+
+    assert result.returncode == 2
+    assert "--supersede-run-id" in result.stderr
+    assert state_file.read_text(encoding="utf-8") == "old-abstract-run\n"
+    assert not paths["invoked"].exists()
+    assert not (state_dir / "archive").exists()
+
+
+def test_changed_source_supersession_failure_keeps_active_state_and_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("old-abstract-run\n", encoding="utf-8")
+    source_file = state_dir / "abstracts.source_path"
+    source_file.write_text("old-database.sqlite3\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_EXIT_CODE", "17")
+
+    result = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "new-database.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+        "--supersede-run-id",
+        "old-abstract-run",
+    )
+
+    assert result.returncode == 17
+    assert paths["invoked"].is_file()
+    assert state_file.read_text(encoding="utf-8") == "old-abstract-run\n"
+    assert source_file.read_text(encoding="utf-8") == "old-database.sqlite3\n"
+    assert not (state_dir / "archive").exists()
+
+
+def test_changed_source_supersession_promotes_state_after_cli_acceptance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("old-abstract-run\n", encoding="utf-8")
+    source_file = state_dir / "abstracts.source_path"
+    source_file.write_text("old-database.sqlite3\n", encoding="utf-8")
+
+    result = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "new-database.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+        "--supersede-run-id",
+        "old-abstract-run",
+    )
+
+    assert result.returncode == 0, result.stderr
+    new_run_id = state_file.read_text(encoding="utf-8").strip()
+    assert new_run_id and new_run_id != "old-abstract-run"
+    assert source_file.read_text(encoding="utf-8").strip() == "new-database.sqlite3"
+    argv = _recorded_argv(paths["args"])
+    assert argv[argv.index("--supersede-run-id") + 1] == "old-abstract-run"
+    archived = list((state_dir / "archive").glob("abstracts.*"))
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8").strip() == "old-abstract-run"
+
+
+def test_pending_abstract_run_can_resume_and_promote_after_interruption(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("old-abstract-run\n", encoding="utf-8")
+    source_file = state_dir / "abstracts.source_path"
+    source_file.write_text("abstracts.sqlite3\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_STATE_FILE", str(state_file))
+    monkeypatch.setenv("FAKE_EXIT_CODE", "17")
+
+    interrupted = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "abstracts.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+    )
+
+    assert interrupted.returncode == 17
+    pending_file = state_dir / "abstracts.pending.run_id"
+    pending_id = pending_file.read_text(encoding="utf-8").strip()
+    assert pending_id
+    assert state_file.read_text(encoding="utf-8") == "old-abstract-run\n"
+
+    monkeypatch.delenv("FAKE_EXIT_CODE")
+    resumed = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "abstracts.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+        "--resume",
+    )
+
+    assert resumed.returncode == 0, resumed.stderr
+    assert state_file.read_text(encoding="utf-8").strip() == pending_id
+    assert source_file.read_text(encoding="utf-8").strip() == "abstracts.sqlite3"
+    assert not pending_file.exists()
+    argv = _recorded_argv(paths["args"])
+    assert "--resume" in argv
 
 
 def test_supersession_cannot_be_combined_with_resume(

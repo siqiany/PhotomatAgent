@@ -307,6 +307,25 @@ async def test_retriever_rejects_wrong_source_candidates() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ["workspace_id", "ingest_state"])
+async def test_retriever_rejects_candidates_missing_scope_or_readiness(
+    missing_field: str,
+) -> None:
+    candidate = candidate_fixture(1)[0]
+    payload = dict(candidate.payload)
+    payload.pop(missing_field)
+    store = FakeStore(
+        [SearchCandidate(candidate.passage_id, candidate.score, payload)]
+    )
+
+    result = await LiteratureRetriever(store, FakeEmbedder(), DisabledReranker()).search(
+        "query", workspace_id="ws", top_k=1
+    )
+
+    assert result.passages == ()
+
+
+@pytest.mark.asyncio
 async def test_abstract_retrieval_source_kind_marks_result_abstract_only() -> None:
     store = FakeStore(candidate_fixture(source_kind=LiteratureSourceKind.ABSTRACT))
     result = await LiteratureRetriever(

@@ -116,6 +116,19 @@ load_run_id() {
   printf '%s\n' "$value"
 }
 
+load_source_path() {
+  local state_file="$1"
+  local stage_name="$2"
+  if [[ ! -f "$state_file" ]]; then
+    return 1
+  fi
+  local value=""
+  IFS= read -r value < "$state_file" || true
+  value="${value//$'\r'/}"
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
 save_run_id() {
   local state_file="$1"
   local value="$2"
@@ -125,6 +138,33 @@ save_run_id() {
   local temporary="${state_file}.tmp.$$"
   printf '%s\n' "$value" > "$temporary"
   mv -f -- "$temporary" "$state_file"
+}
+
+canonical_abstract_source_path() {
+  local workspace_root
+  local database_path
+  if ! command -v realpath >/dev/null 2>&1; then
+    return 1
+  fi
+  if ! workspace_root="$(realpath -m -- "$WORKSPACE")"; then
+    return 1
+  fi
+  if [[ "$ABSTRACT_DATABASE" == /* ]]; then
+    database_path="$ABSTRACT_DATABASE"
+  else
+    database_path="${WORKSPACE%/}/${ABSTRACT_DATABASE}"
+  fi
+  if ! database_path="$(realpath -m -- "$database_path")"; then
+    return 1
+  fi
+  case "$database_path" in
+    "$workspace_root"/*)
+      printf '%s\n' "${database_path#"$workspace_root"/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 archive_run_id() {
@@ -146,6 +186,26 @@ archive_run_id() {
     archive_file="${archive_dir}/${stage_name}.${safe_value}.${timestamp}.$$.${suffix}"
   done
   save_run_id "$archive_file" "$value"
+}
+
+promote_abstract_run() {
+  local previous_run_id="$1"
+  local run_id="$2"
+  local source_path="$3"
+  local state_file="$4"
+  local source_state_file="$5"
+  local pending_state_file="$6"
+  local pending_source_state_file="$7"
+
+  if [[ -n "$previous_run_id" && "$previous_run_id" != "$run_id" ]]; then
+    archive_run_id "abstracts" "$previous_run_id"
+  fi
+  # Write source metadata first.  If the final ID move is interrupted, the
+  # active file still names the old run rather than pairing a new ID with an
+  # old source path.
+  save_run_id "$source_state_file" "$source_path"
+  save_run_id "$state_file" "$run_id"
+  rm -f -- "$pending_state_file" "$pending_source_state_file"
 }
 
 print_dry_run() {
@@ -298,6 +358,9 @@ else
 fi
 PDF_STATE_FILE="${RUN_STATE_DIR}/pdf.run_id"
 ABSTRACTS_STATE_FILE="${RUN_STATE_DIR}/abstracts.run_id"
+ABSTRACTS_SOURCE_PATH_FILE="${RUN_STATE_DIR}/abstracts.source_path"
+ABSTRACTS_PENDING_STATE_FILE="${RUN_STATE_DIR}/abstracts.pending.run_id"
+ABSTRACTS_PENDING_SOURCE_PATH_FILE="${RUN_STATE_DIR}/abstracts.pending.source_path"
 
 if [[ "$STAGE" == "pdf" || "$STAGE" == "abstracts" ]]; then
   STATE_FILE="$PDF_STATE_FILE"
@@ -305,26 +368,68 @@ if [[ "$STAGE" == "pdf" || "$STAGE" == "abstracts" ]]; then
   if [[ "$STAGE" == "abstracts" ]]; then
     STATE_FILE="$ABSTRACTS_STATE_FILE"
     STAGE_LABEL="abstracts"
+    if ! CURRENT_ABSTRACT_SOURCE_PATH="$(canonical_abstract_source_path)"; then
+      die "abstract database path cannot be safely resolved inside the workspace"
+    fi
   fi
 
+  PREVIOUS_RUN_ID=""
   if [[ "$RESUME" == true ]]; then
-    RUN_ID="$(load_run_id "$STATE_FILE" "$STAGE_LABEL")"
+    RUN_FROM_PENDING=false
+    if [[ "$STAGE" == "abstracts" && -f "$ABSTRACTS_PENDING_STATE_FILE" ]]; then
+      RUN_ID="$(load_run_id "$ABSTRACTS_PENDING_STATE_FILE" "pending abstracts")"
+      PENDING_SOURCE_PATH=""
+      if ! PENDING_SOURCE_PATH="$(load_source_path "$ABSTRACTS_PENDING_SOURCE_PATH_FILE" "pending abstracts")"; then
+        die "saved pending abstracts source path is missing: ${ABSTRACTS_PENDING_SOURCE_PATH_FILE}"
+      fi
+      [[ "$PENDING_SOURCE_PATH" == "$CURRENT_ABSTRACT_SOURCE_PATH" ]] || die \
+        "pending abstracts run belongs to another database; pass the original --database path"
+      RUN_FROM_PENDING=true
+    else
+      RUN_ID="$(load_run_id "$STATE_FILE" "$STAGE_LABEL")"
+      if [[ "$STAGE" == "abstracts" && -f "$ABSTRACTS_SOURCE_PATH_FILE" ]]; then
+        SAVED_SOURCE_PATH=""
+        if ! SAVED_SOURCE_PATH="$(load_source_path "$ABSTRACTS_SOURCE_PATH_FILE" "abstracts")"; then
+          die "saved abstracts source path is empty: ${ABSTRACTS_SOURCE_PATH_FILE}"
+        fi
+        [[ "$SAVED_SOURCE_PATH" == "$CURRENT_ABSTRACT_SOURCE_PATH" ]] || die \
+          "saved abstracts run belongs to another database; pass the original --database path"
+      fi
+    fi
   else
-    PREVIOUS_RUN_ID=""
     if [[ -f "$STATE_FILE" ]]; then
       IFS= read -r PREVIOUS_RUN_ID < "$STATE_FILE" || true
       PREVIOUS_RUN_ID="$(trim_run_id "$PREVIOUS_RUN_ID")"
     fi
-    if [[ "$STAGE" == "abstracts" && -z "$SUPERSEDE_RUN_ID" ]]; then
-      # A fresh abstract invocation following a saved run is a source
-      # replacement by default.  Forwarding the old ID makes the lifecycle
-      # explicit at the CLI while preserving the driver's audit trail.
-      SUPERSEDE_RUN_ID="$PREVIOUS_RUN_ID"
+    if [[ "$STAGE" == "abstracts" ]]; then
+      if [[ -f "$ABSTRACTS_PENDING_STATE_FILE" ]]; then
+        die "a pending abstracts run exists; use --resume before starting another fresh run"
+      fi
+      if [[ -n "$PREVIOUS_RUN_ID" && -z "$SUPERSEDE_RUN_ID" ]]; then
+        SAVED_SOURCE_PATH=""
+        if ! SAVED_SOURCE_PATH="$(load_source_path "$ABSTRACTS_SOURCE_PATH_FILE" "abstracts")"; then
+          die "saved abstracts source is unknown; pass --supersede-run-id explicitly"
+        fi
+        if [[ "$SAVED_SOURCE_PATH" != "$CURRENT_ABSTRACT_SOURCE_PATH" ]]; then
+          die "abstract database source changed; pass --supersede-run-id explicitly"
+        fi
+        # A source path match is the only case where the driver can safely
+        # preserve the previous convenience of automatic supersession.
+        SUPERSEDE_RUN_ID="$PREVIOUS_RUN_ID"
+      fi
     fi
     RUN_ID="$(new_run_id)"
-    if [[ "$DRY_RUN" == false ]]; then
-      # This is intentionally before invoking uv: an interrupted process can
-      # always be resumed with the exact ID sent to the CLI.
+    RUN_FROM_PENDING=false
+    if [[ "$DRY_RUN" == false && "$STAGE" == "abstracts" ]]; then
+      # Keep a fresh abstract run resumable without replacing the active ID
+      # until the CLI has accepted and persisted the new run.  The pending
+      # pair survives interruption and is consumed by the next --resume.
+      save_run_id "$ABSTRACTS_PENDING_SOURCE_PATH_FILE" "$CURRENT_ABSTRACT_SOURCE_PATH"
+      save_run_id "$ABSTRACTS_PENDING_STATE_FILE" "$RUN_ID"
+      RUN_FROM_PENDING=true
+    elif [[ "$DRY_RUN" == false ]]; then
+      # PDF retains its historical pre-save behavior so an interrupted index
+      # can immediately be resumed with the exact ID sent to the CLI.
       if [[ -n "$PREVIOUS_RUN_ID" ]]; then
         archive_run_id "$STAGE_LABEL" "$PREVIOUS_RUN_ID"
       fi
@@ -352,6 +457,35 @@ if [[ "$STAGE" == "pdf" || "$STAGE" == "abstracts" ]]; then
     COMMAND+=(--yes)
   fi
   cd -- "$REPOSITORY_ROOT"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    run_command "${COMMAND[@]}"
+    exit $?
+  fi
+
+  if [[ "$STAGE" == "abstracts" && "$RUN_FROM_PENDING" == true ]]; then
+    command_status=0
+    if run_command "${COMMAND[@]}"; then
+      command_status=0
+    else
+      command_status=$?
+    fi
+    if [[ "$command_status" -ne 0 ]]; then
+      printf 'error: abstract run was not accepted; active state is unchanged; pending run ID is at %s\n' \
+        "$ABSTRACTS_PENDING_STATE_FILE" >&2
+      exit "$command_status"
+    fi
+    promote_abstract_run \
+      "$PREVIOUS_RUN_ID" \
+      "$RUN_ID" \
+      "$CURRENT_ABSTRACT_SOURCE_PATH" \
+      "$ABSTRACTS_STATE_FILE" \
+      "$ABSTRACTS_SOURCE_PATH_FILE" \
+      "$ABSTRACTS_PENDING_STATE_FILE" \
+      "$ABSTRACTS_PENDING_SOURCE_PATH_FILE"
+    exit 0
+  fi
+
   run_command "${COMMAND[@]}"
   exit $?
 fi

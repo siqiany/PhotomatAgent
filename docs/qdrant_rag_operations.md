@@ -177,13 +177,20 @@ explicitly supplied. `--dry-run` prints the shell-escaped `uv run` argv and
 resolved paths, without writing run state or starting `uv`, a provider, or
 Qdrant.
 
-Before starting a fresh stage, the driver archives any previous ID under
+Before starting a fresh PDF stage, the driver archives any previous ID under
 `user_output/rag-import/run-state/archive/`, then atomically saves its new run
-ID under `pdf.run_id` or `abstracts.run_id`. A failed process or WSL restart
-therefore leaves an exact ID for the next `--resume`; a missing or empty state
-file is an explicit error for `--resume` and `activate` (status reports an
-unsupplied stage). The CLI's ingestion record remains the source of truth for
-its cursor and progress. Each progress line is bounded JSON
+ID under `pdf.run_id`. Abstract state also records the canonical workspace-
+relative database path in `abstracts.source_path`. A fresh abstract invocation
+automatically links and replaces a saved run only when that path matches
+exactly; a changed or unknown path fails closed and requires an explicit
+`--supersede-run-id OLD_RUN_ID`. New abstract IDs are first written to
+`abstracts.pending.run_id` and `abstracts.pending.source_path`; the active
+`abstracts.run_id` is archived and replaced only after the CLI accepts the run
+(complete or bounded pause). A failed validation or interruption therefore
+leaves the prior active ID intact, while the pending ID remains available to
+the next `--resume`. A missing or empty state file is an explicit error for
+`--resume` and `activate` (status reports an unsupplied stage). The CLI's
+ingestion record remains the source of truth for its cursor and progress. Each progress line is bounded JSON
 with `total`, `processed`, `indexed`, `unchanged`, `failed`, `skipped`,
 `passages`, `rate`, `eta`/`eta_seconds`, `cursor`, `run_id`, and `status` (plus
 the per-invocation `processed_this_invocation` audit field).
@@ -237,10 +244,11 @@ lookups. `activate` requires both IDs, passes both explicit
 uses the existing atomic alias switch. It does not perform a direct Qdrant
 request. An incomplete or retryable stage is rejected before activation.
 
-The WSL driver archives the prior stage ID under `run-state/archive/` before
-replacing its current state file. A fresh `abstracts` invocation automatically
-forwards that prior ID as `--supersede-run-id`; pass an explicit ID to
-override it. Use `--resume` only for the saved run itself, and never combine
+The WSL driver archives the prior stage ID under `run-state/archive/` when an
+accepted fresh run is promoted. For abstracts, a matching saved source path
+automatically forwards that prior ID as `--supersede-run-id`; a different or
+unrecorded path requires an explicit ID so source replacement is an operator
+decision. Use `--resume` for the saved active or pending run, and never combine
 it with supersession.
 
 Retrieval follows the evidence priority local full text → local abstracts →

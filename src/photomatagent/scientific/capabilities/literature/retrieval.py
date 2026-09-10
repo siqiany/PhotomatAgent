@@ -462,12 +462,12 @@ class LiteratureRetriever:
                 continue
             passage_id, score, payload = normalized
             payload_workspace = payload.get("workspace_id")
-            if payload_workspace is not None and str(payload_workspace) != workspace_id:
+            if not isinstance(payload_workspace, str) or payload_workspace != workspace_id:
                 continue
             if _source_kind_value(payload.get("source_kind")) != source_kind.value:
                 continue
             state = payload.get("ingest_state")
-            if state is not None and _enum_value(state) != "ready":
+            if _enum_value(state) != "ready":
                 continue
             key = (_document_id(payload), _normalized_text_hash(payload))
             prior = unique.get(key)
