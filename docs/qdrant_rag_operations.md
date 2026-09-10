@@ -142,6 +142,77 @@ root, and provider state without exposing secrets. Common typed errors include:
 No-result output is not evidence that a scientific claim is false. Recheck the
 generation, query, filters, and source coverage; provenance gaps remain gaps.
 
+## Two-stage import driver
+
+For the local corpus, use the thin WSL driver from any working directory. It
+changes to the repository root and invokes the current project's `uv`
+environment; it does not contain provider logic or call the Qdrant HTTP API.
+The default workspace is `/home/shiqiany/AIagent`, with these workspace-relative
+source paths:
+
+| Stage | Default source |
+| --- | --- |
+| PDF full text | `Photoelectric detection/dataset/paper/pdf` |
+| Abstracts | `Photoelectric detection/dataset/paper/abstract/abstracts.sqlite3` |
+
+Run the stages separately and activate only after both are complete:
+
+```bash
+bash scripts/import_literature_qdrant.sh pdf --stop-after 100
+bash scripts/import_literature_qdrant.sh pdf --resume --stop-after 100
+bash scripts/import_literature_qdrant.sh abstracts --stop-after 5000
+bash scripts/import_literature_qdrant.sh abstracts --resume --stop-after 5000
+bash scripts/import_literature_qdrant.sh status
+bash scripts/import_literature_qdrant.sh activate
+```
+
+The driver also accepts `--workspace PATH`, `--pdf-directory PATH`, and
+`--database PATH` to override those defaults. All source paths are passed as
+individual arguments, so spaces in a path are preserved. `--stop-after N`
+requests a successful, bounded pause after at most `N` source records;
+`--resume` reuses the saved ID for that stage. `--yes` is forwarded only when
+explicitly supplied. `--dry-run` prints the shell-escaped `uv run` argv and
+resolved paths, without writing run state or starting `uv`, a provider, or
+Qdrant.
+
+Before starting a fresh stage, the driver atomically saves its generated run ID
+under the repository's
+`user_output/rag-import/run-state/pdf.run_id` or
+`user_output/rag-import/run-state/abstracts.run_id`. A failed process or WSL
+restart therefore leaves an exact ID for the next `--resume`; a missing or
+empty state file is an explicit error for `--resume` and `activate` (status
+reports an unsupplied stage). The CLI's ingestion record remains the source of
+truth for its cursor and progress. Each progress line is bounded JSON
+with `total`, `processed`, `indexed`, `unchanged`, `failed`, `skipped`,
+`passages`, `rate`, `eta`/`eta_seconds`, `cursor`, `run_id`, and `status` (plus
+the per-invocation `processed_this_invocation` audit field).
+
+Abstract runs record a streamed SHA-256 identity for the SQLite file and the
+workspace-relative source path. If the database changes before resume, the
+service rejects the old run rather than combining two snapshots. Start a new
+`abstracts` run without `--resume` after verifying the replacement database;
+the old staged data is not implicitly deleted, and revision-based idempotency
+avoids re-embedding unchanged rows when the new run sees them.
+
+External embedding or reranking remains behind the existing configuration and
+confirmation gate. When an external provider is configured, each indexing
+stage prints the provider/model and the data scope, then asks for confirmation;
+pass `--yes` only after confirming that full-text or abstract text may leave the
+workspace. The driver never stores or prints API keys.
+
+`status` loads both saved stage IDs and performs the CLI's bounded read-only
+lookups. `activate` requires both IDs, passes both explicit
+`--require-stage pdf --require-stage abstracts` checks and their corresponding
+`--pdf-run-id`/`--abstract-run-id` values to `photomatagent rag activate`, and
+uses the existing atomic alias switch. It does not perform a direct Qdrant
+request. An incomplete or retryable stage is rejected before activation.
+
+Retrieval follows the evidence priority local full text → local abstracts →
+arXiv metadata. Abstract results identify themselves as abstract-only and do
+not imply that a PDF was inspected. arXiv remains a separate, permission-
+controlled, session-only search: its results are not written to Qdrant, the
+SQLite database, or the workspace.
+
 ## Legacy LanceDB artifacts
 
 The Qdrant migration does not import, rewrite, or delete an existing
