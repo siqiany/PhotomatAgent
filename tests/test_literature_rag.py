@@ -35,6 +35,7 @@ from photomatagent.workspace import Workspace
 
 
 CONFIG = ScientificConfig()
+_MISSING = object()
 
 
 def test_literature_probe_uses_source_aware_generation_version() -> None:
@@ -69,6 +70,22 @@ def test_search_schema_defaults_to_fulltext() -> None:
     assert prop["default"] == "fulltext"
 
 
+def test_abstract_limitations_reserve_canonical_slot() -> None:
+    record = SimpleNamespace(
+        limitations=tuple(f"limit-{index}" for index in range(8))
+        + ("ABSTRACT_ONLY", "limit-0"),
+    )
+
+    limitations = literature_capability._public_limitations(
+        record, LiteratureSourceKind.ABSTRACT
+    )
+
+    assert limitations == tuple(f"limit-{index}" for index in range(7)) + (
+        "abstract_only",
+    )
+    assert limitations.count("abstract_only") == 1
+
+
 @pytest.mark.asyncio
 async def test_abstract_result_identifies_source_and_limit(tmp_path) -> None:
     retriever = FakeRetriever()
@@ -101,6 +118,37 @@ async def test_search_rejects_unknown_source_kind(tmp_path) -> None:
 
     assert result.is_error
     assert result.data["error"] == "valueerror"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported_source_kind", [_MISSING, "not-a-tier", "fulltext"])
+async def test_search_rejects_malformed_result_source_kind(
+    tmp_path, reported_source_kind: object
+) -> None:
+    passage_fields: dict[str, Any] = {
+        "passage_id": "passage-1",
+        "document_id": "paper-1",
+        "text": "abstract text",
+        "title": "Abstract paper",
+        "score": 1.0,
+        "relative_source_path": "abstracts.sqlite3",
+        "limitations": (),
+    }
+    if reported_source_kind is not _MISSING:
+        passage_fields["source_kind"] = reported_source_kind
+    services = SimpleNamespace(
+        retriever=MalformedRetriever(SimpleNamespace(**passage_fields)),
+        workspace_id="workspace",
+    )
+
+    result = await LiteratureSearchPassagesTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    ).execute(
+        {"query": "photodetector", "top_k": 1, "source_kind": "abstract"}
+    )
+
+    assert result.is_error
+    assert result.data["error"] == "source_kind_invalid"
 
 
 def test_arxiv_description_forbids_persistence() -> None:
@@ -219,6 +267,29 @@ class FakeRetriever:
         )
         return RetrievalResult(
             passages=(passage,) if top_k else (),
+            diagnostics=RetrievalDiagnostics(
+                mode="hybrid_rrf",
+                candidate_count=1,
+                reranked=False,
+            ),
+        )
+
+
+class MalformedRetriever:
+    def __init__(self, passage: Any) -> None:
+        self.passage = passage
+
+    async def search(
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        top_k: int,
+        source_kind: LiteratureSourceKind | str,
+    ) -> RetrievalResult:
+        del query, workspace_id, top_k, source_kind
+        return RetrievalResult(
+            passages=(self.passage,),
             diagnostics=RetrievalDiagnostics(
                 mode="hybrid_rrf",
                 candidate_count=1,

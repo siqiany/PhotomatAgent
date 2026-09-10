@@ -91,3 +91,56 @@ The existing public search/read contract and wrong-source regression pass:
   existing limitations.
 - Provenance fields are bounded and JSON-compatible; arXiv remains a separate
   network action with no Qdrant write path.
+
+## Review fix round 1
+
+### Findings addressed
+
+- `_public_limitations` now deduplicates limitation keys, recognizes casing and
+  separator variants, reserves one of the eight bounded slots, and always
+  emits exactly one canonical `abstract_only` entry for abstract results.
+- Search result serialization now reads `source_kind` strictly. Missing,
+  invalid, or requested-tier-mismatched result tags return the bounded
+  `source_kind_invalid` error instead of being relabeled from the request.
+  The compatibility fallback remains limited to the non-search passage-read
+  serializer.
+
+### TDD evidence
+
+The new overflow/variant and malformed-result tests failed before the fix:
+
+```text
+4 failed, 14 deselected
+```
+
+After implementation, the same focused review selector passed:
+
+```text
+4 passed, 14 deselected
+```
+
+The complete focused Task 4 review/contract selector passed:
+
+```text
+9 passed, 9 deselected
+```
+
+The source-kind retrieval selector passed:
+
+```text
+1 passed, 19 deselected
+```
+
+The existing public search/read and wrong-source regressions passed:
+
+```text
+3 passed
+```
+
+### Review verification
+
+- Targeted mypy: `Success: no issues found in 2 source files`.
+- Targeted `compileall` exited `0`.
+- `git diff --check` exited `0`.
+- No full suite, live Qdrant, network/arXiv call, real corpus, or model
+  download was run.

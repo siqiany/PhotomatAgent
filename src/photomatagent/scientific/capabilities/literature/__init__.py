@@ -829,20 +829,51 @@ def _public_source_kind(
         return default
 
 
+def _strict_public_source_kind(record: Any) -> LiteratureSourceKind | None:
+    """Read a result source tag without relabeling malformed payloads."""
+    raw = _record_value(record, "source_kind", None)
+    if raw is None:
+        return None
+    try:
+        return LiteratureSourceKind(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _public_limitations(
     record: Any,
     source_kind: LiteratureSourceKind,
 ) -> tuple[str, ...]:
     raw_limitations = _record_value(record, "limitations", ()) or ()
     if isinstance(raw_limitations, str):
-        limitations = [raw_limitations]
+        raw_values = [raw_limitations]
     else:
-        limitations = [str(item) for item in list(raw_limitations)]
-    if source_kind is LiteratureSourceKind.ABSTRACT and not any(
-        limitation.casefold() == "abstract_only" for limitation in limitations
-    ):
+        try:
+            raw_values = list(raw_limitations)
+        except TypeError:
+            raw_values = []
+
+    reserved_slots = 7 if source_kind is LiteratureSourceKind.ABSTRACT else 8
+    limitations: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        limitation = str(raw_value).strip()
+        if not limitation:
+            continue
+        key = re.sub(r"[\s-]+", "_", limitation.casefold())
+        if key == "abstract_only" and source_kind is LiteratureSourceKind.ABSTRACT:
+            # Always emit the canonical spelling below, even if the source
+            # used a variant casing or separator.
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(limitations) < reserved_slots:
+            limitations.append(limitation)
+
+    if source_kind is LiteratureSourceKind.ABSTRACT:
         limitations.append("abstract_only")
-    return tuple(limitations[:8])
+    return tuple(limitations)
 
 
 def _stats_payload(stats: Any) -> dict[str, Any]:
@@ -1377,9 +1408,25 @@ class LiteratureSearchPassagesTool(Tool):
             return _error_result(exc, operation="literature search")
         rows: list[dict[str, Any]] = []
         for passage in list(_record_value(result, "passages", ()) or ())[:10]:
-            passage_source_kind = _public_source_kind(passage, source_kind)
+            passage_source_kind = _strict_public_source_kind(passage)
+            if passage_source_kind is None:
+                return ScientificToolResult(
+                    output=(
+                        "source_kind_invalid: retrieved passage is missing or has "
+                        "an invalid source_kind"
+                    ),
+                    is_error=True,
+                    data={"error": "source_kind_invalid"},
+                )
             if passage_source_kind is not source_kind:
-                continue
+                return ScientificToolResult(
+                    output=(
+                        "source_kind_invalid: retrieved passage source_kind does "
+                        "not match the requested tier"
+                    ),
+                    is_error=True,
+                    data={"error": "source_kind_invalid"},
+                )
             limitations = _public_limitations(passage, passage_source_kind)
             row = {
                 "passage_id": str(_record_value(passage, "passage_id", "")),
