@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,7 +137,7 @@ class HistoricalSessionImporter:
         try:
             episode = self.service.store.load_episode(evolution_id, "v001")
         except FileNotFoundError:
-            episode = self.service.reserve_imported_episode(evolution_id, owner_token=owner).entity
+            episode = self.service._reserve_imported_episode(evolution_id, owner_token=owner).entity
         if episode.execution_mode != "IMPORTED_SESSION" or episode.owner_token != owner:
             raise EvolutionOperationConflict("historical session provenance conflicts with existing import")
         if episode.status == "COMPLETED":
@@ -156,11 +157,12 @@ class HistoricalSessionImporter:
 
     @staticmethod
     def _materialize(canonical: Path, payload: bytes, expected_sha: str) -> None:
+        HistoricalSessionImporter._cleanup_temporary_files(canonical)
         if canonical.is_file():
             if canonical.stat().st_size != len(payload) or sha256_file(canonical) != expected_sha:
                 raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
             return
-        temporary = canonical.with_name(f".{canonical.name}.importing-{hashlib.sha256(payload).hexdigest()[:12]}")
+        temporary = canonical.with_name(f".{canonical.name}.importing-{uuid.uuid4().hex}")
         try:
             with temporary.open("xb") as handle:
                 handle.write(payload)
@@ -177,11 +179,12 @@ class HistoricalSessionImporter:
 
     @staticmethod
     def _materialize_from(canonical: Path, source: Path, expected_sha: str) -> None:
+        HistoricalSessionImporter._cleanup_temporary_files(canonical)
         if canonical.is_file():
             if sha256_file(canonical) != expected_sha:
                 raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
             return
-        temporary = canonical.with_name(f".{canonical.name}.importing-{expected_sha[:12]}")
+        temporary = canonical.with_name(f".{canonical.name}.importing-{uuid.uuid4().hex}")
         try:
             with source.open("rb") as src, temporary.open("xb") as dst:
                 shutil.copyfileobj(src, dst)
@@ -195,6 +198,12 @@ class HistoricalSessionImporter:
                     raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
         finally:
             temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _cleanup_temporary_files(canonical: Path) -> None:
+        for candidate in canonical.parent.glob(f".{canonical.name}.importing-*"):
+            if candidate.is_file() or candidate.is_symlink():
+                candidate.unlink(missing_ok=True)
 
 
 __all__ = ["HistoricalSessionImporter", "HistoricalSessionPreview", "preview_historical_session"]

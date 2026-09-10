@@ -88,7 +88,7 @@ def test_import_retries_after_reservation_interruption(tmp_path: Path, monkeypat
     target = TargetSpec(goal="goal", constraints=[{"property": "x", "operator": "ge", "value": 1}])
     service = EvolutionService(EvolutionStore(workspace))
     importer = HistoricalSessionImporter(workspace, service)
-    original = service.reserve_imported_episode
+    original = service._reserve_imported_episode
     calls = 0
 
     def interrupt(*args: object, **kwargs: object) -> object:
@@ -98,9 +98,29 @@ def test_import_retries_after_reservation_interruption(tmp_path: Path, monkeypat
             raise RuntimeError("simulated interruption")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(service, "reserve_imported_episode", interrupt)
+    monkeypatch.setattr(service, "_reserve_imported_episode", interrupt)
     with pytest.raises(RuntimeError, match="simulated"):
         importer.import_session(session_dir, target=target)
     task = importer.import_session(session_dir, target=target)
     assert task.current_version == "v001"
     assert service.store.load_episode(task.evolution_id, "v001").status == "COMPLETED"
+
+
+def test_import_cleans_stale_partial_temporary_artifact(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path)
+    session_dir = tmp_path / ".photomatagent" / "sessions" / "session-temp"
+    session_dir.mkdir(parents=True)
+    (session_dir / "events.jsonl").write_text(
+        json.dumps({"kind": "loop_started", "session_id": "session-temp", "goal": "goal"})
+        + "\n" + json.dumps({"kind": "text_delta", "session_id": "session-temp", "iteration": 1, "text": "answer"}) + "\n",
+        encoding="utf-8",
+    )
+    target = TargetSpec(goal="goal", constraints=[{"property": "x", "operator": "ge", "value": 1}])
+    service = EvolutionService(EvolutionStore(workspace))
+    evolution_id = "evo_import_" + hashlib.sha256(b"session-temp").hexdigest()[:32]
+    result_dir = tmp_path / "user_output" / evolution_id / "v001"
+    result_dir.mkdir(parents=True)
+    (result_dir / ".result.md.importing-stale").write_bytes(b"partial")
+    task = HistoricalSessionImporter(workspace, service).import_session(session_dir, target=target)
+    assert task.current_version == "v001"
+    assert not list(result_dir.glob(".result.md.importing-*"))

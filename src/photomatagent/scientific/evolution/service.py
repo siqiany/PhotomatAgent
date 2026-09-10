@@ -616,7 +616,7 @@ class EvolutionService:
                 allow_imported=False,
             )
 
-    def reserve_imported_episode(
+    def _reserve_imported_episode(
         self, evolution_id: str, *, owner_token: str
     ) -> MutationResult[EpisodeRecord]:
         """Reserve the importer-owned initial historical episode."""
