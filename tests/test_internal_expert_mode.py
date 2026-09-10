@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import pytest
+from types import SimpleNamespace
 
 from photomatagent.observability.trace import load_trace
 from photomatagent.scientific.evolution.importer import (
@@ -23,6 +24,7 @@ from photomatagent.workspace import Workspace
 from photomatagent.cli.chat import build_runtime
 from rich.console import Console
 from photomatagent.cli.commands import ChatCommandRouter
+from photomatagent.cli.expert import _resume_linked
 
 
 class _Prompt:
@@ -130,6 +132,35 @@ def test_runtime_logger_sessions_follow_workspace(tmp_path: Path) -> None:
     assert runtime.workspace.root == tmp_path.resolve()
     assert logger is not None
     assert logger.session_dir.parent == tmp_path.resolve() / ".photomatagent" / "sessions"
+
+
+@pytest.mark.asyncio
+async def test_linked_awaiting_feedback_continues_compile_then_iterate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = SimpleNamespace(
+        status="AWAITING_EXPERT_FEEDBACK", evolution_id="evo-linked",
+        last_completed_version="v001", current_version="v001",
+    )
+    prompt = _Prompt(["y", "y"])
+    states = iter([SimpleNamespace(status="REVISION_READY")])
+    service = SimpleNamespace(get=lambda _id: next(states))
+    feedback_calls: list[str] = []
+    async def fake_feedback(**kwargs: object) -> object:
+        feedback_calls.append("feedback")
+        return object()
+    monkeypatch.setattr("photomatagent.cli.expert.run_feedback_command", fake_feedback)
+    compile_calls: list[str] = []
+    async def fake_compile(**kwargs: object) -> object:
+        compile_calls.append("compile")
+        return object()
+    iterated: list[str] = []
+    async def iterate(evolution_id: str) -> None:
+        iterated.append(evolution_id)
+    await _resume_linked(task=task, session=prompt, output=Console(record=True),
+                         workspace=tmp_path, compile_runner=fake_compile,
+                         iterate_callback=iterate, service=service)  # type: ignore[arg-type]
+    assert feedback_calls == ["feedback"]
+    assert compile_calls == ["compile"]
+    assert iterated == ["evo-linked"]
 
 
 def test_import_cleans_stale_partial_temporary_artifact(tmp_path: Path) -> None:

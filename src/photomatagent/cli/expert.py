@@ -52,24 +52,52 @@ async def _resume_linked(
     *, task: EvolutionTask, session: PromptSessionLike, output: Console,
     workspace: Path, compile_runner: Callable[..., Awaitable[object]],
     iterate_callback: Callable[[str], Awaitable[object]] | None,
+    service: EvolutionService,
 ) -> None:
     status = task.status
     evolution_id = task.evolution_id
     version = task.last_completed_version or task.current_version
     if status == "AWAITING_EXPERT_FEEDBACK" and version is not None:
-        await run_feedback_command(
+        record = await run_feedback_command(
             session=_ExpertPrompt(session), output=output, workspace=workspace,
             evolution_id=evolution_id, version=version,
         )
+        if record is None:
+            return
+        await _compile_then_maybe_iterate(
+            task=task, session=session, output=output, workspace=workspace,
+            compile_runner=compile_runner, iterate_callback=iterate_callback,
+            service=service, ask_compile=True,
+        )
     elif status == "FEEDBACK_RECORDED":
-        choice = (await _ask(session, "已有反馈；立即 compile？[y/N] 或 /cancel")).strip().lower()
-        if choice in {"y", "yes"}:
-            await compile_runner(session=_ExpertPrompt(session), output=output,
-                                 workspace=workspace, evolution_id=evolution_id)
+        await _compile_then_maybe_iterate(
+            task=task, session=session, output=output, workspace=workspace,
+            compile_runner=compile_runner, iterate_callback=iterate_callback,
+            service=service, ask_compile=True,
+        )
     elif status == "REVISION_READY":
         choice = (await _ask(session, "revision confirmed；立即 iterate？[y/N] 或 /cancel")).strip().lower()
         if choice in {"y", "yes"} and iterate_callback is not None:
             await iterate_callback(evolution_id)
+
+
+async def _compile_then_maybe_iterate(
+    *, task: EvolutionTask, session: PromptSessionLike, output: Console,
+    workspace: Path, compile_runner: Callable[..., Awaitable[object]],
+    iterate_callback: Callable[[str], Awaitable[object]] | None,
+    service: EvolutionService, ask_compile: bool,
+) -> None:
+    if ask_compile:
+        choice = (await _ask(session, "已有反馈；立即 compile？[y/N] 或 /cancel")).strip().lower()
+        if choice not in {"y", "yes"}:
+            return
+    await compile_runner(session=_ExpertPrompt(session), output=output,
+                         workspace=workspace, evolution_id=task.evolution_id)
+    refreshed = service.get(task.evolution_id)
+    if refreshed.status == "REVISION_READY":
+        choice = (await _ask(session, "revision confirmed；立即 iterate？[y/N] 或 /cancel")).strip().lower()
+        if choice in {"y", "yes"} and iterate_callback is not None:
+            await iterate_callback(task.evolution_id)
 
 
 async def run_expert_mode(
@@ -134,7 +162,7 @@ async def run_expert_mode(
             output.print(f"[EXPERT MODE | RESUMING] {linked.evolution_id} {linked.status}")
             await _resume_linked(task=linked, session=session, output=output,
                                  workspace=boundary.root, compile_runner=compile_runner,
-                                 iterate_callback=iterate_callback)
+                                 iterate_callback=iterate_callback, service=service)
             return
         output.print(f"[EXPERT MODE | GOAL] {preview.goal}")
         goal_confirmation = (await _ask(session, "确认 goal（y/n）或 /cancel")).strip().lower()
