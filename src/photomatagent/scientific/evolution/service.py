@@ -598,6 +598,7 @@ class EvolutionService:
         capability_fingerprint: Sha256 | None = None,
         data_source_fingerprints: dict[str, Sha256] | None = None,
         owner_token: str | None = None,
+        historical_import: bool = False,
     ) -> MutationResult[EpisodeRecord]:
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
@@ -611,6 +612,7 @@ class EvolutionService:
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
                 owner_token=owner_token,
+                historical_import=historical_import,
             )
 
     def claim_fresh_evaluation(
@@ -964,6 +966,7 @@ class EvolutionService:
         capability_fingerprint: Sha256 | None,
         data_source_fingerprints: dict[str, Sha256],
         owner_token: str | None,
+        historical_import: bool,
     ) -> MutationResult[EpisodeRecord]:
         evolution_id = task.evolution_id
         initial = task.last_completed_version is None
@@ -1001,7 +1004,10 @@ class EvolutionService:
                 f"required {required_status}"
             )
         if initial and mode != "NORMAL":
-            raise InvalidEvolutionTransition("an initial or retry episode must use NORMAL")
+            if mode != "IMPORTED_SESSION" or not historical_import:
+                raise InvalidEvolutionTransition("an initial or retry episode must use NORMAL")
+        if mode == "IMPORTED_SESSION" and (not initial or not historical_import):
+            raise InvalidEvolutionTransition("IMPORTED_SESSION is only valid for historical initial import")
         if not initial and mode == "NORMAL":
             raise InvalidEvolutionTransition(
                 "a revised episode requires an explicit evidence/evaluation mode"
@@ -1884,6 +1890,7 @@ class EvolutionService:
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
                 owner_token=owner_token,
+                historical_import=False,
             )
             return IterationClaim(
                 context=context,

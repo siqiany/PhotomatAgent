@@ -120,7 +120,9 @@ EvolutionResumeStatus = Literal[
     "REVISION_READY",
 ]
 EpisodeStatus = Literal["RESERVED", "RUNNING", "COMPLETED", "FAILED"]
-ExecutionMode = Literal["NORMAL", "CARRY_VERIFIED_EVIDENCE", "FRESH_EVALUATION"]
+ExecutionMode = Literal[
+    "NORMAL", "CARRY_VERIFIED_EVIDENCE", "FRESH_EVALUATION", "IMPORTED_SESSION"
+]
 StrategyArm = Literal[
     "STATIC", "EVIDENCE_FIRST", "DIVERSITY_FIRST", "UNCERTAINTY_FIRST"
 ]

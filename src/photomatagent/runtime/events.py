@@ -426,7 +426,7 @@ class EvolutionEpisodeEvent(EvolutionRuntimeEvent):
     episode_version: EvolutionEpisodeVersion
     episode_id: EvolutionEventId | None = None
     execution_mode: Literal[
-        "NORMAL", "CARRY_VERIFIED_EVIDENCE", "FRESH_EVALUATION"
+        "NORMAL", "CARRY_VERIFIED_EVIDENCE", "FRESH_EVALUATION", "IMPORTED_SESSION"
     ] | None = None
 
 
