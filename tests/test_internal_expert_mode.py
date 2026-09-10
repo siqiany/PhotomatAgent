@@ -152,7 +152,18 @@ async def test_expert_route_imports_scores_and_keeps_chat_state_clean(tmp_path: 
     target_path.write_text(json.dumps({"goal": "goal", "constraints": [{"property": "x", "operator": "ge", "value": 1}]}), encoding="utf-8")
     answers = ["y", "y", "target.json", "y", "1", "1", "1", "1", "1", "", "", "", "", "", "", "/submit", "", "y", "n"]
     prompt = _Prompt(answers)
-    runtime = type("Runtime", (), {"workspace": workspace, "conversation_state": ConversationState(), "session_id": None})()
+    class _Runtime:
+        def __init__(self) -> None:
+            self.workspace = workspace
+            self.conversation_state = ConversationState()
+            self.session_id = None
+            self.run_calls = 0
+
+        def run(self, _prompt: str) -> None:
+            self.run_calls += 1
+            raise AssertionError("expert input must not call AgentRuntime.run")
+
+    runtime = _Runtime()
     console = Console(record=True)
     router = ChatCommandRouter(console, runtime, workspace, sessions_dir=session_dir.parent, prompt_session=prompt)
     await router.execute("/expert session-e2e")
@@ -164,4 +175,5 @@ async def test_expert_route_imports_scores_and_keeps_chat_state_clean(tmp_path: 
     assert len(feedback) == 1
     assert feedback[0].result_sha256 == hashlib.sha256(b"answer\n").hexdigest()
     assert runtime.conversation_state.messages == []
+    assert runtime.run_calls == 0
     assert all(message.startswith("[EXPERT MODE |") for message in prompt.prompts)

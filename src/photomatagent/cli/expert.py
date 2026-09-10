@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Protocol
 
 from rich.console import Console
 
@@ -25,10 +25,14 @@ from photomatagent.sessions.store import save_session_snapshot
 from photomatagent.workspace import Workspace
 
 
+class PromptSessionLike(Protocol):
+    async def prompt_async(self, message: str) -> str: ...
+
+
 class _ExpertPrompt:
     """Prefix every wizard prompt while preserving the feedback protocol."""
 
-    def __init__(self, session: object) -> None:
+    def __init__(self, session: PromptSessionLike) -> None:
         self._session = session
 
     async def prompt_async(self, message: str) -> str:
@@ -36,16 +40,16 @@ class _ExpertPrompt:
             prompt = message
         else:
             prompt = f"[EXPERT MODE | FEEDBACK] {message}"
-        return await self._session.prompt_async(prompt)  # type: ignore[attr-defined]
+        return await self._session.prompt_async(prompt)
 
 
-async def _ask(session: object, label: str) -> str:
-    return await session.prompt_async(f"[EXPERT MODE | {label}] ")  # type: ignore[attr-defined]
+async def _ask(session: PromptSessionLike, label: str) -> str:
+    return await session.prompt_async(f"[EXPERT MODE | {label}] ")
 
 
 async def run_expert_mode(
     *,
-    session: object,
+    session: PromptSessionLike,
     output: Console,
     workspace: Path | str,
     source: str | Path | None = None,
