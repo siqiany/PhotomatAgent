@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import pytest
 
 from photomatagent.observability.trace import load_trace
 from photomatagent.scientific.evolution.importer import (
@@ -72,3 +73,34 @@ def test_import_historical_session_materializes_provenance_bound_v001(tmp_path: 
     ).hexdigest()
     assert service.store.load_scientific_state(task.evolution_id, "v001").model_dump() == original_state.model_dump()
     assert preview.session_id == "session-abc"
+
+
+def test_import_retries_after_reservation_interruption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = Workspace(tmp_path)
+    session_dir = tmp_path / ".photomatagent" / "sessions" / "session-retry"
+    session_dir.mkdir(parents=True)
+    (session_dir / "events.jsonl").write_text(
+        json.dumps({"kind": "loop_started", "session_id": "session-retry", "goal": "goal"})
+        + "\n"
+        + json.dumps({"kind": "text_delta", "session_id": "session-retry", "iteration": 1, "text": "answer"})
+        + "\n", encoding="utf-8"
+    )
+    target = TargetSpec(goal="goal", constraints=[{"property": "x", "operator": "ge", "value": 1}])
+    service = EvolutionService(EvolutionStore(workspace))
+    importer = HistoricalSessionImporter(workspace, service)
+    original = service.reserve_imported_episode
+    calls = 0
+
+    def interrupt(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated interruption")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "reserve_imported_episode", interrupt)
+    with pytest.raises(RuntimeError, match="simulated"):
+        importer.import_session(session_dir, target=target)
+    task = importer.import_session(session_dir, target=target)
+    assert task.current_version == "v001"
+    assert service.store.load_episode(task.evolution_id, "v001").status == "COMPLETED"

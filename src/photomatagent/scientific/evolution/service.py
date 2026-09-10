@@ -598,8 +598,9 @@ class EvolutionService:
         capability_fingerprint: Sha256 | None = None,
         data_source_fingerprints: dict[str, Sha256] | None = None,
         owner_token: str | None = None,
-        historical_import: bool = False,
     ) -> MutationResult[EpisodeRecord]:
+        if mode == "IMPORTED_SESSION":
+            raise InvalidEvolutionTransition("IMPORTED_SESSION requires historical import service")
         with self.store.transaction(evolution_id) as transaction:
             task = transaction.load_task()
             return self._reserve_episode_locked(
@@ -612,7 +613,20 @@ class EvolutionService:
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
                 owner_token=owner_token,
-                historical_import=historical_import,
+                allow_imported=False,
+            )
+
+    def reserve_imported_episode(
+        self, evolution_id: str, *, owner_token: str
+    ) -> MutationResult[EpisodeRecord]:
+        """Reserve the importer-owned initial historical episode."""
+        with self.store.transaction(evolution_id) as transaction:
+            task = transaction.load_task()
+            return self._reserve_episode_locked(
+                transaction, task, mode="IMPORTED_SESSION", provider=None,
+                model=None, tool_surface_fingerprint=None,
+                capability_fingerprint=None, data_source_fingerprints={},
+                owner_token=owner_token, allow_imported=True,
             )
 
     def claim_fresh_evaluation(
@@ -966,7 +980,7 @@ class EvolutionService:
         capability_fingerprint: Sha256 | None,
         data_source_fingerprints: dict[str, Sha256],
         owner_token: str | None,
-        historical_import: bool,
+        allow_imported: bool,
     ) -> MutationResult[EpisodeRecord]:
         evolution_id = task.evolution_id
         initial = task.last_completed_version is None
@@ -1004,9 +1018,9 @@ class EvolutionService:
                 f"required {required_status}"
             )
         if initial and mode != "NORMAL":
-            if mode != "IMPORTED_SESSION" or not historical_import:
+            if mode != "IMPORTED_SESSION" or not allow_imported:
                 raise InvalidEvolutionTransition("an initial or retry episode must use NORMAL")
-        if mode == "IMPORTED_SESSION" and (not initial or not historical_import):
+        if mode == "IMPORTED_SESSION" and (not initial or not allow_imported):
             raise InvalidEvolutionTransition("IMPORTED_SESSION is only valid for historical initial import")
         if not initial and mode == "NORMAL":
             raise InvalidEvolutionTransition(
@@ -1890,7 +1904,7 @@ class EvolutionService:
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
                 owner_token=owner_token,
-                historical_import=False,
+                allow_imported=False,
             )
             return IterationClaim(
                 context=context,

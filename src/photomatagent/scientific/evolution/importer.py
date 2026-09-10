@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from photomatagent.observability.trace import AgentExecutionTrace, load_trace
 from photomatagent.runtime.events import LoopStarted, TextDelta
+from photomatagent.models.types import AssistantMessage
 from photomatagent.scientific.evolution.artifacts import sha256_file
 from photomatagent.scientific.evolution.models import (
     ArtifactRef,
@@ -52,7 +54,7 @@ def _extract(workspace: Workspace, trace: AgentExecutionTrace, snapshot: Session
     run_id = next((event.run_id for event in reversed(trace.events) if isinstance(event, TextDelta) and event.text.strip()), None)
     pieces = [event.text for event in trace.events if isinstance(event, TextDelta) and event.text.strip() and (run_id is None or event.run_id == run_id)]
     if snapshot is not None:
-        assistants = [message.text for message in snapshot.conversation.messages if getattr(message, "text", "").strip()]
+        assistants = [message.text for message in snapshot.conversation.messages if isinstance(message, AssistantMessage) and message.text.strip()]
         if assistants:
             pieces = [assistants[-1]]
     final_response = "".join(pieces).strip()
@@ -119,42 +121,80 @@ class HistoricalSessionImporter:
                 or task.target.model_dump(mode="json") != target.model_dump(mode="json")
             ):
                 raise EvolutionOperationConflict("historical session import content conflicts with existing task")
-            episode = self.service.store.load_episode(evolution_id, "v001")
-            if episode.execution_mode != "IMPORTED_SESSION" or episode.runtime_session_id != preview.session_id:
-                raise EvolutionOperationConflict("historical session provenance conflicts with existing import")
-            if episode.artifact is None or episode.artifact.path != f"user_output/{evolution_id}/v001/result.md":
-                raise EvolutionOperationConflict("historical session import has no canonical artifact")
-            canonical = self.workspace.resolve(episode.artifact.path, must_exist=True)
-            if sha256_file(canonical) != episode.artifact.sha256 or episode.artifact.sha256 != expected_artifact_sha:
-                raise EvolutionOperationConflict("historical session artifact hash conflicts")
-            return task
 
         relative = f"user_output/{evolution_id}/v001/result.md"
         canonical = self.workspace.resolve(relative, must_exist=False)
         canonical.parent.mkdir(parents=True, exist_ok=True)
         if source_file is None:
             payload = (preview.final_response + "\n").encode("utf-8")
-            try:
-                with canonical.open("xb") as handle:
-                    handle.write(payload)
-            except FileExistsError:
-                if canonical.read_bytes() != payload:
-                    raise EvolutionOperationConflict("canonical historical artifact content conflicts")
+            self._materialize(canonical, payload, expected_artifact_sha)
         else:
-            try:
-                with source_file.open("rb") as src, canonical.open("xb") as dst:
-                    shutil.copyfileobj(src, dst)
-            except FileExistsError:
-                if sha256_file(canonical) != sha256_file(source_file):
-                    raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
+            self._materialize_from(canonical, source_file, expected_artifact_sha)
         artifact = ArtifactRef(path=relative, media_type="text/markdown", size_bytes=canonical.stat().st_size, sha256=sha256_file(canonical))
         state = preview.snapshot.scientific if preview.snapshot is not None else ScientificState(goal=resolved_goal)
         owner = "import_owner_" + hashlib.sha256(preview.session_id.encode()).hexdigest()[:24]
-        reserved = self.service.reserve_episode(evolution_id, mode="IMPORTED_SESSION", owner_token=owner, historical_import=True).entity
-        self.service.store.write_scientific_state(evolution_id, "v001", state)
+        try:
+            episode = self.service.store.load_episode(evolution_id, "v001")
+        except FileNotFoundError:
+            episode = self.service.reserve_imported_episode(evolution_id, owner_token=owner).entity
+        if episode.execution_mode != "IMPORTED_SESSION" or episode.owner_token != owner:
+            raise EvolutionOperationConflict("historical session provenance conflicts with existing import")
+        if episode.status == "COMPLETED":
+            if episode.artifact is None or episode.artifact.sha256 != expected_artifact_sha:
+                raise EvolutionOperationConflict("historical session artifact hash conflicts")
+            return task
+        try:
+            stored_state = self.service.store.load_scientific_state(evolution_id, "v001")
+        except FileNotFoundError:
+            self.service.store.write_scientific_state(evolution_id, "v001", state)
+        else:
+            if stored_state.model_dump(mode="json") != state.model_dump(mode="json"):
+                raise EvolutionOperationConflict("historical scientific state conflicts")
         running = self.service.mark_episode_running(evolution_id, "v001", owner_token=owner, runtime_session_id=preview.session_id, event_log_path=preview.event_log_path).entity
         completed = running.model_copy(update={"artifact": artifact, "scientific_state_path": f".photomatagent/evolutions/{evolution_id}/episodes/v001.scientific.json"})
         return self.service.complete_episode(evolution_id, "v001", result=completed, owner_token=owner).entity and self.service.get(evolution_id)
+
+    @staticmethod
+    def _materialize(canonical: Path, payload: bytes, expected_sha: str) -> None:
+        if canonical.is_file():
+            if canonical.stat().st_size != len(payload) or sha256_file(canonical) != expected_sha:
+                raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
+            return
+        temporary = canonical.with_name(f".{canonical.name}.importing-{hashlib.sha256(payload).hexdigest()[:12]}")
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(payload)
+            if sha256_file(temporary) != expected_sha:
+                raise EvolutionOperationConflict("temporary historical artifact hash mismatch")
+            try:
+                os.link(temporary, canonical)
+                temporary.unlink()
+            except FileExistsError:
+                if not canonical.is_file() or sha256_file(canonical) != expected_sha:
+                    raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _materialize_from(canonical: Path, source: Path, expected_sha: str) -> None:
+        if canonical.is_file():
+            if sha256_file(canonical) != expected_sha:
+                raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
+            return
+        temporary = canonical.with_name(f".{canonical.name}.importing-{expected_sha[:12]}")
+        try:
+            with source.open("rb") as src, temporary.open("xb") as dst:
+                shutil.copyfileobj(src, dst)
+            if sha256_file(temporary) != expected_sha:
+                raise EvolutionOperationConflict("temporary historical artifact hash mismatch")
+            try:
+                os.link(temporary, canonical)
+                temporary.unlink()
+            except FileExistsError:
+                if not canonical.is_file() or sha256_file(canonical) != expected_sha:
+                    raise EvolutionOperationConflict("canonical historical artifact hash conflicts")
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 __all__ = ["HistoricalSessionImporter", "HistoricalSessionPreview", "preview_historical_session"]
