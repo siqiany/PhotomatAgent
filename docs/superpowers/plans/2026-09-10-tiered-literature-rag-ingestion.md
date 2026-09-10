@@ -112,12 +112,14 @@ generation, and returns a dictionary keyed by document ID. Its implementation
 must reject oversized input, retrieve only the requested point IDs, and discard
 payloads whose workspace ID or record type does not match.
 
-Thread source_kind through dense_candidates, sparse_candidates, hybrid_candidates, and LiteratureRetriever.search. Apply the filter in Qdrant and revalidate candidate payloads in Python to fail closed with fake or legacy stores.
+Thread source_kind through dense_candidates, sparse_candidates, hybrid_candidates, and LiteratureRetriever.search. Apply the filter in Qdrant and revalidate candidate payloads in Python to fail closed with fake or legacy stores. Bump the shared chunk/schema generation version from 1 to 2 at every ensure, expected-generation, validation, CLI, and tool assembly call site so legacy points without source_kind remain behind the old aliases.
 
 - [ ] **Step 4: Run GREEN tests**
 
 ~~~bash
-uv run pytest -q tests/test_qdrant_store.py tests/test_rag_retrieval.py
+uv run pytest -q \
+  tests/test_qdrant_store.py -k 'source_kind or collection_schema_indexes_all_filterable_provenance_fields or models_require_lowercase_sha256' \
+  tests/test_rag_retrieval.py -k 'source_kind or hybrid or sparse_only'
 ~~~
 
 - [ ] **Step 5: Commit**
@@ -194,10 +196,11 @@ class SQLiteAbstractReader:
         return int(self._connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0])
 
     def source_identity(self) -> str:
-        stat = self.path.stat()
-        return hashlib.sha256(
-            f"{self.relative_path}:{stat.st_size}:{stat.st_mtime_ns}".encode()
-        ).hexdigest()
+        digest = hashlib.sha256()
+        with self.path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
 
     def fetch_after(
         self, cursor: str | None, *, limit: int
@@ -345,7 +348,9 @@ Add rag index-abstracts with --database, --run-id, --resume, --stop-after, --yes
 - [ ] **Step 4: Run GREEN tests and commit**
 
 ~~~bash
-uv run pytest -q tests/test_rag_cli.py tests/test_rag_ingestion.py
+uv run pytest -q \
+  tests/test_rag_cli.py -k 'pauses_after_requested_budget or abstract_resume or incomplete_required_stage or external_requires_confirmation' \
+  tests/test_rag_ingestion.py -k 'source_kind or resume or retry'
 git add src/photomatagent/cli/rag.py \
   src/photomatagent/scientific/capabilities/literature/ingestion.py \
   src/photomatagent/scientific/capabilities/literature/__init__.py \
@@ -392,7 +397,9 @@ def test_arxiv_description_forbids_persistence() -> None:
 - [ ] **Step 2: Run RED tests**
 
 ~~~bash
-uv run pytest -q tests/test_literature_rag.py tests/test_rag_retrieval.py
+uv run pytest -q \
+  tests/test_literature_rag.py -k 'search_schema_defaults_to_fulltext or abstract_result_identifies_source or arxiv_description_forbids_persistence' \
+  tests/test_rag_retrieval.py -k 'source_kind'
 ~~~
 
 - [ ] **Step 3: Implement the model-visible policy**
@@ -411,7 +418,9 @@ Do not create a wrapper that calls arXiv internally; the network action must rem
 - [ ] **Step 4: Run GREEN tests and commit**
 
 ~~~bash
-uv run pytest -q tests/test_literature_rag.py tests/test_rag_retrieval.py
+uv run pytest -q \
+  tests/test_literature_rag.py -k 'search_schema_defaults_to_fulltext or abstract_result_identifies_source or arxiv_description_forbids_persistence' \
+  tests/test_rag_retrieval.py -k 'source_kind'
 git add src/photomatagent/scientific/capabilities/literature/__init__.py \
   src/photomatagent/scientific/capabilities/literature/retrieval.py \
   tests/test_literature_rag.py tests/test_rag_retrieval.py
@@ -478,14 +487,13 @@ Explain progress fields, external-provider confirmation, source priority, resume
 - [ ] **Step 4: Run the agreed minimal verification**
 
 ~~~bash
-uv run pytest -q \
-  tests/test_abstract_ingestion.py \
-  tests/test_qdrant_store.py \
-  tests/test_rag_ingestion.py \
-  tests/test_rag_retrieval.py \
-  tests/test_literature_rag.py \
-  tests/test_rag_cli.py \
-  tests/test_import_literature_script.py
+uv run pytest -q tests/test_abstract_ingestion.py tests/test_import_literature_script.py
+uv run pytest -q tests/test_qdrant_store.py \
+  -k 'source_kind or collection_schema_indexes_all_filterable_provenance_fields or models_require_lowercase_sha256'
+uv run pytest -q tests/test_rag_ingestion.py tests/test_rag_retrieval.py \
+  -k 'source_kind or resume or retry'
+uv run pytest -q tests/test_literature_rag.py tests/test_rag_cli.py \
+  -k 'search_schema_defaults_to_fulltext or abstract_result_identifies_source or arxiv_description_forbids_persistence or pauses_after_requested_budget or abstract_resume or incomplete_required_stage or external_requires_confirmation'
 uv run mypy src/photomatagent/scientific/capabilities/literature \
   src/photomatagent/cli/rag.py
 bash -n scripts/import_literature_qdrant.sh

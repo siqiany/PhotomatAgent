@@ -1,0 +1,817 @@
+"""Focused offline tests for streaming SQLite abstract ingestion."""
+
+from __future__ import annotations
+
+import sqlite3
+import asyncio
+from dataclasses import replace
+from pathlib import Path
+import shutil
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from photomatagent.scientific.capabilities.literature.abstract_ingestion import (
+    AbstractIngestionError,
+    AbstractIngestionRunState,
+    AbstractIngestionStats,
+    AbstractIngestionService,
+    AbstractSourceRecord,
+    SQLiteAbstractReader,
+    canonical_abstract_revision,
+)
+from photomatagent.scientific.capabilities.literature.models import (
+    DocumentStatus,
+    IngestState,
+    LiteratureSourceKind,
+)
+
+
+@pytest.fixture()
+def abstract_db(tmp_path: Path) -> Path:
+    path = tmp_path / "abstracts.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE papers (
+            paper_key TEXT PRIMARY KEY,
+            title TEXT,
+            abstract TEXT,
+            authors TEXT,
+            publication_year INTEGER,
+            doi TEXT,
+            pmid TEXT,
+            pmcid TEXT,
+            journal TEXT,
+            relevance_tier TEXT,
+            retrieved_at TEXT
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO papers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("key-a", "A", "abstract a", "Alice; Bob", 2022, "", "", "", "J", "core", "one"),
+            ("key-b", "B", "abstract b", "Carol", 2023, "", "", "", "J", "related", "two"),
+            ("key-c", "C", "abstract c", "Dan", 2024, "", "", "", "J", "broad", "three"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+    return path
+
+
+def _record(**changes: object) -> AbstractSourceRecord:
+    values: dict[str, object] = {
+        "paper_key": "key-a",
+        "title": "A title",
+        "abstract": "knowledge",
+        "authors": ("Author",),
+        "publication_year": 2024,
+        "doi": "10.1/example",
+        "pmid": "1",
+        "pmcid": "PMC1",
+        "journal": "Journal",
+        "relevance_tier": "core_title_match",
+        "retrieved_at": "now",
+    }
+    values.update(changes)
+    return AbstractSourceRecord(**values)
+
+
+def test_reader_uses_keyset_pagination(abstract_db: Path) -> None:
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    first = reader.fetch_after(None, limit=2)
+    second = reader.fetch_after(first[-1].paper_key, limit=2)
+    assert [row.paper_key for row in first] == ["key-a", "key-b"]
+    assert [row.paper_key for row in second] == ["key-c"]
+    reader.close()
+
+
+def test_reader_preserves_raw_keyset_cursor_with_whitespace_key(abstract_db: Path) -> None:
+    connection = sqlite3.connect(abstract_db)
+    connection.execute(
+        "INSERT INTO papers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (" a", "Leading", "leading abstract", "Author", 2020, "", "", "", "J", "", ""),
+    )
+    connection.execute(
+        "INSERT INTO papers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("a", "Exact", "exact abstract", "Author", 2020, "", "", "", "J", "", ""),
+    )
+    connection.commit()
+    connection.close()
+
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    first = reader.fetch_after(None, limit=1)
+    second = reader.fetch_after(first[-1].paper_key, limit=1)
+    assert first[0].paper_key == " a"
+    assert second[0].paper_key == "a"
+    reader.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_keys_are_counted_once_and_valid_raw_keys_resume(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-keys.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE papers (paper_key TEXT, title TEXT, abstract TEXT)"
+    )
+    connection.executemany(
+        "INSERT INTO papers VALUES (?, ?, ?)",
+        [
+            (None, "Null", "null abstract"),
+            ("", "Empty", "empty abstract"),
+            ("   ", "Whitespace", "whitespace abstract"),
+            ("\u00a0", "No-break space", "nbsp abstract"),
+            ("\u2003", "Em space", "em-space abstract"),
+            (" a", "Leading", "leading abstract"),
+            ("a", "Exact", "exact abstract"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    reader = SQLiteAbstractReader(path, workspace_root=tmp_path)
+    assert reader.count() == 7
+    assert reader.count_invalid_keys() == 5
+    first = reader.fetch_after(None, limit=1)
+    second = reader.fetch_after(first[-1].paper_key, limit=1)
+    assert [row.paper_key for row in first + second] == [" a", "a"]
+
+    store = FakeAbstractStore()
+    embedder = FakeEmbedder()
+    service = AbstractIngestionService(
+        reader,
+        store,
+        embedder,
+        workspace_id="workspace-a",
+        workspace_root=tmp_path,
+        relative_source_path="invalid-keys.sqlite3",
+        generation=store.generation,
+    )
+    first_progress = await service.index_batch(run_id="invalid-run", limit=1)
+    assert first_progress.total == 7
+    assert first_progress.processed == 6
+    assert first_progress.skipped_invalid_key == 5
+    assert first_progress.indexed == 1
+    assert first_progress.cursor == " a"
+    assert first_progress.complete is False
+
+    resumed = await service.index_batch(
+        run_id="invalid-run", cursor=first_progress.cursor, limit=1
+    )
+    assert resumed.complete is True
+    assert resumed.processed == 7
+    assert resumed.skipped_invalid_key == 5
+    assert resumed.indexed == 2
+    assert resumed.cursor is None
+    assert embedder.embedded_document_count == 2
+    reader.close()
+
+
+def test_reader_requires_workspace_root_and_rejects_outside_database(
+    abstract_db: Path, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="workspace root"):
+        SQLiteAbstractReader(abstract_db)
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    with pytest.raises(ValueError, match="outside workspace"):
+        SQLiteAbstractReader(abstract_db, workspace_root=workspace_root)
+
+    reader = SQLiteAbstractReader("abstracts.sqlite3", workspace_root=abstract_db.parent)
+    assert reader.path == abstract_db.resolve()
+    reader.close()
+
+
+def test_reader_fails_closed_on_nonempty_sqlite_wal(tmp_path: Path) -> None:
+    path = tmp_path / "wal.sqlite3"
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA journal_mode = WAL")
+    writer.execute("CREATE TABLE papers (paper_key TEXT, title TEXT, abstract TEXT)")
+    writer.commit()
+    writer.execute("INSERT INTO papers VALUES ('key-a', 'A', 'abstract a')")
+    writer.commit()
+    wal_path = Path(f"{path}-wal")
+    assert wal_path.is_file() and wal_path.stat().st_size > 0
+
+    with pytest.raises(AbstractIngestionError) as exc:
+        SQLiteAbstractReader(path, workspace_root=tmp_path)
+
+    assert exc.value.code == "source_wal_pending"
+    assert "checkpoint" in str(exc.value).lower()
+    writer.close()
+
+
+@pytest.mark.asyncio
+async def test_source_identity_and_count_are_computed_once_per_service(
+    abstract_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _store, _embedder = _service(abstract_db)
+    identity_calls = 0
+    count_calls = 0
+    original_identity = service.reader.source_identity
+    original_count = service.reader.count
+
+    def source_identity() -> str:
+        nonlocal identity_calls
+        identity_calls += 1
+        return original_identity()
+
+    def count() -> int:
+        nonlocal count_calls
+        count_calls += 1
+        return original_count()
+
+    monkeypatch.setattr(service.reader, "source_identity", source_identity)
+    monkeypatch.setattr(service.reader, "count", count)
+
+    first = await service.index_batch(run_id="cached-run", limit=1)
+    await service.index_batch(run_id="cached-run", cursor=first.cursor, limit=1)
+
+    assert identity_calls == 1
+    assert count_calls == 1
+    service.reader.close()
+
+
+def test_revision_ignores_retrieval_timestamp() -> None:
+    row = _record(abstract="knowledge")
+    assert canonical_abstract_revision(row) == canonical_abstract_revision(
+        replace(row, retrieved_at="later")
+    )
+    assert canonical_abstract_revision(row) != canonical_abstract_revision(
+        replace(row, abstract="changed")
+    )
+
+
+class FakeAbstractStore:
+    def __init__(self) -> None:
+        self.generation = SimpleNamespace(fingerprint="f" * 64)
+        self.manifests: dict[str, Any] = {}
+        self.passages: list[Any] = []
+        self.runs: dict[str, Any] = {}
+        self.delete_other_revisions_calls: list[tuple[str, str]] = []
+        self.fail_delete_other_revisions = False
+        self.nonready_cleanup_calls: list[str] = []
+
+    async def get_document_manifests(self, workspace_id: str, document_ids: list[str], **_: Any) -> dict[str, Any]:
+        del workspace_id
+        return {document_id: self.manifests[document_id] for document_id in document_ids if document_id in self.manifests}
+
+    async def upsert_document(self, manifest: Any, **_: Any) -> None:
+        self.manifests[manifest.document_id] = manifest
+
+    async def upsert_passages(self, points: list[Any], **_: Any) -> None:
+        self.passages.extend(points)
+
+    async def count_revision(self, document_id: str, revision: str, state: IngestState, **_: Any) -> int:
+        return sum(
+            point.document_id == document_id
+            and point.document_revision == revision
+            and point.ingest_state is state
+            for point in self.passages
+        )
+
+    async def set_revision_state(self, document_id: str, revision: str, state: IngestState, **_: Any) -> None:
+        self.passages = [
+            replace(point, ingest_state=state)
+            if point.document_id == document_id and point.document_revision == revision
+            else point
+            for point in self.passages
+        ]
+
+    async def delete_other_revisions(
+        self, document_id: str, keep_revision: str, **_: Any
+    ) -> None:
+        self.delete_other_revisions_calls.append((document_id, keep_revision))
+        if self.fail_delete_other_revisions:
+            raise RuntimeError("abstract revision cleanup failed")
+        self.passages = [
+            point
+            for point in self.passages
+            if point.document_id != document_id
+            or point.document_revision == keep_revision
+        ]
+
+    async def delete_nonready_abstract_artifacts(
+        self, *, workspace_id: str, relative_source_path: str
+    ) -> int:
+        assert workspace_id == "workspace-a"
+        self.nonready_cleanup_calls.append(relative_source_path)
+        return 0
+
+    async def get_ingestion_run(self, run_id: str, workspace_id: str, **_: Any) -> Any:
+        del workspace_id
+        return self.runs.get(run_id)
+
+    async def upsert_ingestion_run(self, run: Any, **_: Any) -> None:
+        self.runs[run.run_id] = run
+
+
+class FakeEmbedder:
+    identity = SimpleNamespace(dimension=2)
+
+    def __init__(self, *, fail: bool = False, fail_after: int | None = None) -> None:
+        self.fail = fail
+        self.fail_after = fail_after
+        self.embedded_document_count = 0
+
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if self.fail or (
+            self.fail_after is not None
+            and self.embedded_document_count >= self.fail_after
+        ):
+            raise RuntimeError("embedding unavailable")
+        self.embedded_document_count += len(texts)
+        return [[float(index), 1.0] for index, _ in enumerate(texts)]
+
+
+class CancellingEmbedder(FakeEmbedder):
+    async def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        del texts
+        raise asyncio.CancelledError
+
+
+def _service(abstract_db: Path, *, fail: bool = False) -> tuple[AbstractIngestionService, FakeAbstractStore, FakeEmbedder]:
+    store = FakeAbstractStore()
+    embedder = FakeEmbedder(fail=fail)
+    service = AbstractIngestionService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        embedder,
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+    return service, store, embedder
+
+
+def test_service_rejects_path_disguised_by_relative_source_path(
+    abstract_db: Path, tmp_path: Path
+) -> None:
+    store = FakeAbstractStore()
+    embedder = FakeEmbedder()
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+
+    with pytest.raises(ValueError, match="outside workspace"):
+        AbstractIngestionService(
+            abstract_db,
+            store,
+            embedder,
+            workspace_id="workspace-a",
+            workspace_root=workspace_root,
+            relative_source_path="abstracts.sqlite3",
+            generation=store.generation,
+        )
+
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    with pytest.raises(ValueError, match="identify the SQLite database path"):
+        AbstractIngestionService(
+            reader,
+            store,
+            embedder,
+            workspace_id="workspace-a",
+            workspace_root=abstract_db.parent,
+            relative_source_path="alias.sqlite3",
+            generation=store.generation,
+        )
+    reader.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_writes_one_document_and_passage_per_row(abstract_db: Path) -> None:
+    service, store, _embedder = _service(abstract_db)
+    progress = await service.index_batch(run_id="run-a", cursor=None, limit=2)
+    assert (progress.indexed, progress.passages) == (2, 2)
+    assert len(store.manifests) == 2
+    assert all("abstract_only" in point.limitations for point in store.passages)
+    assert all(point.source_kind is LiteratureSourceKind.ABSTRACT for point in store.passages)
+    assert all(point.section == "Abstract" for point in store.passages)
+
+
+@pytest.mark.asyncio
+async def test_abstract_revision_replacement_deletes_old_ready_revision(
+    abstract_db: Path,
+) -> None:
+    service, store, _embedder = _service(abstract_db)
+    first = await service.index_batch(run_id="old-run", limit=1)
+    old_revision = store.passages[0].document_revision
+    service.reader.close()
+
+    connection = sqlite3.connect(abstract_db)
+    connection.execute(
+        "UPDATE papers SET abstract = ? WHERE paper_key = 'key-a'",
+        ("changed abstract",),
+    )
+    connection.commit()
+    connection.close()
+    replacement_reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    replacement = AbstractIngestionService(
+        replacement_reader,
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+
+    result = await replacement.index_batch(run_id="new-run", limit=1)
+
+    assert first.complete is False
+    assert result.indexed == 1
+    assert store.delete_other_revisions_calls
+    document_id = store.passages[-1].document_id
+    revisions = {
+        point.document_revision
+        for point in store.passages
+        if point.document_id == document_id
+    }
+    assert old_revision not in revisions
+    assert len(revisions) == 1
+    replacement_reader.close()
+
+
+@pytest.mark.asyncio
+async def test_abstract_revision_cleanup_failure_is_retryable_and_retried(
+    abstract_db: Path,
+) -> None:
+    service, store, _embedder = _service(abstract_db)
+    await service.index_batch(run_id="old-run", limit=1)
+    service.reader.close()
+    connection = sqlite3.connect(abstract_db)
+    connection.execute(
+        "UPDATE papers SET abstract = ? WHERE paper_key = 'key-a'",
+        ("changed abstract",),
+    )
+    connection.commit()
+    connection.close()
+    store.fail_delete_other_revisions = True
+    replacement_reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    replacement = AbstractIngestionService(
+        replacement_reader,
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+
+    failed = await replacement.index_batch(run_id="replacement-run", limit=1)
+
+    assert failed.status == "retryable"
+    assert failed.cursor is None
+    assert len(store.passages) == 2
+    store.fail_delete_other_revisions = False
+    recovered = await replacement.index_batch(
+        run_id="replacement-run", cursor=None, limit=3
+    )
+
+    assert recovered.complete is True
+    document_id = store.passages[-1].document_id
+    assert len(
+        {
+            point.document_revision
+            for point in store.passages
+            if point.document_id == document_id
+        }
+    ) == 1
+    replacement_reader.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_reembed_committed_rows(abstract_db: Path) -> None:
+    service, _store, embedder = _service(abstract_db)
+    first = await service.index_batch(run_id="run-a", cursor=None, limit=1)
+    second = await service.index_batch(run_id="run-a", cursor=first.cursor, limit=2)
+    assert embedder.embedded_document_count == 3
+    assert second.complete is True
+
+
+@pytest.mark.asyncio
+async def test_failure_keeps_pre_record_cursor(abstract_db: Path) -> None:
+    service, _store, _embedder = _service(abstract_db, fail=True)
+    progress = await service.index_batch(run_id="run-a", cursor=None, limit=1)
+    assert progress.status == "retryable"
+    assert progress.cursor is None
+
+
+@pytest.mark.asyncio
+async def test_new_abstract_run_is_persisted_before_batch_cancellation(
+    abstract_db: Path,
+) -> None:
+    store = FakeAbstractStore()
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    service = AbstractIngestionService(
+        reader,
+        store,
+        CancellingEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.index_batch(run_id="cancel-before-fetch", limit=1)
+
+    assert "cancel-before-fetch" in store.runs
+    assert store.runs["cancel-before-fetch"].status == "running"
+    assert store.runs["cancel-before-fetch"].cursor is None
+    reader.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_explicit_abstract_resume_run_is_rejected(
+    abstract_db: Path,
+) -> None:
+    service, _store, _embedder = _service(abstract_db)
+
+    with pytest.raises(AbstractIngestionError) as exc:
+        await service.index_batch(run_id="unknown-resume", limit=1, resume=True)
+
+    assert exc.value.code == "resume_run_missing"
+
+
+@pytest.mark.asyncio
+async def test_changed_database_requires_explicit_supersession_and_preserves_ready_rows(
+    abstract_db: Path,
+) -> None:
+    service, store, _embedder = _service(abstract_db)
+    old_progress = await service.index_batch(run_id="old-run", limit=3)
+    assert old_progress.complete is True
+    old_state = store.runs["old-run"]
+    store.runs["old-run"] = replace(
+        old_state,
+        status="retryable",
+        stats=replace(old_state.stats, complete=False, retryable=True),
+    )
+    ready_by_key = {
+        point.source_record_id: point
+        for point in store.passages
+    }
+    service.reader.close()
+
+    connection = sqlite3.connect(abstract_db)
+    connection.execute(
+        "UPDATE papers SET abstract = ? WHERE paper_key = 'key-a'",
+        ("replacement abstract",),
+    )
+    connection.execute("DELETE FROM papers WHERE paper_key IN ('key-b', 'key-c')")
+    connection.commit()
+    connection.close()
+
+    reader = SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent)
+    replacement = AbstractIngestionService(
+        reader,
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+    completed = await replacement.index_batch(
+        run_id="replacement-run",
+        limit=3,
+        supersede_run_id="old-run",
+    )
+
+    assert completed.complete is True
+    assert replacement._supersede_record is not None
+    assert store.nonready_cleanup_calls == ["abstracts.sqlite3"]
+    assert store.runs["replacement-run"].supersedes_run_id == "old-run"
+    assert store.runs["old-run"].status == "superseded"
+    assert store.runs["old-run"].stats.complete is True
+    # key-b/key-c were READY knowledge and are retained even though absent in
+    # the replacement SQLite source.
+    assert ready_by_key["key-b"] in store.passages
+    assert ready_by_key["key-c"] in store.passages
+    reader.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_supersession_allows_changed_source_path_and_cleans_both_scopes(
+    abstract_db: Path,
+) -> None:
+    store = FakeAbstractStore()
+    old_service = AbstractIngestionService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+    old_progress = await old_service.index_batch(run_id="old-run", limit=1)
+    assert old_progress.complete is False
+    old_ready = store.passages[0]
+    old_service.reader.close()
+
+    replacement_db = abstract_db.parent / "replacement.sqlite3"
+    shutil.copy2(abstract_db, replacement_db)
+    replacement = AbstractIngestionService(
+        SQLiteAbstractReader(replacement_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="replacement.sqlite3",
+        generation=store.generation,
+    )
+
+    completed = await replacement.index_batch(
+        run_id="replacement-run",
+        limit=3,
+        supersede_run_id="old-run",
+    )
+
+    assert completed.complete is True
+    assert replacement._supersede_record is not None
+    assert store.nonready_cleanup_calls == [
+        "abstracts.sqlite3",
+        "replacement.sqlite3",
+    ]
+    assert store.runs["replacement-run"].supersedes_run_id == "old-run"
+    assert store.runs["old-run"].status == "superseded"
+    assert store.runs["old-run"].superseded_by_run_id == "replacement-run"
+    assert old_ready in store.passages
+    replacement.reader.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_replacement_resume_retries_supersession_after_interruption(
+    abstract_db: Path,
+) -> None:
+    store = FakeAbstractStore()
+    old_service = AbstractIngestionService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+    await old_service.index_batch(run_id="old-run", limit=1)
+    old_service.reader.close()
+
+    class InterruptingService(AbstractIngestionService):
+        mark_attempts = 0
+
+        async def _mark_superseded(self, run: Any, *, new_run_id: str) -> None:
+            self.mark_attempts += 1
+            if self.mark_attempts == 1:
+                raise asyncio.CancelledError
+            await super()._mark_superseded(run, new_run_id=new_run_id)
+
+    replacement = InterruptingService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        FakeEmbedder(),
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await replacement.index_batch(
+            run_id="replacement-run",
+            limit=3,
+            supersede_run_id="old-run",
+        )
+    assert store.runs["replacement-run"].stats.complete is True
+    assert store.runs["old-run"].status != "superseded"
+
+    resumed = await replacement.index_batch(
+        run_id="replacement-run",
+        resume=True,
+    )
+
+    assert resumed.complete is True
+    assert replacement.mark_attempts == 2
+    assert store.nonready_cleanup_calls == ["abstracts.sqlite3", "abstracts.sqlite3"]
+    assert store.runs["old-run"].status == "superseded"
+    assert store.runs["old-run"].superseded_by_run_id == "replacement-run"
+    replacement.reader.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_failure_persists_cursor_after_skipped_and_committed_rows(
+    abstract_db: Path,
+) -> None:
+    connection = sqlite3.connect(abstract_db)
+    connection.execute("UPDATE papers SET abstract = '' WHERE paper_key = 'key-b'")
+    connection.commit()
+    connection.close()
+
+    store = FakeAbstractStore()
+    embedder = FakeEmbedder(fail_after=1)
+    service = AbstractIngestionService(
+        SQLiteAbstractReader(abstract_db, workspace_root=abstract_db.parent),
+        store,
+        embedder,
+        workspace_id="workspace-a",
+        workspace_root=abstract_db.parent,
+        relative_source_path="abstracts.sqlite3",
+        generation=store.generation,
+    )
+
+    failed = await service.index_batch(run_id="partial-run", limit=3)
+    assert failed.status == "retryable"
+    assert failed.cursor == "key-b"
+    assert failed.indexed == 1
+    assert failed.skipped_empty == 1
+    assert failed.failed == 1
+    assert failed.processed == 3
+
+    embedder.fail_after = None
+    resumed = await service.index_batch(
+        run_id="partial-run", cursor=failed.cursor, limit=1
+    )
+    assert resumed.complete is True
+    assert resumed.indexed == 2
+    assert resumed.skipped_empty == 1
+    assert resumed.processed == 4
+    assert embedder.embedded_document_count == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_abstract_is_skipped_without_a_vector(abstract_db: Path) -> None:
+    connection = sqlite3.connect(abstract_db)
+    connection.execute("UPDATE papers SET abstract = '' WHERE paper_key = 'key-c'")
+    connection.commit()
+    connection.close()
+    service, store, embedder = _service(abstract_db)
+    progress = await service.index_batch(run_id="run-a", cursor=None, limit=3)
+    assert progress.indexed == 2
+    assert progress.skipped_empty == 1
+    assert progress.passages == 2
+    assert embedder.embedded_document_count == 2
+    assert len(store.passages) == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_changed_sqlite_source_identity(abstract_db: Path) -> None:
+    service, _store, _embedder = _service(abstract_db)
+    first = await service.index_batch(run_id="run-a", cursor=None, limit=1)
+    with abstract_db.open("ab") as handle:
+        handle.write(b"changed")
+    with pytest.raises(AbstractIngestionError, match="source"):
+        await service.index_batch(run_id="run-a", cursor=first.cursor, limit=1)
+
+
+@pytest.mark.asyncio
+async def test_existing_abstract_manifest_is_unchanged(abstract_db: Path) -> None:
+    service, _store, embedder = _service(abstract_db)
+    first = await service.index_batch(run_id="run-a", cursor=None, limit=1)
+    second = await service.index_batch(run_id="run-b", cursor=None, limit=1)
+    assert first.indexed == 1
+    assert second.unchanged == 1
+    assert embedder.embedded_document_count == 1
+
+
+@pytest.mark.asyncio
+async def test_qdrant_run_roundtrip_preserves_abstract_source_context() -> None:
+    from test_qdrant_store import FakeAsyncQdrantClient, IDENTITY
+    from photomatagent.scientific.capabilities.literature.qdrant_store import (
+        QdrantLiteratureStore,
+    )
+
+    client = FakeAsyncQdrantClient()
+    store = QdrantLiteratureStore(client, prefix="photomat_abstract_run_test")
+    generation = await store.ensure_generation(identity=IDENTITY, chunk_schema_version=2)
+    run = AbstractIngestionRunState(
+        run_id="abstract-run",
+        workspace_id="workspace-a",
+        generation_fingerprint=generation.fingerprint,
+        source_identity="a" * 64,
+        source_path="dataset/abstracts.sqlite3",
+        cursor="key-a",
+        status="running",
+        stats=AbstractIngestionStats(
+            run_id="abstract-run",
+            discovered=3,
+            processed=1,
+            indexed=1,
+            skipped_invalid_key=2,
+            passages=1,
+            next_cursor="key-a",
+        ),
+    )
+    await store.upsert_ingestion_run(run)
+    loaded = await store.get_ingestion_run(
+        "abstract-run", "workspace-a", source_kind=LiteratureSourceKind.ABSTRACT
+    )
+    assert loaded is not None
+    assert loaded.source_identity == "a" * 64
+    assert loaded.source_path == "dataset/abstracts.sqlite3"
+    assert loaded.stats.passages == 1
+    assert loaded.stats.skipped_invalid_key == 2

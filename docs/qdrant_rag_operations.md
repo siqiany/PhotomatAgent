@@ -142,6 +142,129 @@ root, and provider state without exposing secrets. Common typed errors include:
 No-result output is not evidence that a scientific claim is false. Recheck the
 generation, query, filters, and source coverage; provenance gaps remain gaps.
 
+## Two-stage import driver
+
+For the local corpus, use the thin WSL driver from the repository root (or
+invoke `bash /absolute/path/to/PhomatAgent/scripts/import_literature_qdrant.sh`
+from another working directory). The driver then changes to the repository
+root and invokes the current project's `uv` environment; it does not contain
+provider logic or call the Qdrant HTTP API.
+The default workspace is `/home/shiqiany/AIagent`, with these workspace-relative
+source paths:
+
+| Stage | Default source |
+| --- | --- |
+| PDF full text | `Photoelectric detection/dataset/paper/pdf` |
+| Abstracts | `Photoelectric detection/dataset/paper/abstract/abstracts.sqlite3` |
+
+Run the stages separately and activate only after both are complete:
+
+```bash
+bash scripts/import_literature_qdrant.sh pdf --stop-after 100
+bash scripts/import_literature_qdrant.sh pdf --resume --stop-after 100
+bash scripts/import_literature_qdrant.sh abstracts --stop-after 5000
+bash scripts/import_literature_qdrant.sh abstracts --resume --stop-after 5000
+bash scripts/import_literature_qdrant.sh status
+bash scripts/import_literature_qdrant.sh activate
+```
+
+The driver also accepts `--workspace PATH`, `--pdf-directory PATH`, and
+`--database PATH` to override those defaults. All source paths are passed as
+individual arguments, so spaces in a path are preserved. `--stop-after N`
+requests a successful, bounded pause after at most `N` source records;
+`--resume` reuses the saved ID for that stage. `--yes` is forwarded only when
+explicitly supplied. `--dry-run` prints the shell-escaped `uv run` argv and
+resolved paths, without writing run state or starting `uv`, a provider, or
+Qdrant.
+
+Before starting a fresh PDF stage, the driver archives any previous ID under
+`user_output/rag-import/run-state/archive/`, then atomically saves its new run
+ID under `pdf.run_id`. Abstract state also records the canonical workspace-
+relative database path in `abstracts.source_path`. A fresh abstract invocation
+automatically links and replaces a saved run only when that path matches
+exactly; a changed or unknown path fails closed and requires an explicit
+`--supersede-run-id OLD_RUN_ID`. New abstract IDs are first written to
+`abstracts.pending.run_id` and `abstracts.pending.source_path`; the active
+`abstracts.run_id` is archived and replaced only after the CLI accepts the run
+(complete or bounded pause). A failed validation or interruption therefore
+leaves the prior active ID intact, while the pending ID remains available to
+the next `--resume`. If the pending run cannot be resumed because its
+supersession precondition is still invalid, pass `abstracts --discard-pending`
+after reviewing the failure. This removes only the two local pending pointer
+files; it does not contact Qdrant, alter the active run, or remove archived
+audit history. A missing or empty state file is an explicit error for
+`--resume` and `activate` (status reports an unsupplied stage). The CLI's
+ingestion record remains the source of truth for its cursor and progress. Each progress line is bounded JSON
+with `total`, `processed`, `indexed`, `unchanged`, `failed`, `skipped`,
+`passages`, `rate`, `eta`/`eta_seconds`, `cursor`, `run_id`, and `status` (plus
+the per-invocation `processed_this_invocation` audit field).
+
+Abstract runs record a streamed SHA-256 identity for the SQLite file and the
+workspace-relative source path. They require one immutable, checkpointed
+snapshot: a non-empty `abstracts.sqlite3-wal` fails closed with
+`source_wal_pending` rather than silently omitting committed WAL content.
+Stop writers and run SQLite's `wal_checkpoint(TRUNCATE)`, then verify the
+`-wal` file is absent or zero length. For a valuable/live source, make a
+consistent SQLite backup/copy after checkpointing and import that
+workspace-contained copy; do not copy a WAL sidecar independently. A main
+database replacement or newly appearing WAL is reported as `source_changed`
+and requires a new run from the verified snapshot.
+
+The service computes the source SHA-256 and row counts once per invocation.
+Each later bounded batch performs only a cheap main/WAL metadata check while
+the reader holds one read transaction. A resume invocation recomputes the
+identity once and validates it against the saved run; an unknown `--resume`
+ID is rejected rather than creating an unrelated run.
+
+If the database changed while an old abstract run was incomplete, do not
+resume that run. Start a fresh run and explicitly link the old run. Explicit
+supersession is also the deliberate path for a changed source pathname: the
+CLI validates the old run's workspace, generation, abstract source kind, and
+bounded saved source path before linking it, then scopes cleanup to both the
+old and new paths while retaining READY knowledge:
+
+```bash
+uv run photomatagent rag index-abstracts \
+  --database dataset/paper/abstract/abstracts.sqlite3 \
+  --run-id NEW_RUN_ID --supersede-run-id OLD_RUN_ID --yes
+```
+
+The new run is persisted before fetching, embedding, or writing documents.
+Only after it completes successfully is `OLD_RUN_ID` marked
+`superseded`/complete; failures leave the old run auditable and activation
+blocked. Replacement cleanup is filtered to this workspace, abstract source
+kind, and exact SQLite path, and removes only non-ready artifacts. READY
+abstract knowledge absent from the changed database is retained until an
+explicit, separately reviewed cleanup. Revision replacement makes the new
+READY revision visible before removing older revisions; cleanup failures are
+retryable and do not delete the new revision.
+
+External embedding or reranking remains behind the existing configuration and
+confirmation gate. When an external provider is configured, each indexing
+stage prints the provider/model and the data scope, then asks for confirmation;
+pass `--yes` only after confirming that full-text or abstract text may leave the
+workspace. The driver never stores or prints API keys.
+
+`status` loads both saved stage IDs and performs the CLI's bounded read-only
+lookups. `activate` requires both IDs, passes both explicit
+`--require-stage pdf --require-stage abstracts` checks and their corresponding
+`--pdf-run-id`/`--abstract-run-id` values to `photomatagent rag activate`, and
+uses the existing atomic alias switch. It does not perform a direct Qdrant
+request. An incomplete or retryable stage is rejected before activation.
+
+The WSL driver archives the prior stage ID under `run-state/archive/` when an
+accepted fresh run is promoted. For abstracts, a matching saved source path
+automatically forwards that prior ID as `--supersede-run-id`; a different or
+unrecorded path requires an explicit ID so source replacement is an operator
+decision. Use `--resume` for the saved active or pending run, and never combine
+it with supersession.
+
+Retrieval follows the evidence priority local full text → local abstracts →
+arXiv metadata. Abstract results identify themselves as abstract-only and do
+not imply that a PDF was inspected. arXiv remains a separate, permission-
+controlled, session-only search: its results are not written to Qdrant, the
+SQLite database, or the workspace.
+
 ## Legacy LanceDB artifacts
 
 The Qdrant migration does not import, rewrite, or delete an existing

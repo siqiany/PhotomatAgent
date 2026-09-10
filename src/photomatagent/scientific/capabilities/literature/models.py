@@ -69,6 +69,18 @@ class IngestState(str, Enum):
     SUPERSEDED = "superseded"
 
 
+class LiteratureSourceKind(str, Enum):
+    """The corpus tier from which a literature record was sourced."""
+
+    FULLTEXT = "fulltext"
+    ABSTRACT = "abstract"
+
+
+# Source-aware payloads are a distinct semantic generation from legacy points
+# that predate the ``source_kind`` field.
+LITERATURE_CHUNK_SCHEMA_VERSION = 2
+
+
 @dataclass(frozen=True)
 class DocumentManifest:
     """Vectorless document control record persisted in Qdrant.
@@ -94,6 +106,13 @@ class DocumentManifest:
     model_fingerprint: str = ""
     indexed_at: datetime | None = None
     last_error: str = ""
+    source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT
+    source_record_id: str = ""
+    doi: str = ""
+    pmid: str = ""
+    pmcid: str = ""
+    journal: str = ""
+    relevance_tier: str = ""
 
     def __post_init__(self) -> None:
         validate_relative_source_path(self.relative_source_path)
@@ -101,6 +120,7 @@ class DocumentManifest:
         _validate_sha256(self.model_fingerprint, "model_fingerprint")
         if self.record_type != "document":
             raise ValueError("DocumentManifest.record_type must be 'document'")
+        object.__setattr__(self, "source_kind", LiteratureSourceKind(self.source_kind))
         object.__setattr__(self, "status", DocumentStatus(self.status))
         object.__setattr__(self, "authors", tuple(self.authors))
 
@@ -123,6 +143,13 @@ class DocumentManifest:
             "model_fingerprint": self.model_fingerprint,
             "indexed_at": self.indexed_at,
             "last_error": self.last_error,
+            "source_kind": self.source_kind.value,
+            "source_record_id": self.source_record_id,
+            "doi": self.doi,
+            "pmid": self.pmid,
+            "pmcid": self.pmcid,
+            "journal": self.journal,
+            "relevance_tier": self.relevance_tier,
         }
 
 
@@ -156,6 +183,13 @@ class PassagePoint:
     # One timestamp is shared by every passage in a document revision.  It is
     # additive so legacy payloads without the field can still be read.
     indexed_at: datetime | None = None
+    source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT
+    source_record_id: str = ""
+    doi: str = ""
+    pmid: str = ""
+    pmcid: str = ""
+    journal: str = ""
+    relevance_tier: str = ""
 
     def __post_init__(self) -> None:
         validate_relative_source_path(self.relative_source_path)
@@ -165,6 +199,7 @@ class PassagePoint:
             _validate_sha256(self.normalized_text_sha256, "normalized_text_sha256")
         if self.record_type != "passage":
             raise ValueError("PassagePoint.record_type must be 'passage'")
+        object.__setattr__(self, "source_kind", LiteratureSourceKind(self.source_kind))
         object.__setattr__(self, "ingest_state", IngestState(self.ingest_state))
         object.__setattr__(self, "authors", tuple(self.authors))
         object.__setattr__(self, "limitations", tuple(self.limitations))
@@ -202,6 +237,13 @@ class PassagePoint:
             "chunk_index": self.chunk_index,
             "normalized_text_sha256": self.normalized_text_sha256,
             "indexed_at": self.indexed_at,
+            "source_kind": self.source_kind.value,
+            "source_record_id": self.source_record_id,
+            "doi": self.doi,
+            "pmid": self.pmid,
+            "pmcid": self.pmcid,
+            "journal": self.journal,
+            "relevance_tier": self.relevance_tier,
         }
 
 

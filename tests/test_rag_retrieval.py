@@ -22,6 +22,7 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
 from photomatagent.scientific.capabilities.literature.providers.base import ModelIdentity
 from photomatagent.scientific.capabilities.literature.models import (
     IngestState,
+    LiteratureSourceKind,
     PassagePoint,
 )
 from photomatagent.scientific.capabilities.literature.retrieval import (
@@ -41,6 +42,7 @@ def candidate_fixture(
     workspace_id: str = "ws",
     document_id: str = "doc",
     text_prefix: str = "passage",
+    source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
 ) -> list[SearchCandidate]:
     candidates: list[SearchCandidate] = []
     for index in range(count):
@@ -66,6 +68,7 @@ def candidate_fixture(
             "next_passage_id": f"p-{index + 1}" if index < count - 1 else None,
             "normalized_text_sha256": _hash(text),
             "indexed_at": datetime(2024, 1, (index % 28) + 1, tzinfo=timezone.utc),
+            "source_kind": source_kind,
         }
         candidates.append(
             SearchCandidate(passage_id=f"p-{index}", score=1.0 / (index + 1), payload=payload)
@@ -128,15 +131,22 @@ class FakeStore:
         self.dense_queries = 0
         self.sparse_queries = 0
         self.neighbor_calls: list[tuple[str, list[str]]] = []
+        self.neighbor_source_kinds: list[LiteratureSourceKind] = []
         self.neighbors: dict[str, Any] = {}
         self.hybrid_error: Exception | None = None
         self.dense_error: Exception | None = None
         self.sparse_error: Exception | None = None
 
     async def hybrid_candidates(
-        self, query: str, dense: list[float], *, workspace_id: str, limit: int
+        self,
+        query: str,
+        dense: list[float],
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind,
+        limit: int,
     ) -> list[SearchCandidate]:
-        del query, dense, workspace_id
+        del query, dense, workspace_id, source_kind
         self.hybrid_queries += 1
         self.hybrid_limit = limit
         if self.hybrid_error is not None:
@@ -144,9 +154,14 @@ class FakeStore:
         return list(self.hybrid_results)
 
     async def dense_candidates(
-        self, dense: list[float], *, workspace_id: str, limit: int
+        self,
+        dense: list[float],
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind,
+        limit: int,
     ) -> list[SearchCandidate]:
-        del dense, workspace_id
+        del dense, workspace_id, source_kind
         self.dense_queries += 1
         self.dense_limit = limit
         if self.dense_error is not None:
@@ -154,17 +169,29 @@ class FakeStore:
         return list(self.dense_results)
 
     async def sparse_candidates(
-        self, query: str, *, workspace_id: str, limit: int
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind,
+        limit: int,
     ) -> list[SearchCandidate]:
-        del query, workspace_id
+        del query, workspace_id, source_kind
         self.sparse_queries += 1
         self.sparse_limit = limit
         if self.sparse_error is not None:
             raise self.sparse_error
         return list(self.sparse_results)
 
-    async def retrieve_passages(self, workspace_id: str, passage_ids: list[str]) -> list[Any]:
+    async def retrieve_passages(
+        self,
+        workspace_id: str,
+        passage_ids: list[str],
+        *,
+        source_kind: LiteratureSourceKind,
+    ) -> list[Any]:
         self.neighbor_calls.append((workspace_id, list(passage_ids)))
+        self.neighbor_source_kinds.append(source_kind)
         return [self.neighbors[passage_id] for passage_id in passage_ids if passage_id in self.neighbors]
 
 
@@ -195,7 +222,7 @@ async def test_retrieval_validates_provider_generation_before_query() -> None:
 
     assert calls == [
         collection_fingerprint(
-            identity, 1, prefix="photomat_test_retrieval", sparse_model="qdrant/bm25"
+            identity, 2, prefix="photomat_test_retrieval", sparse_model="qdrant/bm25"
         )
     ]
 
@@ -268,6 +295,46 @@ async def test_dense_failure_uses_sparse_without_external_fallback() -> None:
     assert store.sparse_queries == 1
     assert store.sparse_limit == 50
     assert store.hybrid_queries == 0
+
+
+@pytest.mark.asyncio
+async def test_retriever_rejects_wrong_source_candidates() -> None:
+    store = FakeStore(candidate_fixture(source_kind=LiteratureSourceKind.ABSTRACT))
+    result = await LiteratureRetriever(
+        store, FakeEmbedder(), DisabledReranker()
+    ).search("HgTe", workspace_id="ws", source_kind="fulltext")
+    assert result.passages == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", ["workspace_id", "ingest_state"])
+async def test_retriever_rejects_candidates_missing_scope_or_readiness(
+    missing_field: str,
+) -> None:
+    candidate = candidate_fixture(1)[0]
+    payload = dict(candidate.payload)
+    payload.pop(missing_field)
+    store = FakeStore(
+        [SearchCandidate(candidate.passage_id, candidate.score, payload)]
+    )
+
+    result = await LiteratureRetriever(store, FakeEmbedder(), DisabledReranker()).search(
+        "query", workspace_id="ws", top_k=1
+    )
+
+    assert result.passages == ()
+
+
+@pytest.mark.asyncio
+async def test_abstract_retrieval_source_kind_marks_result_abstract_only() -> None:
+    store = FakeStore(candidate_fixture(source_kind=LiteratureSourceKind.ABSTRACT))
+    result = await LiteratureRetriever(
+        store, FakeEmbedder(), DisabledReranker()
+    ).search("HgTe", workspace_id="ws", source_kind=LiteratureSourceKind.ABSTRACT)
+
+    assert result.passages
+    assert result.passages[0].source_kind is LiteratureSourceKind.ABSTRACT
+    assert "abstract_only" in result.passages[0].limitations
 
 
 @pytest.mark.asyncio
@@ -432,6 +499,7 @@ async def test_neighbor_context_is_one_bounded_call_and_isolated() -> None:
             document_id="doc",
             document_revision="a" * 64,
             ingest_state="ready",
+            source_kind=LiteratureSourceKind.FULLTEXT,
             text="before context that is long",
             previous_passage_id=None,
             next_passage_id=None,
@@ -442,6 +510,7 @@ async def test_neighbor_context_is_one_bounded_call_and_isolated() -> None:
             document_id="doc",
             document_revision="a" * 64,
             ingest_state="ready",
+            source_kind=LiteratureSourceKind.FULLTEXT,
             text="must be rejected",
             previous_passage_id=None,
             next_passage_id=None,
@@ -454,9 +523,45 @@ async def test_neighbor_context_is_one_bounded_call_and_isolated() -> None:
 
     assert len(store.neighbor_calls) == 1
     assert store.neighbor_calls[0] == ("ws", ["before", "after"])
+    assert store.neighbor_source_kinds == [LiteratureSourceKind.FULLTEXT]
     assert len(result.passages[0].context_before) == 9
     assert result.passages[0].context_before.endswith("long")
     assert result.passages[0].context_after == ""
+
+
+@pytest.mark.asyncio
+async def test_neighbor_context_is_source_isolated() -> None:
+    center = candidate_fixture(1)[0]
+    center = SearchCandidate(
+        passage_id="center",
+        score=1.0,
+        payload={
+            **center.payload,
+            "passage_id": "center",
+            "previous_passage_id": "abstract-before",
+        },
+    )
+    store = FakeStore([center])
+    store.neighbors = {
+        "abstract-before": SimpleNamespace(
+            passage_id="abstract-before",
+            workspace_id="ws",
+            document_id="doc",
+            document_revision="a" * 64,
+            ingest_state="ready",
+            source_kind=LiteratureSourceKind.ABSTRACT,
+            text="abstract context must not leak",
+            previous_passage_id=None,
+            next_passage_id=None,
+        ),
+    }
+
+    result = await LiteratureRetriever(store, FakeEmbedder(), DisabledReranker()).search(
+        "query", workspace_id="ws", top_k=1, source_kind=LiteratureSourceKind.FULLTEXT
+    )
+
+    assert store.neighbor_source_kinds == [LiteratureSourceKind.FULLTEXT]
+    assert result.passages[0].context_before == ""
 
 
 @pytest.mark.asyncio

@@ -8,12 +8,16 @@ from typing import Any
 import pytest
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
+from photomatagent.scientific.capabilities import literature as literature_capability
 from photomatagent.scientific.capabilities.literature import (
     LiteratureExtractEvidenceTool,
     LiteratureIndexPapersTool,
     LiteratureReadPassageTool,
+    LiteratureSearchArxivTool,
     LiteratureSearchPassagesTool,
+    build_literature_services,
 )
+from photomatagent.scientific.capabilities.literature.models import LiteratureSourceKind
 from photomatagent.scientific.capabilities.literature.evidence import (
     extract_evidence_from_text,
 )
@@ -25,11 +29,156 @@ from photomatagent.scientific.capabilities.literature.retrieval import (
     RetrievalDiagnostics,
     RetrievalResult,
 )
+from photomatagent.scientific.capabilities.literature import retrieval as retrieval_module
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
 
 CONFIG = ScientificConfig()
+_MISSING = object()
+
+
+def test_literature_probe_uses_source_aware_generation_version() -> None:
+    assert literature_capability._CHUNK_SCHEMA_VERSION == 2
+
+
+def test_build_literature_services_passes_source_aware_generation_version(
+    tmp_path, monkeypatch
+) -> None:
+    seen: list[int | None] = []
+
+    class CapturingRetriever:
+        def __init__(self, store, embedder, reranker, **kwargs: Any) -> None:
+            del store, embedder, reranker
+            seen.append(kwargs.get("chunk_schema_version"))
+
+    monkeypatch.setattr(retrieval_module, "LiteratureRetriever", CapturingRetriever)
+    build_literature_services(
+        CONFIG,
+        Workspace(tmp_path),
+        store=object(),
+        embedder=object(),
+        reranker=object(),
+    )
+
+    assert seen == [2]
+
+
+def test_search_schema_defaults_to_fulltext() -> None:
+    prop = LiteratureSearchPassagesTool.input_schema["properties"]["source_kind"]
+    assert prop["enum"] == ["fulltext", "abstract"]
+    assert prop["default"] == "fulltext"
+
+
+@pytest.mark.parametrize(
+    "tool_cls",
+    [LiteratureReadPassageTool, LiteratureExtractEvidenceTool],
+)
+def test_read_and_evidence_schemas_default_to_fulltext(tool_cls: type) -> None:
+    prop = tool_cls.input_schema["properties"]["source_kind"]
+    assert prop["enum"] == ["fulltext", "abstract"]
+    assert prop["default"] == "fulltext"
+
+
+def test_abstract_limitations_reserve_canonical_slot() -> None:
+    record = SimpleNamespace(
+        limitations=tuple(f"limit-{index}" for index in range(8))
+        + ("ABSTRACT_ONLY", "limit-0"),
+    )
+
+    limitations = literature_capability._public_limitations(
+        record, LiteratureSourceKind.ABSTRACT
+    )
+
+    assert limitations == tuple(f"limit-{index}" for index in range(7)) + (
+        "abstract_only",
+    )
+    assert limitations.count("abstract_only") == 1
+
+
+@pytest.mark.asyncio
+async def test_abstract_result_identifies_source_and_limit(tmp_path) -> None:
+    retriever = FakeRetriever()
+    services = SimpleNamespace(
+        retriever=retriever,
+        workspace_id="workspace",
+    )
+    result = await LiteratureSearchPassagesTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    ).execute(
+        {"query": "photodetector", "top_k": 1, "source_kind": "abstract"}
+    )
+
+    assert not result.is_error
+    row = result.data["results"][0]
+    assert retriever.source_kinds == [LiteratureSourceKind.ABSTRACT]
+    assert row["source_kind"] == "abstract"
+    assert "abstract_only" in row["limitations"]
+    assert row["source_record_id"] == "paper-key"
+    assert row["doi"] == "10.1000/example"
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_unknown_source_kind(tmp_path) -> None:
+    result = await LiteratureSearchPassagesTool(
+        ScientificConfig(),
+        Workspace(tmp_path),
+        SimpleNamespace(retriever=FakeRetriever(), workspace_id="workspace"),
+    ).execute({"query": "photodetector", "source_kind": "not-a-tier"})
+
+    assert result.is_error
+    assert result.data["error"] == "valueerror"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported_source_kind", [_MISSING, "not-a-tier", "fulltext"])
+async def test_search_rejects_malformed_result_source_kind(
+    tmp_path, reported_source_kind: object
+) -> None:
+    passage_fields: dict[str, Any] = {
+        "passage_id": "passage-1",
+        "document_id": "paper-1",
+        "text": "abstract text",
+        "title": "Abstract paper",
+        "score": 1.0,
+        "relative_source_path": "abstracts.sqlite3",
+        "limitations": (),
+    }
+    if reported_source_kind is not _MISSING:
+        passage_fields["source_kind"] = reported_source_kind
+    services = SimpleNamespace(
+        retriever=MalformedRetriever(SimpleNamespace(**passage_fields)),
+        workspace_id="workspace",
+    )
+
+    result = await LiteratureSearchPassagesTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    ).execute(
+        {"query": "photodetector", "top_k": 1, "source_kind": "abstract"}
+    )
+
+    assert result.is_error
+    assert result.data["error"] == "source_kind_invalid"
+
+
+def test_arxiv_description_forbids_persistence() -> None:
+    assert "not persisted" in LiteratureSearchArxivTool.description.lower()
+
+
+def test_literature_guidance_orders_local_tiers_before_arxiv() -> None:
+    descriptions = " ".join(
+        (
+            literature_capability.LiteratureProbe.description,
+            LiteratureSearchPassagesTool.description,
+            LiteratureSearchArxivTool.description,
+        )
+    ).lower()
+    fulltext = descriptions.index("full-text")
+    abstract = descriptions.index("abstract")
+    arxiv = descriptions.index("literature.search_arxiv")
+    assert fulltext < abstract < arxiv
+    assert "evidence gap" in descriptions
+    assert "explicitly asks for recent work" in descriptions
 
 
 class FakeIngestion:
@@ -63,8 +212,21 @@ class FakeIngestion:
 
 
 class FakeStore:
-    async def retrieve_passages(self, workspace_id: str, passage_ids: list[str]) -> list[Any]:
+    def __init__(self, *, source_record_id: str = "paper-key") -> None:
+        self.source_kinds: list[LiteratureSourceKind | str] = []
+        self.source_record_id = source_record_id
+
+    async def retrieve_passages(
+        self,
+        workspace_id: str,
+        passage_ids: list[str],
+        *,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+    ) -> list[Any]:
         del workspace_id
+        selected_source_kind = LiteratureSourceKind(source_kind)
+        self.source_kinds.append(source_kind)
+        is_abstract = selected_source_kind is LiteratureSourceKind.ABSTRACT
         return [
             SimpleNamespace(
                 passage_id=passage_id,
@@ -72,31 +234,54 @@ class FakeStore:
                 document_revision="a" * 64,
                 workspace_id="workspace",
                 text="The detector achieved a responsivity of 0.82 A/W at 80 K.",
-                title="HgTe quantum dot infrared detector",
+                title=(
+                    "Abstract HgTe quantum dot infrared detector"
+                    if is_abstract
+                    else "HgTe quantum dot infrared detector"
+                ),
                 authors=("A. Author",),
                 year=2024,
-                section="Results",
-                heading_path="Results",
-                page_start=3,
-                page_end=3,
-                relative_source_path="papers/hgte.pdf",
+                section="Abstract" if is_abstract else "Results",
+                heading_path="Abstract" if is_abstract else "Results",
+                page_start=None if is_abstract else 3,
+                page_end=None if is_abstract else 3,
+                relative_source_path=(
+                    "abstracts.sqlite3" if is_abstract else "papers/hgte.pdf"
+                ),
                 previous_passage_id=None,
                 next_passage_id=None,
-                limitations=(),
+                limitations=(
+                    ("abstract_only", "fulltext_not_checked")
+                    if is_abstract
+                    else ()
+                ),
+                source_kind=selected_source_kind,
+                source_record_id=self.source_record_id,
+                doi="10.1000/example" if is_abstract else "",
+                pmid="12345" if is_abstract else "",
+                pmcid="PMC12345" if is_abstract else "",
+                journal="Journal of Detectors" if is_abstract else "",
+                relevance_tier="curated" if is_abstract else "",
             )
             for passage_id in passage_ids
         ]
 
 
 class FakeRetriever:
+    def __init__(self, *, source_record_id: str = "paper-key") -> None:
+        self.source_kinds: list[LiteratureSourceKind | str] = []
+        self.source_record_id = source_record_id
+
     async def search(
         self,
         query: str,
         *,
         workspace_id: str,
         top_k: int,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
     ) -> RetrievalResult:
         del workspace_id
+        self.source_kinds.append(source_kind)
         passage = RetrievedPassage(
             passage_id="passage-1",
             workspace_id="workspace",
@@ -113,9 +298,39 @@ class FakeRetriever:
             page_start=2,
             page_end=2,
             relative_source_path="papers/hgte.pdf",
+            source_kind=source_kind,
+            source_record_id=self.source_record_id,
+            doi="10.1000/example",
+            pmid="12345",
+            pmcid="PMC12345",
+            journal="Journal of Detectors",
+            relevance_tier="curated",
         )
         return RetrievalResult(
             passages=(passage,) if top_k else (),
+            diagnostics=RetrievalDiagnostics(
+                mode="hybrid_rrf",
+                candidate_count=1,
+                reranked=False,
+            ),
+        )
+
+
+class MalformedRetriever:
+    def __init__(self, passage: Any) -> None:
+        self.passage = passage
+
+    async def search(
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        top_k: int,
+        source_kind: LiteratureSourceKind | str,
+    ) -> RetrievalResult:
+        del query, workspace_id, top_k, source_kind
+        return RetrievalResult(
+            passages=(self.passage,),
             diagnostics=RetrievalDiagnostics(
                 mode="hybrid_rrf",
                 candidate_count=1,
@@ -217,6 +432,61 @@ async def test_extract_evidence_resolves_exact_passage(tmp_path, services) -> No
     assert not result.is_error
     assert result.data["count"] == 1
     assert result.data["evidence"][0]["property"] == "responsivity"
+
+
+@pytest.mark.asyncio
+async def test_abstract_search_id_round_trips_read_and_evidence_provenance(
+    tmp_path,
+) -> None:
+    raw_source_record_id = "  raw   key\twith spaces  "
+    services = SimpleNamespace(
+        retriever=FakeRetriever(source_record_id=raw_source_record_id),
+        store=FakeStore(source_record_id=raw_source_record_id),
+        workspace_id="workspace",
+    )
+    config = ScientificConfig()
+    workspace = Workspace(tmp_path)
+
+    search_result = await LiteratureSearchPassagesTool(
+        config, workspace, services
+    ).execute({"query": "responsivity", "top_k": 1, "source_kind": "abstract"})
+    assert not search_result.is_error
+    search_row = search_result.data["results"][0]
+    assert search_row["source_kind"] == "abstract"
+    assert search_row["source_record_id"] == raw_source_record_id
+    assert "abstract_only" in search_row["limitations"]
+
+    read_result = await LiteratureReadPassageTool(config, workspace, services).execute(
+        {
+            "passage_id": search_row["passage_id"],
+            "source_kind": search_row["source_kind"],
+        }
+    )
+    assert not read_result.is_error
+    assert services.store.source_kinds == [LiteratureSourceKind.ABSTRACT]
+    assert read_result.data["source_kind"] == "abstract"
+    assert read_result.data["source_record_id"] == raw_source_record_id
+    assert "abstract_only" in read_result.data["limitations"]
+    assert "fulltext_not_checked" in read_result.data["limitations"]
+
+    evidence_result = await LiteratureExtractEvidenceTool(
+        config, workspace, services
+    ).execute(
+        {
+            "source_kind": "abstract",
+            "passages": [{"passage_id": search_row["passage_id"]}],
+        }
+    )
+    assert not evidence_result.is_error
+    evidence = evidence_result.evidence[0]
+    assert evidence.provenance["source_kind"] == "abstract"
+    assert evidence.provenance["source_record_id"] == raw_source_record_id
+    assert "abstract_only" in evidence.limitations
+    assert "fulltext_not_checked" in evidence.limitations
+    assert "source PDF" not in evidence.limitations
+    public_evidence = evidence_result.data["evidence"][0]
+    assert public_evidence["provenance"]["source_record_id"] == raw_source_record_id
+    assert public_evidence["source_kind"] == "abstract"
 
 
 def test_evidence_extraction_known_sentence() -> None:

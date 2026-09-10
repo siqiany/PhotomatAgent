@@ -8,6 +8,7 @@ degradation, bounded post-processing, and provenance-safe context expansion.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -15,6 +16,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from photomatagent.scientific.capabilities.literature.models import (
+    LITERATURE_CHUNK_SCHEMA_VERSION,
+    LiteratureSourceKind,
+)
 from photomatagent.scientific.capabilities.literature.qdrant_store import (
     SearchCandidate,
     collection_fingerprint,
@@ -71,6 +76,28 @@ class RetrievedPassage:
     indexed_at: datetime | str | None = None
     context_before: str = ""
     context_after: str = ""
+    source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT
+    source_record_id: str = ""
+    doi: str = ""
+    pmid: str = ""
+    pmcid: str = ""
+    journal: str = ""
+    relevance_tier: str = ""
+
+    def __post_init__(self) -> None:
+        source_kind = LiteratureSourceKind(self.source_kind)
+        object.__setattr__(self, "source_kind", source_kind)
+        raw_limitations = self.limitations or ()
+        limitations = (
+            (raw_limitations,)
+            if isinstance(raw_limitations, str)
+            else tuple(str(item) for item in raw_limitations)
+        )
+        if source_kind is LiteratureSourceKind.ABSTRACT and not any(
+            item.casefold() == "abstract_only" for item in limitations
+        ):
+            limitations += ("abstract_only",)
+        object.__setattr__(self, "limitations", limitations)
 
     @property
     def passage(self) -> str:
@@ -122,6 +149,13 @@ class RetrievedPassage:
             "previous_passage_id": self.previous_passage_id,
             "next_passage_id": self.next_passage_id,
             "limitations": list(self.limitations),
+            "source_kind": self.source_kind.value,
+            "source_record_id": self.source_record_id,
+            "doi": self.doi,
+            "pmid": self.pmid,
+            "pmcid": self.pmcid,
+            "journal": self.journal,
+            "relevance_tier": self.relevance_tier,
         }
 
 
@@ -141,6 +175,15 @@ def _value(item: Any, name: str, default: Any = None) -> Any:
 
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
+
+
+def _source_kind_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return LiteratureSourceKind(value).value
+    except (TypeError, ValueError):
+        return None
 
 
 def _candidate_parts(candidate: Any) -> tuple[str, float, dict[str, Any]] | None:
@@ -230,6 +273,7 @@ def _neighbor_is_compatible(
     workspace_id: str,
     document_id: str,
     document_revision: str,
+    source_kind: LiteratureSourceKind,
 ) -> bool:
     return (
         str(_ready_neighbor_value(item, "passage_id", "")) == requested_id
@@ -238,6 +282,8 @@ def _neighbor_is_compatible(
         and str(_ready_neighbor_value(item, "document_revision", ""))
         == document_revision
         and _enum_value(_ready_neighbor_value(item, "ingest_state", "")) == "ready"
+        and _source_kind_value(_ready_neighbor_value(item, "source_kind", None))
+        == source_kind.value
     )
 
 
@@ -250,7 +296,7 @@ class LiteratureRetriever:
         embedder: Any,
         reranker: Any,
         *,
-        chunk_schema_version: int = 1,
+        chunk_schema_version: int = LITERATURE_CHUNK_SCHEMA_VERSION,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -280,6 +326,7 @@ class LiteratureRetriever:
         top_k: int,
         expand_radius: int,
         context_chars: int,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
     ) -> None:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
@@ -291,9 +338,15 @@ class LiteratureRetriever:
             raise ValueError("expand_radius must be 0 or 1")
         if type(context_chars) is not int or context_chars < 0:
             raise ValueError("context_chars must be non-negative")
+        if _source_kind_value(source_kind) is None:
+            raise ValueError("source_kind must be 'fulltext' or 'abstract'")
 
     async def _retrieve_candidates(
-        self, query: str, *, workspace_id: str
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT,
     ) -> tuple[list[tuple[str, float, dict[str, Any]]], str, tuple[str, ...]]:
         await self._validate_current_generation()
         dense: list[float] | None = None
@@ -311,41 +364,92 @@ class LiteratureRetriever:
 
         if dense is None:
             try:
-                sparse = await self._store.sparse_candidates(
-                    query, workspace_id=workspace_id, limit=MAX_CANDIDATES
+                sparse = await self._call_candidate_store(
+                    "sparse_candidates",
+                    query,
+                    workspace_id=workspace_id,
+                    source_kind=source_kind,
+                    limit=MAX_CANDIDATES,
                 )
             except Exception as exc:
                 raise RagRetrievalError(
                     "retrieval_unavailable", "dense and sparse retrieval are unavailable"
                 ) from exc
-            return self._normalize_candidates(sparse, workspace_id), "sparse_only", (
+            return self._normalize_candidates(sparse, workspace_id, source_kind), "sparse_only", (
                 "dense_unavailable",
             )
 
         try:
-            hybrid = await self._store.hybrid_candidates(
+            hybrid = await self._call_candidate_store(
+                "hybrid_candidates",
                 query,
                 dense,
                 workspace_id=workspace_id,
+                source_kind=source_kind,
                 limit=MAX_CANDIDATES,
             )
         except Exception:
             try:
-                dense_only = await self._store.dense_candidates(
-                    dense, workspace_id=workspace_id, limit=MAX_CANDIDATES
+                dense_only = await self._call_candidate_store(
+                    "dense_candidates",
+                    dense,
+                    workspace_id=workspace_id,
+                    source_kind=source_kind,
+                    limit=MAX_CANDIDATES,
                 )
             except Exception as exc:
                 raise RagRetrievalError(
                     "retrieval_unavailable", "dense and sparse retrieval are unavailable"
                 ) from exc
-            return self._normalize_candidates(dense_only, workspace_id), "dense_only", (
+            return self._normalize_candidates(dense_only, workspace_id, source_kind), "dense_only", (
                 "sparse_unavailable",
             )
-        return self._normalize_candidates(hybrid, workspace_id), "hybrid_rrf", ()
+        return self._normalize_candidates(hybrid, workspace_id, source_kind), "hybrid_rrf", ()
+
+    async def _call_candidate_store(
+        self,
+        method_name: str,
+        *args: Any,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind,
+        limit: int,
+    ) -> Any:
+        """Call a candidate route while tolerating pre-source-aware fakes.
+
+        The production Qdrant adapter has an explicit ``source_kind``
+        parameter, so it always receives the server-side filter.  Some local
+        test/legacy stores expose the older signature; those stores are still
+        safe because ``_normalize_candidates`` rejects missing or mismatched
+        source payloads before any result is returned.
+        """
+        method = getattr(self._store, method_name)
+        kwargs: dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "source_kind": source_kind,
+            "limit": limit,
+        }
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            supports_source_kind = True
+        else:
+            supports_var_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            supports_source_kind = "source_kind" in parameters or supports_var_kwargs
+        if not supports_source_kind:
+            kwargs.pop("source_kind")
+        result = method(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
     @staticmethod
     def _normalize_candidates(
-        candidates: Any, workspace_id: str
+        candidates: Any,
+        workspace_id: str,
+        source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT,
     ) -> list[tuple[str, float, dict[str, Any]]]:
         if not isinstance(candidates, Sequence) or isinstance(
             candidates, (str, bytes, bytearray)
@@ -358,10 +462,12 @@ class LiteratureRetriever:
                 continue
             passage_id, score, payload = normalized
             payload_workspace = payload.get("workspace_id")
-            if payload_workspace is not None and str(payload_workspace) != workspace_id:
+            if not isinstance(payload_workspace, str) or payload_workspace != workspace_id:
+                continue
+            if _source_kind_value(payload.get("source_kind")) != source_kind.value:
                 continue
             state = payload.get("ingest_state")
-            if state is not None and _enum_value(state) != "ready":
+            if _enum_value(state) != "ready":
                 continue
             key = (_document_id(payload), _normalized_text_hash(payload))
             prior = unique.get(key)
@@ -439,6 +545,7 @@ class LiteratureRetriever:
         rows: Sequence[tuple[str, float, dict[str, Any], float]],
         *,
         workspace_id: str,
+        source_kind: LiteratureSourceKind,
         expand_radius: int,
         context_chars: int,
     ) -> dict[str, tuple[str, str]]:
@@ -476,7 +583,9 @@ class LiteratureRetriever:
 
         try:
             neighbors = await self._store.retrieve_passages(
-                workspace_id, requested_ids[:MAX_NEIGHBOR_IDS]
+                workspace_id,
+                requested_ids[:MAX_NEIGHBOR_IDS],
+                source_kind=source_kind,
             )
         except Exception:
             return contexts
@@ -495,6 +604,7 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     document_id=document_id,
                     document_revision=revision,
+                    source_kind=source_kind,
                 ):
                     neighbor_map[neighbor_id] = neighbor
 
@@ -515,6 +625,7 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     document_id=document_id,
                     document_revision=revision,
+                    source_kind=source_kind,
                 ):
                     break
                 previous_parts.append(str(_ready_neighbor_value(neighbor, "text", "")))
@@ -534,6 +645,7 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     document_id=document_id,
                     document_revision=revision,
+                    source_kind=source_kind,
                 ):
                     break
                 next_parts.append(str(_ready_neighbor_value(neighbor, "text", "")))
@@ -586,6 +698,12 @@ class LiteratureRetriever:
         indexed_at = payload.get("indexed_at")
         if indexed_at is not None and not isinstance(indexed_at, (datetime, str)):
             indexed_at = str(indexed_at)
+        source_kind_value = _source_kind_value(payload.get("source_kind"))
+        source_kind = (
+            LiteratureSourceKind(source_kind_value)
+            if source_kind_value is not None
+            else LiteratureSourceKind.FULLTEXT
+        )
         return RetrievedPassage(
             passage_id=passage_id,
             workspace_id=workspace_id,
@@ -613,6 +731,13 @@ class LiteratureRetriever:
             indexed_at=indexed_at,
             context_before=context[0],
             context_after=context[1],
+            source_kind=source_kind,
+            source_record_id=str(payload.get("source_record_id", "") or ""),
+            doi=str(payload.get("doi", "") or ""),
+            pmid=str(payload.get("pmid", "") or ""),
+            pmcid=str(payload.get("pmcid", "") or ""),
+            journal=str(payload.get("journal", "") or ""),
+            relevance_tier=str(payload.get("relevance_tier", "") or ""),
         )
 
     async def search(
@@ -623,19 +748,32 @@ class LiteratureRetriever:
         top_k: int = 5,
         expand_radius: int = 1,
         context_chars: int = 300,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
     ) -> RetrievalResult:
         """Search one workspace with bounded candidates and context."""
+        normalized_source_kind = _source_kind_value(source_kind)
+        if normalized_source_kind is None:
+            raise ValueError("source_kind must be 'fulltext' or 'abstract'")
+        requested_source_kind = LiteratureSourceKind(normalized_source_kind)
         self._validate_request(
-            query, workspace_id, top_k, expand_radius, context_chars
+            query,
+            workspace_id,
+            top_k,
+            expand_radius,
+            context_chars,
+            requested_source_kind,
         )
         candidates, mode, degraded = await self._retrieve_candidates(
-            query, workspace_id=workspace_id
+            query,
+            workspace_id=workspace_id,
+            source_kind=requested_source_kind,
         )
         ranked, reranked, rerank_reasons = await self._rerank(query, candidates)
         final_rows = ranked[:top_k]
         contexts = await self._contexts(
             final_rows,
             workspace_id=workspace_id,
+            source_kind=requested_source_kind,
             expand_radius=expand_radius,
             context_chars=context_chars,
         )
