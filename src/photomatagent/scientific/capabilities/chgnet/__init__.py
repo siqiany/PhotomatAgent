@@ -222,20 +222,6 @@ class CHGNetScreenTool(_CHGNetTool):
                     "structures."
                 ),
             },
-            "structure_paths": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Compatibility alias for paths.",
-            },
-            "structures": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Compatibility alias for paths.",
-            },
-            "path": {
-                "type": "string",
-                "description": "Single-structure shorthand for paths.",
-            },
             "rank": {
                 "type": "boolean",
                 "description": (
@@ -566,15 +552,7 @@ def _accepts_n_positional(function: Callable[..., Any], count: int) -> bool:
 
 def _screen_input_paths(arguments: Mapping[str, Any]) -> list[str]:
     raw: Any = arguments.get("paths")
-    if raw is None:
-        raw = arguments.get("structure_paths")
-    if raw is None:
-        raw = arguments.get("structures")
-    if raw is None and arguments.get("path") is not None:
-        raw = [arguments["path"]]
-    if isinstance(raw, str):
-        raw = [raw]
-    if not isinstance(raw, Sequence) or isinstance(raw, (bytes, bytearray)):
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
         raise ValueError("paths must be a list of strings")
     paths = []
     for item in raw:

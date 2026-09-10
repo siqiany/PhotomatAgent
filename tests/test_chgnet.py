@@ -15,6 +15,8 @@ from photomatagent.scientific.capabilities.chgnet import (
 )
 from photomatagent.scientific.capabilities.config import ScientificConfig
 from photomatagent.scientific.capabilities.registry import build_scientific_tools
+from photomatagent.errors import ToolValidationError
+from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
@@ -103,6 +105,26 @@ def test_pack_tools_are_deferred_and_registered(tmp_path):
     assert pack_names == {"chgnet.screen", "chgnet.relax"}
     assert set(registered) == pack_names
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in registered.values())
+
+
+def test_screen_schema_and_registry_use_only_canonical_paths(tmp_path):
+    workspace = Workspace(tmp_path)
+    screen = next(
+        tool
+        for tool in chgnet_pack(ScientificConfig(), workspace).tools()
+        if tool.name == "chgnet.screen"
+    )
+    registry = ToolRegistry()
+    registry.register(screen)
+
+    assert set(screen.input_schema["properties"]) == {"paths", "rank"}
+    assert registry.validate_arguments(screen.name, {"paths": ["candidate.cif"]}) == {
+        "paths": ["candidate.cif"]
+    }
+    with pytest.raises(ToolValidationError, match="missing required argument 'paths'"):
+        registry.validate_arguments(
+            screen.name, {"structure_paths": ["candidate.cif"]}
+        )
 
 
 @pytest.mark.asyncio

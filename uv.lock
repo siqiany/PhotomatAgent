@@ -699,6 +699,31 @@ wheels = [
 ]
 
 [[package]]
+name = "chgnet"
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ase" },
+    { name = "cython" },
+    { name = "numpy" },
+    { name = "nvidia-ml-py3" },
+    { name = "pymatgen" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version < '3.15' and platform_machine != 'x86_64' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(python_full_version >= '3.15' and platform_machine != 'x86_64') or platform_machine == 'x86_64' or sys_platform != 'darwin'" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/14/0f75f76611f5d0ac08e38b8f9ce7e94df2e9d026fb355e40b774eb171f2c/chgnet-0.4.2.tar.gz", hash = "sha256:a24dfa050f1eb6c51d46727029015c2b44aa1da22f11d5ffedc5b499c59e2088", size = 13171054, upload-time = "2025-09-22T20:51:11.91Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/e6/9d7d2be0d7aacafc1e5b1b4c2f71c9e817c3ef1880daa9f0966622f2c272/chgnet-0.4.2-cp312-cp312-macosx_10_9_universal2.whl", hash = "sha256:b4924160bbf09c099e5bc46cdbe73d4375c776c049e431d58b6618844bf99bcf", size = 13318901, upload-time = "2025-09-22T20:50:56.377Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/c3/afb4e09bdb379fa0756a5bcecd34e19e5e893f2e04e3171d5821b71b478b/chgnet-0.4.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c5231eac9348cb1a2dac27077d3e836a1f6dc324da8aa16b28139c5e3c5da1d6", size = 13675179, upload-time = "2025-09-22T20:50:58.479Z" },
+    { url = "https://files.pythonhosted.org/packages/de/38/356e07e684fab1e9b305d31e7213fcec4f3a30b7cfed53f040781c748466/chgnet-0.4.2-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:f3328cf21675a002bd9746c5159200dcc997c1f94f924d9d0a99ee09d73f9308", size = 13651898, upload-time = "2025-09-22T20:51:00.677Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/8d/66e929f699df5ae7281c51e9357585680ba7c1df4dc1e3a5b44dba884674/chgnet-0.4.2-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:bcc919a7b7a2fbe907db281ba6855824bff441cb3dfa87a7b4870888e796df03", size = 13679734, upload-time = "2025-09-22T20:51:02.777Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/63/9e87f70cc3526da1f1d03042d04b3653bcb73df4f80b2b4055f11e03281f/chgnet-0.4.2-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:492fd13fde33769367e55cf907b404b5feec1109d9a428042a3ebaf247f744d8", size = 13695482, upload-time = "2025-09-22T20:51:05.406Z" },
+    { url = "https://files.pythonhosted.org/packages/23/b8/17c214b94dff4f222d87baef8a93f7e833062a2d48560bbb91bb06e6e67c/chgnet-0.4.2-cp312-cp312-win32.whl", hash = "sha256:8f04c7dd9f135cc398cc0134b398f85fbb1d3ce70a57436d1cf7e56e06ee70d2", size = 13217545, upload-time = "2025-09-22T20:51:07.432Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/23/4858d23a2538897736f24b7f48a0d33162c466cc5d9e31211f5331d2d425/chgnet-0.4.2-cp312-cp312-win_amd64.whl", hash = "sha256:3ee8104bcd7b1f49b67ee7132d3f296f2148bc61288bef5be81d6ff6864cbdfc", size = 13229419, upload-time = "2025-09-22T20:51:09.656Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2939,6 +2964,12 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-ml-py3"
+version = "7.352.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/64/cce82bddb80c0b0f5c703bbdafa94bfb69a1c5ad7a79cff00b482468f0d3/nvidia-ml-py3-7.352.0.tar.gz", hash = "sha256:390f02919ee9d73fe63a98c73101061a6b37fa694a793abf56673320f1f51277", size = 19494, upload-time = "2017-06-03T07:43:46.299Z" }
+
+[[package]]
 name = "olefile"
 version = "0.47"
 source = { registry = "https://pypi.org/simple" }
@@ -3239,6 +3270,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+chgnet = [
+    { name = "chgnet" },
+]
 defects = [
     { name = "doped" },
 ]
@@ -3273,6 +3307,7 @@ optics = [
 science = [
     { name = "amset" },
     { name = "arxiv" },
+    { name = "chgnet" },
     { name = "devsim" },
     { name = "docling" },
     { name = "doped" },
@@ -3304,6 +3339,7 @@ requires-dist = [
     { name = "amset", marker = "extra == 'transport'", specifier = ">=0.5" },
     { name = "anthropic", specifier = ">=0.60" },
     { name = "arxiv", marker = "extra == 'literature'", specifier = ">=2.1" },
+    { name = "chgnet", marker = "extra == 'chgnet'", specifier = ">=0.4.1,<0.5" },
     { name = "coverage", specifier = ">=7.6,<8" },
     { name = "devsim", marker = "extra == 'device'", specifier = ">=2.9" },
     { name = "docling", marker = "extra == 'literature'", specifier = ">=2.0" },
@@ -3313,7 +3349,7 @@ requires-dist = [
     { name = "mp-api", extras = ["mcp"], marker = "extra == 'materials'", specifier = ">=0.44" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "openai", specifier = ">=1.100" },
-    { name = "photomatagent", extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "generation"], marker = "extra == 'science'" },
+    { name = "photomatagent", extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "chgnet", "generation"], marker = "extra == 'science'" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pymatgen", specifier = ">=2024.10" },
@@ -3329,7 +3365,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'literature'", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cpu" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "generation", "science"]
+provides-extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "chgnet", "generation", "science"]
 
 [package.metadata.requires-dev]
 dev = [
