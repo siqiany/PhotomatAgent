@@ -1536,6 +1536,7 @@ class QdrantLiteratureStore:
         workspace_id: str,
         *,
         generation: CollectionGeneration | None = None,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
     ) -> dict[str, DocumentManifest]:
         if not isinstance(workspace_id, str) or not workspace_id.strip():
             raise ValueError("workspace_id must be a non-empty string")
@@ -1553,7 +1554,12 @@ class QdrantLiteratureStore:
             if explicit_generation or self._staging_generation is generation
             else generation.documents_alias
         )
-        scroll_filter = self._filter(workspace_id=workspace_id, record_type="document")
+        source_kind_value = _source_kind_value(source_kind)
+        scroll_filter = self._filter(
+            workspace_id=workspace_id,
+            record_type="document",
+            source_kind=source_kind_value,
+        )
         records: list[Any] = []
         offset: Any = None
         while True:
@@ -1577,6 +1583,7 @@ class QdrantLiteratureStore:
             manifest.document_id: manifest
             for record in records
             if (manifest := self._manifest_from_record(record)) is not None
+            and manifest.source_kind.value == source_kind_value
         }
 
     async def get_document_manifests(
@@ -1585,6 +1592,7 @@ class QdrantLiteratureStore:
         document_ids: Sequence[str],
         *,
         generation: CollectionGeneration | None = None,
+        source_kind: LiteratureSourceKind | str | None = None,
     ) -> dict[str, DocumentManifest]:
         """Retrieve a bounded set of document manifests by their point IDs.
 
@@ -1620,6 +1628,7 @@ class QdrantLiteratureStore:
             if explicit_generation or self._staging_generation is generation
             else generation.documents_alias
         )
+        requested_source_kind = _source_kind_value(source_kind)
         retrieved = await self._client.retrieve(
             collection_name=collection_name,
             ids=requested_ids,
@@ -1634,6 +1643,11 @@ class QdrantLiteratureStore:
             if (
                 payload.get("workspace_id") != workspace_id
                 or payload.get("record_type") != "document"
+                or (
+                    requested_source_kind is not None
+                    and _source_kind_value(payload.get("source_kind"))
+                    != requested_source_kind
+                )
             ):
                 continue
             payload_document_id = str(
@@ -1642,7 +1656,14 @@ class QdrantLiteratureStore:
             if payload_document_id not in requested_set:
                 continue
             manifest = self._manifest_from_record(record)
-            if manifest is not None and manifest.document_id in requested_set:
+            if (
+                manifest is not None
+                and manifest.document_id in requested_set
+                and (
+                    requested_source_kind is None
+                    or manifest.source_kind.value == requested_source_kind
+                )
+            ):
                 result[manifest.document_id] = manifest
         return result
 
@@ -1841,6 +1862,14 @@ class QdrantLiteratureStore:
             "retryable": bool(getattr(stats, "retryable", False)),
             "errors": errors,
         }
+        supersedes_run_id = str(getattr(run, "supersedes_run_id", "") or "").strip()
+        superseded_by_run_id = str(
+            getattr(run, "superseded_by_run_id", "") or ""
+        ).strip()
+        if supersedes_run_id:
+            payload["supersedes_run_id"] = supersedes_run_id
+        if superseded_by_run_id:
+            payload["superseded_by_run_id"] = superseded_by_run_id
         if run_source_kind is not None:
             payload["source_kind"] = run_source_kind
         if run_source_kind == LiteratureSourceKind.ABSTRACT.value:
@@ -1971,6 +2000,16 @@ class QdrantLiteratureStore:
                 status=str(payload.get("status", "running")),
                 stats=abstract_stats,
                 source_kind=LiteratureSourceKind.ABSTRACT,
+                supersedes_run_id=(
+                    str(payload["supersedes_run_id"])
+                    if payload.get("supersedes_run_id")
+                    else None
+                ),
+                superseded_by_run_id=(
+                    str(payload["superseded_by_run_id"])
+                    if payload.get("superseded_by_run_id")
+                    else None
+                ),
             )
         from photomatagent.scientific.capabilities.literature.ingestion import (
             IngestionRunState,
@@ -2104,6 +2143,7 @@ class QdrantLiteratureStore:
         keep_revision: str,
         *,
         workspace_id: str,
+        source_kind: LiteratureSourceKind | str | None = None,
     ) -> None:
         generation = await self._ingestion_or_error()
         await self._client.delete(
@@ -2111,6 +2151,7 @@ class QdrantLiteratureStore:
             points_selector=self._passage_filter(
                 workspace_id=workspace_id,
                 document_id=document_id,
+                source_kind=source_kind,
                 revision_except=keep_revision,
             ),
             wait=True,
@@ -2130,6 +2171,98 @@ class QdrantLiteratureStore:
             wait=True,
             **self._timeout_kwargs(),
         )
+
+    async def delete_nonready_abstract_artifacts(
+        self,
+        *,
+        workspace_id: str,
+        relative_source_path: str,
+    ) -> int:
+        """Remove only non-ready artifacts for one abstract SQLite source.
+
+        This is used when an operator explicitly replaces an incomplete
+        abstract run after the source database changed.  The source path and
+        ``source_kind`` filters are mandatory, and ready documents/passages
+        are excluded so knowledge that disappeared from the replacement DB is
+        never pruned implicitly.
+        """
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("workspace_id must be a non-empty string")
+        validate_relative_source_path(relative_source_path)
+        generation = await self._ingestion_or_error()
+        models = _qdrant_models()
+        source_path_condition = models.FieldCondition(
+            key="relative_source_path",
+            match=models.MatchValue(value=relative_source_path),
+        )
+        document_filter = self._filter(
+            workspace_id=workspace_id,
+            record_type="document",
+            source_kind=LiteratureSourceKind.ABSTRACT,
+            extra=(
+                source_path_condition,
+                models.FieldCondition(
+                    key="status",
+                    match=models.MatchAny(
+                        any=[
+                            DocumentStatus.PENDING.value,
+                            DocumentStatus.STAGED.value,
+                            DocumentStatus.FAILED.value,
+                        ]
+                    ),
+                ),
+            ),
+        )
+        passage_filter = self._passage_filter(
+            workspace_id=workspace_id,
+            source_kind=LiteratureSourceKind.ABSTRACT,
+            extra=(
+                source_path_condition,
+                models.FieldCondition(
+                    key="ingest_state",
+                    match=models.MatchAny(
+                        any=[IngestState.STAGED.value, IngestState.SUPERSEDED.value]
+                    ),
+                ),
+            ),
+        )
+        document_count_result = await self._client.count(
+            collection_name=self._ingestion_collection(generation, passages=False),
+            count_filter=document_filter,
+            exact=True,
+            **self._timeout_kwargs(),
+        )
+        passage_count_result = await self._client.count(
+            collection_name=self._ingestion_collection(generation, passages=True),
+            count_filter=passage_filter,
+            exact=True,
+            **self._timeout_kwargs(),
+        )
+        document_count = int(
+            document_count_result
+            if isinstance(document_count_result, int)
+            else _record_attr(document_count_result, "count", 0)
+        )
+        passage_count = int(
+            passage_count_result
+            if isinstance(passage_count_result, int)
+            else _record_attr(passage_count_result, "count", 0)
+        )
+        if document_count:
+            await self._client.delete(
+                collection_name=self._ingestion_collection(generation, passages=False),
+                points_selector=document_filter,
+                wait=True,
+                **self._timeout_kwargs(),
+            )
+        if passage_count:
+            await self._client.delete(
+                collection_name=self._ingestion_collection(generation, passages=True),
+                points_selector=passage_filter,
+                wait=True,
+                **self._timeout_kwargs(),
+            )
+        return document_count + passage_count
 
     def _candidate_from_record(self, record: Any) -> SearchCandidate:
         payload = _payload(record)

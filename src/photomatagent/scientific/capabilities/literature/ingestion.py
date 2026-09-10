@@ -370,12 +370,20 @@ class LiteratureIngestionService:
             list_manifests = self.store.list_document_manifests
             try:
                 manifests = await list_manifests(
-                    workspace_id, generation=generation
+                    workspace_id,
+                    generation=generation,
+                    source_kind=LiteratureSourceKind.FULLTEXT,
                 )
             except TypeError:
                 # Keep compatibility with narrow fake stores used by callers
                 # that have not adopted generation-scoped reads yet.
-                manifests = await list_manifests(workspace_id)
+                try:
+                    manifests = await list_manifests(
+                        workspace_id,
+                        generation=generation,
+                    )
+                except TypeError:
+                    manifests = await list_manifests(workspace_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -386,6 +394,15 @@ class LiteratureIngestionService:
         for relative_path, source_path, content_sha256 in discovered:
             document_id = document_id_for(workspace_id, relative_path)
             manifest = manifests.get(document_id)
+            # A PDF plan is never allowed to classify or replace an abstract
+            # document, even when a legacy/fake store ignored the server-side
+            # source_kind filter or returned a colliding point ID.
+            if manifest is not None:
+                try:
+                    if LiteratureSourceKind(manifest.source_kind) is not LiteratureSourceKind.FULLTEXT:
+                        manifest = None
+                except (TypeError, ValueError):
+                    manifest = None
             seen_ids.add(document_id)
             items.append(
                 IngestionPlanItem(
@@ -399,6 +416,12 @@ class LiteratureIngestionService:
         # A successful full enumeration is the safety gate for deletions.
         for document_id, manifest in manifests.items():
             if manifest.workspace_id != workspace_id:
+                continue
+            try:
+                if LiteratureSourceKind(manifest.source_kind) is not LiteratureSourceKind.FULLTEXT:
+                    continue
+            except (TypeError, ValueError):
+                # Unknown source kinds are not safe deletion candidates.
                 continue
             if document_id in seen_ids or manifest.status is DocumentStatus.DELETED:
                 continue

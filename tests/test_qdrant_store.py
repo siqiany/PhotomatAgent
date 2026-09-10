@@ -236,6 +236,8 @@ def _manifest(
     workspace_id: str = "workspace-a",
     document_id: str = "doc-1",
     model_fingerprint: str = "f" * 64,
+    source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+    source_record_id: str = "",
 ) -> DocumentManifest:
     return DocumentManifest(
         schema_version=1,
@@ -254,6 +256,8 @@ def _manifest(
         model_fingerprint=model_fingerprint,
         indexed_at=datetime.now(timezone.utc),
         last_error="",
+        source_kind=source_kind,
+        source_record_id=source_record_id,
     )
 
 

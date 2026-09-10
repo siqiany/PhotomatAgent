@@ -24,6 +24,7 @@ STOP_AFTER=""
 RESUME=false
 DRY_RUN=false
 YES=false
+SUPERSEDE_RUN_ID=""
 
 usage() {
   cat <<EOF
@@ -42,6 +43,8 @@ Options:
   --run-state-dir PATH       Override local run-state directory
   --stop-after N             Pause after at most N source records (index stages)
   --resume                  Reuse the saved stage run ID (index stages)
+  --supersede-run-id ID      Abstracts: explicitly replace a previous run after
+                             a changed SQLite source
   --dry-run                 Print shell-escaped argv without starting uv
   --yes                     Forward explicit provider/activation confirmation
   -h, --help                Show this help
@@ -122,6 +125,27 @@ save_run_id() {
   local temporary="${state_file}.tmp.$$"
   printf '%s\n' "$value" > "$temporary"
   mv -f -- "$temporary" "$state_file"
+}
+
+archive_run_id() {
+  local stage_name="$1"
+  local value="$2"
+  [[ -n "$value" ]] || return 0
+  local archive_dir="${RUN_STATE_DIR}/archive"
+  mkdir -p -- "$archive_dir"
+  # Keep the original ID in the file contents while sanitising only the
+  # operator-visible filename.  The counter handles two invocations in the
+  # same second without overwriting an earlier audit copy.
+  local safe_value="${value//[^A-Za-z0-9._-]/_}"
+  local timestamp
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  local archive_file="${archive_dir}/${stage_name}.${safe_value}.${timestamp}.$$"
+  local suffix=0
+  while [[ -e "$archive_file" ]]; do
+    suffix=$((suffix + 1))
+    archive_file="${archive_dir}/${stage_name}.${safe_value}.${timestamp}.$$.${suffix}"
+  done
+  save_run_id "$archive_file" "$value"
 }
 
 print_dry_run() {
@@ -225,6 +249,17 @@ while [[ "$#" -gt 0 ]]; do
       RESUME=true
       shift
       ;;
+    --supersede-run-id)
+      require_option_value "$@"
+      SUPERSEDE_RUN_ID="$(trim_run_id "$2")"
+      [[ -n "$SUPERSEDE_RUN_ID" ]] || die "--supersede-run-id requires a value"
+      shift 2
+      ;;
+    --supersede-run-id=*)
+      SUPERSEDE_RUN_ID="$(trim_run_id "${1#*=}")"
+      [[ -n "$SUPERSEDE_RUN_ID" ]] || die "--supersede-run-id requires a value"
+      shift
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -246,6 +281,14 @@ done
 if [[ "$STAGE" == "status" || "$STAGE" == "activate" ]]; then
   [[ -z "$STOP_AFTER" ]] || die "--stop-after is only valid for pdf or abstracts"
   [[ "$RESUME" == false ]] || die "--resume is only valid for pdf or abstracts"
+  [[ -z "$SUPERSEDE_RUN_ID" ]] || die "--supersede-run-id is only valid for abstracts"
+fi
+
+if [[ "$STAGE" == "pdf" ]]; then
+  [[ -z "$SUPERSEDE_RUN_ID" ]] || die "--supersede-run-id is only valid for abstracts"
+fi
+if [[ "$RESUME" == true ]]; then
+  [[ -z "$SUPERSEDE_RUN_ID" ]] || die "--resume cannot be combined with --supersede-run-id"
 fi
 
 if [[ -n "$RUN_STATE_OVERRIDE" ]]; then
@@ -267,10 +310,24 @@ if [[ "$STAGE" == "pdf" || "$STAGE" == "abstracts" ]]; then
   if [[ "$RESUME" == true ]]; then
     RUN_ID="$(load_run_id "$STATE_FILE" "$STAGE_LABEL")"
   else
+    PREVIOUS_RUN_ID=""
+    if [[ -f "$STATE_FILE" ]]; then
+      IFS= read -r PREVIOUS_RUN_ID < "$STATE_FILE" || true
+      PREVIOUS_RUN_ID="$(trim_run_id "$PREVIOUS_RUN_ID")"
+    fi
+    if [[ "$STAGE" == "abstracts" && -z "$SUPERSEDE_RUN_ID" ]]; then
+      # A fresh abstract invocation following a saved run is a source
+      # replacement by default.  Forwarding the old ID makes the lifecycle
+      # explicit at the CLI while preserving the driver's audit trail.
+      SUPERSEDE_RUN_ID="$PREVIOUS_RUN_ID"
+    fi
     RUN_ID="$(new_run_id)"
     if [[ "$DRY_RUN" == false ]]; then
       # This is intentionally before invoking uv: an interrupted process can
       # always be resumed with the exact ID sent to the CLI.
+      if [[ -n "$PREVIOUS_RUN_ID" ]]; then
+        archive_run_id "$STAGE_LABEL" "$PREVIOUS_RUN_ID"
+      fi
       save_run_id "$STATE_FILE" "$RUN_ID"
     fi
   fi
@@ -284,6 +341,9 @@ if [[ "$STAGE" == "pdf" || "$STAGE" == "abstracts" ]]; then
   COMMAND+=(--run-id "$RUN_ID")
   if [[ "$RESUME" == true ]]; then
     COMMAND+=(--resume)
+  fi
+  if [[ "$STAGE" == "abstracts" && -n "$SUPERSEDE_RUN_ID" ]]; then
+    COMMAND+=(--supersede-run-id "$SUPERSEDE_RUN_ID")
   fi
   if [[ -n "$STOP_AFTER" ]]; then
     COMMAND+=(--stop-after "$STOP_AFTER")

@@ -1465,6 +1465,7 @@ async def _index_abstracts_until_complete(
     run_id: str,
     config: ScientificConfig,
     resume: bool = False,
+    supersede_run_id: str | None = None,
     generation: Any | None = None,
     generation_selected: bool = False,
     stop_after: int | None = None,
@@ -1537,6 +1538,8 @@ async def _index_abstracts_until_complete(
             run_id=run_id,
             cursor=cursor,
             limit=batch_limit,
+            resume=resume,
+            supersede_run_id=supersede_run_id,
         )
         last = _abstract_stats_dict(batch, run_id=run_id)
         batch_processed, previous_processed = _progress_delta(
@@ -1595,6 +1598,14 @@ def rag_index_abstracts(
     database: Path | None = typer.Option(None, "--database"),
     run_id: str | None = typer.Option(None, "--run-id"),
     resume: bool = typer.Option(False, "--resume", help="Resume the specified run ID."),
+    supersede_run_id: str | None = typer.Option(
+        None,
+        "--supersede-run-id",
+        help=(
+            "Start a fresh abstract run that explicitly replaces the saved "
+            "run after a changed SQLite source."
+        ),
+    ),
     stop_after: int | None = typer.Option(None, "--stop-after", min=1),
     yes: bool = typer.Option(False, "--yes", help="Confirm external data transfer."),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
@@ -1603,6 +1614,19 @@ def rag_index_abstracts(
     if not isinstance(stop_after, int):
         stop_after = None
     resume_requested = resume if isinstance(resume, bool) else False
+    supersede_requested = (
+        str(supersede_run_id).strip()
+        if isinstance(supersede_run_id, str) and supersede_run_id.strip()
+        else None
+    )
+    if resume_requested and supersede_requested is not None:
+        _print_error(
+            _RagCliError(
+                "resume_supersede_conflict",
+                "--supersede-run-id cannot be combined with --resume",
+            )
+        )
+        raise typer.Exit(code=1)
     try:
         effective_run_id = _require_resume_run_id(
             resume=resume_requested,
@@ -1647,6 +1671,7 @@ def rag_index_abstracts(
                 run_id=effective_run_id,
                 config=config,
                 resume=resume_requested,
+                supersede_run_id=supersede_requested,
                 generation=generation,
                 generation_selected=True,
                 stop_after=stop_after,

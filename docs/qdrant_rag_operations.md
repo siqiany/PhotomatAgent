@@ -177,24 +177,52 @@ explicitly supplied. `--dry-run` prints the shell-escaped `uv run` argv and
 resolved paths, without writing run state or starting `uv`, a provider, or
 Qdrant.
 
-Before starting a fresh stage, the driver atomically saves its generated run ID
-under the repository's
-`user_output/rag-import/run-state/pdf.run_id` or
-`user_output/rag-import/run-state/abstracts.run_id`. A failed process or WSL
-restart therefore leaves an exact ID for the next `--resume`; a missing or
-empty state file is an explicit error for `--resume` and `activate` (status
-reports an unsupplied stage). The CLI's ingestion record remains the source of
-truth for its cursor and progress. Each progress line is bounded JSON
+Before starting a fresh stage, the driver archives any previous ID under
+`user_output/rag-import/run-state/archive/`, then atomically saves its new run
+ID under `pdf.run_id` or `abstracts.run_id`. A failed process or WSL restart
+therefore leaves an exact ID for the next `--resume`; a missing or empty state
+file is an explicit error for `--resume` and `activate` (status reports an
+unsupplied stage). The CLI's ingestion record remains the source of truth for
+its cursor and progress. Each progress line is bounded JSON
 with `total`, `processed`, `indexed`, `unchanged`, `failed`, `skipped`,
 `passages`, `rate`, `eta`/`eta_seconds`, `cursor`, `run_id`, and `status` (plus
 the per-invocation `processed_this_invocation` audit field).
 
 Abstract runs record a streamed SHA-256 identity for the SQLite file and the
-workspace-relative source path. If the database changes before resume, the
-service rejects the old run rather than combining two snapshots. Start a new
-`abstracts` run without `--resume` after verifying the replacement database;
-the old staged data is not implicitly deleted, and revision-based idempotency
-avoids re-embedding unchanged rows when the new run sees them.
+workspace-relative source path. They require one immutable, checkpointed
+snapshot: a non-empty `abstracts.sqlite3-wal` fails closed with
+`source_wal_pending` rather than silently omitting committed WAL content.
+Stop writers and run SQLite's `wal_checkpoint(TRUNCATE)`, then verify the
+`-wal` file is absent or zero length. For a valuable/live source, make a
+consistent SQLite backup/copy after checkpointing and import that
+workspace-contained copy; do not copy a WAL sidecar independently. A main
+database replacement or newly appearing WAL is reported as `source_changed`
+and requires a new run from the verified snapshot.
+
+The service computes the source SHA-256 and row counts once per invocation.
+Each later bounded batch performs only a cheap main/WAL metadata check while
+the reader holds one read transaction. A resume invocation recomputes the
+identity once and validates it against the saved run; an unknown `--resume`
+ID is rejected rather than creating an unrelated run.
+
+If the database changed while an old abstract run was incomplete, do not
+resume that run. Start a fresh run and explicitly link the old run:
+
+```bash
+uv run photomatagent rag index-abstracts \
+  --database dataset/paper/abstract/abstracts.sqlite3 \
+  --run-id NEW_RUN_ID --supersede-run-id OLD_RUN_ID --yes
+```
+
+The new run is persisted before fetching, embedding, or writing documents.
+Only after it completes successfully is `OLD_RUN_ID` marked
+`superseded`/complete; failures leave the old run auditable and activation
+blocked. Replacement cleanup is filtered to this workspace, abstract source
+kind, and exact SQLite path, and removes only non-ready artifacts. READY
+abstract knowledge absent from the changed database is retained until an
+explicit, separately reviewed cleanup. Revision replacement makes the new
+READY revision visible before removing older revisions; cleanup failures are
+retryable and do not delete the new revision.
 
 External embedding or reranking remains behind the existing configuration and
 confirmation gate. When an external provider is configured, each indexing
@@ -208,6 +236,12 @@ lookups. `activate` requires both IDs, passes both explicit
 `--pdf-run-id`/`--abstract-run-id` values to `photomatagent rag activate`, and
 uses the existing atomic alias switch. It does not perform a direct Qdrant
 request. An incomplete or retryable stage is rejected before activation.
+
+The WSL driver archives the prior stage ID under `run-state/archive/` before
+replacing its current state file. A fresh `abstracts` invocation automatically
+forwards that prior ID as `--supersede-run-id`; pass an explicit ID to
+override it. Use `--resume` only for the saved run itself, and never combine
+it with supersession.
 
 Retrieval follows the evidence priority local full text → local abstracts →
 arXiv metadata. Abstract results identify themselves as abstract-only and do

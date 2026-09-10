@@ -113,6 +113,7 @@ class FakeStore:
         self.runs: dict[str, Any] = {}
         self.fail_cleanup = False
         self.fail_old_revision_cleanup = False
+        self.list_manifest_calls: list[dict[str, Any]] = []
 
     async def resolve_current_generation(self) -> CollectionGeneration:
         return self.generation
@@ -124,9 +125,25 @@ class FakeStore:
         self.expected_generation_versions.append(chunk_schema_version)
         return self.generation
 
-    async def list_document_manifests(self, workspace_id: str) -> dict[str, DocumentManifest]:
+    async def list_document_manifests(
+        self,
+        workspace_id: str,
+        *,
+        generation: CollectionGeneration | None = None,
+        source_kind: LiteratureSourceKind | str | None = None,
+    ) -> dict[str, DocumentManifest]:
         assert workspace_id
-        return dict(self.manifests)
+        self.list_manifest_calls.append(
+            {"workspace_id": workspace_id, "generation": generation, "source_kind": source_kind}
+        )
+        if source_kind is None:
+            return dict(self.manifests)
+        kind = LiteratureSourceKind(source_kind)
+        return {
+            document_id: manifest
+            for document_id, manifest in self.manifests.items()
+            if manifest.source_kind is kind
+        }
 
     async def upsert_passages(
         self,
@@ -278,6 +295,73 @@ async def test_plan_classifies_new_changed_unchanged_and_deleted(
         PlanKind.DELETED,
         PlanKind.UNCHANGED,
     ]
+
+
+async def test_pdf_plan_filters_fulltext_manifests_and_never_deletes_abstracts(
+    tmp_path: Path, store: FakeStore
+) -> None:
+    root = tmp_path / "papers"
+    root.mkdir()
+    (root / "present.pdf").write_bytes(b"present")
+    pdf = _manifest("present.pdf", _sha(b"present"))
+    abstract = DocumentManifest(
+        schema_version=2,
+        record_type="document",
+        workspace_id=WORKSPACE,
+        document_id="abstract-document",
+        relative_source_path="dataset/abstracts.sqlite3",
+        file_name="abstracts.sqlite3",
+        content_sha256="b" * 64,
+        status=DocumentStatus.READY,
+        model_fingerprint=FINGERPRINT,
+        source_kind=LiteratureSourceKind.ABSTRACT,
+        source_record_id="key-a",
+    )
+    store.manifests = {
+        pdf.document_id: pdf,
+        abstract.document_id: abstract,
+    }
+
+    plan = await LiteratureIngestionService(store, FakeEmbedder()).plan(root, WORKSPACE)
+
+    assert store.list_manifest_calls[-1]["source_kind"] is LiteratureSourceKind.FULLTEXT
+    assert all(item.document_id != abstract.document_id for item in plan.items)
+    assert [item.kind for item in plan.items] == [PlanKind.UNCHANGED]
+
+
+async def test_pdf_plan_defensively_skips_abstracts_from_legacy_manifest_reader(
+    tmp_path: Path, store: FakeStore
+) -> None:
+    root = tmp_path / "papers"
+    root.mkdir()
+    (root / "present.pdf").write_bytes(b"present")
+    pdf = _manifest("present.pdf", _sha(b"present"))
+    abstract = DocumentManifest(
+        schema_version=2,
+        record_type="document",
+        workspace_id=WORKSPACE,
+        document_id="abstract-document",
+        relative_source_path="dataset/abstracts.sqlite3",
+        file_name="abstracts.sqlite3",
+        content_sha256="b" * 64,
+        status=DocumentStatus.READY,
+        model_fingerprint=FINGERPRINT,
+        source_kind=LiteratureSourceKind.ABSTRACT,
+        source_record_id="key-a",
+    )
+
+    class LegacyMixedStore(FakeStore):
+        async def list_document_manifests(self, workspace_id: str) -> dict[str, DocumentManifest]:
+            assert workspace_id
+            return dict(self.manifests)
+
+    legacy = LegacyMixedStore()
+    legacy.manifests = {pdf.document_id: pdf, abstract.document_id: abstract}
+
+    plan = await LiteratureIngestionService(legacy, FakeEmbedder()).plan(root, WORKSPACE)
+
+    assert all(item.document_id != abstract.document_id for item in plan.items)
+    assert [item.kind for item in plan.items] == [PlanKind.UNCHANGED]
 
 
 async def test_plan_uses_source_aware_chunk_schema_generation(

@@ -173,6 +173,62 @@ def test_resume_reuses_exact_id_and_missing_state_fails_closed(
     assert paths["count"].read_text(encoding="utf-8") == "1"
 
 
+def test_fresh_abstract_run_archives_previous_id_and_forwards_supersession(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("old-abstract-run\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_STATE_FILE", str(state_file))
+
+    result = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--database",
+        "database with spaces.sqlite3",
+        "--run-state-dir",
+        str(state_dir),
+    )
+
+    assert result.returncode == 0, result.stderr
+    new_run_id = state_file.read_text(encoding="utf-8").strip()
+    assert new_run_id and new_run_id != "old-abstract-run"
+    argv = _recorded_argv(paths["args"])
+    assert "--supersede-run-id" in argv
+    assert argv[argv.index("--supersede-run-id") + 1] == "old-abstract-run"
+    archived = list((state_dir / "archive").glob("abstracts.*"))
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8").strip() == "old-abstract-run"
+
+
+def test_supersession_cannot_be_combined_with_resume(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _fake_uv(tmp_path, monkeypatch)
+    state_dir = tmp_path / "run-state"
+    state_dir.mkdir()
+    state_file = state_dir / "abstracts.run_id"
+    state_file.write_text("saved-abstract-run\n", encoding="utf-8")
+
+    result = _run_driver(
+        "abstracts",
+        "--workspace",
+        str(tmp_path),
+        "--run-state-dir",
+        str(state_dir),
+        "--resume",
+        "--supersede-run-id",
+        "old-abstract-run",
+    )
+
+    assert result.returncode == 2
+    assert "cannot be combined" in result.stderr
+    assert not paths["invoked"].exists()
+
+
 def test_status_and_activate_forward_both_ids_and_activation_requires_both(
     tmp_path: Path, monkeypatch
 ) -> None:

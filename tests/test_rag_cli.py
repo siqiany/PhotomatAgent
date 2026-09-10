@@ -403,6 +403,51 @@ async def test_index_abstracts_binds_staging_generation_before_first_batch(tmp_p
     assert selected == [generation]
 
 
+@pytest.mark.asyncio
+async def test_index_abstracts_forwards_resume_and_supersede_context(tmp_path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Ingestion:
+        embedder = SimpleNamespace(identity=object())
+
+        async def index_batch(self, **kwargs):
+            calls.append(dict(kwargs))
+            return SimpleNamespace(
+                run_id="replacement-run",
+                total=0,
+                processed=0,
+                indexed=0,
+                unchanged=0,
+                failed=0,
+                skipped_empty=0,
+                skipped_invalid_key=0,
+                passages=0,
+                cursor=None,
+                complete=True,
+                status="complete",
+                errors=(),
+            )
+
+    result = await rag_cli._index_abstracts_until_complete(
+        Ingestion(),
+        run_id="replacement-run",
+        config=rag_cli.ScientificConfig(rag_tool_max_documents=1),
+        resume=False,
+        supersede_run_id="old-run",
+    )
+
+    assert result["complete"] is True
+    assert calls == [
+        {
+            "run_id": "replacement-run",
+            "cursor": None,
+            "limit": 1,
+            "resume": False,
+            "supersede_run_id": "old-run",
+        }
+    ]
+
+
 def test_index_abstracts_resume_rejects_missing_run(
     cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
