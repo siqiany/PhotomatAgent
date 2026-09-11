@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from photomatagent.scientific.capabilities.generation.formulas import (
     VAEFormulaGenerator,
 )
 from photomatagent.scientific.capabilities.generation.mattergen import (
+    LocalIsolatedMatterGenProvider,
     MatterGenGenerator,
     composition_distance,
 )
@@ -368,6 +371,14 @@ def make_manifest(tmp_path: Path, *, candidates: list[dict] | None = None) -> Pa
             {
                 "pretrained_name": "dft_band_gap",
                 "properties_to_condition_on": {"dft_band_gap": 0.5},
+                "run_spec": {
+                    "pretrained_name": "dft_band_gap",
+                    "candidate_count": 8,
+                    "target_band_gap_eV": 0.5,
+                    "chemical_system": None,
+                    "guidance_factor": 2.0,
+                    "seed": 42,
+                },
                 "band_gap_target_source": "explicit_request",
                 "candidates": candidates
                 or [{"structure_path": str(cif), "candidate_id": "mg-1"}],
@@ -420,6 +431,52 @@ def test_mattergen_formula_consistency_fields():
         assert candidate["composition_distance"] > 0
 
 
+def test_mattergen_explicit_manifest_requires_complete_run_spec(tmp_path):
+    manifest = make_manifest(tmp_path)
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    del raw["run_spec"]
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="complete run_spec"):
+        MatterGenGenerator().generate(
+            target_band_gap_eV=0.5,
+            manifest_path=manifest,
+        )
+
+
+def test_mattergen_explicit_manifest_mismatch_is_rejected(tmp_path):
+    manifest = make_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="guidance_factor"):
+        MatterGenGenerator().generate(
+            target_band_gap_eV=0.5,
+            guidance_factor=1.5,
+            manifest_path=manifest,
+        )
+
+
+def test_mattergen_lineage_uses_manifest_run_spec(tmp_path):
+    manifest = make_manifest(tmp_path)
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["run_spec"].update(
+        {
+            "guidance_factor": 1.5,
+            "seed": 7,
+        }
+    )
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    candidates, _ = MatterGenGenerator().generate(
+        target_band_gap_eV=0.5,
+        guidance_factor=1.5,
+        seed=7,
+        manifest_path=manifest,
+    )
+    generation_parameters = candidates[0]["lineage"]["generation_parameters"]
+    assert generation_parameters["guidance_factor"] == 1.5
+    assert generation_parameters["seed"] == 7
+
+
 def test_composition_distance_zero_for_same_formula():
     assert composition_distance("NaCl", "NaCl") == 0.0
     assert composition_distance("HgTe", "NaCl") > 0.0
@@ -440,7 +497,21 @@ def test_mattergen_empty_archive_fails():
         tmp = Path(directory)
         manifest = tmp / "manifest.json"
         manifest.write_text(
-            json.dumps({"candidates": []}), encoding="utf-8"
+            json.dumps(
+                {
+                    "run_spec": {
+                        "pretrained_name": "dft_band_gap",
+                        "candidate_count": 8,
+                        "target_band_gap_eV": 0.5,
+                        "chemical_system": None,
+                        "guidance_factor": 2.0,
+                        "seed": 42,
+                    },
+                    "properties_to_condition_on": {"dft_band_gap": 0.5},
+                    "candidates": [],
+                }
+            ),
+            encoding="utf-8",
         )
         with pytest.raises(RuntimeError, match="no usable candidates"):
             MatterGenGenerator().generate(
@@ -500,6 +571,51 @@ def test_mattergen_runner_builds_argv_without_shell_interpolation(tmp_path):
     assert any("chemical_system" in item for item in command)
     assert any("Na-O; touch SHOULD_NOT_RUN" in item for item in command)
     assert all(item != "touch" for item in command)
+    assert not any(item.startswith("--seed") for item in command)
+
+
+def test_mattergen_runner_command_matches_generate_main_signature(tmp_path):
+    spec = MatterGenRunSpec(
+        output_dir=tmp_path / "run",
+        pretrained_name="dft_band_gap",
+        candidate_count=1,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=1.0,
+        seed=17,
+    )
+    command = MatterGenRunner(workspace=Workspace(tmp_path)).build_command(spec)
+
+    # MatterGen 1.0.3's ``mattergen.scripts.generate.main`` has these flags;
+    # seed is applied by the isolated adapter, not passed as an unsupported
+    # Fire argument to the official executable.
+    assert command[0] == "mattergen-generate"
+    assert command[1] == str(spec.output_dir)
+    assert {item.split("=", 1)[0] for item in command[2:]} == {
+        "--pretrained_name",
+        "--batch_size",
+        "--num_batches",
+        "--properties_to_condition_on",
+        "--diffusion_guidance_factor",
+    }
+
+
+def test_configured_mattergen_cli_help_contract_without_generation(monkeypatch):
+    executable = os.environ.get("MATTERGEN_EXECUTABLE")
+    if not executable:
+        pytest.skip("MATTERGEN_EXECUTABLE is not configured for the real CLI contract")
+    completed = subprocess.run(
+        [os.path.expanduser(executable), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "MPLCONFIGDIR": "/tmp/photomatagent-mattergen-test-mpl"},
+    )
+    help_text = f"{completed.stdout}\n{completed.stderr}"
+    assert "--pretrained_name" in help_text
+    assert "--properties_to_condition_on" in help_text
+    assert "--seed" not in help_text
 
 
 def test_mattergen_runner_extracts_sorted_cifs_and_reuses_manifest(
@@ -520,8 +636,9 @@ def test_mattergen_runner_extracts_sorted_cifs_and_reuses_manifest(
 
     def fake_run(command, **kwargs):
         calls.append(command)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        archive = output_dir / "generated_crystals_cif.zip"
+        staging_output = Path(command[1])
+        staging_output.mkdir(parents=True, exist_ok=True)
+        archive = staging_output / "generated_crystals_cif.zip"
         with zipfile.ZipFile(archive, "w") as handle:
             handle.writestr("z-last.cif", NACL_CIF)
             handle.writestr("a-first.cif", NACL_CIF)
@@ -533,7 +650,7 @@ def test_mattergen_runner_extracts_sorted_cifs_and_reuses_manifest(
         fake_run,
     )
     runner = MatterGenRunner(
-        executable="mattergen-generate",
+        executable="/bin/true",
         workspace=workspace,
     )
 
@@ -557,6 +674,137 @@ def test_mattergen_runner_extracts_sorted_cifs_and_reuses_manifest(
     assert runner.run(spec) == manifest_path
 
 
+def test_mattergen_runner_rebuilds_when_cached_candidate_is_missing(
+    tmp_path, monkeypatch
+):
+    workspace = Workspace(tmp_path)
+    output_dir = workspace.user_output_dir / "mattergen" / "missing-cache"
+    spec = MatterGenRunSpec(
+        output_dir=output_dir,
+        pretrained_name="dft_band_gap",
+        candidate_count=1,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=2.0,
+        seed=42,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        staging_output = Path(command[1])
+        staging_output.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(staging_output / "generated_crystals_cif.zip", "w") as handle:
+            handle.writestr("candidate.cif", NACL_CIF)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "photomatagent.scientific.capabilities.generation.mattergen_runner.subprocess.run",
+        fake_run,
+    )
+    runner = MatterGenRunner(executable="/bin/true", workspace=workspace)
+    manifest_path = runner.run(spec)
+    first_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    Path(first_manifest["candidates"][0]["structure_path"]).unlink()
+
+    runner.run(spec)
+    assert len(calls) == 2
+
+
+def test_mattergen_runner_failure_does_not_replace_old_manifest_or_read_old_zip(
+    tmp_path, monkeypatch
+):
+    workspace = Workspace(tmp_path)
+    output_dir = workspace.user_output_dir / "mattergen" / "atomic-failure"
+    output_dir.mkdir(parents=True)
+    old_candidate = output_dir / "old-candidate.cif"
+    old_candidate.write_text(NACL_CIF, encoding="utf-8")
+    old_manifest = {
+        "manifest_version": 1,
+        "backend": "mattergen",
+        "validation_status": "UNVALIDATED_GENERATED_STRUCTURE",
+        "pretrained_name": "dft_band_gap",
+        "properties_to_condition_on": {"dft_band_gap": 0.5},
+        "run_spec": {
+            "pretrained_name": "dft_band_gap",
+            "candidate_count": 1,
+            "target_band_gap_eV": 0.5,
+            "chemical_system": None,
+            "guidance_factor": 2.0,
+            "seed": 41,
+        },
+        "candidates": [
+            {
+                "candidate_id": "old",
+                "structure_path": str(old_candidate),
+            }
+        ],
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(old_manifest), encoding="utf-8")
+    (output_dir / "generated_crystals_cif.zip").write_bytes(b"old archive")
+
+    def failing_run(command, **kwargs):
+        assert Path(command[1]) != output_dir
+        raise subprocess.CalledProcessError(
+            17, command, output=b"staged failure", stderr=b"do not publish"
+        )
+
+    monkeypatch.setattr(
+        "photomatagent.scientific.capabilities.generation.mattergen_runner.subprocess.run",
+        failing_run,
+    )
+    spec = MatterGenRunSpec(
+        output_dir=output_dir,
+        pretrained_name="dft_band_gap",
+        candidate_count=1,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=2.0,
+        seed=42,
+    )
+    with pytest.raises(RuntimeError, match="exit code 17"):
+        MatterGenRunner(executable="/bin/true", workspace=workspace).run(spec)
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == old_manifest
+    assert old_candidate.is_file()
+
+
+def test_mattergen_runner_rejects_cached_candidate_escape(tmp_path):
+    workspace = Workspace(tmp_path)
+    output_dir = workspace.user_output_dir / "mattergen" / "escape-cache"
+    output_dir.mkdir(parents=True)
+    outside = tmp_path.parent / "outside-cache.cif"
+    outside.write_text(NACL_CIF, encoding="utf-8")
+    manifest = output_dir / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "run_spec": {
+                    "pretrained_name": "dft_band_gap",
+                    "candidate_count": 1,
+                    "target_band_gap_eV": 0.5,
+                    "chemical_system": None,
+                    "guidance_factor": 2.0,
+                    "seed": 42,
+                },
+                "candidates": [{"structure_path": str(outside)}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    spec = MatterGenRunSpec(
+        output_dir=output_dir,
+        pretrained_name="dft_band_gap",
+        candidate_count=1,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=2.0,
+        seed=42,
+    )
+    with pytest.raises(ValueError, match="outside workspace"):
+        MatterGenRunner(executable="/bin/true", workspace=workspace).run(spec)
+
+
 def test_mattergen_runner_rejects_output_escape(tmp_path):
     workspace = Workspace(tmp_path)
     spec = MatterGenRunSpec(
@@ -569,14 +817,14 @@ def test_mattergen_runner_rejects_output_escape(tmp_path):
         seed=0,
     )
     with pytest.raises(ValueError, match="workspace"):
-        MatterGenRunner(workspace=workspace).run(spec)
+        MatterGenRunner(executable="/bin/true", workspace=workspace).run(spec)
 
 
 def test_mattergen_runner_fake_executable_e2e(tmp_path):
     workspace = Workspace(tmp_path)
     executable = tmp_path / "fake-mattergen"
     executable.write_text(
-        "#!/usr/bin/env python3\n"
+        f"#!{sys.executable}\n"
         "from pathlib import Path\n"
         "import sys\n"
         "import zipfile\n"
@@ -606,6 +854,45 @@ def test_mattergen_runner_fake_executable_e2e(tmp_path):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["properties_to_condition_on"] == {"chemical_system": "Na-O"}
     assert Path(manifest["candidates"][0]["structure_path"]).is_file()
+    assert Path(manifest["candidates"][0]["structure_path"]).parent.name != "e2e"
+
+
+def test_mattergen_runner_seed_adapter_is_deterministic_without_seed_flag(tmp_path):
+    workspace = Workspace(tmp_path)
+    executable = tmp_path / "seeded-mattergen"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        "import random\n"
+        "import sys\n"
+        "import zipfile\n"
+        "import numpy as np\n"
+        "output = Path(sys.argv[1])\n"
+        "output.mkdir(parents=True, exist_ok=True)\n"
+        "payload = f'data_seed\\n# {random.random():.16f} {np.random.random():.16f}\\n'\n"
+        "with zipfile.ZipFile(output / 'generated_crystals_cif.zip', 'w') as archive:\n"
+        "    archive.writestr('generated/one.cif', payload)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    runner = MatterGenRunner(executable=executable, workspace=workspace)
+
+    def run_at(name: str) -> str:
+        spec = MatterGenRunSpec(
+            output_dir=workspace.user_output_dir / "mattergen" / name,
+            pretrained_name="chemical_system",
+            candidate_count=1,
+            target_band_gap_eV=None,
+            chemical_system="Na-O",
+            guidance_factor=1.0,
+            seed=123,
+        )
+        manifest = json.loads(runner.run(spec).read_text(encoding="utf-8"))
+        return Path(manifest["candidates"][0]["structure_path"]).read_text(
+            encoding="utf-8"
+        )
+
+    assert run_at("seed-a") == run_at("seed-b")
 
 
 def test_generation_capabilities_reports_configured_mattergen(tmp_path):
@@ -614,7 +901,8 @@ def test_generation_capabilities_reports_configured_mattergen(tmp_path):
     )
 
     executable = tmp_path / "mattergen-generate"
-    executable.write_text("", encoding="utf-8")
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
     config = ScientificConfig(
         mattergen_executable=str(executable),
         mattergen_pretrained_name="chemical_system",
@@ -629,12 +917,44 @@ def test_generation_capabilities_reports_configured_mattergen(tmp_path):
     assert result.data["mattergen"]["seed"] == 23
 
 
+def test_generation_capabilities_rejects_non_executable_configured_file(tmp_path):
+    from photomatagent.scientific.capabilities.generation.tools import (
+        GenerationCapabilitiesTool,
+    )
+
+    executable = tmp_path / "mattergen-generate"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    config = ScientificConfig(mattergen_executable=str(executable))
+    result = asyncio.run(
+        GenerationCapabilitiesTool(config, Workspace(tmp_path)).execute({})
+    )
+    assert result.data["mattergen"]["status"] == "UNCONFIGURED"
+
+
+def test_mattergen_executable_probe_and_runner_share_path_normalization(
+    tmp_path, monkeypatch
+):
+    from photomatagent.scientific.capabilities.generation.mattergen_runner import (
+        resolve_mattergen_executable,
+    )
+
+    executable = tmp_path / "bin" / "mattergen-generate"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+
+    resolved = resolve_mattergen_executable("bin/mattergen-generate")
+    assert resolved == executable.resolve()
+    assert resolve_mattergen_executable(str(executable).replace(str(Path.home()), "~")) == resolved
+
+
 def test_mattergen_tool_uses_isolated_executable_and_emits_evidence(tmp_path):
     from photomatagent.scientific.capabilities.generation.tools import MatterGenTool
 
     executable = tmp_path / "fake-mattergen-tool"
     executable.write_text(
-        "#!/usr/bin/env python3\n"
+        f"#!{sys.executable}\n"
         "from pathlib import Path\n"
         "import sys\n"
         "import zipfile\n"
@@ -704,3 +1024,67 @@ def test_generation_tools_registered_deferred():
         assert expected in names
     assert all(tool.exposure.value == "deferred" for tool in pack.tools())
     assert pack.probe().status.value in {"MISSING_DEPENDENCY", "AVAILABLE"}
+
+
+def test_legacy_mattergen_rejects_unsupported_controls_before_script(tmp_path):
+    script = tmp_path / "legacy.py"
+    script.write_text("raise AssertionError('must not execute')\n", encoding="utf-8")
+    workspace = Workspace(tmp_path)
+    provider = LocalIsolatedMatterGenProvider(
+        skill_script=script,
+        workspace=workspace,
+    )
+
+    with pytest.raises(ValueError, match="legacy MatterGen override.*guidance_factor"):
+        provider.run(
+            output_dir=workspace.user_output_dir / "mattergen" / "legacy",
+            target_band_gap_eV=0.5,
+            chemical_system=None,
+            pretrained_name="dft_band_gap",
+            guidance_factor=1.5,
+            seed=42,
+        )
+
+
+def test_legacy_mattergen_defaults_are_explicitly_marked_non_deterministic(
+    tmp_path,
+):
+    script = tmp_path / "legacy.py"
+    script.write_text(
+        "import argparse, json\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--output-dir', required=True)\n"
+        "args, _ = parser.parse_known_args()\n"
+        "output = Path(args.output_dir)\n"
+        "output.mkdir(parents=True, exist_ok=True)\n"
+        "cif = output / 'candidate.cif'\n"
+        f"cif.write_text({NACL_CIF!r}, encoding='utf-8')\n"
+        "(output / 'manifest.json').write_text(json.dumps({'candidates': [{'structure_path': str(cif)}]}), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    workspace = Workspace(tmp_path)
+    provider = LocalIsolatedMatterGenProvider(
+        skill_script=script,
+        workspace=workspace,
+    )
+    manifest = provider.run(
+        output_dir=workspace.user_output_dir / "mattergen" / "legacy",
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        pretrained_name="dft_band_gap",
+        guidance_factor=2.0,
+        seed=42,
+    )
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    assert raw["run_spec"]["seed"] == 42
+    assert raw["reproducibility"]["seed_applied"] is False
+
+    candidates, metadata = MatterGenGenerator(
+        provider=provider,
+        output_root=workspace.user_output_dir / "mattergen",
+        workspace=workspace,
+    ).generate(target_band_gap_eV=0.5)
+    assert candidates[0]["lineage"]["generation_parameters"]["seed_effective"] is False
+    assert metadata["reproducibility"]["seed_applied"] is False

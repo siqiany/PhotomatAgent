@@ -16,9 +16,12 @@ output records ``vae_proposed_formula``, ``vae_chemical_system``,
 from __future__ import annotations
 
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +32,16 @@ from photomatagent.scientific.capabilities.generation.mattergen_runner import (
     MatterGenPretrainedName,
     MatterGenRunSpec,
     MatterGenRunner,
+    MAX_CIF_BYTES,
+    _parameter_tag,
+    _atomic_bytes_replace,
+    _atomic_json_replace,
 )
 from photomatagent.workspace import Workspace
+
+
+LEGACY_MATTERGEN_GUIDANCE_FACTOR = 2.0
+LEGACY_MATTERGEN_SEED = 42
 
 
 def composition_distance(formula_a: str, formula_b: str) -> float:
@@ -86,35 +97,77 @@ class LocalIsolatedMatterGenProvider:
         seed: int = 42,
     ) -> Path:
         """Run the generation; returns the manifest path (raises on failure)."""
+        runner = self.runner or MatterGenRunner(
+            executable=self.mattergen_executable,
+            workspace=self.workspace,
+            hf_home=self.hf_home,
+            timeout_seconds=self.timeout_seconds,
+        )
+        workspace = self.workspace or runner.workspace
+        condition_band_gap: float | None = None
+        if pretrained_name == "dft_band_gap":
+            if target_band_gap_eV is None:
+                raise ValueError("dft_band_gap mode requires target_band_gap_eV")
+            condition_band_gap = float(target_band_gap_eV)
+        condition_chemical_system = (
+            chemical_system if pretrained_name == "chemical_system" else None
+        )
+        spec = MatterGenRunSpec(
+            output_dir=output_dir,
+            pretrained_name=pretrained_name,
+            candidate_count=self.candidate_limit,
+            target_band_gap_eV=condition_band_gap,
+            chemical_system=condition_chemical_system,
+            guidance_factor=guidance_factor,
+            seed=seed,
+        )
+        validated_output = runner._validate_output_dir(output_dir)
+
         # The old skill-script adapter remains available as an explicit
         # compatibility override.  Normal operation uses the packaged runner
         # directly and therefore does not depend on MATTERGEN_SKILL_SCRIPT.
         if self.skill_script is None:
-            runner = self.runner or MatterGenRunner(
-                executable=self.mattergen_executable,
-                workspace=self.workspace,
-                hf_home=self.hf_home,
-                timeout_seconds=self.timeout_seconds,
-            )
-            condition_band_gap: float | None = None
-            if pretrained_name == "dft_band_gap":
-                assert target_band_gap_eV is not None
-                condition_band_gap = float(target_band_gap_eV)
-            condition_chemical_system = (
-                chemical_system if pretrained_name == "chemical_system" else None
-            )
-            spec = MatterGenRunSpec(
-                output_dir=output_dir,
-                pretrained_name=pretrained_name,
-                candidate_count=self.candidate_limit,
-                target_band_gap_eV=condition_band_gap,
-                chemical_system=condition_chemical_system,
-                guidance_factor=guidance_factor,
-                seed=seed,
-            )
             return runner.run(spec)
         if not self.skill_script.is_file():
             raise FileNotFoundError(f"MatterGen skill script not found: {self.skill_script}")
+        if not math.isclose(
+            float(guidance_factor),
+            LEGACY_MATTERGEN_GUIDANCE_FACTOR,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "legacy MatterGen override does not support guidance_factor; "
+                f"only the default {LEGACY_MATTERGEN_GUIDANCE_FACTOR:g} is allowed"
+            )
+        if seed != LEGACY_MATTERGEN_SEED:
+            raise ValueError(
+                "legacy MatterGen override does not support seed; only the "
+                f"default {LEGACY_MATTERGEN_SEED} is allowed"
+            )
+        manifest_path = validated_output / "manifest.json"
+        runner._validate_path_boundary(manifest_path, label="legacy manifest")
+        legacy_parent = workspace.tmp_dir / "mattergen-legacy" / _parameter_tag(spec)
+        runner._validate_path_boundary(legacy_parent, label="legacy staging parent")
+        legacy_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        run_root = legacy_parent / uuid.uuid4().hex
+        runner._validate_path_boundary(run_root, label="legacy staging run")
+        run_root.mkdir(mode=0o700)
+        staging_output = run_root / "output"
+        matplotlib_dir = staging_output / ".matplotlib"
+        archive = staging_output / "generated_crystals_cif.zip"
+        extraction_dir = run_root / "candidates"
+        published_dir = validated_output / "candidates" / run_root.name
+        for path, label in (
+            (staging_output, "legacy staging output"),
+            (matplotlib_dir, "Matplotlib cache"),
+            (archive, "legacy MatterGen archive"),
+            (extraction_dir, "legacy candidate extraction"),
+            (published_dir, "legacy published candidates"),
+        ):
+            runner._validate_path_boundary(path, label=label)
+        staging_output.mkdir(parents=True, exist_ok=True, mode=0o700)
+        matplotlib_dir.mkdir(mode=0o700)
         command = [
             sys.executable,
             str(self.skill_script),
@@ -127,7 +180,7 @@ class LocalIsolatedMatterGenProvider:
             "--mattergen-executable",
             self.mattergen_executable,
             "--output-dir",
-            str(output_dir),
+            str(staging_output),
         ]
         if target_band_gap_eV is not None:
             command.extend(["--band-gap-ev", str(target_band_gap_eV)])
@@ -136,21 +189,109 @@ class LocalIsolatedMatterGenProvider:
         environment = os.environ.copy()
         if self.hf_home:
             environment["HF_HOME"] = str(self.hf_home)
-        environment.setdefault("MPLCONFIGDIR", str(output_dir / ".matplotlib"))
-        subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-            env=environment,
-        )
-        manifest = output_dir / "manifest.json"
-        if not manifest.is_file():
-            raise FileNotFoundError(
-                f"MatterGen manifest not produced: {manifest}"
+        environment["MPLCONFIGDIR"] = str(matplotlib_dir)
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                env=environment,
+                cwd=str(staging_output),
             )
-        return manifest
+            runner._validate_path_boundary(matplotlib_dir, label="Matplotlib cache")
+            manifest = staging_output / "manifest.json"
+            manifest = runner._validate_file_path(
+                manifest, label="legacy MatterGen manifest"
+            )
+            if archive.exists() or archive.is_symlink():
+                runner._validate_file_path(archive, label="legacy MatterGen archive")
+            normalized_manifest = self._normalize_legacy_manifest(
+                manifest, spec, workspace
+            )
+            normalized_candidates = normalized_manifest["candidates"]
+            if not normalized_candidates:
+                raise RuntimeError("legacy MatterGen manifest contained no candidates")
+            extraction_dir.mkdir(mode=0o700)
+            for index, candidate in enumerate(normalized_candidates, start=1):
+                source = Path(candidate["structure_path"])
+                runner._validate_file_path(source, label="legacy candidate")
+                if source.stat().st_size > MAX_CIF_BYTES:
+                    raise ValueError("legacy MatterGen CIF is too large")
+                target = extraction_dir / f"candidate-{index:04d}.cif"
+                _atomic_bytes_replace(target, source.read_bytes())
+                candidate["structure_path"] = str(target)
+                candidate["relative_path"] = workspace.relative(target)
+            runner._publish_candidates(
+                normalized_candidates, extraction_dir, published_dir
+            )
+            normalized_manifest["candidates"] = normalized_candidates
+            normalized_manifest["candidate_count"] = len(normalized_candidates)
+            normalized_manifest["output_relative_dir"] = workspace.relative(
+                validated_output
+            )
+            _atomic_json_replace(manifest_path, normalized_manifest)
+            return manifest_path
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
+
+    def _normalize_legacy_manifest(
+        self,
+        manifest_path: Path,
+        spec: MatterGenRunSpec,
+        workspace: Workspace,
+    ) -> dict[str, Any]:
+        """Add an explicit legacy contract without claiming seed determinism."""
+
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"legacy MatterGen manifest is invalid: {manifest_path}") from exc
+        if not isinstance(raw, dict) or not isinstance(raw.get("candidates"), list):
+            raise ValueError("legacy MatterGen manifest has no candidate list")
+        normalized_candidates: list[dict[str, Any]] = []
+        for candidate in raw["candidates"]:
+            if not isinstance(candidate, dict) or not isinstance(
+                candidate.get("structure_path"), str
+            ):
+                raise ValueError("legacy MatterGen candidate has no structure_path")
+            candidate_path = Path(candidate["structure_path"])
+            if not candidate_path.is_absolute():
+                candidate_path = manifest_path.parent / candidate_path
+            try:
+                resolved = workspace.resolve(str(candidate_path), must_exist=True)
+            except Exception as exc:
+                raise ValueError(
+                    "legacy MatterGen candidate is outside or missing from workspace"
+                ) from exc
+            if resolved.suffix.lower() != ".cif":
+                raise ValueError("legacy MatterGen candidates must be CIF files")
+            normalized = dict(candidate)
+            normalized["structure_path"] = str(resolved)
+            normalized["relative_path"] = workspace.relative(resolved)
+            normalized_candidates.append(normalized)
+        raw.update(
+            {
+                "manifest_version": 1,
+                "backend": "mattergen-legacy",
+                "validation_status": "UNVALIDATED_GENERATED_STRUCTURE",
+                "pretrained_name": spec.pretrained_name,
+                "properties_to_condition_on": spec.conditioning_properties(),
+                "run_spec": spec.manifest_parameters(),
+                "candidate_count": len(normalized_candidates),
+                "candidates": normalized_candidates,
+                "reproducibility": {
+                    "seed_requested": spec.seed,
+                    "seed_applied": False,
+                    "reason": (
+                        "legacy MATTERGEN_SKILL_SCRIPT has no seed contract; "
+                        "the default is accepted for compatibility only"
+                    ),
+                },
+            }
+        )
+        return raw
 
 
 class MatterGenGenerator:
@@ -243,16 +384,43 @@ class MatterGenGenerator:
                 guidance_factor=guidance_factor,
                 seed=seed,
             )
-        manifest_file = Path(manifest_path)
+        manifest_file = Path(manifest_path).expanduser()
+        if self.workspace is not None:
+            manifest_file = self.workspace.resolve(str(manifest_file), must_exist=True)
+        else:
+            manifest_file = manifest_file.resolve()
         if not manifest_file.is_file():
             raise FileNotFoundError(f"MatterGen manifest not found: {manifest_file}")
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-        manifest_mode = manifest.get("pretrained_name")
-        if manifest_mode and manifest_mode != pretrained_name:
+        manifest_spec = _validate_manifest_run_spec(
+            manifest,
+            expected={
+                "pretrained_name": pretrained_name,
+                "candidate_count": int(self.provider.candidate_limit),
+                "target_band_gap_eV": band_gap_float,
+                "chemical_system": (
+                    chemical_system if pretrained_name == "chemical_system" else None
+                ),
+                "guidance_factor": float(guidance_factor),
+                "seed": seed,
+            },
+        )
+        expected_properties = (
+            {"dft_band_gap": band_gap_float}
+            if pretrained_name == "dft_band_gap"
+            else {"chemical_system": chemical_system}
+        )
+        if manifest.get("properties_to_condition_on") != expected_properties:
             raise ValueError(
-                "MatterGen manifest conditioning mode does not match "
-                f"requested {pretrained_name}: {manifest_mode}"
+                "MatterGen manifest properties_to_condition_on does not match "
+                "the requested conditioning mode"
             )
+        reproducibility = manifest.get("reproducibility")
+        if not isinstance(reproducibility, dict):
+            reproducibility = {
+                "seed_requested": manifest_spec["seed"],
+                "seed_applied": True,
+            }
         candidates: list[dict[str, Any]] = []
         raw_candidates = manifest.get("candidates", [])
         if not raw_candidates:
@@ -281,14 +449,15 @@ class MatterGenGenerator:
             lineage = CandidateLineage(
                 generated_by="mattergen",
                 generation_parameters={
-                    "target_band_gap_eV": band_gap_float,
-                    "chemical_system": chemical_system,
-                    "pretrained_name": manifest.get("pretrained_name", pretrained_name),
+                    "target_band_gap_eV": manifest_spec["target_band_gap_eV"],
+                    "chemical_system": manifest_spec["chemical_system"],
+                    "pretrained_name": manifest_spec["pretrained_name"],
                     "properties_to_condition_on": manifest.get(
                         "properties_to_condition_on"
                     ),
-                    "guidance_factor": guidance_factor,
-                    "seed": seed,
+                    "guidance_factor": manifest_spec["guidance_factor"],
+                    "seed": manifest_spec["seed"],
+                    "seed_effective": reproducibility.get("seed_applied", True),
                 },
                 source_artifacts=[str(manifest_file)],
                 transformation="vae_formula_plus_mattergen"
@@ -326,10 +495,11 @@ class MatterGenGenerator:
             "candidate_count": len(candidates),
             "proposed_formula": proposed_formula,
             "chemical_system": chemical_system,
-            "pretrained_name": manifest.get("pretrained_name", pretrained_name),
+            "pretrained_name": manifest_spec["pretrained_name"],
             "properties_to_condition_on": manifest.get("properties_to_condition_on"),
-            "guidance_factor": guidance_factor,
-            "seed": seed,
+            "guidance_factor": manifest_spec["guidance_factor"],
+            "seed": manifest_spec["seed"],
+            "reproducibility": reproducibility,
             "formula_consistency_note": (
                 "VAE formula and MatterGen formula are separate scientific "
                 "facts; formula_preserved/composition_distance record their "
@@ -353,3 +523,47 @@ def _default_output_name(
     )
     safe = "".join(character if character.isalnum() or character in "._-" else "-" for character in system)
     return f"mg-chemical-system-{safe or 'unknown'}"
+
+
+def _validate_manifest_run_spec(
+    manifest: Any,
+    *,
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(manifest, dict):
+        raise ValueError("MatterGen manifest must be a JSON object")
+    actual = manifest.get("run_spec")
+    if not isinstance(actual, dict) or set(actual) != set(expected):
+        raise ValueError(
+            "MatterGen explicit manifest must contain a complete run_spec "
+            "with checkpoint, candidate_count, target_band_gap_eV, "
+            "chemical_system, guidance_factor, and seed"
+        )
+    validated: dict[str, Any] = {}
+    for key, expected_value in expected.items():
+        actual_value = actual.get(key)
+        if isinstance(expected_value, float):
+            if actual_value is None:
+                raise ValueError(
+                    f"MatterGen manifest run_spec {key} does not match request"
+                )
+            try:
+                actual_float = float(actual_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"MatterGen manifest run_spec {key} does not match request"
+                ) from exc
+            if not math.isfinite(actual_float) or not math.isclose(
+                actual_float, expected_value, rel_tol=0, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    f"MatterGen manifest run_spec {key} does not match request"
+                )
+            validated[key] = actual_float
+        elif actual_value != expected_value:
+            raise ValueError(
+                f"MatterGen manifest run_spec {key} does not match request"
+            )
+        else:
+            validated[key] = actual_value
+    return validated

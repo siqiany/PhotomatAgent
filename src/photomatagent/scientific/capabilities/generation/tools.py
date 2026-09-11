@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import shutil
 from pathlib import Path
 from typing import Any, IO, Iterable, Literal, Mapping, cast
 
@@ -26,6 +25,7 @@ from photomatagent.scientific.capabilities.generation.mattergen import (
 )
 from photomatagent.scientific.capabilities.generation.mattergen_runner import (
     MatterGenRunner,
+    resolve_mattergen_executable,
 )
 from photomatagent.scientific.capabilities.config import ScientificConfig
 from photomatagent.scientific.errors import MissingScientificPrerequisite
@@ -792,10 +792,10 @@ def _row_chemical_system(row: Mapping[str, Any]) -> str:
 
 
 def _mattergen_executable_path(value: str) -> str | None:
-    path = Path(value).expanduser()
-    if path.is_file():
-        return str(path.resolve())
-    return shutil.which(value)
+    try:
+        return str(resolve_mattergen_executable(value))
+    except (FileNotFoundError, PermissionError, ValueError, OSError):
+        return None
 
 
 def generation_pack(

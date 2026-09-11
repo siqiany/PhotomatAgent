@@ -10,16 +10,20 @@ normalizes MatterGen's ZIP archive into a deterministic manifest.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from photomatagent.errors import ToolExecutionError
 from photomatagent.workspace import Workspace
 
 
@@ -30,6 +34,9 @@ MAX_GUIDANCE_FACTOR = 20.0
 MAX_SEED = 2**31 - 1
 MAX_PROCESS_OUTPUT_CHARS = 4_000
 MAX_CIF_BYTES = 20_000_000
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 128_000_000
+SEED_ENV = "PHOTOMATAGENT_MATTERGEN_SEED"
+SEED_ADAPTER_PATH_ENV = "PHOTOMATAGENT_MATTERGEN_SEED_ADAPTER"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,40 +187,67 @@ class MatterGenRunner:
             "--num_batches=1",
             f"--properties_to_condition_on={properties}",
             f"--diffusion_guidance_factor={_format_float(spec.guidance_factor)}",
-            f"--seed={spec.seed}",
         ]
 
     def run(self, spec: MatterGenRunSpec) -> Path:
-        """Run MatterGen, extract CIFs, and return a workspace-local manifest."""
+        """Run MatterGen in a private staging tree and publish atomically."""
 
         output_dir = self._validate_output_dir(spec.output_dir)
         manifest_path = output_dir / "manifest.json"
-        if manifest_path.exists() and not self.workspace.contains(
-            manifest_path.resolve()
-        ):
-            raise ValueError("MatterGen manifest path is outside workspace")
+        self._validate_path_boundary(manifest_path, label="manifest")
         if self._reusable_manifest(manifest_path, spec):
             return manifest_path
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / ".matplotlib").mkdir(parents=True, exist_ok=True)
-        command = self.build_command(
-            MatterGenRunSpec(
-                output_dir=output_dir,
-                pretrained_name=spec.pretrained_name,
-                candidate_count=spec.candidate_count,
-                target_band_gap_eV=spec.target_band_gap_eV,
-                chemical_system=spec.chemical_system,
-                guidance_factor=spec.guidance_factor,
-                seed=spec.seed,
-            )
-        )
+        executable = resolve_mattergen_executable(self.executable)
+        run_tag = _parameter_tag(spec)
+        staging_parent = self.workspace.tmp_dir / "mattergen" / run_tag
+        self._validate_path_boundary(staging_parent, label="staging directory")
+        staging_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        run_root = staging_parent / uuid.uuid4().hex
+        self._validate_path_boundary(run_root, label="staging run directory")
+        run_root.mkdir(mode=0o700)
+        staging_output = run_root / "output"
+        matplotlib_dir = staging_output / ".matplotlib"
+        archive = staging_output / "generated_crystals_cif.zip"
+        extraction_dir = run_root / "candidates"
+        published_dir = output_dir / "candidates" / run_root.name
+        for path, label in (
+            (staging_output, "staging output"),
+            (matplotlib_dir, "Matplotlib cache"),
+            (archive, "MatterGen archive"),
+            (extraction_dir, "candidate extraction"),
+            (published_dir, "published candidates"),
+        ):
+            self._validate_path_boundary(path, label=label)
+
+        staging_output.mkdir(parents=True, exist_ok=True, mode=0o700)
+        matplotlib_dir.mkdir(mode=0o700)
+        adapter_dir = run_root / "seed-adapter"
+        adapter_dir.mkdir(mode=0o700)
+        _write_seed_adapter(adapter_dir, spec.seed)
         environment = os.environ.copy()
         if self.hf_home is not None:
             self.hf_home.mkdir(parents=True, exist_ok=True)
             environment["HF_HOME"] = str(self.hf_home)
-        environment["MPLCONFIGDIR"] = str(output_dir / ".matplotlib")
+        environment["MPLCONFIGDIR"] = str(matplotlib_dir)
+        environment[SEED_ENV] = str(spec.seed)
+        environment[SEED_ADAPTER_PATH_ENV] = str(run_root / "seed-adapter-error")
+        existing_pythonpath = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(adapter_dir), existing_pythonpath) if item
+        )
 
+        staging_spec = MatterGenRunSpec(
+            output_dir=staging_output,
+            pretrained_name=spec.pretrained_name,
+            candidate_count=spec.candidate_count,
+            target_band_gap_eV=spec.target_band_gap_eV,
+            chemical_system=spec.chemical_system,
+            guidance_factor=spec.guidance_factor,
+            seed=spec.seed,
+        )
+        command = self.build_command(staging_spec)
+        command[0] = str(executable)
         try:
             completed = subprocess.run(
                 command,
@@ -222,7 +256,7 @@ class MatterGenRunner:
                 text=True,
                 timeout=self.timeout_seconds,
                 env=environment,
-                cwd=str(output_dir),
+                cwd=str(staging_output),
                 shell=False,
             )
             if completed.returncode:
@@ -235,36 +269,49 @@ class MatterGenRunner:
                     + (f": {detail}" if detail else "")
                 )
         except subprocess.TimeoutExpired as exc:
+            shutil.rmtree(run_root, ignore_errors=True)
             detail = _bounded_process_text(exc.stdout, exc.stderr)
             raise TimeoutError(
                 f"MatterGen timed out after {self.timeout_seconds:g}s"
                 + (f": {detail}" if detail else "")
             ) from exc
         except subprocess.CalledProcessError as exc:
+            shutil.rmtree(run_root, ignore_errors=True)
             detail = _bounded_process_text(exc.stdout, exc.stderr)
             raise RuntimeError(
                 f"MatterGen command failed with exit code {exc.returncode}"
                 + (f": {detail}" if detail else "")
             ) from exc
+        except RuntimeError:
+            shutil.rmtree(run_root, ignore_errors=True)
+            raise
         except FileNotFoundError as exc:
+            shutil.rmtree(run_root, ignore_errors=True)
             raise FileNotFoundError(
-                f"MatterGen executable not found: {self.executable}"
+                f"MatterGen executable not found or not executable: {self.executable}"
+            ) from exc
+        except PermissionError as exc:
+            shutil.rmtree(run_root, ignore_errors=True)
+            raise PermissionError(
+                f"MatterGen executable is not executable: {self.executable}"
             ) from exc
 
-        archive = output_dir / "generated_crystals_cif.zip"
-        resolved_archive = archive.resolve(strict=False)
-        if not self.workspace.contains(resolved_archive):
-            raise ValueError("MatterGen archive path is outside workspace")
-        if not resolved_archive.is_file():
-            raise FileNotFoundError(
-                f"MatterGen archive not found: {self.workspace.relative(archive)}"
-            )
-        candidates = self._extract_cifs(resolved_archive, output_dir, spec)
-        manifest = self._manifest_payload(spec, output_dir, candidates)
-        _atomic_json_replace(manifest_path, manifest)
-        return manifest_path
+        try:
+            self._validate_path_boundary(matplotlib_dir, label="Matplotlib cache")
+            resolved_archive = self._validate_file_path(archive, label="MatterGen archive")
+            candidates = self._extract_cifs(resolved_archive, extraction_dir, spec)
+            self._publish_candidates(candidates, extraction_dir, published_dir)
+            manifest = self._manifest_payload(spec, output_dir, candidates)
+            _atomic_json_replace(manifest_path, manifest)
+            return manifest_path
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
 
     def _validate_output_dir(self, output_dir: Path) -> Path:
+        candidate = Path(output_dir).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace.root / candidate
+        self._validate_path_boundary(candidate, label="MatterGen output")
         try:
             resolved = self.workspace.resolve(str(output_dir), must_exist=False)
         except Exception as exc:
@@ -276,6 +323,45 @@ class MatterGenRunner:
                 f"{output_dir}"
             )
         return resolved
+
+    def _validate_path_boundary(self, path: Path, *, label: str) -> Path:
+        resolved = path.expanduser().resolve(strict=False)
+        if not self.workspace.contains(resolved):
+            raise ValueError(f"{label} is outside workspace: {path}")
+        current = path.expanduser()
+        while True:
+            if current.is_symlink():
+                raise ValueError(f"{label} crosses a symbolic link: {current}")
+            if current == self.workspace.root or current.parent == current:
+                break
+            current = current.parent
+        return resolved
+
+    def _validate_file_path(self, path: Path, *, label: str) -> Path:
+        resolved = self._validate_path_boundary(path, label=label)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"{label} not found: {self.workspace.relative(resolved)}")
+        return resolved
+
+    def _publish_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        extraction_dir: Path,
+        published_dir: Path,
+    ) -> None:
+        self._validate_path_boundary(published_dir, label="published candidates")
+        if published_dir.exists() or published_dir.is_symlink():
+            raise ValueError(f"published candidate directory already exists: {published_dir}")
+        published_dir.parent.mkdir(parents=True, exist_ok=True)
+        self._validate_path_boundary(published_dir.parent, label="published candidate parent")
+        os.replace(extraction_dir, published_dir)
+        for candidate in candidates:
+            source = Path(str(candidate["structure_path"]))
+            filename = source.name
+            published = published_dir / filename
+            self._validate_file_path(published, label="published candidate")
+            candidate["structure_path"] = str(published)
+            candidate["relative_path"] = self.workspace.relative(published)
 
     def _reusable_manifest(
         self, manifest_path: Path, spec: MatterGenRunSpec
@@ -290,10 +376,7 @@ class MatterGenRunner:
                 return False
             recorded = raw.get("run_spec")
             if not isinstance(recorded, dict):
-                recorded = {
-                    key: raw.get(key)
-                    for key in spec.manifest_parameters()
-                }
+                return False
             expected = spec.manifest_parameters()
             if not _same_parameters(recorded, expected):
                 return False
@@ -306,11 +389,26 @@ class MatterGenRunner:
                 candidate_path = candidate.get("structure_path")
                 if not isinstance(candidate_path, str):
                     return False
-                resolved = self.workspace.resolve(candidate_path, must_exist=True)
+                try:
+                    candidate_source = Path(candidate_path).expanduser()
+                    if not candidate_source.is_absolute():
+                        candidate_source = self.workspace.root / candidate_source
+                    self._validate_path_boundary(
+                        candidate_source, label="cached MatterGen candidate"
+                    )
+                    resolved = self.workspace.resolve(candidate_path, must_exist=False)
+                except ToolExecutionError as exc:
+                    if "outside workspace" in str(exc):
+                        raise ValueError(
+                            f"cached MatterGen candidate is outside workspace: {candidate_path}"
+                        ) from exc
+                    return False
+                if not resolved.is_file():
+                    return False
                 if resolved.suffix.lower() != ".cif":
                     return False
             return True
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, TypeError, json.JSONDecodeError):
             return False
 
     def _extract_cifs(
@@ -319,11 +417,24 @@ class MatterGenRunner:
         try:
             with zipfile.ZipFile(archive) as handle:
                 members = sorted(handle.infolist(), key=lambda member: member.filename)
-                candidates: list[dict[str, Any]] = []
+                total_size = 0
                 for member in members:
                     _validate_zip_member(member)
-                    if not member.filename.lower().endswith(".cif"):
-                        continue
+                    total_size += member.file_size
+                    if total_size > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                        raise ValueError("MatterGen archive is too large")
+                bad_member = handle.testzip()
+                if bad_member is not None:
+                    raise ValueError(
+                        f"MatterGen archive failed CRC validation: {bad_member}"
+                    )
+                cif_members = [
+                    member
+                    for member in members
+                    if member.filename.lower().endswith(".cif")
+                ]
+                candidates: list[dict[str, Any]] = []
+                for member in cif_members:
                     if member.file_size > MAX_CIF_BYTES:
                         raise ValueError(
                             f"MatterGen CIF is too large: {member.filename}"
@@ -332,7 +443,7 @@ class MatterGenRunner:
                     if not payload.strip():
                         continue
                     if len(candidates) >= spec.candidate_count:
-                        break
+                        continue
                     number = len(candidates) + 1
                     output_path = output_dir / f"candidate-{number:04d}.cif"
                     _atomic_bytes_replace(output_path, payload)
@@ -377,6 +488,82 @@ def _format_properties(properties: dict[str, float | str]) -> str:
     return "{" + repr(key) + ":" + repr(value) + "}"
 
 
+def _parameter_tag(spec: MatterGenRunSpec) -> str:
+    encoded = json.dumps(
+        spec.manifest_parameters(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _write_seed_adapter(adapter_dir: Path, seed: int) -> None:
+    """Install a startup adapter in the isolated child Python process.
+
+    MatterGen 1.0.3's public ``mattergen-generate`` function does not expose a
+    seed argument.  ``sitecustomize`` is imported by that same isolated Python
+    process before the executable's module, so this sets every RNG used by the
+    generation stack without changing the external MatterGen installation or
+    passing an unsupported Fire flag.  Failure terminates the child before it
+    can generate an unseeded result.
+    """
+
+    code = f"""\
+import os
+import random
+from pathlib import Path
+
+try:
+    _seed = {seed}
+    random.seed(_seed)
+    import numpy as _numpy
+    _numpy.random.seed(_seed)
+    import torch as _torch
+    _torch.manual_seed(_seed)
+    if _torch.cuda.is_available():
+        _torch.cuda.manual_seed(_seed)
+        _torch.cuda.manual_seed_all(_seed)
+except BaseException as _exc:
+    # Python reports sitecustomize failures and continues importing.  Exit
+    # explicitly so the configured executable cannot produce an unseeded run.
+    try:
+        Path(os.environ.get("{SEED_ADAPTER_PATH_ENV}", "seed-adapter-error")).write_text(
+            f"{{type(_exc).__name__}}: {{_exc}}", encoding="utf-8"
+        )
+    finally:
+        os._exit(78)
+"""
+    adapter_path = adapter_dir / "sitecustomize.py"
+    _atomic_bytes_replace(adapter_path, code.encode("utf-8"))
+    os.chmod(adapter_path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def resolve_mattergen_executable(value: str | Path) -> Path:
+    """Resolve one executable path for both capability probes and execution."""
+
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("MatterGen executable must not be empty")
+    expanded = Path(raw).expanduser()
+    has_path = expanded.is_absolute() or "/" in raw or "\\" in raw
+    if has_path:
+        candidate = expanded if expanded.is_absolute() else Path.cwd() / expanded
+    else:
+        found = shutil.which(raw)
+        if found is None:
+            raise FileNotFoundError(f"MatterGen executable not found: {raw}")
+        candidate = Path(found)
+    resolved = candidate.resolve(strict=False)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"MatterGen executable is not a file: {resolved}")
+    if resolved.stat().st_size == 0:
+        raise ValueError(f"MatterGen executable is empty: {resolved}")
+    if not os.access(resolved, os.X_OK):
+        raise PermissionError(f"MatterGen executable is not executable: {resolved}")
+    return resolved
+
+
 def _format_float(value: float) -> str:
     return format(float(value), ".12g")
 
@@ -397,7 +584,7 @@ def _bounded_process_text(stdout: Any, stderr: Any) -> str:
 def _validate_zip_member(member: zipfile.ZipInfo) -> None:
     name = member.filename.replace("\\", "/")
     path = Path(name)
-    if not name or path.is_absolute() or ".." in path.parts:
+    if not name or path.is_absolute() or ".." in path.parts or member.is_dir():
         raise ValueError(f"MatterGen archive member escapes output: {member.filename}")
     mode = (member.external_attr >> 16) & 0xFFFF
     if mode and stat.S_IFMT(mode) not in {0, stat.S_IFREG}:
