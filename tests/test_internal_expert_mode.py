@@ -20,6 +20,8 @@ from photomatagent.scientific.state import ScientificState
 from photomatagent.sessions.store import save_session_snapshot
 from photomatagent.runtime.state import ConversationState
 from photomatagent.models.types import AssistantMessage
+from photomatagent.models.fake import FakeModelProvider
+from photomatagent.tools.registry import ToolRegistry
 from photomatagent.workspace import Workspace
 from photomatagent.cli.chat import build_runtime
 from rich.console import Console
@@ -127,7 +129,18 @@ def test_import_retries_after_reservation_interruption(tmp_path: Path, monkeypat
     assert service.store.load_episode(task.evolution_id, "v001").status == "COMPLETED"
 
 
-def test_runtime_logger_sessions_follow_workspace(tmp_path: Path) -> None:
+def test_runtime_logger_sessions_follow_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "photomatagent.cli.chat.create_default_registry",
+        lambda *args, **kwargs: ToolRegistry(),
+    )
+    monkeypatch.setattr(
+        "photomatagent.cli.chat.create_provider",
+        lambda *args, **kwargs: FakeModelProvider(),
+    )
     runtime, logger = build_runtime(workspace_root=tmp_path, provider="fake")
     assert runtime.workspace.root == tmp_path.resolve()
     assert logger is not None
