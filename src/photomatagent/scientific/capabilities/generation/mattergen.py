@@ -42,6 +42,14 @@ from photomatagent.workspace import Workspace
 
 LEGACY_MATTERGEN_GUIDANCE_FACTOR = 2.0
 LEGACY_MATTERGEN_SEED = 42
+_LEGACY_RUN_SPEC_FIELDS = (
+    "pretrained_name",
+    "candidate_count",
+    "target_band_gap_eV",
+    "chemical_system",
+    "guidance_factor",
+    "seed",
+)
 
 
 def composition_distance(formula_a: str, formula_b: str) -> float:
@@ -210,6 +218,18 @@ class LocalIsolatedMatterGenProvider:
             normalized_manifest = self._normalize_legacy_manifest(
                 manifest, spec, workspace
             )
+            legacy_provenance = normalized_manifest.get("legacy_provenance")
+            unknown_fields = (
+                legacy_provenance.get("unknown_fields", [])
+                if isinstance(legacy_provenance, dict)
+                else []
+            )
+            if unknown_fields:
+                raise ValueError(
+                    "legacy MatterGen manifest cannot prove the requested "
+                    "parameters; unknown/unverified: "
+                    + ", ".join(str(field) for field in unknown_fields)
+                )
             normalized_candidates = normalized_manifest["candidates"]
             if not normalized_candidates:
                 raise RuntimeError("legacy MatterGen manifest contained no candidates")
@@ -271,27 +291,175 @@ class LocalIsolatedMatterGenProvider:
             normalized["structure_path"] = str(resolved)
             normalized["relative_path"] = workspace.relative(resolved)
             normalized_candidates.append(normalized)
-        raw.update(
-            {
-                "manifest_version": 1,
-                "backend": "mattergen-legacy",
-                "validation_status": "UNVALIDATED_GENERATED_STRUCTURE",
-                "pretrained_name": spec.pretrained_name,
-                "properties_to_condition_on": spec.conditioning_properties(),
-                "run_spec": spec.manifest_parameters(),
-                "candidate_count": len(normalized_candidates),
-                "candidates": normalized_candidates,
-                "reproducibility": {
-                    "seed_requested": spec.seed,
-                    "seed_applied": False,
-                    "reason": (
-                        "legacy MATTERGEN_SKILL_SCRIPT has no seed contract; "
-                        "the default is accepted for compatibility only"
-                    ),
-                },
-            }
+        requested = spec.manifest_parameters()
+        (
+            actual,
+            known_fields,
+            actual_properties,
+            properties_known,
+            raw_run_spec,
+        ) = (
+            _legacy_manifest_parameters(raw)
         )
+        for field in _LEGACY_RUN_SPEC_FIELDS:
+            if field not in known_fields:
+                continue
+            actual_value = actual[field]
+            if not _legacy_values_match(actual_value, requested[field]):
+                raise ValueError(
+                    "legacy MatterGen manifest "
+                    f"{field} conflicts with request: requested "
+                    f"{requested[field]!r}, manifest {actual_value!r}"
+                )
+        expected_properties = spec.conditioning_properties()
+        if properties_known and not _legacy_values_match(
+            actual_properties, expected_properties
+        ):
+            raise ValueError(
+                "legacy MatterGen manifest properties_to_condition_on conflicts "
+                f"with request: requested {expected_properties!r}, "
+                f"manifest {actual_properties!r}"
+            )
+        unknown_fields = [
+            field for field in _LEGACY_RUN_SPEC_FIELDS if field not in known_fields
+        ]
+        if not properties_known:
+            unknown_fields.append("properties_to_condition_on")
+        normalized_run_spec = {
+            field: actual.get(field) for field in _LEGACY_RUN_SPEC_FIELDS
+        }
+        raw["manifest_version"] = 1
+        raw["backend"] = "mattergen-legacy"
+        raw["validation_status"] = "UNVALIDATED_GENERATED_STRUCTURE"
+        raw["pretrained_name"] = actual.get("pretrained_name")
+        raw["properties_to_condition_on"] = actual_properties
+        raw["run_spec"] = normalized_run_spec
+        raw["candidate_count"] = len(normalized_candidates)
+        raw["candidates"] = normalized_candidates
+        raw["reproducibility"] = {
+            "seed_requested": actual.get("seed"),
+            "seed_applied": False,
+            "reason": (
+                "legacy MATTERGEN_SKILL_SCRIPT has no seed contract; "
+                "the default is accepted for compatibility only"
+            ),
+        }
+        raw["legacy_provenance"] = {
+            "status": "UNVERIFIED" if unknown_fields else "VERIFIED",
+            "requested_run_spec": requested,
+            "actual_run_spec": normalized_run_spec,
+            "unknown_fields": unknown_fields,
+            "raw_run_spec": raw_run_spec,
+        }
         return raw
+
+
+def _legacy_manifest_parameters(
+    raw: dict[str, Any],
+) -> tuple[dict[str, Any], set[str], Any, bool, dict[str, Any]]:
+    """Read actual parameters from a legacy manifest without request fallback."""
+
+    raw_run_spec_value = raw.get("run_spec")
+    raw_run_spec = raw_run_spec_value if isinstance(raw_run_spec_value, dict) else {}
+    aliases: dict[str, tuple[str, ...]] = {
+        "pretrained_name": ("pretrained_name", "checkpoint", "checkpoint_name"),
+        "candidate_count": (
+            "candidate_count",
+            "requested_candidate_count",
+            "batch_size",
+            "num_candidates",
+        ),
+        "target_band_gap_eV": (
+            "target_band_gap_eV",
+            "band_gap_target_eV",
+            "target_band_gap",
+        ),
+        "chemical_system": ("chemical_system",),
+        "guidance_factor": ("guidance_factor", "diffusion_guidance_factor"),
+        "seed": ("seed",),
+    }
+    actual: dict[str, Any] = {}
+    known_fields: set[str] = set()
+    for field, keys in aliases.items():
+        sources: list[tuple[str, Any]] = []
+        for key in keys:
+            if key in raw_run_spec:
+                sources.append((f"run_spec.{key}", raw_run_spec[key]))
+            if key in raw:
+                sources.append((key, raw[key]))
+        if not sources:
+            continue
+        source_name, value = sources[0]
+        for other_name, other_value in sources[1:]:
+            if not _legacy_values_match(value, other_value):
+                raise ValueError(
+                    "legacy MatterGen manifest has conflicting values for "
+                    f"{field}: {source_name}={value!r}, "
+                    f"{other_name}={other_value!r}"
+                )
+        actual[field] = value
+        known_fields.add(field)
+
+    property_sources: list[tuple[str, Any]] = []
+    if "properties_to_condition_on" in raw_run_spec:
+        property_sources.append(
+            ("run_spec.properties_to_condition_on", raw_run_spec["properties_to_condition_on"])
+        )
+    if "properties_to_condition_on" in raw:
+        property_sources.append(
+            ("properties_to_condition_on", raw["properties_to_condition_on"])
+        )
+    properties_known = bool(property_sources)
+    actual_properties: Any = None
+    if property_sources:
+        property_source, actual_properties = property_sources[0]
+        for other_source, other_value in property_sources[1:]:
+            if not _legacy_values_match(actual_properties, other_value):
+                raise ValueError(
+                    "legacy MatterGen manifest has conflicting values for "
+                    "properties_to_condition_on: "
+                    f"{property_source}={actual_properties!r}, "
+                    f"{other_source}={other_value!r}"
+                )
+    elif actual.get("pretrained_name") == "dft_band_gap" and (
+        "target_band_gap_eV" in known_fields
+        and actual.get("target_band_gap_eV") is not None
+    ):
+        # This is reconstructed solely from explicit values returned by the
+        # legacy manifest, never from the current request.
+        actual_properties = {"dft_band_gap": actual["target_band_gap_eV"]}
+        properties_known = True
+    elif actual.get("pretrained_name") == "chemical_system" and (
+        "chemical_system" in known_fields and actual.get("chemical_system")
+    ):
+        actual_properties = {"chemical_system": actual["chemical_system"]}
+        properties_known = True
+
+    return (
+        actual,
+        known_fields,
+        actual_properties,
+        properties_known,
+        dict(raw_run_spec),
+    )
+
+
+def _legacy_values_match(actual: Any, expected: Any) -> bool:
+    """Compare legacy scalar/mapping values with numeric tolerance."""
+
+    if isinstance(expected, float):
+        try:
+            actual_float = float(actual)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(actual_float) and math.isclose(
+            actual_float, expected, rel_tol=0, abs_tol=1e-12
+        )
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict) or set(actual) != set(expected):
+            return False
+        return all(_legacy_values_match(actual[key], expected[key]) for key in expected)
+    return actual == expected
 
 
 class MatterGenGenerator:

@@ -1060,7 +1060,14 @@ def test_legacy_mattergen_defaults_are_explicitly_marked_non_deterministic(
         "output.mkdir(parents=True, exist_ok=True)\n"
         "cif = output / 'candidate.cif'\n"
         f"cif.write_text({NACL_CIF!r}, encoding='utf-8')\n"
-        "(output / 'manifest.json').write_text(json.dumps({'candidates': [{'structure_path': str(cif)}]}), encoding='utf-8')\n",
+        "run_spec = {'pretrained_name': 'dft_band_gap', 'candidate_count': 8, "
+        "'target_band_gap_eV': 0.5, 'chemical_system': None, "
+        "'guidance_factor': 2.0, 'seed': 42}\n"
+        "manifest = {'pretrained_name': 'dft_band_gap', "
+        "'properties_to_condition_on': {'dft_band_gap': 0.5}, "
+        "'run_spec': run_spec, "
+        "'candidates': [{'structure_path': str(cif)}]}\n"
+        "(output / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -1088,3 +1095,120 @@ def test_legacy_mattergen_defaults_are_explicitly_marked_non_deterministic(
     ).generate(target_band_gap_eV=0.5)
     assert candidates[0]["lineage"]["generation_parameters"]["seed_effective"] is False
     assert metadata["reproducibility"]["seed_applied"] is False
+
+
+def test_legacy_mattergen_rejects_manifest_parameter_conflict(tmp_path):
+    script = tmp_path / "legacy-conflict.py"
+    script.write_text(
+        "import argparse, json\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--output-dir', required=True)\n"
+        "args, _ = parser.parse_known_args()\n"
+        "output = Path(args.output_dir)\n"
+        "output.mkdir(parents=True, exist_ok=True)\n"
+        "cif = output / 'candidate.cif'\n"
+        f"cif.write_text({NACL_CIF!r}, encoding='utf-8')\n"
+        "run_spec = {'pretrained_name': 'dft_band_gap', 'candidate_count': 8, "
+        "'target_band_gap_eV': 0.8, 'chemical_system': None, "
+        "'guidance_factor': 2.0, 'seed': 42}\n"
+        "manifest = {'pretrained_name': 'dft_band_gap', "
+        "'properties_to_condition_on': {'dft_band_gap': 0.8}, "
+        "'run_spec': run_spec, "
+        "'candidates': [{'structure_path': str(cif)}]}\n"
+        "(output / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    workspace = Workspace(tmp_path)
+    output_dir = workspace.user_output_dir / "mattergen" / "legacy-conflict"
+    provider = LocalIsolatedMatterGenProvider(
+        skill_script=script,
+        workspace=workspace,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="legacy MatterGen manifest.*target_band_gap_eV.*conflicts",
+    ):
+        provider.run(
+            output_dir=output_dir,
+            target_band_gap_eV=0.5,
+            chemical_system=None,
+            pretrained_name="dft_band_gap",
+            guidance_factor=2.0,
+            seed=42,
+        )
+    assert not (output_dir / "manifest.json").exists()
+
+
+def test_legacy_mattergen_missing_manifest_parameters_are_unverified(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    cif = tmp_path / "candidate.cif"
+    cif.write_text(NACL_CIF, encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps({"candidates": [{"structure_path": str(cif)}]}),
+        encoding="utf-8",
+    )
+    workspace = Workspace(tmp_path)
+    provider = LocalIsolatedMatterGenProvider(workspace=workspace)
+    spec = MatterGenRunSpec(
+        output_dir=workspace.user_output_dir / "mattergen" / "legacy-missing",
+        pretrained_name="dft_band_gap",
+        candidate_count=8,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=2.0,
+        seed=42,
+    )
+
+    normalized = provider._normalize_legacy_manifest(manifest_path, spec, workspace)
+
+    provenance = normalized["legacy_provenance"]
+    assert provenance["status"] == "UNVERIFIED"
+    assert set(provenance["unknown_fields"]) == {
+        "pretrained_name",
+        "candidate_count",
+        "target_band_gap_eV",
+        "chemical_system",
+        "guidance_factor",
+        "seed",
+        "properties_to_condition_on",
+    }
+    assert normalized["run_spec"]["target_band_gap_eV"] is None
+    assert normalized["reproducibility"]["seed_requested"] is None
+
+
+def test_legacy_mattergen_rejects_missing_manifest_parameters(tmp_path):
+    script = tmp_path / "legacy-missing.py"
+    script.write_text(
+        "import argparse, json\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--output-dir', required=True)\n"
+        "args, _ = parser.parse_known_args()\n"
+        "output = Path(args.output_dir)\n"
+        "output.mkdir(parents=True, exist_ok=True)\n"
+        "cif = output / 'candidate.cif'\n"
+        f"cif.write_text({NACL_CIF!r}, encoding='utf-8')\n"
+        "(output / 'manifest.json').write_text(json.dumps({'candidates': [{'structure_path': str(cif)}]}), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    workspace = Workspace(tmp_path)
+    output_dir = workspace.user_output_dir / "mattergen" / "legacy-missing"
+    provider = LocalIsolatedMatterGenProvider(
+        skill_script=script,
+        workspace=workspace,
+    )
+
+    with pytest.raises(ValueError, match="unknown/unverified"):
+        provider.run(
+            output_dir=output_dir,
+            target_band_gap_eV=0.5,
+            chemical_system=None,
+            pretrained_name="dft_band_gap",
+            guidance_factor=2.0,
+            seed=42,
+        )
+    assert not (output_dir / "manifest.json").exists()
