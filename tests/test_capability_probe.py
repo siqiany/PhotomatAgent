@@ -141,6 +141,7 @@ def test_all_probes_report_without_raising(tmp_path):
         "transport",
         "device",
         "optics",
+        "chgnet",
         "ir",
         "materials_mcp",
     } <= names

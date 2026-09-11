@@ -37,6 +37,7 @@ def probe_all_capabilities(
     from photomatagent.scientific.capabilities.generation.tools import (
         generation_pack,
     )
+    from photomatagent.scientific.capabilities.chgnet import chgnet_pack
 
     effective_config = config or ScientificConfig.from_environment(
         workspace=workspace.root if workspace else None
@@ -60,7 +61,8 @@ def probe_all_capabilities(
         vasp_pack(effective_workspace),
         namd_pack(effective_workspace),
         magus_pack(effective_workspace),
-        generation_pack(effective_config),
+        generation_pack(effective_config, effective_workspace),
+        chgnet_pack(effective_config, effective_workspace),
     ]
     infos: list[CapabilityInfo] = []
     for pack in packs:

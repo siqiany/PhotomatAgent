@@ -53,6 +53,9 @@ uv sync --extra literature
 
 # All optional scientific capability groups
 uv sync --extra science
+
+# Optional CHGNet ML-potential screening (MatterGen stays isolated)
+uv sync --extra chgnet
 ```
 
 ## Configuration
@@ -80,6 +83,36 @@ ANTHROPIC_MODEL=...
 ```
 
 Never commit `.env`. It can contain model credentials, Materials Project credentials, and SCNet/HPC settings.
+
+### MatterGen and CHGNet candidate funnel
+
+MatterGen is not installed into PhotomatAgent's Python environment. Configure
+the isolated `mattergen-generate` executable and, optionally, its Hugging Face
+cache in the workspace environment:
+
+```dotenv
+PHOTOMATAGENT_MATTERGEN_EXECUTABLE=mattergen-generate
+PHOTOMATAGENT_MATTERGEN_HF_HOME=/path/to/mattergen-hf-cache
+PHOTOMATAGENT_MATTERGEN_PRETRAINED_NAME=dft_band_gap
+PHOTOMATAGENT_MATTERGEN_CANDIDATE_LIMIT=8
+PHOTOMATAGENT_MATTERGEN_TIMEOUT_SECONDS=3600
+PHOTOMATAGENT_MATTERGEN_GUIDANCE_FACTOR=2.0
+PHOTOMATAGENT_MATTERGEN_SEED=42
+```
+
+Supported MatterGen checkpoints are exactly `dft_band_gap` and
+`chemical_system`; they are not a joint-conditioning model. Generation output
+is written below `user_output/mattergen/`, normalized from
+`generated_crystals_cif.zip`, and recorded in a deterministic manifest that is
+reused when the run parameters match. `MATTERGEN_SKILL_SCRIPT` remains a
+legacy compatibility override but is not required on the normal path.
+
+The recommended funnel is formula/database evidence → MatterGen structure
+generation (when needed) → `chgnet.screen` → `chgnet.relax` for finalists →
+gated VASP validation. CHGNet evidence is always an ML interatomic-potential
+estimate (`source_type=ml_interatomic_potential`, `fidelity=ml_potential`);
+raw energies may only be ranked within the same reduced composition and are
+not DFT or detector validation.
 
 Run the local diagnostic after configuration:
 
@@ -240,7 +273,8 @@ Capability packs are registered from `src/photomatagent/scientific/capabilities/
 | `quantum_dot` / `alloy` | Brus-model analysis, size/composition scans, and band-gap bowing. |
 | `photodetector` | EQE/responsivity conversion and target checks. |
 | `defects`, `transport`, `device`, `optics`, `interface`, `kp` | Optional domain-specific calculations and diagnostics. |
-| `generation` | Formula retrieval/validation and optional generative workflows. |
+| `generation` | Formula proposals/retrieval and isolated MatterGen structure generation. |
+| `chgnet` | Optional same-composition CHGNet screening and finalist pre-relaxation. |
 | `vasp` | Unified deferred `vasp.*` family: capabilities, plan, prepare, preflight, submit, status, resume, collect, report. |
 | `namd`, `magus` | Prepare, submit, monitor, collect, and inspect high-cost workflows. |
 
