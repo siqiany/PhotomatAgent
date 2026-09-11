@@ -281,6 +281,55 @@ def write_tiny_parchg(path: Path, *, box: float = 24.0) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+@pytest.mark.parametrize("import_error_type", [ModuleNotFoundError, RuntimeError])
+def test_orbital_isosurface_renders_when_skimage_is_unavailable(
+    tmp_path, monkeypatch, import_error_type
+):
+    """A valid PARCHG produces a PNG when optional skimage cannot load."""
+    import builtins
+
+    from photomatagent.scientific.applications.vasp.study.plotting import (
+        plot_orbital_isosurface,
+    )
+
+    original_import = builtins.__import__
+
+    def import_without_skimage(name, *args, **kwargs):
+        if name == "skimage" or name.startswith("skimage."):
+            raise import_error_type("synthetic unavailable optional skimage")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_skimage)
+
+    parchg = tmp_path / "PARCHG"
+    write_tiny_parchg(parchg)
+    structure = tmp_path / "structure.xyz"
+    structure.write_text("1\nsynthetic\nC 0.0 0.0 0.0\n", encoding="utf-8")
+    output = tmp_path / "figures" / "homo_isosurface_test.png"
+
+    assert plot_orbital_isosurface(parchg, structure, output) == output
+    assert output.is_file()
+    assert output.stat().st_size > 0
+    assert not output.with_suffix(".txt").exists()
+
+
+def test_orbital_isosurface_fallback_bounds_large_grids():
+    import numpy as np
+
+    from photomatagent.scientific.applications.vasp.study.plotting import (
+        _bounded_isosurface_grid,
+    )
+
+    values = np.zeros((65, 48, 33), dtype=float)
+    bounded, spacing, strides = _bounded_isosurface_grid(
+        values, (1.0, 2.0, 3.0)
+    )
+
+    assert all(size <= 32 for size in bounded.shape)
+    assert strides == (3, 2, 2)
+    assert spacing == (3.0, 4.0, 6.0)
+
+
 def seed_results(backend: FakeSCNetBackend, tmp_path: Path) -> None:
     """Seed plausible, per-system-NELECT results into every job directory."""
     original_upload = backend.upload_files

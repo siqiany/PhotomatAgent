@@ -147,6 +147,129 @@ def _skeleton_lines(symbols: list[str], coords: Any, cutoff: float = 1.7) -> lis
     return bonds
 
 
+def _bounded_isosurface_grid(
+    values: np.ndarray,
+    spacing: tuple[float, float, float],
+    *,
+    max_axis: int = 32,
+) -> tuple[np.ndarray, tuple[float, float, float], tuple[int, int, int]]:
+    """Bound the pure-NumPy fallback while preserving physical grid spacing."""
+    if values.ndim != 3:
+        raise ValueError("isosurface grid must be three-dimensional")
+    if max_axis < 2:
+        raise ValueError("max_axis must be at least 2")
+    strides = (
+        max(1, int(np.ceil(values.shape[0] / max_axis))),
+        max(1, int(np.ceil(values.shape[1] / max_axis))),
+        max(1, int(np.ceil(values.shape[2] / max_axis))),
+    )
+    bounded = values[tuple(slice(None, None, stride) for stride in strides)]
+    bounded_spacing = (
+        float(spacing[0]) * strides[0],
+        float(spacing[1]) * strides[1],
+        float(spacing[2]) * strides[2],
+    )
+    return bounded, bounded_spacing, strides
+
+
+def _marching_tetrahedra(
+    values: np.ndarray,
+    level: float,
+    spacing: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract a linearly interpolated isosurface without optional packages.
+
+    ``skimage.measure.marching_cubes`` is preferred when installed, but it is
+    not a base runtime dependency.  Splitting each voxel into six tetrahedra
+    keeps the fallback tied to the actual PARCHG scalar field instead of
+    substituting a placeholder or fabricated surface.
+    """
+    cube_offsets = np.asarray(
+        (
+            (0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+            (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1),
+        ),
+        dtype=int,
+    )
+    tetrahedra = (
+        (0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6),
+        (0, 7, 4, 6), (0, 4, 5, 6), (0, 5, 1, 6),
+    )
+    tetra_edges = (
+        (0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3),
+    )
+    vertices: list[np.ndarray] = []
+    faces: list[tuple[int, int, int]] = []
+    scale = np.asarray(spacing, dtype=float)
+
+    def add_polygon(points: list[np.ndarray]) -> None:
+        if len(points) < 3:
+            return
+        first = len(vertices)
+        vertices.extend(points)
+        if len(points) == 3:
+            faces.append((first, first + 1, first + 2))
+            return
+        # Four crossings form a planar quadrilateral for a tetrahedron with
+        # two vertices on each side of the level.  Sort around its centroid
+        # before splitting it so the triangles do not self-intersect.
+        polygon = np.asarray(points, dtype=float)
+        center = polygon.mean(axis=0)
+        normal = np.cross(polygon[1] - polygon[0], polygon[2] - polygon[0])
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm > 1e-12:
+            normal /= normal_norm
+            basis = polygon[0] - center
+            basis_norm = float(np.linalg.norm(basis))
+            if basis_norm > 1e-12:
+                basis /= basis_norm
+                other = np.cross(normal, basis)
+                order = np.argsort(
+                    np.arctan2(
+                        (polygon - center) @ other,
+                        (polygon - center) @ basis,
+                    )
+                )
+                first = len(vertices) - len(points)
+                vertices[first:] = [polygon[index] for index in order]
+        faces.extend(
+            (
+                (first, first + 1, first + 2),
+                (first, first + 2, first + 3),
+            )
+        )
+
+    for origin in np.ndindex(tuple(max(size - 1, 0) for size in values.shape)):
+        cube_indices = cube_offsets + np.asarray(origin, dtype=int)
+        cube_points = cube_indices.astype(float) * scale
+        cube_values = np.asarray(
+            [values[tuple(index)] for index in cube_indices], dtype=float
+        )
+        for tetra in tetrahedra:
+            points = cube_points[list(tetra)]
+            tetra_values = cube_values[list(tetra)]
+            crossings: list[np.ndarray] = []
+            for left, right in tetra_edges:
+                left_value = tetra_values[left]
+                right_value = tetra_values[right]
+                if (left_value < level) == (right_value < level):
+                    continue
+                denominator = right_value - left_value
+                if abs(float(denominator)) < 1e-15:
+                    continue
+                fraction = (level - left_value) / denominator
+                crossing = points[left] + fraction * (
+                    points[right] - points[left]
+                )
+                if not any(np.allclose(crossing, item) for item in crossings):
+                    crossings.append(crossing)
+            add_polygon(crossings)
+
+    if not vertices:
+        return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=int)
+    return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=int)
+
+
 def plot_orbital_isosurface(
     parchg_path: Path,
     structure_path: Path,
@@ -160,7 +283,6 @@ def plot_orbital_isosurface(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-    from skimage import measure
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     grid = read_grid(parchg_path)
@@ -177,15 +299,44 @@ def plot_orbital_isosurface(
         if isovalue is not None
         else float(values.mean() + 0.4 * values.std())
     )
+    spacing = (
+        grid["lattice"][0][0] / grid["dims"][0],
+        grid["lattice"][1][1] / grid["dims"][1],
+        grid["lattice"][2][2] / grid["dims"][2],
+    )
+    measure_module: Any = None
     try:
-        vertices, faces, _normals, _values = measure.marching_cubes(
-            values, level=threshold, spacing=(
-                grid["lattice"][0][0] / grid["dims"][0],
-                grid["lattice"][1][1] / grid["dims"][1],
-                grid["lattice"][2][2] / grid["dims"][2],
-            )
-        )
+        from skimage import measure as skimage_measure
+
+        measure_module = skimage_measure
     except Exception:
+        # Optional binary wheels can fail at import time because of an ABI
+        # mismatch as well as a missing package. Both cases use the bounded
+        # NumPy fallback below.
+        pass
+    fallback_strides: tuple[int, int, int] | None = None
+    try:
+        if measure_module is not None:
+            try:
+                vertices, faces, _normals, _values = measure_module.marching_cubes(
+                    values, level=threshold, spacing=spacing
+                )
+            except Exception:
+                measure_module = None
+        if measure_module is None:
+            surface_values, surface_spacing, fallback_strides = (
+                _bounded_isosurface_grid(values, spacing)
+            )
+            vertices, faces = _marching_tetrahedra(
+                surface_values, threshold, surface_spacing
+            )
+    except Exception:
+        out_path.with_suffix(".txt").write_text(
+            "no isosurface at the chosen level (or marching cubes failed)",
+            encoding="utf-8",
+        )
+        return out_path
+    if len(vertices) == 0 or len(faces) == 0:
         out_path.with_suffix(".txt").write_text(
             "no isosurface at the chosen level (or marching cubes failed)",
             encoding="utf-8",
@@ -224,7 +375,12 @@ def plot_orbital_isosurface(
             )
     axis.set_title(
         f"{parchg_path.name} isosurface @ {threshold:.4g} "
-        "(PARCHG grid, skeleton overlay)",
+        "(PARCHG grid, skeleton overlay)"
+        + (
+            f"; bounded fallback strides={fallback_strides}"
+            if fallback_strides is not None
+            else ""
+        ),
         fontsize=8,
     )
     figure.savefig(out_path, dpi=140)

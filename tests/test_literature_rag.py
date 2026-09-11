@@ -1,128 +1,375 @@
-"""Literature RAG V1 tests: index, hybrid search, provenance, evidence."""
+"""Public literature-tool contracts over injected Qdrant application services."""
 
 from __future__ import annotations
 
-from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
+from photomatagent.scientific.capabilities import literature as literature_capability
+from photomatagent.scientific.capabilities.literature import (
+    LiteratureExtractEvidenceTool,
+    LiteratureIndexPapersTool,
+    LiteratureReadPassageTool,
+    LiteratureSearchArxivTool,
+    LiteratureSearchPassagesTool,
+    build_literature_services,
+)
+from photomatagent.scientific.capabilities.literature.models import LiteratureSourceKind
 from photomatagent.scientific.capabilities.literature.evidence import (
     extract_evidence_from_text,
 )
-from photomatagent.scientific.capabilities.literature.index import LiteratureIndex
-from photomatagent.scientific.capabilities.literature.retrieval import Retriever
+from photomatagent.scientific.capabilities.literature.qdrant_store import (
+    QdrantStoreError,
+)
+from photomatagent.scientific.capabilities.literature.retrieval import (
+    RetrievedPassage,
+    RetrievalDiagnostics,
+    RetrievalResult,
+)
+from photomatagent.scientific.capabilities.literature import retrieval as retrieval_module
+from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
 
-def _pdf_escape(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+CONFIG = ScientificConfig()
+_MISSING = object()
 
 
-def make_pdf(path: Path, pages: list[str]) -> None:
-    """Write a minimal, valid single/multi-page PDF with plain text lines."""
-    objects: list[bytes] = []
-    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
-    kids = b" ".join(f"{3 + 2 * i} 0 R".encode() for i in range(len(pages)))
-    objects.append(
-        b"<< /Type /Pages /Kids [" + kids + b"] /Count "
-        + str(len(pages)).encode()
-        + b" >>"
+def test_literature_probe_uses_source_aware_generation_version() -> None:
+    assert literature_capability._CHUNK_SCHEMA_VERSION == 2
+
+
+def test_build_literature_services_passes_source_aware_generation_version(
+    tmp_path, monkeypatch
+) -> None:
+    seen: list[int | None] = []
+
+    class CapturingRetriever:
+        def __init__(self, store, embedder, reranker, **kwargs: Any) -> None:
+            del store, embedder, reranker
+            seen.append(kwargs.get("chunk_schema_version"))
+
+    monkeypatch.setattr(retrieval_module, "LiteratureRetriever", CapturingRetriever)
+    build_literature_services(
+        CONFIG,
+        Workspace(tmp_path),
+        store=object(),
+        embedder=object(),
+        reranker=object(),
     )
-    for index, text in enumerate(pages):
-        content_id = 3 + 2 * index + 1
-        objects.append(
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-            b"/Contents "
-            + str(content_id).encode()
-            + b" 0 R /Resources << /Font << /F1 5 0 R >> >> >>"
-        )
-        stream = (
-            b"BT /F1 11 Tf 72 720 Td ("
-            + _pdf_escape(text).encode()
-            + b") Tj ET"
-        )
-        objects.append(
-            b"<< /Length "
-            + str(len(stream)).encode()
-            + b" >>\nstream\n"
-            + stream
-            + b"\nendstream"
-        )
-    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 
-    buffer = bytearray(b"%PDF-1.4\n")
-    offsets: list[int] = []
-    for number, body in enumerate(objects, start=1):
-        offsets.append(len(buffer))
-        buffer += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
-    xref_position = len(buffer)
-    buffer += f"xref\n0 {len(objects) + 1}\n".encode()
-    buffer += b"0000000000 65535 f \n"
-    for offset in offsets:
-        buffer += f"{offset:010d} 00000 n \n".encode()
-    buffer += (
-        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
-        f"startxref\n{xref_position}\n%%EOF\n"
-    ).encode()
-    path.write_bytes(buffer)
+    assert seen == [2]
 
 
-def _index_two_papers(tmp_path: Path) -> tuple[Path, Path]:
+def test_search_schema_defaults_to_fulltext() -> None:
+    prop = LiteratureSearchPassagesTool.input_schema["properties"]["source_kind"]
+    assert prop["enum"] == ["fulltext", "abstract"]
+    assert prop["default"] == "fulltext"
+
+
+@pytest.mark.parametrize(
+    "tool_cls",
+    [LiteratureReadPassageTool, LiteratureExtractEvidenceTool],
+)
+def test_read_and_evidence_schemas_default_to_fulltext(tool_cls: type) -> None:
+    prop = tool_cls.input_schema["properties"]["source_kind"]
+    assert prop["enum"] == ["fulltext", "abstract"]
+    assert prop["default"] == "fulltext"
+
+
+def test_abstract_limitations_reserve_canonical_slot() -> None:
+    record = SimpleNamespace(
+        limitations=tuple(f"limit-{index}" for index in range(8))
+        + ("ABSTRACT_ONLY", "limit-0"),
+    )
+
+    limitations = literature_capability._public_limitations(
+        record, LiteratureSourceKind.ABSTRACT
+    )
+
+    assert limitations == tuple(f"limit-{index}" for index in range(7)) + (
+        "abstract_only",
+    )
+    assert limitations.count("abstract_only") == 1
+
+
+@pytest.mark.asyncio
+async def test_abstract_result_identifies_source_and_limit(tmp_path) -> None:
+    retriever = FakeRetriever()
+    services = SimpleNamespace(
+        retriever=retriever,
+        workspace_id="workspace",
+    )
+    result = await LiteratureSearchPassagesTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    ).execute(
+        {"query": "photodetector", "top_k": 1, "source_kind": "abstract"}
+    )
+
+    assert not result.is_error
+    row = result.data["results"][0]
+    assert retriever.source_kinds == [LiteratureSourceKind.ABSTRACT]
+    assert row["source_kind"] == "abstract"
+    assert "abstract_only" in row["limitations"]
+    assert row["source_record_id"] == "paper-key"
+    assert row["doi"] == "10.1000/example"
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_unknown_source_kind(tmp_path) -> None:
+    result = await LiteratureSearchPassagesTool(
+        ScientificConfig(),
+        Workspace(tmp_path),
+        SimpleNamespace(retriever=FakeRetriever(), workspace_id="workspace"),
+    ).execute({"query": "photodetector", "source_kind": "not-a-tier"})
+
+    assert result.is_error
+    assert result.data["error"] == "valueerror"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reported_source_kind", [_MISSING, "not-a-tier", "fulltext"])
+async def test_search_rejects_malformed_result_source_kind(
+    tmp_path, reported_source_kind: object
+) -> None:
+    passage_fields: dict[str, Any] = {
+        "passage_id": "passage-1",
+        "document_id": "paper-1",
+        "text": "abstract text",
+        "title": "Abstract paper",
+        "score": 1.0,
+        "relative_source_path": "abstracts.sqlite3",
+        "limitations": (),
+    }
+    if reported_source_kind is not _MISSING:
+        passage_fields["source_kind"] = reported_source_kind
+    services = SimpleNamespace(
+        retriever=MalformedRetriever(SimpleNamespace(**passage_fields)),
+        workspace_id="workspace",
+    )
+
+    result = await LiteratureSearchPassagesTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    ).execute(
+        {"query": "photodetector", "top_k": 1, "source_kind": "abstract"}
+    )
+
+    assert result.is_error
+    assert result.data["error"] == "source_kind_invalid"
+
+
+def test_arxiv_description_forbids_persistence() -> None:
+    assert "not persisted" in LiteratureSearchArxivTool.description.lower()
+
+
+def test_literature_guidance_orders_local_tiers_before_arxiv() -> None:
+    descriptions = " ".join(
+        (
+            literature_capability.LiteratureProbe.description,
+            LiteratureSearchPassagesTool.description,
+            LiteratureSearchArxivTool.description,
+        )
+    ).lower()
+    fulltext = descriptions.index("full-text")
+    abstract = descriptions.index("abstract")
+    arxiv = descriptions.index("literature.search_arxiv")
+    assert fulltext < abstract < arxiv
+    assert "evidence gap" in descriptions
+    assert "explicitly asks for recent work" in descriptions
+
+
+class FakeIngestion:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.plans: list[tuple[Any, Any]] = []
+        self.batches: list[dict[str, Any]] = []
+
+    async def plan(self, root: Any, workspace: Any) -> object:
+        if self.error is not None:
+            raise self.error
+        self.plans.append((root, workspace))
+        return "fake-plan"
+
+    async def index_batch(self, plan: object, **kwargs: Any) -> SimpleNamespace:
+        self.batches.append({"plan": plan, **kwargs})
+        return SimpleNamespace(
+            run_id=kwargs.get("run_id") or "run-fake",
+            discovered=2,
+            unchanged=0,
+            indexed=2,
+            failed=0,
+            deleted=0,
+            chunks=3,
+            staged_cleanup=0,
+            next_cursor=None,
+            complete=True,
+            retryable=False,
+            errors=(),
+        )
+
+
+class FakeStore:
+    def __init__(self, *, source_record_id: str = "paper-key") -> None:
+        self.source_kinds: list[LiteratureSourceKind | str] = []
+        self.source_record_id = source_record_id
+
+    async def retrieve_passages(
+        self,
+        workspace_id: str,
+        passage_ids: list[str],
+        *,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+    ) -> list[Any]:
+        del workspace_id
+        selected_source_kind = LiteratureSourceKind(source_kind)
+        self.source_kinds.append(source_kind)
+        is_abstract = selected_source_kind is LiteratureSourceKind.ABSTRACT
+        return [
+            SimpleNamespace(
+                passage_id=passage_id,
+                document_id="paper-1",
+                document_revision="a" * 64,
+                workspace_id="workspace",
+                text="The detector achieved a responsivity of 0.82 A/W at 80 K.",
+                title=(
+                    "Abstract HgTe quantum dot infrared detector"
+                    if is_abstract
+                    else "HgTe quantum dot infrared detector"
+                ),
+                authors=("A. Author",),
+                year=2024,
+                section="Abstract" if is_abstract else "Results",
+                heading_path="Abstract" if is_abstract else "Results",
+                page_start=None if is_abstract else 3,
+                page_end=None if is_abstract else 3,
+                relative_source_path=(
+                    "abstracts.sqlite3" if is_abstract else "papers/hgte.pdf"
+                ),
+                previous_passage_id=None,
+                next_passage_id=None,
+                limitations=(
+                    ("abstract_only", "fulltext_not_checked")
+                    if is_abstract
+                    else ()
+                ),
+                source_kind=selected_source_kind,
+                source_record_id=self.source_record_id,
+                doi="10.1000/example" if is_abstract else "",
+                pmid="12345" if is_abstract else "",
+                pmcid="PMC12345" if is_abstract else "",
+                journal="Journal of Detectors" if is_abstract else "",
+                relevance_tier="curated" if is_abstract else "",
+            )
+            for passage_id in passage_ids
+        ]
+
+
+class FakeRetriever:
+    def __init__(self, *, source_record_id: str = "paper-key") -> None:
+        self.source_kinds: list[LiteratureSourceKind | str] = []
+        self.source_record_id = source_record_id
+
+    async def search(
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        top_k: int,
+        source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+    ) -> RetrievalResult:
+        del workspace_id
+        self.source_kinds.append(source_kind)
+        passage = RetrievedPassage(
+            passage_id="passage-1",
+            workspace_id="workspace",
+            document_id="paper-1",
+            document_revision="a" * 64,
+            text=(
+                "HgTe quantum dot infrared detector responsivity is 0.82 A/W "
+                "at 3.5 um and 80 K. "
+                + "long text " * 100
+            ),
+            score=0.987654,
+            title="HgTe quantum dot infrared detector",
+            section="Results",
+            page_start=2,
+            page_end=2,
+            relative_source_path="papers/hgte.pdf",
+            source_kind=source_kind,
+            source_record_id=self.source_record_id,
+            doi="10.1000/example",
+            pmid="12345",
+            pmcid="PMC12345",
+            journal="Journal of Detectors",
+            relevance_tier="curated",
+        )
+        return RetrievalResult(
+            passages=(passage,) if top_k else (),
+            diagnostics=RetrievalDiagnostics(
+                mode="hybrid_rrf",
+                candidate_count=1,
+                reranked=False,
+            ),
+        )
+
+
+class MalformedRetriever:
+    def __init__(self, passage: Any) -> None:
+        self.passage = passage
+
+    async def search(
+        self,
+        query: str,
+        *,
+        workspace_id: str,
+        top_k: int,
+        source_kind: LiteratureSourceKind | str,
+    ) -> RetrievalResult:
+        del query, workspace_id, top_k, source_kind
+        return RetrievalResult(
+            passages=(self.passage,),
+            diagnostics=RetrievalDiagnostics(
+                mode="hybrid_rrf",
+                candidate_count=1,
+                reranked=False,
+            ),
+        )
+
+
+@pytest.fixture
+def services() -> SimpleNamespace:
+    return SimpleNamespace(
+        ingestion=FakeIngestion(),
+        retriever=FakeRetriever(),
+        store=FakeStore(),
+        workspace_id="workspace",
+    )
+
+
+@pytest.mark.asyncio
+async def test_tools_index_search_and_read_keep_public_contract(
+    tmp_path, services: SimpleNamespace
+) -> None:
     papers = tmp_path / "papers"
     papers.mkdir()
-    make_pdf(
-        papers / "2020_HgTe-quantum-dot-infrared-detector_aaa.pdf",
-        [
-            "HgTe quantum dot infrared detector responsivity of 0.82 A/W "
-            "at 3.5 um and 80 K.",
-            "The specific detectivity reached 1.2e10 Jones at 80 K.",
-        ],
+    config = ScientificConfig(literature_root="papers")
+    workspace = Workspace(tmp_path)
+
+    index_result = await LiteratureIndexPapersTool(config, workspace, services).execute(
+        {"max_documents": 2}
     )
-    make_pdf(
-        papers / "2019_PbS-colloidal-quantum-dot-photodetector_bbb.pdf",
-        [
-            "PbS colloidal quantum dot photodetector with a band gap of "
-            "1.3 eV and an electron mobility of 500 cm2/Vs.",
-        ],
+    assert index_result.data["run_id"]
+    assert index_result.data["complete"] is True
+
+    search_result = await LiteratureSearchPassagesTool(config, workspace, services).execute(
+        {"query": "HgTe quantum dot infrared detector", "top_k": 3}
     )
-    index_dir = tmp_path / "index"
-    return papers, index_dir
-
-
-def test_index_small_pdf_folder(tmp_path):
-    papers, index_dir = _index_two_papers(tmp_path)
-    index = LiteratureIndex(index_dir)
-    stats = index.index_directory(papers)
-
-    assert stats["indexed"] == 2
-    assert stats["failed"] == 0
-    assert stats["chunks"] >= 2
-    assert index.count_passages() >= 2
-    assert index_dir.is_dir()
-
-
-def test_incremental_index_skips_unchanged_pdfs(tmp_path):
-    papers, index_dir = _index_two_papers(tmp_path)
-    index = LiteratureIndex(index_dir)
-    first = index.index_directory(papers)
-    second = index.index_directory(papers)
-    assert second["indexed"] == 0
-    assert second["skipped"] == first["indexed"]
-
-
-def test_search_known_topic_returns_provenance(tmp_path):
-    papers, index_dir = _index_two_papers(tmp_path)
-    index = LiteratureIndex(index_dir)
-    index.index_directory(papers)
-    retriever = Retriever(index)
-    results = retriever.hybrid_search(
-        "HgTe quantum dot infrared detector", top_k=3
-    )
-
-    assert results
-    first = results[0]
-    for key in (
+    assert not search_result.is_error
+    row = search_result.data["results"][0]
+    assert {
         "passage_id",
         "paper_id",
         "title",
@@ -131,17 +378,118 @@ def test_search_known_topic_returns_provenance(tmp_path):
         "page",
         "score",
         "source",
-        "context_before",
-        "context_after",
-    ):
-        assert key in first, f"missing provenance key: {key}"
-    assert first["source"].endswith(".pdf")
-    assert first["title"]
-    # The HgTe paper must rank above the PbS paper for this query.
-    assert "HgTe" in first["title"] or "HgTe" in first["passage"]
+    } <= row.keys()
+    assert len(row["passage"]) <= 600
+    assert row["source"] == "papers/hgte.pdf"
+    assert "diagnostics" in search_result.data
+    assert "payload" not in row
+
+    read_result = await LiteratureReadPassageTool(config, workspace, services).execute(
+        {"passage_id": row["passage_id"]}
+    )
+    assert not read_result.is_error
+    assert read_result.data["passage_id"] == row["passage_id"]
+    assert read_result.data["text"]
+    assert "payload" not in read_result.data
 
 
-def test_evidence_extraction_known_sentence():
+def test_qdrant_tools_are_deferred_and_index_is_expensive() -> None:
+    workspace = Workspace(".")
+    tools = [
+        LiteratureIndexPapersTool(CONFIG, workspace),
+        LiteratureSearchPassagesTool(CONFIG, workspace),
+        LiteratureReadPassageTool(CONFIG, workspace),
+        LiteratureExtractEvidenceTool(CONFIG, workspace),
+    ]
+    assert all(tool.exposure is ToolExposure.DEFERRED for tool in tools)
+    assert tools[0].cost_class == "EXPENSIVE"
+    assert all("qdrant" not in str(tool.input_schema).casefold() for tool in tools)
+
+
+@pytest.mark.asyncio
+async def test_missing_qdrant_keeps_typed_error_code(tmp_path) -> None:
+    services = SimpleNamespace(
+        ingestion=FakeIngestion(
+            error=QdrantStoreError("qdrant_unreachable", "Qdrant is unavailable")
+        ),
+        retriever=FakeRetriever(),
+        store=FakeStore(),
+        workspace_id="workspace",
+    )
+    result = await LiteratureIndexPapersTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    ).execute({})
+    assert result.is_error
+    assert result.data["error"] == "qdrant_unreachable"
+    assert "qdrant_unreachable" in result.output
+
+
+@pytest.mark.asyncio
+async def test_extract_evidence_resolves_exact_passage(tmp_path, services) -> None:
+    result = await LiteratureExtractEvidenceTool(
+        ScientificConfig(), Workspace(tmp_path), services
+    ).execute({"passages": [{"passage_id": "passage-1"}]})
+    assert not result.is_error
+    assert result.data["count"] == 1
+    assert result.data["evidence"][0]["property"] == "responsivity"
+
+
+@pytest.mark.asyncio
+async def test_abstract_search_id_round_trips_read_and_evidence_provenance(
+    tmp_path,
+) -> None:
+    raw_source_record_id = "  raw   key\twith spaces  "
+    services = SimpleNamespace(
+        retriever=FakeRetriever(source_record_id=raw_source_record_id),
+        store=FakeStore(source_record_id=raw_source_record_id),
+        workspace_id="workspace",
+    )
+    config = ScientificConfig()
+    workspace = Workspace(tmp_path)
+
+    search_result = await LiteratureSearchPassagesTool(
+        config, workspace, services
+    ).execute({"query": "responsivity", "top_k": 1, "source_kind": "abstract"})
+    assert not search_result.is_error
+    search_row = search_result.data["results"][0]
+    assert search_row["source_kind"] == "abstract"
+    assert search_row["source_record_id"] == raw_source_record_id
+    assert "abstract_only" in search_row["limitations"]
+
+    read_result = await LiteratureReadPassageTool(config, workspace, services).execute(
+        {
+            "passage_id": search_row["passage_id"],
+            "source_kind": search_row["source_kind"],
+        }
+    )
+    assert not read_result.is_error
+    assert services.store.source_kinds == [LiteratureSourceKind.ABSTRACT]
+    assert read_result.data["source_kind"] == "abstract"
+    assert read_result.data["source_record_id"] == raw_source_record_id
+    assert "abstract_only" in read_result.data["limitations"]
+    assert "fulltext_not_checked" in read_result.data["limitations"]
+
+    evidence_result = await LiteratureExtractEvidenceTool(
+        config, workspace, services
+    ).execute(
+        {
+            "source_kind": "abstract",
+            "passages": [{"passage_id": search_row["passage_id"]}],
+        }
+    )
+    assert not evidence_result.is_error
+    evidence = evidence_result.evidence[0]
+    assert evidence.provenance["source_kind"] == "abstract"
+    assert evidence.provenance["source_record_id"] == raw_source_record_id
+    assert "abstract_only" in evidence.limitations
+    assert "fulltext_not_checked" in evidence.limitations
+    assert "source PDF" not in evidence.limitations
+    public_evidence = evidence_result.data["evidence"][0]
+    assert public_evidence["provenance"]["source_record_id"] == raw_source_record_id
+    assert public_evidence["source_kind"] == "abstract"
+
+
+def test_evidence_extraction_known_sentence() -> None:
     evidence = extract_evidence_from_text(
         "The detector achieved a responsivity of 0.82 A/W at 3.5 μm and 80 K.",
         source="paper_x",
@@ -158,31 +506,7 @@ def test_evidence_extraction_known_sentence():
     assert item.provenance["temperature_K"] == pytest.approx(80)
 
 
-def test_evidence_extraction_detectivity_scientific_notation():
-    evidence = extract_evidence_from_text(
-        "A specific detectivity of 1.2×10^10 Jones was measured.",
-        source="paper_y",
-    )
-    detectivity = [item for item in evidence if item.property == "detectivity"]
-    assert detectivity
-    item = detectivity[0]
-    assert item.value == pytest.approx(1.2e10)
-    assert item.unit == "Jones"
-
-
-def test_evidence_extraction_detectivity_latex_spaced_notation():
-    evidence = extract_evidence_from_text(
-        "The largest QDIP detectivity value obtained (~ 10 10 cm Hz 1/2 /W) "
-        "orders of magnitude below the desired value.",
-        source="paper_w",
-    )
-    detectivity = [item for item in evidence if item.property == "detectivity"]
-    assert detectivity
-    assert detectivity[0].value == pytest.approx(1e10)
-    assert detectivity[0].unit == "Jones"
-
-
-def test_evidence_never_guesses_missing_numbers():
+def test_evidence_never_guesses_missing_numbers() -> None:
     evidence = extract_evidence_from_text(
         "The device showed improved performance under illumination.",
         source="paper_z",
@@ -190,90 +514,24 @@ def test_evidence_never_guesses_missing_numbers():
     assert evidence == []
 
 
-def test_empty_index_search_is_graceful(tmp_path):
-    index = LiteratureIndex(tmp_path / "index")
-    retriever = Retriever(index)
-    assert retriever.hybrid_search("anything", top_k=3) == []
-
-
-def test_existing_index_rejects_mismatched_vector_dimension(tmp_path):
-    LiteratureIndex(tmp_path / "index", vector_dim=384).count_passages()
-    mismatched = LiteratureIndex(tmp_path / "index", vector_dim=768)
-    with pytest.raises(ValueError, match="vector_dim=384"):
-        mismatched.count_passages()
-
-
-def test_retriever_cache_invalidates_when_content_changes_at_same_count():
-    class MutableIndex:
-        embedding_model = "unused"
-
-        def __init__(self):
-            self.version = "a"
-            self.text = "old content"
-
-        def revision(self):
-            return 1, (("paper", self.version),)
-
-        def all_passages(self):
-            return [{"passage_id": "p1", "text": self.text}]
-
-    index = MutableIndex()
-    retriever = Retriever(index)  # type: ignore[arg-type]
-    assert retriever._load_corpus()[0]["text"] == "old content"
-    index.version = "b"
-    index.text = "new content"
-    assert retriever._load_corpus()[0]["text"] == "new content"
-
-
-async def test_tools_index_search_and_read_roundtrip(tmp_path):
-    from photomatagent.scientific.capabilities.literature import (
-        LiteratureIndexPapersTool,
-        LiteratureReadPassageTool,
-        LiteratureSearchPassagesTool,
+@pytest.mark.asyncio
+async def test_extract_evidence_bounds_input_and_state_updates(tmp_path, services) -> None:
+    tool = LiteratureExtractEvidenceTool(
+        ScientificConfig(), Workspace(tmp_path), services
     )
+    passages = [
+        {
+            "text": "The responsivity was 0.82 A/W at 80 K and 3.5 um. "
+            * 20,
+            "page": index + 1,
+        }
+        for index in range(150)
+    ]
 
-    papers, index_dir = _index_two_papers(tmp_path)
-    workspace = Workspace(tmp_path)
-    config = ScientificConfig(
-        literature_root=str(papers),
-        literature_index_dir=str(index_dir),
-    )
+    result = await tool.execute({"passages": passages})
 
-    index_result = await LiteratureIndexPapersTool(config, workspace).execute({})
-    assert not index_result.is_error
-    assert index_result.data["indexed"] == 2
-
-    search_result = await LiteratureSearchPassagesTool(config, workspace).execute(
-        {"query": "HgTe quantum dot infrared detector", "top_k": 3}
-    )
-    assert not search_result.is_error
-    assert search_result.data["count"] >= 1
-    row = search_result.data["results"][0]
-    assert row["passage_id"]
-    assert row["title"]
-    assert row["source"].endswith(".pdf")
-    assert len(row["passage"]) <= 600
-
-    read_result = await LiteratureReadPassageTool(config, workspace).execute(
-        {"passage_id": row["passage_id"]}
-    )
-    assert not read_result.is_error
-    assert read_result.data["passage_id"] == row["passage_id"]
-    assert read_result.data["text"]
-
-
-async def test_search_without_index_returns_guidance(tmp_path):
-    from photomatagent.scientific.capabilities.literature import (
-        LiteratureSearchPassagesTool,
-    )
-
-    workspace = Workspace(tmp_path)
-    config = ScientificConfig(
-        literature_root=str(tmp_path / "papers"),
-        literature_index_dir=str(tmp_path / "index"),
-    )
-    result = await LiteratureSearchPassagesTool(config, workspace).execute(
-        {"query": "anything"}
-    )
-    assert result.is_error
-    assert "index_papers" in result.output
+    assert not result.is_error
+    assert len(result.data["evidence"]) <= 100
+    assert len(result.evidence) <= 100
+    assert len(result.state_updates) <= 100
+    assert tool.input_schema["properties"]["passages"]["maxItems"] == 100

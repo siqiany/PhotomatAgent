@@ -54,11 +54,13 @@
     },
     {
       "path": "data/photoelectric_vae/training/raw/jarvis_dft2d_2022.zip",
+      "availability": "external_source",
       "size": 8394653,
       "sha256": "eb38d5d16c15e8b9afeef964a47dd6434d2770fc601c21eab35b354ac2b06914"
     },
     {
       "path": "data/photoelectric_vae/training/raw/jarvis_dft3d_2025.zip",
+      "availability": "external_source",
       "size": 48447610,
       "sha256": "f9e0a3309f0000d5de1ec9e49c93963109ea45e63f451103f8f6595d2eabf7f5"
     }

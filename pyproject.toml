@@ -30,8 +30,7 @@ literature = [
     "arxiv>=2.1",
     "pypdf>=4.0",
     "docling>=2.0",
-    "lancedb>=0.15",
-    "pylance>=0.20",
+    "qdrant-client>=1.19,<2",
     "sentence-transformers>=3.0",
     # Direct torch pins so the CPU-only index below actually applies (uv
     # ignores index sources for purely transitive deps).

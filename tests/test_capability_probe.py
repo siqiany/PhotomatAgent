@@ -2,11 +2,128 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
+import sys
+from types import SimpleNamespace
+
+import pytest
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
+from photomatagent.scientific.capabilities.literature import LiteratureProbe
+from photomatagent.scientific.capabilities.literature.qdrant_store import (
+    CollectionGeneration,
+    QdrantStoreError,
+    collection_fingerprint,
+)
+from photomatagent.scientific.capabilities.literature.providers.factory import (
+    build_embedding_provider,
+)
+from photomatagent.scientific.capabilities.literature.providers.base import ModelIdentity
 from photomatagent.scientific.capabilities.status import probe_all_capabilities
 from photomatagent.workspace import Workspace
+
+
+class _ProbeClient:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def get_collections(self):
+        return SimpleNamespace(collections=[])
+
+    def get_aliases(self):
+        return SimpleNamespace(
+            aliases=[
+                SimpleNamespace(
+                    alias_name="photomat_literature_documents_current",
+                    collection_name="photomat_literature_documents_123456789abc",
+                ),
+                SimpleNamespace(
+                    alias_name="photomat_literature_passages_current",
+                    collection_name="photomat_literature_passages_123456789abc",
+                ),
+            ]
+        )
+
+    def get_collection_aliases(self, *args, **kwargs):
+        del args, kwargs
+        return self.get_aliases()
+
+    def info(self):
+        return SimpleNamespace(version="1.18.2")
+
+    def close(self):
+        return None
+
+
+def _patch_probe_client(monkeypatch):
+    import qdrant_client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", _ProbeClient)
+
+
+def _ready_generation(
+    config: ScientificConfig, *, identity: ModelIdentity | None = None
+) -> CollectionGeneration:
+    embedding_identity = (
+        identity if identity is not None else build_embedding_provider(config).identity
+    )
+    fingerprint = collection_fingerprint(
+        embedding_identity,
+        1,
+        prefix=config.qdrant_collection_prefix,
+    )
+    return CollectionGeneration(
+        fingerprint=fingerprint,
+        documents_physical=(
+            f"{config.qdrant_collection_prefix}_documents_{fingerprint[:12]}"
+        ),
+        passages_physical=(
+            f"{config.qdrant_collection_prefix}_passages_{fingerprint[:12]}"
+        ),
+        documents_alias=f"{config.qdrant_collection_prefix}_documents_current",
+        passages_alias=f"{config.qdrant_collection_prefix}_passages_current",
+    )
+
+
+def _patch_probe_store(
+    monkeypatch,
+    config: ScientificConfig,
+    *,
+    error=None,
+    missing=False,
+    identity: ModelIdentity | None = None,
+):
+    generation = _ready_generation(config, identity=identity)
+    calls: list[str] = []
+
+    class FakeStore:
+        prefix = config.qdrant_collection_prefix
+        sparse_model = "qdrant/bm25"
+
+        async def resolve_current_generation(self):
+            calls.append("resolve")
+            if error is not None:
+                raise error
+            return None if missing else generation
+
+        async def validate_current_generation(self, expected_fingerprint):
+            calls.append(f"validate:{expected_fingerprint}")
+            if error is not None:
+                raise error
+            assert expected_fingerprint == generation.fingerprint
+
+    class FakeStoreFactory:
+        @classmethod
+        def from_config(cls, config):
+            del config
+            return FakeStore()
+
+    qdrant_store_module = __import__(
+        "photomatagent.scientific.capabilities.literature.qdrant_store",
+        fromlist=["QdrantLiteratureStore"],
+    )
+    monkeypatch.setattr(qdrant_store_module, "QdrantLiteratureStore", FakeStoreFactory)
+    return calls
 
 
 def test_all_probes_report_without_raising(tmp_path):
@@ -73,7 +190,7 @@ def test_existing_env_wins_over_workspace_dotenv(tmp_path, monkeypatch):
 
 
 def test_embedding_vector_dimension_from_environment(tmp_path, monkeypatch):
-    monkeypatch.setenv("PHOTOMATAGENT_EMBEDDING_VECTOR_DIM", "768")
+    monkeypatch.setenv("PHOTOMATAGENT_RAG_EMBEDDING_VECTOR_DIM", "768")
     config = ScientificConfig.from_environment(workspace=tmp_path)
     assert config.embedding_vector_dim == 768
 
@@ -110,3 +227,252 @@ def test_structure_pack_tools_are_deferred(tmp_path):
         "structure.convert",
     }
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in structure_tools)
+
+
+def test_effective_mass_reports_typed_missing_dependency(tmp_path, monkeypatch):
+    from photomatagent.scientific.capabilities.electronic import (
+        ElectronicEffectiveMassTool,
+    )
+
+    vasprun = tmp_path / "vasprun.xml"
+    vasprun.write_text("synthetic", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "effmass", None)
+
+    result = asyncio.run(
+        ElectronicEffectiveMassTool(Workspace(tmp_path)).execute(
+            {"path": "vasprun.xml", "carrier": "electron"}
+        )
+    )
+
+    assert result.is_error
+    assert result.data["error"] == "MISSING_DEPENDENCY"
+    assert result.data["dependency"] == "effmass"
+
+
+def test_literature_tools_remain_deferred_when_qdrant_is_unavailable(tmp_path):
+    from photomatagent.scientific.capabilities.literature import literature_pack
+    from photomatagent.tools.exposure import ToolExposure
+
+    pack = literature_pack(
+        ScientificConfig.from_environment(workspace=tmp_path), Workspace(tmp_path)
+    )
+    names = {tool.name for tool in pack.tools()}
+    assert {
+        "literature.index_papers",
+        "literature.search_passages",
+        "literature.read_passage",
+        "literature.extract_evidence",
+    } <= names
+    assert all(tool.exposure is ToolExposure.DEFERRED for tool in pack.tools())
+
+
+def test_literature_probe_rejects_incomplete_external_provider_config(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(
+        literature_root="dataset/paper",
+        embedding_provider="openai_compatible",
+        embedding_model="embedding-test",
+        embedding_base_url="",
+        embedding_api_key_env="MISSING_EMBEDDING_KEY",
+        rag_allow_external=True,
+    )
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value in {"UNCONFIGURED", "ERROR"}
+    assert "available" not in result.detail.casefold()
+    assert "missing" in result.detail.casefold() or "base" in result.detail.casefold()
+
+
+@pytest.mark.parametrize("provider", ["embedding", "reranker"])
+def test_literature_probe_rejects_invalid_external_base_url(
+    tmp_path, monkeypatch, provider
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    if provider == "embedding":
+        monkeypatch.setenv("EMBEDDING_KEY", "secret-value")
+        config = ScientificConfig(
+            literature_root="dataset/paper",
+            rag_allow_external=True,
+            embedding_provider="openai_compatible",
+            embedding_model="embedding-test",
+            embedding_vector_dim=384,
+            embedding_base_url="not-a-url",
+            embedding_api_key_env="EMBEDDING_KEY",
+        )
+        identity = ModelIdentity(
+            provider="openai_compatible",
+            model=config.embedding_model,
+            dimension=config.embedding_vector_dim,
+            normalize=False,
+        )
+        _patch_probe_store(monkeypatch, config, identity=identity)
+    else:
+        monkeypatch.setenv("RERANKER_KEY", "secret-value")
+        config = ScientificConfig(
+            literature_root="dataset/paper",
+            rag_allow_external=True,
+            reranker_provider="cohere_compatible",
+            reranker_model="reranker-test",
+            reranker_base_url="not-a-url",
+            reranker_api_key_env="RERANKER_KEY",
+        )
+        _patch_probe_store(monkeypatch, config)
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value in {"UNCONFIGURED", "ERROR"}
+    assert result.status.value != "AVAILABLE"
+    assert "external_base_url_invalid" in result.detail
+
+
+def test_literature_probe_reports_server_version_and_validates_generation(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    calls = _patch_probe_store(monkeypatch, config)
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value == "AVAILABLE"
+    assert "qdrant-server=1.18.2" in result.version
+    assert "alias" in result.detail.casefold()
+    assert "generation" in result.detail.casefold()
+    assert calls[0] == "resolve"
+    assert any(call.startswith("validate:") for call in calls)
+
+
+def test_literature_probe_keeps_qdrant_checks_when_source_root_is_missing(
+    tmp_path, monkeypatch
+):
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    result = probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert result.status.value == "UNCONFIGURED"
+    assert "source root" in result.detail.casefold()
+    assert snapshot["server_version"] == "1.18.2"
+    assert snapshot["alias_state"] == "ready"
+    assert snapshot["generation_state"].startswith("ready:")
+
+
+def test_literature_probe_marks_missing_alias_generation_unconfigured(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    calls = _patch_probe_store(monkeypatch, config, missing=True)
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value == "UNCONFIGURED"
+    assert "alias" in result.detail.casefold() or "generation" in result.detail.casefold()
+    assert calls == ["resolve"]
+
+
+@pytest.mark.parametrize("error_code", ["schema_mismatch", "model_fingerprint_mismatch"])
+def test_literature_probe_rejects_schema_or_fingerprint_mismatch(
+    tmp_path, monkeypatch, error_code
+):
+    source_root = tmp_path / "dataset" / "paper"
+    source_root.mkdir(parents=True)
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(
+        monkeypatch,
+        config,
+        error=QdrantStoreError(error_code, "invalid current generation"),
+    )
+
+    result = LiteratureProbe(config, Workspace(tmp_path)).probe()
+
+    assert result.status.value == "ERROR"
+    assert error_code in result.detail
+
+
+def test_literature_probe_keeps_qdrant_checks_when_optional_dependency_is_missing(
+    tmp_path, monkeypatch
+):
+    _patch_probe_client(monkeypatch)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+    original_import = __import__
+
+    def import_without_docling(name, *args, **kwargs):
+        if name == "docling":
+            raise ImportError("docling unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", import_without_docling)
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    result = probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert result.status.value == "MISSING_DEPENDENCY"
+    assert "docling" in result.detail
+    assert snapshot["server_version"] == "1.18.2"
+    assert snapshot["alias_state"] == "ready"
+
+
+def test_literature_probe_keeps_alias_check_when_server_version_check_fails(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "dataset" / "paper").mkdir(parents=True)
+    class InfoFailClient(_ProbeClient):
+        def info(self):
+            raise RuntimeError("version endpoint unavailable")
+
+    import qdrant_client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", InfoFailClient)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    result = probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert result.status.value == "ERROR"
+    assert snapshot["alias_state"] == "ready"
+
+
+def test_literature_probe_reports_capacity_warning_from_server_health(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "dataset" / "paper").mkdir(parents=True)
+
+    class CapacityClient(_ProbeClient):
+        def info(self):
+            return SimpleNamespace(
+                version="1.18.2",
+                disk_total_bytes=100,
+                disk_free_bytes=5,
+            )
+
+    import qdrant_client
+
+    monkeypatch.setattr(qdrant_client, "QdrantClient", CapacityClient)
+    config = ScientificConfig(literature_root="dataset/paper")
+    _patch_probe_store(monkeypatch, config)
+
+    probe = LiteratureProbe(config, Workspace(tmp_path))
+    probe.probe()
+    snapshot = probe.status_snapshot()
+
+    assert "disk_free_bytes=5" in snapshot["capacity"]
+    assert snapshot["capacity_warning"] == "disk_free_below_10_percent"

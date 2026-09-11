@@ -74,12 +74,9 @@ class ElectronicProbe(CapabilityPack):
             )
         except ImportError:
             pass
-        try:
-            import effmass  # noqa: F401
-
-            tools.append(ElectronicEffectiveMassTool(self._workspace))
-        except ImportError:
-            pass
+        # Keep the capability discoverable when the optional dependency is
+        # unavailable; the tool reports that prerequisite at call time.
+        tools.append(ElectronicEffectiveMassTool(self._workspace))
         return tools
 
     def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
@@ -430,6 +427,19 @@ class ElectronicEffectiveMassTool(Tool):
             segments = extrema.generate_segments(settings, data)
             carrier = str(arguments["carrier"])
             method = str(arguments.get("method", "five_point_leastsq"))
+        except ImportError as exc:
+            return ScientificToolResult(
+                output=(
+                    "electronic.effective_mass requires the optional "
+                    f"'effmass' dependency: {exc}"
+                ),
+                is_error=True,
+                data={
+                    "error": "MISSING_DEPENDENCY",
+                    "dependency": "effmass",
+                    "detail": str(exc),
+                },
+            )
         except Exception as exc:
             return ScientificToolResult(
                 output=f"electronic.effective_mass failed: {type(exc).__name__}: {exc}",
