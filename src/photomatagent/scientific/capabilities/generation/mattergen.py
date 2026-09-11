@@ -291,6 +291,18 @@ class LocalIsolatedMatterGenProvider:
             normalized["structure_path"] = str(resolved)
             normalized["relative_path"] = workspace.relative(resolved)
             normalized_candidates.append(normalized)
+        if "candidate_count" in raw:
+            output_count = raw["candidate_count"]
+            if (
+                isinstance(output_count, bool)
+                or not isinstance(output_count, int)
+                or output_count != len(normalized_candidates)
+            ):
+                raise ValueError(
+                    "legacy MatterGen manifest candidate_count must match "
+                    f"the number of candidates: manifest {output_count!r}, "
+                    f"candidates {len(normalized_candidates)}"
+                )
         requested = spec.manifest_parameters()
         (
             actual,
@@ -385,7 +397,11 @@ def _legacy_manifest_parameters(
         for key in keys:
             if key in raw_run_spec:
                 sources.append((f"run_spec.{key}", raw_run_spec[key]))
-            if key in raw:
+            # ``candidate_count`` at the manifest root records the number of
+            # emitted candidates, while the run spec records the request.
+            if key in raw and not (
+                field == "candidate_count" and key == "candidate_count"
+            ):
                 sources.append((key, raw[key]))
         if not sources:
             continue

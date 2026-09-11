@@ -1097,6 +1097,58 @@ def test_legacy_mattergen_defaults_are_explicitly_marked_non_deterministic(
     assert metadata["reproducibility"]["seed_applied"] is False
 
 
+def test_legacy_mattergen_preserves_requested_and_output_counts_idempotently(
+    tmp_path,
+):
+    manifest_path = make_manifest(tmp_path)
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw["candidate_count"] = 1
+    manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+    workspace = Workspace(tmp_path)
+    provider = LocalIsolatedMatterGenProvider(workspace=workspace)
+    spec = MatterGenRunSpec(
+        output_dir=workspace.user_output_dir / "mattergen" / "legacy-counts",
+        pretrained_name="dft_band_gap",
+        candidate_count=8,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=2.0,
+        seed=42,
+    )
+
+    normalized = provider._normalize_legacy_manifest(manifest_path, spec, workspace)
+
+    assert normalized["candidate_count"] == 1
+    assert normalized["run_spec"]["candidate_count"] == 8
+    assert normalized["legacy_provenance"]["actual_run_spec"]["candidate_count"] == 8
+
+    manifest_path.write_text(json.dumps(normalized), encoding="utf-8")
+    renormalized = provider._normalize_legacy_manifest(manifest_path, spec, workspace)
+
+    assert renormalized == normalized
+
+
+def test_legacy_mattergen_rejects_output_count_mismatch(tmp_path):
+    manifest_path = make_manifest(tmp_path)
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw["candidate_count"] = 8
+    manifest_path.write_text(json.dumps(raw), encoding="utf-8")
+    workspace = Workspace(tmp_path)
+    provider = LocalIsolatedMatterGenProvider(workspace=workspace)
+    spec = MatterGenRunSpec(
+        output_dir=workspace.user_output_dir / "mattergen" / "legacy-count-mismatch",
+        pretrained_name="dft_band_gap",
+        candidate_count=8,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=2.0,
+        seed=42,
+    )
+
+    with pytest.raises(ValueError, match="candidate_count.*candidates"):
+        provider._normalize_legacy_manifest(manifest_path, spec, workspace)
+
+
 def test_legacy_mattergen_rejects_manifest_parameter_conflict(tmp_path):
     script = tmp_path / "legacy-conflict.py"
     script.write_text(
