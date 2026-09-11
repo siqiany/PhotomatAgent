@@ -112,4 +112,3 @@ Use TDD with focused tests only. Run the new CHGNet unit tests, affected
 generation/skill/registry tests, one tool-registry E2E, one real small CHGNet
 inference when installation succeeds, and a MatterGen dry-run/manifest E2E.
 Do not run the repository-wide suite or a large MatterGen generation batch.
-

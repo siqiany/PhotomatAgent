@@ -289,6 +289,7 @@ class LocalIsolatedMatterGenProvider:
                 raise ValueError("legacy MatterGen candidates must be CIF files")
             normalized = dict(candidate)
             normalized["structure_path"] = str(resolved)
+            normalized["path"] = workspace.relative(resolved)
             normalized["relative_path"] = workspace.relative(resolved)
             normalized_candidates.append(normalized)
         if "candidate_count" in raw:
@@ -619,6 +620,33 @@ class MatterGenGenerator:
                 path = path.resolve()
             if not path.is_file():
                 raise FileNotFoundError(f"generated CIF not found: {path}")
+            if self.workspace is not None and "path" in raw:
+                candidate_path = raw["path"]
+                if not isinstance(candidate_path, str) or not candidate_path.strip():
+                    raise ValueError("MatterGen candidate path must be a non-empty string")
+                candidate_path_value = Path(candidate_path).expanduser()
+                if (
+                    candidate_path_value.is_absolute()
+                    or ".." in candidate_path_value.parts
+                ):
+                    raise ValueError(
+                        "MatterGen candidate path is outside workspace: "
+                        f"{candidate_path}"
+                    )
+                try:
+                    candidate_path_resolved = self.workspace.resolve(
+                        candidate_path, must_exist=True
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        "MatterGen candidate path is outside workspace: "
+                        f"{candidate_path}"
+                    ) from exc
+                if candidate_path_resolved != path:
+                    raise ValueError(
+                        "MatterGen candidate path does not match structure_path: "
+                        f"{candidate_path}"
+                    )
             from pymatgen.core import Structure
 
             structure = Structure.from_file(path)
@@ -654,6 +682,16 @@ class MatterGenGenerator:
                     "candidate_id": lineage.candidate_id,
                     "formula": generated_formula,
                     "structure_path": str(path),
+                    "path": (
+                        self.workspace.relative(path)
+                        if self.workspace is not None
+                        else _manifest_relative_path(path, manifest_file.parent)
+                    ),
+                    "relative_path": (
+                        self.workspace.relative(path)
+                        if self.workspace is not None
+                        else _manifest_relative_path(path, manifest_file.parent)
+                    ),
                     "vae_proposed_formula": proposed_formula,
                     "vae_chemical_system": chemical_system,
                     "mattergen_generated_formula": generated_formula,
@@ -707,6 +745,15 @@ def _default_output_name(
     )
     safe = "".join(character if character.isalnum() or character in "._-" else "-" for character in system)
     return f"mg-chemical-system-{safe or 'unknown'}"
+
+
+def _manifest_relative_path(path: Path, manifest_parent: Path) -> str:
+    """Return a portable candidate path when no Workspace was supplied."""
+
+    try:
+        return path.relative_to(manifest_parent).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _validate_manifest_run_spec(

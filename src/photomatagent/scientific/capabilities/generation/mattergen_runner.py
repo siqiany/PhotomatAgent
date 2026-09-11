@@ -361,6 +361,7 @@ class MatterGenRunner:
             published = published_dir / filename
             self._validate_file_path(published, label="published candidate")
             candidate["structure_path"] = str(published)
+            candidate["path"] = self.workspace.relative(published)
             candidate["relative_path"] = self.workspace.relative(published)
 
     def _reusable_manifest(
@@ -452,6 +453,7 @@ class MatterGenRunner:
                             "candidate_id": f"mattergen-{number:04d}",
                             "archive_member": member.filename,
                             "structure_path": str(output_path),
+                            "path": self.workspace.relative(output_path),
                             "relative_path": self.workspace.relative(output_path),
                         }
                     )

@@ -1,8 +1,6 @@
 ---
 name: ml-potential-screening
 description: Screen generated or known crystal structures with CHGNet as a bounded ML-potential funnel before gated DFT; preserve evidence fidelity and composition-scoped ranking.
-category: materials
-tags: [CHGNet, machine learning potential, structure screening, relaxation]
 license: MIT
 ---
 

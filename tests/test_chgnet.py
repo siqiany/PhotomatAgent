@@ -84,6 +84,27 @@ class FakeOptimizer:
         }
 
 
+class ZeroForceModel:
+    def predict_structure(self, structure):
+        return {
+            "e": -1.0,
+            "f": [[0.0, 0.0, 0.0] for _ in range(len(structure))],
+        }
+
+
+def _write_many_atom_cif(root: Path, name: str, count: int = 33) -> str:
+    from pymatgen.core import Lattice, Structure
+
+    structure = Structure(
+        Lattice.cubic(30.0),
+        ["Na"] * count,
+        [[(index + 0.5) / count, 0.25, 0.25] for index in range(count)],
+    )
+    path = root / name
+    path.write_text(structure.to(fmt="cif"), encoding="utf-8")
+    return name
+
+
 def test_pack_probes_missing_dependency_without_raising(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "chgnet", None)
 
@@ -191,6 +212,53 @@ async def test_screen_same_composition_ranking_is_deterministic(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_screen_max_force_includes_atoms_after_observation_limit(tmp_path):
+    source = _write_many_atom_cif(tmp_path, "many.cif", count=33)
+
+    class TailForceModel:
+        def predict_structure(self, structure):
+            forces = [[0.0, 0.0, 0.0] for _ in range(len(structure))]
+            forces[-1] = [123.0, 0.0, 0.0]
+            return {"e": -1.0, "f": forces}
+
+    result = await CHGNetScreenTool(
+        ScientificConfig(), Workspace(tmp_path), model=TailForceModel()
+    ).execute({"paths": [source]})
+
+    assert not result.is_error, result.output
+    assert result.data["results"][0]["max_force_eV_A"] == pytest.approx(123.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "forces",
+    [
+        None,
+        [[0.0, 0.0, 0.0]],
+        [[0.0, 0.0]],
+        [[float("nan"), 0.0, 0.0]],
+        [[float("inf"), 0.0, 0.0]],
+    ],
+)
+async def test_screen_rejects_missing_malformed_or_nonfinite_forces(
+    tmp_path, forces
+):
+    source = _write_cif(tmp_path, "bad-force.cif")
+
+    class BadForceModel:
+        def predict_structure(self, structure):
+            return {"e": -1.0, "f": forces}
+
+    result = await CHGNetScreenTool(
+        ScientificConfig(), Workspace(tmp_path), model=BadForceModel()
+    ).execute({"paths": [source]})
+
+    assert result.is_error
+    assert result.data["error_type"] == "invalid_prediction"
+    assert "force" in result.output.casefold()
+
+
+@pytest.mark.asyncio
 async def test_relax_writes_workspace_user_output_cif_and_reports_before_after(tmp_path):
     source = _write_cif(tmp_path, "candidate.cif")
     model = FakeModel({"NaCl": -1.0})
@@ -218,6 +286,71 @@ async def test_relax_writes_workspace_user_output_cif_and_reports_before_after(t
     assert result.data["before"]["energy_eV_per_atom"] == pytest.approx(-1.0)
     assert result.data["after"]["energy_eV_per_atom"] == pytest.approx(-1.0)
     assert result.artifacts == ["user_output/chgnet/candidate_relaxed.cif"]
+
+
+@pytest.mark.asyncio
+async def test_relax_cell_requires_explicit_joint_convergence_evidence(tmp_path):
+    source = _write_cif(tmp_path, "candidate.cif")
+    result = await CHGNetRelaxTool(
+        ScientificConfig(chgnet_relax_fmax=0.05, chgnet_relax_steps=7),
+        Workspace(tmp_path),
+        model=ZeroForceModel(),
+        optimizer=FakeOptimizer(),
+    ).execute({"path": source, "fmax": 0.05, "steps": 7, "relax_cell": True})
+
+    assert not result.is_error, result.output
+    assert result.data["converged"] is None
+    assert "cell convergence unconfirmed" in result.evidence[-1].limitations.casefold()
+    provenance = result.evidence[-1].provenance
+    assert provenance["input_path"] == "candidate.cif"
+    assert provenance["output_relative_path"] == "user_output/chgnet/candidate_relaxed.cif"
+    assert provenance["fmax_eV_A"] == pytest.approx(0.05)
+    assert provenance["steps"] == 7
+    assert provenance["relax_cell"] is True
+
+
+@pytest.mark.asyncio
+async def test_relax_cell_uses_explicit_optimizer_convergence_state(tmp_path):
+    source = _write_cif(tmp_path, "candidate.cif")
+
+    class ExplicitOptimizer(FakeOptimizer):
+        def relax(self, structure, **kwargs):
+            result = super().relax(structure, **kwargs)
+            result["converged"] = True
+            return result
+
+    result = await CHGNetRelaxTool(
+        ScientificConfig(chgnet_relax_fmax=0.05),
+        Workspace(tmp_path),
+        model=ZeroForceModel(),
+        optimizer=ExplicitOptimizer(),
+    ).execute({"path": source, "fmax": 0.05, "relax_cell": True})
+
+    assert not result.is_error, result.output
+    assert result.data["converged"] is True
+
+
+@pytest.mark.asyncio
+async def test_fixed_cell_convergence_uses_unrounded_final_force(tmp_path):
+    source = _write_cif(tmp_path, "candidate.cif")
+
+    class NearThresholdModel:
+        def predict_structure(self, structure):
+            return {
+                "e": -1.0,
+                "f": [[0.050000004, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            }
+
+    result = await CHGNetRelaxTool(
+        ScientificConfig(chgnet_relax_fmax=0.05),
+        Workspace(tmp_path),
+        model=NearThresholdModel(),
+        optimizer=FakeOptimizer(),
+    ).execute({"path": source, "fmax": 0.05, "relax_cell": False})
+
+    assert not result.is_error, result.output
+    assert result.data["after"]["max_force_eV_A"] > 0.05
+    assert result.data["converged"] is False
 
 
 def test_config_exposes_bounded_chgnet_defaults_and_environment_overrides(

@@ -477,6 +477,51 @@ def test_mattergen_lineage_uses_manifest_run_spec(tmp_path):
     assert generation_parameters["seed"] == 7
 
 
+@pytest.mark.asyncio
+async def test_mattergen_candidate_keeps_relative_path_for_chgnet_funnel(tmp_path):
+    from photomatagent.scientific.capabilities.chgnet import CHGNetScreenTool
+
+    workspace = Workspace(tmp_path)
+    manifest = make_manifest(tmp_path)
+    candidates, _ = MatterGenGenerator(workspace=workspace).generate(
+        target_band_gap_eV=0.5,
+        manifest_path=manifest,
+    )
+
+    candidate = candidates[0]
+    artifact = Path(candidate["structure_path"])
+    assert artifact.is_absolute()
+    assert candidate["path"] == "0001.cif"
+    assert workspace.resolve(candidate["path"], must_exist=True) == artifact
+
+    class ScreenModel:
+        def predict_structure(self, structure):
+            return {
+                "e": -1.0,
+                "f": [[0.0, 0.0, 0.0] for _ in range(len(structure))],
+            }
+
+    screen_result = await CHGNetScreenTool(
+        ScientificConfig(), workspace, model=ScreenModel()
+    ).execute({"paths": [candidate["path"]]})
+    assert not screen_result.is_error, screen_result.output
+    assert screen_result.data["results"][0]["path"] == candidate["path"]
+
+
+def test_mattergen_rejects_candidate_relative_path_escape(tmp_path):
+    workspace = Workspace(tmp_path)
+    manifest = make_manifest(tmp_path)
+    raw = json.loads(manifest.read_text(encoding="utf-8"))
+    raw["candidates"][0]["path"] = "../outside.cif"
+    manifest.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate path.*outside workspace"):
+        MatterGenGenerator(workspace=workspace).generate(
+            target_band_gap_eV=0.5,
+            manifest_path=manifest,
+        )
+
+
 def test_composition_distance_zero_for_same_formula():
     assert composition_distance("NaCl", "NaCl") == 0.0
     assert composition_distance("HgTe", "NaCl") > 0.0

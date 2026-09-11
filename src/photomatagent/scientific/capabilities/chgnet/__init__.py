@@ -50,6 +50,10 @@ OptimizerFactory = Callable[..., Any]
 Row = TypeVar("Row", bound=Mapping[str, Any])
 
 
+class CHGNetPredictionError(ValueError):
+    """Raised when a prediction cannot support a trustworthy force summary."""
+
+
 class CHGNetCapabilityPack(CapabilityPack):
     """Capability-pack owner for the two CHGNet deferred tools."""
 
@@ -128,10 +132,11 @@ def _load_chgnet_model(config: ScientificConfig) -> Any:
     except ImportError:
         from chgnet.model.model import CHGNet
 
+    load_model: Any = getattr(CHGNet, "load")
     try:
-        model = CHGNet.load(model_name=config.chgnet_model_name)
+        model = load_model(model_name=config.chgnet_model_name)
     except TypeError:
-        model = CHGNet.load(config.chgnet_model_name)
+        model = load_model(config.chgnet_model_name)
     to = getattr(model, "to", None)
     if callable(to):
         moved = to(config.chgnet_device)
@@ -292,6 +297,12 @@ class CHGNetScreenTool(_CHGNetTool):
                 )
             _apply_same_composition_ranks(rows, enabled=rank)
         except Exception as exc:
+            if isinstance(exc, CHGNetPredictionError):
+                return self._error(
+                    f"chgnet.screen invalid prediction: {exc}",
+                    error_type="invalid_prediction",
+                    details={"error": "INVALID_PREDICTION"},
+                )
             if isinstance(exc, ImportError):
                 return self._error(
                     "chgnet.screen missing dependency: install photomatagent[chgnet]",
@@ -443,6 +454,7 @@ class CHGNetRelaxTool(_CHGNetTool):
                 error_type="invalid_input",
             )
 
+        output_relative = self._workspace.relative(output_path)
         try:
             model = self._get_model()
             before_prediction = _predict_structure(model, structure)
@@ -461,26 +473,44 @@ class CHGNetRelaxTool(_CHGNetTool):
                 steps=steps,
                 relax_cell=relax_cell,
             )
+            joint_convergence = _explicit_joint_convergence(relaxed, optimizer)
             final_structure = _final_structure(relaxed)
             after_prediction = _predict_structure(model, final_structure)
             after = _prediction_summary(
-                after_prediction, final_structure, self._workspace.relative(path)
+                after_prediction, final_structure, output_relative
             )
             cif = _structure_to_cif(final_structure)
             _atomic_write_text(output_path, cif)
         except Exception as exc:
+            if isinstance(exc, CHGNetPredictionError):
+                return self._error(
+                    f"chgnet.relax invalid prediction: {exc}",
+                    error_type="invalid_prediction",
+                    details={"error": "INVALID_PREDICTION"},
+                )
             return self._error(
                 f"chgnet.relax failed: {type(exc).__name__}: {exc}",
                 error_type="chgnet_error",
             )
 
         max_force = after.get("max_force_eV_A")
-        converged = (
-            bool(max_force is not None and float(max_force) <= fmax)
-            if max_force is not None
-            else None
-        )
-        output_relative = self._workspace.relative(output_path)
+        if relax_cell:
+            # Atomic fmax alone cannot establish convergence of the cell
+            # degrees of freedom.  Only an explicit optimizer/ASE convergence
+            # marker is accepted as joint-cell evidence.
+            converged = (
+                bool(
+                    joint_convergence
+                    and max_force is not None
+                    and float(max_force) <= fmax
+                )
+                if joint_convergence is not None
+                else None
+            )
+        else:
+            # For fixed-cell relaxation the complete finite force matrix is a
+            # sufficient convergence criterion.
+            converged = bool(max_force is not None and float(max_force) <= fmax)
         payload = {
             "input_path": self._workspace.relative(path),
             "output_path": str(output_path),
@@ -500,12 +530,26 @@ class CHGNetRelaxTool(_CHGNetTool):
                 phase="before",
                 model_name=self._config.chgnet_model_name,
                 tool_name=self.name,
+                input_path=self._workspace.relative(path),
+                output_relative_path=output_relative,
+                fmax=fmax,
+                steps=steps,
+                relax_cell=relax_cell,
+                joint_convergence=joint_convergence,
+                converged=None,
             ),
             _relax_evidence(
                 after,
                 phase="after",
                 model_name=self._config.chgnet_model_name,
                 tool_name=self.name,
+                input_path=self._workspace.relative(path),
+                output_relative_path=output_relative,
+                fmax=fmax,
+                steps=steps,
+                relax_cell=relax_cell,
+                joint_convergence=joint_convergence,
+                converged=converged,
             ),
         ]
         return ScientificToolResult(
@@ -626,17 +670,21 @@ def _prediction_summary(
         prediction, "m", "magmom", "magmoms", "magnetic_moments"
     )
     energy = _finite_scalar(energy_raw)
-    max_force = _maximum_force(force_raw)
+    try:
+        n_atoms = int(len(structure))
+    except Exception as exc:
+        raise CHGNetPredictionError(
+            "structure atom count is unavailable"
+        ) from exc
+    if n_atoms <= 0:
+        raise CHGNetPredictionError("structure must contain at least one atom")
+    max_force = _maximum_force(force_raw, expected_atoms=n_atoms)
     stress = _bounded_numeric_tree(stress_raw, MAX_SUMMARY_VALUES)
     magmom_values = _flatten_numbers(magmom_raw, MAX_SUMMARY_VALUES)
     try:
         formula = str(structure.composition.reduced_formula)
     except Exception:
         formula = ""
-    try:
-        n_atoms = int(len(structure))
-    except Exception:
-        n_atoms = None
     magmom_summary: Any
     if len(magmom_values) == 1:
         magmom_summary = magmom_values[0]
@@ -649,9 +697,11 @@ def _prediction_summary(
         "composition_group": formula,
         "n_atoms": n_atoms,
         "energy_eV_per_atom": _round_or_none(energy),
-        "max_force_eV_A": _round_or_none(max_force),
-        "max_force_eV_per_A": _round_or_none(max_force),
-        "max_force_eV_per_angstrom": _round_or_none(max_force),
+        # Keep the convergence scalar unrounded.  Display truncation must not
+        # turn a force just above fmax into a false converged result.
+        "max_force_eV_A": max_force,
+        "max_force_eV_per_A": max_force,
+        "max_force_eV_per_angstrom": max_force,
         "stress_GPa": stress,
         "magmom_mu_B": magmom_summary,
         "max_abs_magmom_mu_B": _round_or_none(
@@ -726,36 +776,98 @@ def _flatten_numbers(value: Any, limit: int = MAX_SUMMARY_VALUES) -> list[float]
     return [] if scalar is None else [scalar]
 
 
-def _maximum_force(value: Any) -> float | None:
+def _maximum_force(value: Any, *, expected_atoms: int | None = None) -> float:
+    """Return the maximum norm over every atomic force vector.
+
+    Force arrays are a scientific convergence input rather than an observation
+    payload.  They therefore must be a complete finite ``(n_atoms, 3)``
+    matrix; no display bound may truncate or silently discard rows.
+    """
+
     value = _as_python(value)
-    if value is None:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise CHGNetPredictionError(
+            "CHGNet forces are missing or are not a non-empty atomic matrix"
+        )
+    if expected_atoms is not None and len(value) != expected_atoms:
+        raise CHGNetPredictionError(
+            "CHGNet force dimensions do not match the structure atom count: "
+            f"expected ({expected_atoms}, 3), got ({len(value)}, ...)"
+        )
+
+    maximum = 0.0
+    for index, row in enumerate(value):
+        if not isinstance(row, (list, tuple)) or len(row) != 3:
+            raise CHGNetPredictionError(
+                "CHGNet force dimensions must be (n_atoms, 3); "
+                f"row {index} is invalid"
+            )
+        components: list[float] = []
+        for component in row:
+            if isinstance(component, bool):
+                raise CHGNetPredictionError(
+                    f"CHGNet force row {index} contains a non-numeric component"
+                )
+            try:
+                numeric = float(component)
+            except (TypeError, ValueError) as exc:
+                raise CHGNetPredictionError(
+                    f"CHGNet force row {index} contains a non-numeric component"
+                ) from exc
+            if not math.isfinite(numeric):
+                raise CHGNetPredictionError(
+                    f"CHGNet force row {index} contains NaN or Inf"
+                )
+            components.append(numeric)
+        norm = math.hypot(*components)
+        if not math.isfinite(norm):
+            raise CHGNetPredictionError(
+                f"CHGNet force row {index} has a non-finite norm"
+            )
+        maximum = max(maximum, norm)
+    return maximum
+
+
+def _max_force(value: Any, *, expected_atoms: int | None = None) -> float:
+    """Compatibility spelling for the complete atomic force maximum."""
+
+    return _maximum_force(value, expected_atoms=expected_atoms)
+
+
+def _explicit_joint_convergence(result: Any, optimizer: Any) -> bool | None:
+    """Read only explicit optimizer/ASE convergence markers.
+
+    CHGNet's current ``StructOptimizer.relax`` return value contains a final
+    structure and trajectory observer but no joint cell-convergence verdict.
+    In that case this returns ``None`` rather than treating atomic fmax as a
+    cell-filter convergence proof.  Small fake optimizers may expose one of
+    the explicit markers below for deterministic tests.
+    """
+
+    for source in (result, optimizer):
+        marker = _convergence_marker(source)
+        if marker is not None:
+            return marker
+    return None
+
+
+def _convergence_marker(source: Any) -> bool | None:
+    if isinstance(source, Mapping):
+        for key in ("joint_converged", "cell_converged", "converged"):
+            if key in source and isinstance(source[key], bool):
+                return source[key]
+        nested = source.get("convergence")
+        if isinstance(nested, Mapping):
+            return _convergence_marker(nested)
         return None
-    rows: list[list[float]] = []
-    if isinstance(value, (list, tuple)):
-        if value and all(
-            isinstance(item, (int, float)) and not isinstance(item, bool)
-            for item in value
-        ):
-            scalar_values = _flatten_numbers(value, 3)
-            if len(scalar_values) == 3:
-                rows.append(scalar_values)
-            elif scalar_values:
-                return max(abs(item) for item in scalar_values)
-        else:
-            for item in value[:MAX_SUMMARY_VALUES]:
-                if isinstance(item, (list, tuple)):
-                    row = _flatten_numbers(item, 3)
-                    if row:
-                        rows.append(row)
-    else:
-        scalar = _finite_scalar(value)
-        return abs(scalar) if scalar is not None else None
-    norms = [
-        math.sqrt(sum(component * component for component in row))
-        for row in rows
-        if row
-    ]
-    return max(norms, default=None)
+    for key in ("joint_converged", "cell_converged", "converged"):
+        value = getattr(source, key, None)
+        if isinstance(value, bool):
+            return value
+    nested = getattr(source, "convergence", None)
+    if isinstance(nested, Mapping):
+        return _convergence_marker(nested)
+    return None
 
 
 def _bounded_numeric_tree(value: Any, limit: int) -> Any:
@@ -852,7 +964,23 @@ def _relax_evidence(
     phase: str,
     model_name: str,
     tool_name: str,
+    input_path: str,
+    output_relative_path: str,
+    fmax: float,
+    steps: int,
+    relax_cell: bool,
+    joint_convergence: bool | None,
+    converged: bool | None,
 ) -> ScientificEvidence:
+    limitations = (
+        "ML-potential pre-relaxation only; the CIF requires downstream "
+        "DFT validation and is not a stability or detector-performance claim."
+    )
+    if relax_cell and joint_convergence is None:
+        limitations += (
+            " cell convergence unconfirmed unless an explicit optimizer/ASE "
+            "joint convergence marker was reported."
+        )
     return ScientificEvidence(
         subject=str(row.get("formula") or row.get("path") or "structure"),
         property=f"chgnet_relax_{phase}",
@@ -869,11 +997,19 @@ def _relax_evidence(
             f"CHGNet {phase} relaxation summary for "
             f"{row.get('formula', 'structure')}"
         ),
-        limitations=(
-            "ML-potential pre-relaxation only; the CIF requires downstream "
-            "DFT validation and is not a stability or detector-performance claim."
-        ),
-        provenance={"tool": tool_name, "model": model_name, "phase": phase},
+        limitations=limitations,
+        provenance={
+            "tool": tool_name,
+            "model": model_name,
+            "phase": phase,
+            "input_path": input_path,
+            "structure_path": input_path,
+            "output_relative_path": output_relative_path,
+            "fmax_eV_A": fmax,
+            "steps": steps,
+            "relax_cell": relax_cell,
+            "converged": converged,
+        },
     )
 
 
@@ -956,6 +1092,12 @@ def _final_structure(result: Any) -> Any:
                 break
         else:
             raise ValueError("optimizer result has no final structure")
+    else:
+        for key in ("final_structure", "structure", "final_atoms", "atoms"):
+            candidate = getattr(result, key, None)
+            if candidate is not None:
+                result = candidate
+                break
     try:
         from pymatgen.core import Structure
 
