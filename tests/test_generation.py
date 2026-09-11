@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +18,13 @@ from photomatagent.scientific.capabilities.generation.mattergen import (
     MatterGenGenerator,
     composition_distance,
 )
+from photomatagent.scientific.capabilities.generation.mattergen_runner import (
+    MatterGenRunSpec,
+    MatterGenRunner,
+)
+from photomatagent.scientific.capabilities.config import ScientificConfig
 from photomatagent.scientific.errors import MissingScientificPrerequisite
+from photomatagent.workspace import Workspace
 
 VOCABULARY = ["Na", "Cl", "Hg", "Te", "Pb", "O"]
 
@@ -442,8 +450,242 @@ def test_mattergen_empty_archive_fails():
 
 def test_mattergen_no_script_no_manifest_fails_cleanly():
     generator = MatterGenGenerator()
-    with pytest.raises(FileNotFoundError, match="script"):
+    with pytest.raises(FileNotFoundError, match="MatterGen"):
         generator.generate(target_band_gap_eV=0.5)
+
+
+def test_mattergen_run_spec_requires_mode_specific_conditioning(tmp_path):
+    with pytest.raises(ValueError, match="target_band_gap_eV"):
+        MatterGenRunSpec(
+            output_dir=tmp_path,
+            pretrained_name="dft_band_gap",
+            candidate_count=2,
+            target_band_gap_eV=None,
+            chemical_system=None,
+            guidance_factor=1.0,
+            seed=7,
+        )
+
+    with pytest.raises(ValueError, match="chemical_system"):
+        MatterGenRunSpec(
+            output_dir=tmp_path,
+            pretrained_name="chemical_system",
+            candidate_count=2,
+            target_band_gap_eV=None,
+            chemical_system=None,
+            guidance_factor=1.0,
+            seed=7,
+        )
+
+
+def test_mattergen_runner_builds_argv_without_shell_interpolation(tmp_path):
+    spec = MatterGenRunSpec(
+        output_dir=tmp_path / "run",
+        pretrained_name="chemical_system",
+        candidate_count=3,
+        target_band_gap_eV=None,
+        chemical_system="Na-O; touch SHOULD_NOT_RUN",
+        guidance_factor=1.25,
+        seed=17,
+    )
+    runner = MatterGenRunner(
+        executable="mattergen-generate",
+        workspace=Workspace(tmp_path),
+    )
+    command = runner.build_command(spec)
+
+    assert isinstance(command, list)
+    assert command[0] == "mattergen-generate"
+    assert str(spec.output_dir) in command
+    assert any("chemical_system" in item for item in command)
+    assert any("Na-O; touch SHOULD_NOT_RUN" in item for item in command)
+    assert all(item != "touch" for item in command)
+
+
+def test_mattergen_runner_extracts_sorted_cifs_and_reuses_manifest(
+    tmp_path, monkeypatch
+):
+    workspace = Workspace(tmp_path)
+    output_dir = workspace.user_output_dir / "mattergen" / "reuse"
+    spec = MatterGenRunSpec(
+        output_dir=output_dir,
+        pretrained_name="dft_band_gap",
+        candidate_count=4,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=2.0,
+        seed=42,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        archive = output_dir / "generated_crystals_cif.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("z-last.cif", NACL_CIF)
+            handle.writestr("a-first.cif", NACL_CIF)
+            handle.writestr("empty.cif", "")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "photomatagent.scientific.capabilities.generation.mattergen_runner.subprocess.run",
+        fake_run,
+    )
+    runner = MatterGenRunner(
+        executable="mattergen-generate",
+        workspace=workspace,
+    )
+
+    manifest_path = runner.run(spec)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(calls) == 1
+    assert [Path(row["structure_path"]).name for row in manifest["candidates"]] == [
+        "candidate-0001.cif",
+        "candidate-0002.cif",
+    ]
+    assert manifest["properties_to_condition_on"] == {"dft_band_gap": 0.5}
+    assert all(workspace.contains(Path(row["structure_path"])) for row in manifest["candidates"])
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("matching manifest should be reused")
+
+    monkeypatch.setattr(
+        "photomatagent.scientific.capabilities.generation.mattergen_runner.subprocess.run",
+        should_not_run,
+    )
+    assert runner.run(spec) == manifest_path
+
+
+def test_mattergen_runner_rejects_output_escape(tmp_path):
+    workspace = Workspace(tmp_path)
+    spec = MatterGenRunSpec(
+        output_dir=tmp_path.parent / "outside",
+        pretrained_name="dft_band_gap",
+        candidate_count=1,
+        target_band_gap_eV=0.5,
+        chemical_system=None,
+        guidance_factor=1.0,
+        seed=0,
+    )
+    with pytest.raises(ValueError, match="workspace"):
+        MatterGenRunner(workspace=workspace).run(spec)
+
+
+def test_mattergen_runner_fake_executable_e2e(tmp_path):
+    workspace = Workspace(tmp_path)
+    executable = tmp_path / "fake-mattergen"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "import zipfile\n"
+        "output = Path(sys.argv[1])\n"
+        "output.mkdir(parents=True, exist_ok=True)\n"
+        "with zipfile.ZipFile(output / 'generated_crystals_cif.zip', 'w') as archive:\n"
+        "    archive.writestr('generated/one.cif', 'data_fake\\n')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    spec = MatterGenRunSpec(
+        output_dir=workspace.user_output_dir / "mattergen" / "e2e",
+        pretrained_name="chemical_system",
+        candidate_count=1,
+        target_band_gap_eV=None,
+        chemical_system="Na-O",
+        guidance_factor=1.0,
+        seed=5,
+    )
+
+    manifest_path = MatterGenRunner(
+        executable=executable,
+        workspace=workspace,
+    ).run(spec)
+
+    assert manifest_path.is_relative_to(workspace.root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["properties_to_condition_on"] == {"chemical_system": "Na-O"}
+    assert Path(manifest["candidates"][0]["structure_path"]).is_file()
+
+
+def test_generation_capabilities_reports_configured_mattergen(tmp_path):
+    from photomatagent.scientific.capabilities.generation.tools import (
+        GenerationCapabilitiesTool,
+    )
+
+    executable = tmp_path / "mattergen-generate"
+    executable.write_text("", encoding="utf-8")
+    config = ScientificConfig(
+        mattergen_executable=str(executable),
+        mattergen_pretrained_name="chemical_system",
+        mattergen_seed=23,
+    )
+    result = asyncio.run(
+        GenerationCapabilitiesTool(config, Workspace(tmp_path)).execute({})
+    )
+
+    assert result.data["mattergen"]["status"] == "AVAILABLE"
+    assert result.data["mattergen"]["pretrained_name"] == "chemical_system"
+    assert result.data["mattergen"]["seed"] == 23
+
+
+def test_mattergen_tool_uses_isolated_executable_and_emits_evidence(tmp_path):
+    from photomatagent.scientific.capabilities.generation.tools import MatterGenTool
+
+    executable = tmp_path / "fake-mattergen-tool"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "import zipfile\n"
+        "output = Path(sys.argv[1])\n"
+        "output.mkdir(parents=True, exist_ok=True)\n"
+        "with zipfile.ZipFile(output / 'generated_crystals_cif.zip', 'w') as archive:\n"
+        f"    archive.writestr('generated/one.cif', {NACL_CIF!r})\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    workspace = Workspace(tmp_path)
+    config = ScientificConfig(
+        mattergen_executable=str(executable),
+        mattergen_candidate_limit=1,
+    )
+
+    result = asyncio.run(
+        MatterGenTool(config, workspace).execute(
+            {
+                "pretrained_name": "chemical_system",
+                "chemical_system": "Na-Cl",
+                "candidate_count": 1,
+                "seed": 11,
+            }
+        )
+    )
+
+    assert result.is_error is False
+    assert result.data["metadata"]["pretrained_name"] == "chemical_system"
+    assert result.evidence[0].source_type == "generative_model"
+    assert result.evidence[0].fidelity == "ml_generated"
+    assert result.artifacts[0].startswith("user_output/mattergen/")
+
+
+def test_mattergen_config_reads_bounded_runner_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("PHOTOMATAGENT_MATTERGEN_EXECUTABLE", "/opt/mattergen-generate")
+    monkeypatch.setenv("PHOTOMATAGENT_MATTERGEN_HF_HOME", "/opt/hf-cache")
+    monkeypatch.setenv("PHOTOMATAGENT_MATTERGEN_PRETRAINED_NAME", "chemical_system")
+    monkeypatch.setenv("PHOTOMATAGENT_MATTERGEN_CANDIDATE_LIMIT", "6")
+    monkeypatch.setenv("PHOTOMATAGENT_MATTERGEN_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("PHOTOMATAGENT_MATTERGEN_GUIDANCE_FACTOR", "1.75")
+    monkeypatch.setenv("PHOTOMATAGENT_MATTERGEN_SEED", "19")
+    config = ScientificConfig.from_environment(workspace=tmp_path)
+
+    assert config.mattergen_executable == "/opt/mattergen-generate"
+    assert config.mattergen_hf_home == "/opt/hf-cache"
+    assert config.mattergen_pretrained_name == "chemical_system"
+    assert config.mattergen_candidate_limit == 6
+    assert config.mattergen_timeout_seconds == pytest.approx(120.0)
+    assert config.mattergen_guidance_factor == pytest.approx(1.75)
+    assert config.mattergen_seed == 19
 
 
 def test_generation_tools_registered_deferred():

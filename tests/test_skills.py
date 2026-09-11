@@ -67,3 +67,30 @@ def test_native_composition_generation_skill_routes_to_vae_tool():
     assert resolved == "SKILL.md"
     assert "generation.vae_formula" in body
     assert "generation.mattergen" in body
+    assert "chgnet.screen" in body
+    assert "chgnet.relax" in body
+    assert "vasp" in body.lower()
+
+
+def test_native_infrared_skill_routes_through_mattergen_chgnet_and_vasp():
+    loader = SkillLoader()
+    body, _ = loader.view("infrared-material-screening")
+    for marker in ("generation.mattergen", "chgnet.screen", "chgnet.relax", "VASP"):
+        assert marker in body
+    assert "UNVALIDATED_GENERATED_STRUCTURE" in body
+
+
+def test_ml_potential_skill_has_evidence_hierarchy_and_funnel():
+    loader = SkillLoader()
+    body, resolved = loader.view("ml-potential-screening")
+    assert resolved == "SKILL.md"
+    for marker in (
+        "generation.mattergen",
+        "chgnet.screen",
+        "chgnet.relax",
+        "VASP",
+        "ml_interatomic_potential",
+        "ml_potential",
+        "UNVALIDATED_GENERATED_STRUCTURE",
+    ):
+        assert marker in body

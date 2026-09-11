@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 from pathlib import Path
-from typing import Any, IO, Iterable, Mapping
+from typing import Any, IO, Iterable, Literal, Mapping, cast
 
 from photomatagent.scientific.capabilities.base import (
     CapabilityPack,
@@ -23,9 +24,14 @@ from photomatagent.scientific.capabilities.generation.mattergen import (
     LocalIsolatedMatterGenProvider,
     MatterGenGenerator,
 )
+from photomatagent.scientific.capabilities.generation.mattergen_runner import (
+    MatterGenRunner,
+)
+from photomatagent.scientific.capabilities.config import ScientificConfig
 from photomatagent.scientific.errors import MissingScientificPrerequisite
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
+from photomatagent.workspace import Workspace
 
 UNSUPPORTED_DEVICE_PROPERTIES = {
     "responsivity",
@@ -70,8 +76,13 @@ class GenerationCapabilitiesTool(Tool):
     cost_class = "CHEAP"
     input_schema: dict[str, Any] = {"type": "object", "properties": {}}
 
-    def __init__(self, config: Any = None) -> None:
+    def __init__(
+        self,
+        config: ScientificConfig | None = None,
+        workspace: Workspace | None = None,
+    ) -> None:
         self.config = config
+        self.workspace = workspace
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         torch_available = importlib.util.find_spec("torch") is not None
@@ -96,7 +107,16 @@ class GenerationCapabilitiesTool(Tool):
             vae_detail = (
                 f"checkpoint: {vae_checkpoint}; novelty metadata: {vae_metadata}"
             )
+        config = self.config or ScientificConfig()
         mattergen_script = _env("MATTERGEN_SKILL_SCRIPT")
+        legacy_script_path = (
+            str(Path(mattergen_script).expanduser().resolve())
+            if mattergen_script and Path(mattergen_script).expanduser().is_file()
+            else None
+        )
+        mattergen_executable = config.mattergen_executable
+        executable_path = _mattergen_executable_path(mattergen_executable)
+        mattergen_available = executable_path is not None or legacy_script_path is not None
         payload = {
             "vae_formula": {
                 "status": vae_status,
@@ -113,18 +133,32 @@ class GenerationCapabilitiesTool(Tool):
                 ),
             },
             "mattergen": {
-                "status": (
-                    "AVAILABLE"
-                    if mattergen_script
-                    else "UNCONFIGURED"
-                ),
+                "status": "AVAILABLE" if mattergen_available else "UNCONFIGURED",
                 "detail": (
-                    f"skill script: {mattergen_script}"
-                    if mattergen_script
-                    else "set MATTERGEN_SKILL_SCRIPT to enable generation"
+                    f"executable: {mattergen_executable}"
+                    + (
+                        f" ({executable_path})"
+                        if executable_path is not None
+                        else " (not found on PATH)"
+                    )
+                    + (
+                        f"; legacy skill script: {legacy_script_path}"
+                        if legacy_script_path
+                        else (
+                            "; legacy skill script configured but missing: "
+                            f"{mattergen_script}"
+                            if mattergen_script
+                            else "; legacy MATTERGEN_SKILL_SCRIPT override unset"
+                        )
+                    )
                 ),
                 "modes": ["dft_band_gap", "chemical_system"],
                 "execution": "isolated environment (conda/uv), never the main venv",
+                "pretrained_name": config.mattergen_pretrained_name,
+                "candidate_limit": config.mattergen_candidate_limit,
+                "timeout_seconds": config.mattergen_timeout_seconds,
+                "guidance_factor": config.mattergen_guidance_factor,
+                "seed": config.mattergen_seed,
             },
             "cost_class": {
                 "vae_formula": "CHEAP",
@@ -441,8 +475,9 @@ class MatterGenTool(Tool):
         "proposed_formula is supplied, the output records formula "
         "consistency (formula_preserved, composition_distance) -- the VAE "
         "formula and MatterGen formula are separate scientific facts. All "
-        "candidates are UNVALIDATED_GENERATED_STRUCTURE. Requires "
-        "MATTERGEN_SKILL_SCRIPT or an existing manifest_path."
+        "candidates are UNVALIDATED_GENERATED_STRUCTURE. Uses the configured "
+        "mattergen-generate executable in an isolated environment; the legacy "
+        "MATTERGEN_SKILL_SCRIPT remains an explicit compatibility override."
     )
     short_description = "MatterGen structure generation (isolated env)."
     exposure = ToolExposure.DEFERRED
@@ -456,22 +491,99 @@ class MatterGenTool(Tool):
             "target_band_gap_eV": {"type": "number", "minimum": 0},
             "target_wavelength_um": {"type": "number", "minimum": 0},
             "chemical_system": {"type": "string"},
+            "pretrained_name": {
+                "type": "string",
+                "enum": ["dft_band_gap", "chemical_system"],
+            },
             "proposed_formula": {"type": "string"},
             "candidate_count": {"type": "integer", "minimum": 1, "maximum": 32},
+            "guidance_factor": {"type": "number", "minimum": 0, "maximum": 20},
+            "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647},
             "manifest_path": {"type": "string"},
             "output_dir": {"type": "string"},
         },
     }
 
-    def __init__(self, config: Any = None) -> None:
-        self.config = config
+    def __init__(
+        self,
+        config: ScientificConfig | None = None,
+        workspace: Workspace | None = None,
+        *,
+        runner: MatterGenRunner | None = None,
+    ) -> None:
+        self.config = config or ScientificConfig()
+        self.workspace = workspace or Workspace(Path.cwd())
+        self.runner = runner
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        config = self.config
+        requested_mode = arguments.get("pretrained_name")
+        if requested_mode is None:
+            requested_mode = (
+                "chemical_system"
+                if arguments.get("chemical_system")
+                and arguments.get("target_band_gap_eV") is None
+                and arguments.get("target_wavelength_um") is None
+                else config.mattergen_pretrained_name
+            )
+        if not isinstance(requested_mode, str) or requested_mode not in {
+            "dft_band_gap",
+            "chemical_system",
+        }:
+            return ScientificToolResult(
+                output="generation.mattergen invalid pretrained_name",
+                is_error=True,
+                data={"error_type": "invalid_input"},
+            )
+        mode = cast(Literal["dft_band_gap", "chemical_system"], requested_mode)
+        try:
+            candidate_count = int(
+                arguments.get("candidate_count", config.mattergen_candidate_limit)
+            )
+            guidance_factor = float(
+                arguments.get("guidance_factor", config.mattergen_guidance_factor)
+            )
+            seed = int(arguments.get("seed", config.mattergen_seed))
+        except (TypeError, ValueError) as exc:
+            return ScientificToolResult(
+                output=f"generation.mattergen invalid numeric setting: {exc}",
+                is_error=True,
+                data={"error_type": "invalid_input", "message": str(exc)},
+            )
+        explicit_output = arguments.get("output_dir")
+        explicit_manifest = arguments.get("manifest_path")
+        try:
+            output_override = (
+                str(self.workspace.resolve(str(explicit_output), must_exist=False))
+                if explicit_output
+                else None
+            )
+            manifest_override = (
+                str(self.workspace.resolve(str(explicit_manifest), must_exist=True))
+                if explicit_manifest
+                else None
+            )
+        except Exception as exc:
+            return ScientificToolResult(
+                output=f"generation.mattergen invalid workspace path: {exc}",
+                is_error=True,
+                data={"error_type": "invalid_path", "message": str(exc)},
+            )
+        workspace = self.workspace
         provider = LocalIsolatedMatterGenProvider(
             skill_script=_env("MATTERGEN_SKILL_SCRIPT") or None,
-            candidate_limit=int(arguments.get("candidate_count", 8)),
+            mattergen_executable=config.mattergen_executable,
+            candidate_limit=candidate_count,
+            timeout_seconds=config.mattergen_timeout_seconds,
+            hf_home=config.mattergen_hf_home,
+            runner=self.runner,
+            workspace=workspace,
         )
-        generator = MatterGenGenerator(provider=provider)
+        generator = MatterGenGenerator(
+            provider=provider,
+            output_root=workspace.user_output_dir / "mattergen",
+            workspace=workspace,
+        )
         try:
             candidates, metadata = generator.generate(
                 target_band_gap_eV=(
@@ -486,8 +598,11 @@ class MatterGenTool(Tool):
                 ),
                 chemical_system=arguments.get("chemical_system"),
                 proposed_formula=arguments.get("proposed_formula"),
-                manifest_path=arguments.get("manifest_path"),
-                output_dir_override=arguments.get("output_dir"),
+                manifest_path=manifest_override,
+                output_dir_override=output_override,
+                pretrained_name=mode,
+                guidance_factor=guidance_factor,
+                seed=seed,
             )
         except Exception as exc:
             return ScientificToolResult(
@@ -499,9 +614,43 @@ class MatterGenTool(Tool):
             "candidates": candidates,
             "metadata": metadata,
         }
+        manifest_value = metadata.get("manifest")
+        artifacts: list[str] = []
+        if isinstance(manifest_value, str):
+            try:
+                artifacts.append(self.workspace.relative(Path(manifest_value)))
+            except ValueError:
+                # Explicit manifests are still validated as workspace paths
+                # above; keep this guard for injected generator doubles.
+                pass
+        evidence = [
+            ScientificEvidence(
+                subject="generated_candidates",
+                property="crystal_structure",
+                value=[candidate.get("structure_path") for candidate in candidates],
+                unit="",
+                source="MatterGen isolated executable",
+                source_type="generative_model",
+                method=(
+                    f"MatterGen {metadata.get('pretrained_name', requested_mode)} "
+                    "conditional crystal generation"
+                ),
+                fidelity="ml_generated",
+                summary=(
+                    f"{len(candidates)} MatterGen candidate structure(s) generated"
+                ),
+                limitations=(
+                    "candidates are UNVALIDATED_GENERATED_STRUCTURE; no stability, "
+                    "synthesizability, band-gap, or detector claim"
+                ),
+                provenance={"tool": self.name, "manifest": manifest_value},
+            )
+        ]
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False, indent=2),
             data=payload,
+            evidence=evidence,
+            artifacts=artifacts,
         )
 
 
@@ -511,35 +660,49 @@ class GenerationCapabilityPack(CapabilityPack):
     execution_mode = "subprocess/local"
     backend_name = "isolated environments (torch/conda)"
 
+    def __init__(
+        self,
+        config: ScientificConfig | None = None,
+        workspace: Workspace | None = None,
+    ) -> None:
+        self.config = config or ScientificConfig()
+        self.workspace = workspace or Workspace(Path.cwd())
+
     def probe(self) -> ProbeResult:
         torch_available = importlib.util.find_spec("torch") is not None
         checkpoint, metadata = _resolve_vae_assets()
         script = _env("MATTERGEN_SKILL_SCRIPT")
+        script_available = bool(script and Path(script).expanduser().is_file())
+        executable_path = _mattergen_executable_path(self.config.mattergen_executable)
         vae_available = torch_available and checkpoint is not None
-        if vae_available or script:
+        if vae_available or script_available or executable_path:
             return ProbeResult(
                 status=CapabilityStatus.AVAILABLE,
                 detail=(
                     f"torch={'yes' if torch_available else 'no'}; "
                     f"vae checkpoint={'set' if checkpoint else 'unset'}; "
                     f"vae metadata={'set' if metadata else 'unset'}; "
-                    f"mattergen script={'set' if script else 'unset'}"
+                    f"mattergen executable={self.config.mattergen_executable}; "
+                    f"mattergen executable status={'set' if executable_path else 'unset'}; "
+                    f"legacy script={'set' if script_available else 'unset'}; "
+                    f"pretrained_name={self.config.mattergen_pretrained_name}; "
+                    f"seed={self.config.mattergen_seed}"
                 ),
             )
         return ProbeResult(
             status=CapabilityStatus.MISSING_DEPENDENCY,
             detail=(
-                "VAE runtime/assets and MATTERGEN_SKILL_SCRIPT are unavailable; "
+                "VAE runtime/assets and configured MatterGen executable are unavailable; "
                 "generation tools return typed missing_prerequisites"
             ),
         )
 
     def tools(self) -> list[Tool]:
         return [
-            GenerationCapabilitiesTool(),
+            GenerationCapabilitiesTool(self.config, self.workspace),
             VAEFormulaTool(),
             VAERetrieveTool(),
-            MatterGenTool(),
+            MatterGenTool(self.config, self.workspace),
         ]
 
 
@@ -628,5 +791,15 @@ def _row_chemical_system(row: Mapping[str, Any]) -> str:
     return _canonical_system(value)
 
 
-def generation_pack(config: Any = None) -> GenerationCapabilityPack:
-    return GenerationCapabilityPack()
+def _mattergen_executable_path(value: str) -> str | None:
+    path = Path(value).expanduser()
+    if path.is_file():
+        return str(path.resolve())
+    return shutil.which(value)
+
+
+def generation_pack(
+    config: ScientificConfig | None = None,
+    workspace: Workspace | None = None,
+) -> GenerationCapabilityPack:
+    return GenerationCapabilityPack(config, workspace)

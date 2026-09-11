@@ -41,18 +41,27 @@ proposal, structure generation, and property validation as separate stages.
 5. Do not call `generation.vae_retrieve` for inverse-generation requests. It
    searches existing records and cannot replace VAE sampling. Use it only when
    the user separately and explicitly asks for known database analogues.
-6. If the user requests crystal structures, pass a selected proposal's
-   `formula` as `proposed_formula` and its `chemical_system` to
-   `generation.mattergen`. Preserve `vae_proposed_formula`,
+6. If the user requests crystal structures, select the MatterGen checkpoint
+   explicitly: use `pretrained_name=dft_band_gap` for a band-gap/cutoff target
+   or `pretrained_name=chemical_system` for an element system. The supplied
+   checkpoints do not jointly condition on both fields; run separate small
+   batches when both constraints matter. Pass a selected proposal's `formula`
+   as `proposed_formula` and call `generation.mattergen`. Preserve `vae_proposed_formula`,
    `mattergen_generated_formula`, `formula_preserved`, and
-   `composition_distance`; never silently treat the MatterGen stoichiometry as
-   identical to the VAE proposal. If MatterGen is unconfigured, report the
-   missing `MATTERGEN_SKILL_SCRIPT` prerequisite instead of implying that a
-   structure was generated.
-7. Treat every generated formula or structure as
+   `composition_distance`. The normal path uses the configured isolated
+   `mattergen-generate` executable. `MATTERGEN_SKILL_SCRIPT` is retained only
+   as a legacy compatibility override; never imply that a structure was
+   generated when the executable, checkpoint, archive, or manifest is missing.
+7. After structures exist, run `chgnet.screen` on a small batch. Compare raw
+   CHGNet energies only within identical reduced compositions; label all
+   CHGNet values `source_type=ml_interatomic_potential` and
+   `fidelity=ml_potential`. Run `chgnet.relax` only for finalists, then send a
+   much smaller set through the gated VASP workflow for DFT validation.
+8. Treat every generated formula or structure as
    `UNVALIDATED_GENERATED_STRUCTURE`. Use database, electronic-structure,
    stability, transport, defect, optical, and device capabilities in later
-   stages according to the evidence gap.
+   stages according to the evidence gap. A CHGNet result is not DFT energy,
+   energy above hull, synthesizability, or detector validation.
 
 ## Failure handling
 

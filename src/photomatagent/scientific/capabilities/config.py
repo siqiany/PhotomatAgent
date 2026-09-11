@@ -78,6 +78,15 @@ def _text_env(name: str, default: str, *aliases: str) -> str:
     return value.strip() or default
 
 
+def _optional_text_env(name: str, *aliases: str) -> str | None:
+    """Read an optional text setting, treating blank values as unset."""
+    value = _first_env(name, *aliases)
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def _bounded_int_env_with_aliases(
     name: str,
     default: int,
@@ -132,6 +141,16 @@ class ScientificConfig:
     chgnet_max_structures: int = 32
     chgnet_relax_fmax: float = 0.1
     chgnet_relax_steps: int = 200
+    # MatterGen is deliberately an isolated executable integration.  Keep its
+    # settings separate from the main Python environment and pass only the
+    # configured executable/cache through the narrow runner boundary.
+    mattergen_executable: str = "mattergen-generate"
+    mattergen_hf_home: str | None = None
+    mattergen_pretrained_name: str = "dft_band_gap"
+    mattergen_candidate_limit: int = 8
+    mattergen_timeout_seconds: float = 3600.0
+    mattergen_guidance_factor: float = 2.0
+    mattergen_seed: int = 42
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
 
     @classmethod
@@ -285,6 +304,41 @@ class ScientificConfig:
                 minimum=1,
                 maximum=200,
             ),
+            mattergen_executable=_text_env(
+                "PHOTOMATAGENT_MATTERGEN_EXECUTABLE",
+                "mattergen-generate",
+                "MATTERGEN_EXECUTABLE",
+            ),
+            mattergen_hf_home=_optional_text_env(
+                "PHOTOMATAGENT_MATTERGEN_HF_HOME",
+                "MATTERGEN_HF_HOME",
+                "HF_HOME",
+            ),
+            mattergen_pretrained_name=_mattergen_pretrained_name(),
+            mattergen_candidate_limit=_bounded_int_env(
+                "PHOTOMATAGENT_MATTERGEN_CANDIDATE_LIMIT",
+                8,
+                minimum=1,
+                maximum=32,
+            ),
+            mattergen_timeout_seconds=_bounded_float_env(
+                "PHOTOMATAGENT_MATTERGEN_TIMEOUT_SECONDS",
+                3600.0,
+                minimum=1.0,
+                maximum=7200.0,
+            ),
+            mattergen_guidance_factor=_bounded_float_env(
+                "PHOTOMATAGENT_MATTERGEN_GUIDANCE_FACTOR",
+                2.0,
+                minimum=0.0,
+                maximum=20.0,
+            ),
+            mattergen_seed=_bounded_int_env(
+                "PHOTOMATAGENT_MATTERGEN_SEED",
+                42,
+                minimum=0,
+                maximum=2**31 - 1,
+            ),
             mcp_servers=servers,
         )
 
@@ -301,3 +355,17 @@ def _load_dotenv_if_present(root: Path) -> None:
     env_path = root / ".env"
     if env_path.is_file():
         load_dotenv(env_path, override=False)
+
+
+def _mattergen_pretrained_name() -> str:
+    value = _text_env(
+        "PHOTOMATAGENT_MATTERGEN_PRETRAINED_NAME",
+        "dft_band_gap",
+        "MATTERGEN_PRETRAINED_NAME",
+    )
+    if value not in {"dft_band_gap", "chemical_system"}:
+        raise ValueError(
+            "PHOTOMATAGENT_MATTERGEN_PRETRAINED_NAME must be "
+            "dft_band_gap or chemical_system"
+        )
+    return value

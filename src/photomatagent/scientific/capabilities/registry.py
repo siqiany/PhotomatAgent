@@ -71,7 +71,7 @@ def build_scientific_tools(
         vasp_pack(effective_workspace, approval_root=vasp_approval_root),
         namd_pack(effective_workspace),
         magus_pack(effective_workspace),
-        generation_pack(effective_config),
+        generation_pack(effective_config, effective_workspace),
         chemistry_pack(),
         chgnet_pack(effective_config, effective_workspace),
     ]
