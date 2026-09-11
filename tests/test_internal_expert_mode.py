@@ -21,6 +21,7 @@ from photomatagent.sessions.store import save_session_snapshot
 from photomatagent.runtime.state import ConversationState
 from photomatagent.models.types import AssistantMessage
 from photomatagent.models.fake import FakeModelProvider
+from photomatagent.models.fake import FakeResponse
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.workspace import Workspace
 from photomatagent.cli.chat import build_runtime
@@ -206,9 +207,18 @@ async def test_expert_route_imports_scores_and_keeps_chat_state_clean(tmp_path: 
         + "\n" + json.dumps({"kind": "text_delta", "session_id": "session-e2e", "iteration": 1, "text": "answer"}) + "\n",
         encoding="utf-8",
     )
-    target_path = tmp_path / "target.json"
-    target_path.write_text(json.dumps({"goal": "goal", "constraints": [{"property": "x", "operator": "ge", "value": 1}]}), encoding="utf-8")
-    answers = ["y", "y", "target.json", "y", "1", "1", "1", "1", "1", "", "", "", "", "", "", "/submit", "", "y", "n"]
+    generated_target = json.dumps({
+        "goal": "goal",
+        "constraints": [{
+            "property": "x", "operator": "ge", "value": 1,
+            "unit": "", "severity": "HARD", "weight": 1.0,
+            "description": "explicit requirement", "basis": "EXPLICIT_GOAL",
+            "rationale": "goal says so", "confidence": 1.0,
+            "requires_confirmation": False,
+        }],
+        "objectives": [], "operating_conditions": {}, "warnings": [],
+    })
+    answers = ["y", "y", "y", "1", "1", "1", "1", "1", "", "", "", "", "", "", "/submit", "", "y", "n"]
     prompt = _Prompt(answers)
     class _Runtime:
         def __init__(self) -> None:
@@ -216,6 +226,7 @@ async def test_expert_route_imports_scores_and_keeps_chat_state_clean(tmp_path: 
             self.conversation_state = ConversationState()
             self.session_id = None
             self.run_calls = 0
+            self.model_provider = FakeModelProvider([FakeResponse(text=generated_target)])
 
         def run(self, _prompt: str) -> None:
             self.run_calls += 1

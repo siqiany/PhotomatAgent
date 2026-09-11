@@ -172,6 +172,12 @@ class AgentRuntime:
         return self._scientific
 
     @property
+    def model_provider(self) -> ModelProvider:
+        """Provider available to bounded, tool-free host workflows."""
+
+        return self._model
+
+    @property
     def conversation_state(self) -> ConversationState:
         return self._conversation
 

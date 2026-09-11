@@ -398,9 +398,14 @@ Strategy ID，并要求交互确认。只有确认后任务才进入 `REVISION_R
 
 交互聊天中也可使用 `/expert` 启动内部专家评审：`/expert` 检查当前 session，
 `/expert <session-id>` 检查历史 session，`/expert history` 列出并选择历史记录。历史
-导入前须确认目标与结果，并提供 workspace 内的 `TargetSpec` JSON；该文件必须至少包含
-一个机器可验证 constraint。向导中的输入不会作为普通聊天消息发送；任何阶段均可输入
-`/cancel`。完成 rubric 后可选择立即 compile，确认 revision plan 后还可选择 iterate。
+导入前须确认目标与结果。系统会优先自动加载该 session 已绑定或已确认缓存的
+`TargetSpec`；找不到时，会使用当前聊天的 provider，在 `tools=[]` 的隔离请求中根据原始
+goal 与结构化科学状态生成草案。待评分的最终答案不会进入这个请求，模型推断的标准只能
+是 SOFT constraint，并必须由人确认。确认后的目标会自动保存在
+`.photomatagent/evolution-targets/`，再次处理该历史任务时会自动加载。确认界面支持让智能体
+按自然语言修改（`e`）、重新生成（`r`）以及高级文件导入（`f`），普通使用不再需要手工
+创建 JSON。向导中的输入不会作为普通聊天消息发送；任何阶段均可取消。完成 rubric 后可
+选择立即 compile，确认 revision plan 后还可选择 iterate。
 
 `evaluate --fresh` 要求 `REVISION_READY`、`--fresh` 和已确认生成的
 `--strategy-id`，因此必须在 `iterate` 之前运行；它保持主任务的修订就绪状态，并使用
