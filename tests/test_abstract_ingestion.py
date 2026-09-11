@@ -89,6 +89,24 @@ def test_reader_uses_keyset_pagination(abstract_db: Path) -> None:
     reader.close()
 
 
+def test_reader_accepts_abstracts_table(tmp_path: Path) -> None:
+    path = tmp_path / "abstracts.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE abstracts (paper_key TEXT PRIMARY KEY, title TEXT, abstract TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO abstracts VALUES (?, ?, ?)",
+        ("key-a", "A", "abstract a"),
+    )
+    connection.commit()
+    connection.close()
+
+    reader = SQLiteAbstractReader(path, workspace_root=tmp_path)
+    assert [row.paper_key for row in reader.fetch_after(None, limit=1)] == ["key-a"]
+    reader.close()
+
+
 def test_reader_preserves_raw_keyset_cursor_with_whitespace_key(abstract_db: Path) -> None:
     connection = sqlite3.connect(abstract_db)
     connection.execute(
