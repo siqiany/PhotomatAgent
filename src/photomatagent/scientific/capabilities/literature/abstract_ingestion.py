@@ -45,6 +45,11 @@ from photomatagent.scientific.capabilities.literature.qdrant_store import (
 MAX_ABSTRACT_BATCH = 20
 MAX_ERRORS = 20
 MAX_ERROR_CHARS = 512
+_ABSTRACT_TABLES = ("abstracts", "papers")
+_ABSTRACT_TABLE_SQL = {
+    "abstracts": '"abstracts"',
+    "papers": '"papers"',
+}
 _ABSTRACT_COLUMNS = (
     "paper_key",
     "title",
@@ -278,7 +283,12 @@ def _sqlite_key_valid(value: Any) -> int:
 
 
 class SQLiteAbstractReader:
-    """Read the ``papers`` table in SQLite read-only mode using keyset pages."""
+    """Read a supported abstract table in SQLite read-only mode using keyset pages.
+
+    ``abstracts`` is preferred when both supported tables have the same column
+    contract.  If both tables are valid but expose different contracts, the
+    reader fails closed rather than choosing a potentially wrong corpus.
+    """
 
     def __init__(
         self,
@@ -314,7 +324,7 @@ class SQLiteAbstractReader:
                 _sqlite_key_valid,
                 deterministic=True,
             )
-            self._columns = self._validate_schema()
+            self._table_name, self._columns = self._validate_schema()
             # Hold one read transaction for the life of the reader.  A valid
             # checkpointed database therefore presents one logical snapshot
             # across all keyset pages; any source replacement is detected by
@@ -395,33 +405,98 @@ class SQLiteAbstractReader:
                 "abstract SQLite source changed during import; start a new run from one checkpointed snapshot",
             )
 
-    def _validate_schema(self) -> set[str]:
+    def _table_columns(self, table_name: str) -> set[str]:
         connection = self._connection_or_error()
-        try:
-            table = connection.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'papers'"
-            ).fetchone()
-            if table is None:
-                raise ValueError("abstract SQLite database is missing the papers table")
-            columns = {
-                str(row[1]).casefold()
-                for row in connection.execute('PRAGMA table_info("papers")')
-            }
-        except sqlite3.Error as exc:
-            raise ValueError("abstract SQLite database schema cannot be inspected") from exc
-        required = {
+        table_sql = _ABSTRACT_TABLE_SQL[table_name]
+        return {
+            str(row[1]).casefold()
+            for row in connection.execute(f"PRAGMA table_info({table_sql})")
+        }
+
+    @staticmethod
+    def _missing_columns(columns: set[str]) -> tuple[str, ...]:
+        return tuple(
             canonical
             for canonical in ("paper_key", "title", "abstract")
             if not any(alias in columns for alias in _COLUMN_ALIASES[canonical])
-        }
-        missing = sorted(required)
-        if missing:
-            raise ValueError(
-                "abstract SQLite papers table is missing required columns: "
-                + ", ".join(missing)
+        )
+
+    @staticmethod
+    def _column_contract(columns: set[str]) -> tuple[str | None, ...]:
+        return tuple(
+            next(
+                (
+                    alias
+                    for alias in _COLUMN_ALIASES[name]
+                    if alias.casefold() in columns
+                ),
+                None,
             )
-        return columns
+            for name in _ABSTRACT_COLUMNS
+        )
+
+    def _validate_schema(self) -> tuple[str, set[str]]:
+        connection = self._connection_or_error()
+        try:
+            available = {
+                str(row[0]).casefold()
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND lower(name) IN (?, ?)",
+                    _ABSTRACT_TABLES,
+                )
+            }
+            available.intersection_update(_ABSTRACT_TABLES)
+            if not available:
+                raise ValueError(
+                    "abstract SQLite database is missing the abstracts or papers table"
+                )
+
+            valid: dict[str, tuple[set[str], tuple[str | None, ...]]] = {}
+            invalid: dict[str, tuple[str, ...]] = {}
+            for table_name in _ABSTRACT_TABLES:
+                if table_name not in available:
+                    continue
+                columns = self._table_columns(table_name)
+                missing = self._missing_columns(columns)
+                if missing:
+                    invalid[table_name] = missing
+                else:
+                    valid[table_name] = (columns, self._column_contract(columns))
+
+            if not valid:
+                if len(invalid) == 1:
+                    table_name, missing = next(iter(invalid.items()))
+                    raise ValueError(
+                        f"abstract SQLite {table_name} table is missing required columns: "
+                        + ", ".join(missing)
+                    )
+                details = "; ".join(
+                    f"{table_name}: {', '.join(invalid[table_name])}"
+                    for table_name in _ABSTRACT_TABLES
+                    if table_name in invalid
+                )
+                raise ValueError(
+                    "abstract SQLite abstracts and papers tables are missing "
+                    f"required columns: {details}"
+                )
+
+            if len(valid) == 1:
+                table_name, (columns, _contract) = next(iter(valid.items()))
+                return table_name, columns
+
+            abstracts_columns, abstracts_contract = valid["abstracts"]
+            _papers_columns, papers_contract = valid["papers"]
+            if abstracts_contract != papers_contract:
+                raise ValueError(
+                    "abstract SQLite database has ambiguous abstracts and papers "
+                    "tables with different column contracts"
+                )
+            # Both tables implement the same source contract, so prefer the
+            # real abstract corpus name deterministically.
+            return "abstracts", abstracts_columns
+        except sqlite3.Error as exc:
+            raise ValueError("abstract SQLite database schema cannot be inspected") from exc
 
     def _select_sql(self) -> str:
         expressions = []
@@ -459,13 +534,16 @@ class SQLiteAbstractReader:
 
     def count(self) -> int:
         self.validate_snapshot()
-        row = self._connection_or_error().execute('SELECT COUNT(*) FROM "papers"').fetchone()
+        row = self._connection_or_error().execute(
+            f"SELECT COUNT(*) FROM {_ABSTRACT_TABLE_SQL[self._table_name]}"
+        ).fetchone()
         return int(row[0]) if row is not None else 0
 
     def count_invalid_keys(self) -> int:
         self.validate_snapshot()
         row = self._connection_or_error().execute(
-            f'SELECT COUNT(*) FROM "papers" WHERE {_SQL_KEY_INVALID}'
+            f"SELECT COUNT(*) FROM {_ABSTRACT_TABLE_SQL[self._table_name]} "
+            f"WHERE {_SQL_KEY_INVALID}"
         ).fetchone()
         return int(row[0]) if row is not None else 0
 
@@ -486,7 +564,8 @@ class SQLiteAbstractReader:
             raise ValueError("limit must be positive")
         self.validate_snapshot()
         statement = (
-            f'SELECT {self._select_sql()} FROM "papers" '
+            f"SELECT {self._select_sql()} FROM "
+            f"{_ABSTRACT_TABLE_SQL[self._table_name]} "
             f'WHERE {_SQL_KEY_VALID} AND "paper_key" > ? '
             'ORDER BY "paper_key" LIMIT ?'
         )
