@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from datetime import datetime
 from math import gcd
-from typing import Annotated, Literal
+from typing import Any, Annotated, Literal, Never, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from photomatagent.scientific.capabilities.generation.lineage import CandidateLineage
 
@@ -30,12 +38,70 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+class _ImmutableList(list[Any]):
+    def _deny_mutation(self, *args: object, **kwargs: object) -> Never:
+        raise TypeError("registered hypothesis containers are immutable")
+
+    __setitem__ = _deny_mutation
+    __delitem__ = _deny_mutation
+    __iadd__ = _deny_mutation
+    __imul__ = _deny_mutation
+    append = _deny_mutation
+    clear = _deny_mutation
+    extend = _deny_mutation
+    insert = _deny_mutation
+    pop = _deny_mutation
+    remove = _deny_mutation
+    reverse = _deny_mutation
+    sort = _deny_mutation
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        return self
+
+
+class _ImmutableDict(dict[str, Any]):
+    def _deny_mutation(self, *args: object, **kwargs: object) -> Never:
+        raise TypeError("registered hypothesis containers are immutable")
+
+    __setitem__ = _deny_mutation
+    __delitem__ = _deny_mutation
+    __ior__ = _deny_mutation
+    clear = _deny_mutation
+    pop = _deny_mutation
+    popitem = _deny_mutation
+    setdefault = _deny_mutation
+    update = _deny_mutation
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        return self
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _ImmutableDict({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return _ImmutableList(_deep_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
 class BasisReference(_StrictModel):
     """A traceable evidence reference used as a proposal basis."""
 
     evidence_id: NonEmptyId
     relation: BasisRelation
     anchor: str = ""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, frozen=True)
 
 
 class ExpectedEffect(_StrictModel):
@@ -44,6 +110,8 @@ class ExpectedEffect(_StrictModel):
     property: Annotated[str, Field(min_length=1)]
     direction: EffectDirection
     rationale: Annotated[str, Field(min_length=1)]
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, frozen=True)
 
 
 class HypothesisProposal(_StrictModel):
@@ -69,6 +137,24 @@ class HypothesisProposal(_StrictModel):
         return formula
 
 
+class _ImmutableHypothesisProposal(HypothesisProposal):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, frozen=True)
+
+    @model_validator(mode="after")
+    def freeze_containers(self) -> "_ImmutableHypothesisProposal":
+        for field_name in (
+            "parent_hypothesis_ids",
+            "basis",
+            "assumptions",
+            "expected_effects",
+            "counter_hypotheses",
+            "validation_questions",
+            "synthesis_notes",
+        ):
+            object.__setattr__(self, field_name, _deep_freeze(getattr(self, field_name)))
+        return self
+
+
 class HypothesisRegistration(_StrictModel):
     """Pure update command requesting registration of one proposal."""
 
@@ -90,6 +176,20 @@ class HypothesisOrigin(_StrictModel):
     model: str
 
 
+class _ImmutableCandidateLineage(CandidateLineage):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="after")
+    def freeze_containers(self) -> "_ImmutableCandidateLineage":
+        object.__setattr__(
+            self,
+            "generation_parameters",
+            _deep_freeze(self.generation_parameters),
+        )
+        object.__setattr__(self, "source_artifacts", _deep_freeze(self.source_artifacts))
+        return self
+
+
 class ScientificHypothesis(_StrictModel):
     """Immutable runtime record for one registered scientific hypothesis."""
 
@@ -98,11 +198,23 @@ class ScientificHypothesis(_StrictModel):
     id: NonEmptyId
     candidate_id: NonEmptyId
     proposal: HypothesisProposal
-    normalized_composition: tuple[tuple[str, int], ...]
+    normalized_composition: tuple[tuple[StrictStr, StrictInt], ...]
     request_payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     lineage: CandidateLineage
     origin: HypothesisOrigin
     created_at: datetime
+
+    @field_validator("proposal", mode="before")
+    @classmethod
+    def snapshot_proposal(cls, proposal: object) -> _ImmutableHypothesisProposal:
+        payload = proposal.model_dump(mode="python") if isinstance(proposal, BaseModel) else proposal
+        return _ImmutableHypothesisProposal.model_validate(payload)
+
+    @field_validator("lineage", mode="before")
+    @classmethod
+    def snapshot_lineage(cls, lineage: object) -> _ImmutableCandidateLineage:
+        payload = lineage.model_dump(mode="python") if isinstance(lineage, BaseModel) else lineage
+        return _ImmutableCandidateLineage.model_validate(payload)
 
     @model_validator(mode="after")
     def normalized_composition_is_canonical(self) -> "ScientificHypothesis":
@@ -116,6 +228,14 @@ class ScientificHypothesis(_StrictModel):
         symbols = [symbol for symbol, _ in composition]
         if any(not symbol for symbol in symbols) or symbols != sorted(symbols):
             raise ValueError("normalized_composition elements must be non-empty and sorted")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("normalized_composition elements must be unique")
+        try:
+            from pymatgen.core import Element
+        except ImportError as exc:  # pragma: no cover - pymatgen is a core dependency
+            raise ValueError("element validation requires pymatgen") from exc
+        if any(not Element.is_valid_symbol(symbol) for symbol in symbols):
+            raise ValueError("normalized_composition contains an invalid element symbol")
         amounts = [amount for _, amount in composition]
         if any(amount <= 0 for amount in amounts):
             raise ValueError("normalized_composition amounts must be positive integers")

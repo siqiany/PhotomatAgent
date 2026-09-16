@@ -41,9 +41,7 @@ def test_normalize_composition_reduces_and_sorts_elements(
         "Na1-xAgxBiS2",
         "Na-1Cl2",
         "Na0Cl",
-        "NaNaNCl",
         "NaInfCl",
-        "Na1e999Cl",
         "Xx2O",
         "Na" + "1" * 256,
         "Na0.00005Cl",
@@ -54,6 +52,26 @@ def test_normalize_composition_reduces_and_sorts_elements(
 def test_normalize_composition_rejects_invalid_or_unbounded_formulas(formula: str) -> None:
     with pytest.raises(ValueError):
         normalize_composition(formula)
+
+
+@pytest.mark.parametrize(
+    ("formula", "expected"),
+    [
+        ("NaN", (("N", 1), ("Na", 1))),
+        ("NaNCl", (("Cl", 1), ("N", 1), ("Na", 1))),
+        ("NaNaNCl", (("Cl", 1), ("N", 1), ("Na", 2))),
+    ],
+)
+def test_element_tokens_that_spell_nan_remain_valid(
+    formula: str,
+    expected: tuple[tuple[str, int], ...],
+) -> None:
+    assert normalize_composition(formula) == expected
+
+
+def test_nonfinite_parsed_amount_is_rejected() -> None:
+    with pytest.raises(ValueError, match="finite|invalid"):
+        normalize_composition("Na1e999Cl")
 
 
 def test_composition_module_import_is_independent_of_pymatgen() -> None:

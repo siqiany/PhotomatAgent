@@ -27,6 +27,35 @@ def _proposal_payload() -> dict[str, object]:
     }
 
 
+def _scientific_hypothesis(
+    *,
+    proposal: HypothesisProposal | None = None,
+    lineage: CandidateLineage | None = None,
+    normalized_composition: object = (("Bi", 1), ("Na", 1), ("S", 2)),
+) -> ScientificHypothesis:
+    return ScientificHypothesis.model_validate({
+        "id": "hyp_1",
+        "candidate_id": "cand_1",
+        "proposal": proposal or HypothesisProposal(**_proposal_payload()),
+        "normalized_composition": normalized_composition,
+        "request_payload_sha256": "a" * 64,
+        "lineage": lineage or CandidateLineage(
+            candidate_id="cand_1",
+            generated_by="mechanism_reasoning",
+            validation_status="UNVALIDATED_HYPOTHESIS",
+        ),
+        "origin": HypothesisOrigin(
+            tool_name="hypothesis.register",
+            tool_call_id="call_1",
+            session_id="session_1",
+            run_id="run_1",
+            provider="test",
+            model="test-model",
+        ),
+        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+    })
+
+
 def test_model_cannot_submit_validation_status() -> None:
     payload = _proposal_payload()
     payload["status"] = "PASS"
@@ -140,7 +169,7 @@ def test_scientific_hypothesis_reuses_candidate_lineage() -> None:
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
 
-    assert record.lineage is lineage
+    assert isinstance(record.lineage, CandidateLineage)
     with pytest.raises(ValidationError):
         ScientificHypothesis.model_validate({**record.model_dump(), "status": "PASS"})
 
@@ -181,6 +210,73 @@ def test_scientific_hypothesis_requires_unvalidated_mechanism_lineage(
             ),
             created_at=datetime(2026, 1, 1, tzinfo=UTC),
         )
+
+
+def test_scientific_hypothesis_takes_deeply_immutable_nested_snapshots() -> None:
+    proposal = HypothesisProposal(
+        **_proposal_payload(),
+        assumptions=["Initial assumption"],
+        basis=[BasisReference(evidence_id="ev1", relation="supports")],
+    )
+    lineage = CandidateLineage(
+        candidate_id="cand_1",
+        generated_by="mechanism_reasoning",
+        validation_status="UNVALIDATED_HYPOTHESIS",
+        generation_parameters={"nested": {"source": "initial"}},
+        source_artifacts=["source.json"],
+    )
+    record = _scientific_hypothesis(proposal=proposal, lineage=lineage)
+
+    assert record.proposal is not proposal
+    assert record.lineage is not lineage
+    with pytest.raises(ValidationError):
+        record.proposal.statement = "rewritten"
+    with pytest.raises(TypeError):
+        record.proposal.assumptions.append("rewritten")
+    with pytest.raises(ValidationError):
+        record.proposal.basis[0].anchor = "rewritten"
+    with pytest.raises(ValidationError):
+        record.lineage.validation_status = "PASS"
+    with pytest.raises(TypeError):
+        record.lineage.source_artifacts.append("rewritten.json")
+    with pytest.raises(TypeError):
+        record.lineage.generation_parameters["changed"] = True
+    with pytest.raises(TypeError):
+        record.lineage.generation_parameters["nested"]["source"] = "rewritten"
+
+    proposal.statement = "externally rewritten"
+    proposal.assumptions.append("externally rewritten")
+    lineage.validation_status = "PASS"
+    lineage.source_artifacts.append("external.json")
+    lineage.generation_parameters["nested"]["source"] = "externally rewritten"
+
+    assert record.proposal.statement == "Test a parent composition"
+    assert record.proposal.assumptions == ["Initial assumption"]
+    assert record.lineage.validation_status == "UNVALIDATED_HYPOTHESIS"
+    assert record.lineage.source_artifacts == ["source.json"]
+    assert record.lineage.generation_parameters == {"nested": {"source": "initial"}}
+    assert record.model_copy(deep=True) == record
+
+
+@pytest.mark.parametrize(
+    "normalized_composition",
+    [
+        (("Na", 1), ("Na", 1)),
+        (("Bogus", 1),),
+        (("Na", True),),
+        (("Na", 1.0),),
+        (("Na", "1"),),
+        (("Na", 1), ("Cl", 1)),
+        (("Na", 0),),
+        (("Na", -1),),
+        (("Cl", 2), ("Na", 2)),
+    ],
+)
+def test_scientific_hypothesis_rejects_noncanonical_composition_domain(
+    normalized_composition: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        _scientific_hypothesis(normalized_composition=normalized_composition)
 
 
 def test_discovery_constraints_have_neutral_defaults() -> None:

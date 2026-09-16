@@ -19,9 +19,6 @@ MAX_TOTAL_NORMALIZED_AMOUNT = 1_000_000_000
 COMPOSITION_ERROR_TOLERANCE = Fraction(1, 100_000_000)
 
 _NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
-_NON_FINITE_TOKEN = re.compile(r"(?:NaN|nan|Inf|inf|Infinity|infinity)")
-
-
 class CompositionCapabilityError(RuntimeError):
     """Raised when composition canonicalization lacks its parser dependency."""
 
@@ -37,8 +34,6 @@ def _lazy_pymatgen_types() -> tuple[Any, Any]:
 
 
 def _validate_numeric_literals(formula: str) -> None:
-    if _NON_FINITE_TOKEN.search(formula):
-        raise ValueError("composition amounts must be finite")
     for literal in _NUMBER.findall(formula):
         try:
             value = Decimal(literal)
