@@ -174,6 +174,48 @@ def _event_tool_arguments(
     return arguments
 
 
+def _partial_bridge_target(payload: str) -> str | None:
+    """Return a complete outer ``name`` value without parsing nested arguments."""
+
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(payload)
+
+    def skip_whitespace(position: int) -> int:
+        while position < length and payload[position].isspace():
+            position += 1
+        return position
+
+    index = skip_whitespace(index)
+    if index >= length or payload[index] != "{":
+        return None
+    index += 1
+    while True:
+        index = skip_whitespace(index)
+        if index >= length or payload[index] == "}":
+            return None
+        try:
+            key, index = decoder.raw_decode(payload, index)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(key, str):
+            return None
+        index = skip_whitespace(index)
+        if index >= length or payload[index] != ":":
+            return None
+        index = skip_whitespace(index + 1)
+        try:
+            value, index = decoder.raw_decode(payload, index)
+        except json.JSONDecodeError:
+            return None
+        if key == "name":
+            return value if isinstance(value, str) else None
+        index = skip_whitespace(index)
+        if index >= length or payload[index] != ",":
+            return None
+        index += 1
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -391,6 +433,7 @@ class AgentRuntime:
                 buffered_argument_deltas: dict[
                     str, list[ModelToolCallArgumentsDelta]
                 ] = {}
+                bridge_delta_targets: dict[str, str] = {}
                 try:
                     async for model_event in self._model.stream(request):
                         if isinstance(model_event, ProviderStreamStarted):
@@ -422,13 +465,57 @@ class AgentRuntime:
                             streamed_name = stream_tool_names.get(
                                 model_event.tool_call_id, ""
                             )
-                            if streamed_name in {
-                                "tool_call",
-                                _HYPOTHESIS_REGISTRATION_TOOL,
-                            }:
+                            if streamed_name == _HYPOTHESIS_REGISTRATION_TOOL:
                                 buffered_argument_deltas.setdefault(
                                     model_event.tool_call_id, []
                                 ).append(model_event)
+                            elif streamed_name == "tool_call":
+                                known_target = bridge_delta_targets.get(
+                                    model_event.tool_call_id
+                                )
+                                if known_target == _HYPOTHESIS_REGISTRATION_TOOL:
+                                    buffered_argument_deltas.setdefault(
+                                        model_event.tool_call_id, []
+                                    ).append(model_event)
+                                elif known_target is not None:
+                                    yield await self._emit(
+                                        ToolCallArgumentsDelta(
+                                            iteration=iteration,
+                                            tool_call_id=model_event.tool_call_id,
+                                            delta=model_event.delta,
+                                            index=model_event.index,
+                                        )
+                                    )
+                                else:
+                                    pending = buffered_argument_deltas.setdefault(
+                                        model_event.tool_call_id, []
+                                    )
+                                    pending.append(model_event)
+                                    partial_target = _partial_bridge_target(
+                                        "".join(item.delta for item in pending)
+                                    )
+                                    if partial_target is not None:
+                                        bridge_delta_targets[
+                                            model_event.tool_call_id
+                                        ] = partial_target
+                                        if (
+                                            partial_target
+                                            != _HYPOTHESIS_REGISTRATION_TOOL
+                                        ):
+                                            for buffered in pending:
+                                                yield await self._emit(
+                                                    ToolCallArgumentsDelta(
+                                                        iteration=iteration,
+                                                        tool_call_id=(
+                                                            buffered.tool_call_id
+                                                        ),
+                                                        delta=buffered.delta,
+                                                        index=buffered.index,
+                                                    )
+                                                )
+                                            buffered_argument_deltas.pop(
+                                                model_event.tool_call_id, None
+                                            )
                             else:
                                 yield await self._emit(
                                     ToolCallArgumentsDelta(
@@ -441,6 +528,7 @@ class AgentRuntime:
                         elif isinstance(model_event, ModelToolCallCompleted):
                             call = model_event.tool_call
                             pending_deltas = buffered_argument_deltas.pop(call.id, [])
+                            bridge_delta_targets.pop(call.id, None)
                             if pending_deltas and _is_hypothesis_registration_call(
                                 call.name, call.arguments
                             ):
@@ -459,13 +547,13 @@ class AgentRuntime:
                                     )
                                 )
                             else:
-                                for pending in pending_deltas:
+                                for buffered_delta in pending_deltas:
                                     yield await self._emit(
                                         ToolCallArgumentsDelta(
                                             iteration=iteration,
-                                            tool_call_id=pending.tool_call_id,
-                                            delta=pending.delta,
-                                            index=pending.index,
+                                            tool_call_id=buffered_delta.tool_call_id,
+                                            delta=buffered_delta.delta,
+                                            index=buffered_delta.index,
                                         )
                                     )
                             yield await self._emit(
@@ -638,11 +726,16 @@ class AgentRuntime:
         bridge_tool: str | None = None
         protocol_tool_name = tool_call.name
         if tool_call.name == "tool_call":
-            target_name: str | None = None
+            raw_target_name = tool_call.arguments.get("name")
+            target_name = (
+                raw_target_name if isinstance(raw_target_name, str) else None
+            )
+            bridge_validated = False
             try:
                 bridge_arguments = self._tools.validate_arguments(
                     "tool_call", tool_call.arguments
                 )
+                bridge_validated = True
                 target_name = str(bridge_arguments["name"])
                 target_arguments = bridge_arguments["arguments"]
                 target = self._tools.get(target_name)
@@ -662,7 +755,7 @@ class AgentRuntime:
                     yield await self._emit_hypothesis_rejection(
                         tool_call,
                         "TOOL_UNAVAILABLE"
-                        if isinstance(exc, KeyError)
+                        if bridge_validated and isinstance(exc, KeyError)
                         else "SCHEMA_VALIDATION_FAILED",
                     )
                 async for event in self._record_tool_failure(
@@ -1045,8 +1138,15 @@ class AgentRuntime:
         tool_call: ToolCall,
         reason_code: HypothesisRegistrationReasonCode,
     ) -> RuntimeEvent:
+        request_arguments = tool_call.arguments
+        nested_arguments = request_arguments.get("arguments")
+        if (
+            request_arguments.get("name") == _HYPOTHESIS_REGISTRATION_TOOL
+            and isinstance(nested_arguments, dict)
+        ):
+            request_arguments = nested_arguments
         request_id = _bounded_event_text(
-            tool_call.arguments.get("request_id", ""), limit=128
+            request_arguments.get("request_id", ""), limit=128
         )
         return await self._emit(
             HypothesisRegistrationRejected(

@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 
 import pytest
 
+from photomatagent.errors import ProviderError
 from photomatagent.logging.event_logger import EventLogger
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
+from photomatagent.models.types import (
+    ModelCompleted,
+    ModelRequest,
+    ModelResponse,
+    ModelStreamEvent,
+    ModelStreamStarted as ProviderStreamStarted,
+    ModelTextDelta,
+    ModelToolCallArgumentsDelta,
+    ModelToolCallCompleted,
+    ModelToolCallStarted,
+    ToolCall,
+)
 from photomatagent.runtime.events import (
     HypothesisRegistered,
     HypothesisRegistrationRejected,
@@ -75,6 +89,91 @@ def _replace_registration_tool(runtime, tool: Tool) -> None:
     runtime._tools._tools["generation.register_hypothesis"] = tool
 
 
+class _InterleavedBridgeProvider:
+    provider = "interleaved"
+    model = "bridge-stream"
+
+    def __init__(self, *, fail_before_completed: bool = False) -> None:
+        self.calls = 0
+        self.fail_before_completed = fail_before_completed
+
+    async def stream(
+        self, request: ModelRequest
+    ) -> AsyncIterator[ModelStreamEvent]:
+        self.calls += 1
+        yield ProviderStreamStarted(provider=self.provider, model=self.model)
+        if self.calls > 1:
+            yield ModelCompleted(
+                response=ModelResponse(text="done", finish_reason="stop")
+            )
+            return
+
+        first = ToolCall(
+            id="bridge-a",
+            name="tool_call",
+            arguments={
+                "name": "mock.run_calculation",
+                "arguments": {
+                    "material": "GaAs",
+                    "calculation_type": "band_structure",
+                },
+            },
+        )
+        second = ToolCall(
+            id="bridge-b",
+            name="tool_call",
+            arguments={
+                "name": "mock.run_calculation",
+                "arguments": {
+                    "material": "InAs",
+                    "calculation_type": "dos",
+                },
+            },
+        )
+        yield ModelToolCallStarted(
+            tool_call_id=first.id, tool_name="tool_call", index=0
+        )
+        yield ModelToolCallArgumentsDelta(
+            tool_call_id=first.id,
+            delta='{"name":"mock.run_calculation",',
+            index=0,
+        )
+        if self.fail_before_completed:
+            raise ProviderError(self.provider, "failed after safe delta")
+        yield ModelToolCallStarted(
+            tool_call_id=second.id, tool_name="tool_call", index=1
+        )
+        yield ModelToolCallArgumentsDelta(
+            tool_call_id=second.id,
+            delta='{"name":"mock.run_calculation",',
+            index=1,
+        )
+        yield ModelToolCallArgumentsDelta(
+            tool_call_id=first.id,
+            delta=(
+                '"arguments":{"material":"GaAs",'
+                '"calculation_type":"band_structure"}}'
+            ),
+            index=0,
+        )
+        yield ModelTextDelta(text="between calls")
+        yield ModelToolCallArgumentsDelta(
+            tool_call_id=second.id,
+            delta=(
+                '"arguments":{"material":"InAs",'
+                '"calculation_type":"dos"}}'
+            ),
+            index=1,
+        )
+        yield ModelToolCallCompleted(tool_call=second, index=1)
+        yield ModelToolCallCompleted(tool_call=first, index=0)
+        yield ModelCompleted(
+            response=ModelResponse(
+                tool_calls=[first, second], finish_reason="tool_calls"
+            )
+        )
+
+
 def test_hypothesis_events_round_trip_through_discriminated_union():
     registered = HypothesisRegistered(
         hypothesis_id="hyp_123",
@@ -88,6 +187,67 @@ def test_hypothesis_events_round_trip_through_discriminated_union():
 
     assert parse_event(registered.model_dump(mode="json")) == registered
     assert parse_event(rejected.model_dump(mode="json")) == rejected
+
+
+@pytest.mark.asyncio
+async def test_non_registration_bridge_deltas_keep_interleaved_arrival_order():
+    runtime = make_runtime(_InterleavedBridgeProvider())
+
+    events = await collect(runtime, "preserve bridge streaming")
+
+    streamed = [
+        (
+            event.kind,
+            getattr(event, "tool_call_id", None),
+            getattr(event, "delta", None),
+        )
+        for event in events
+        if event.kind in {
+            "tool_call_arguments_delta",
+            "text_delta",
+            "tool_call_completed",
+        }
+    ]
+    assert streamed[:7] == [
+        (
+            "tool_call_arguments_delta",
+            "bridge-a",
+            '{"name":"mock.run_calculation",',
+        ),
+        (
+            "tool_call_arguments_delta",
+            "bridge-b",
+            '{"name":"mock.run_calculation",',
+        ),
+        (
+            "tool_call_arguments_delta",
+            "bridge-a",
+            '"arguments":{"material":"GaAs","calculation_type":"band_structure"}}',
+        ),
+        ("text_delta", None, None),
+        (
+            "tool_call_arguments_delta",
+            "bridge-b",
+            '"arguments":{"material":"InAs","calculation_type":"dos"}}',
+        ),
+        ("tool_call_completed", "bridge-b", None),
+        ("tool_call_completed", "bridge-a", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_non_registration_delta_survives_provider_failure():
+    runtime = make_runtime(_InterleavedBridgeProvider(fail_before_completed=True))
+    seen = []
+
+    with pytest.raises(ProviderError):
+        async for event in runtime.run("provider fails after safe bridge delta"):
+            seen.append(event)
+
+    delta = next(event for event in seen if event.kind == "tool_call_arguments_delta")
+    assert delta.tool_call_id == "bridge-a"
+    assert delta.delta == '{"name":"mock.run_calculation",'
+    assert [event.kind for event in seen][-2:] == ["provider_failed", "loop_failed"]
 
 
 @pytest.mark.asyncio
@@ -151,6 +311,92 @@ async def test_runtime_schema_rejection_emits_typed_registration_event(tmp_path)
     assert rejected[0].request_id == "event-r1"
     assert rejected[0].reason_code == "SCHEMA_VALIDATION_FAILED"
     assert runtime.scientific_state.material_hypotheses == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"name": "generation.register_hypothesis"},
+        {
+            "name": "generation.register_hypothesis",
+            "arguments": _arguments(),
+            "unexpected": "field",
+        },
+        {"name": "generation.register_hypothesis", "arguments": "not-an-object"},
+    ],
+)
+async def test_malformed_registration_bridge_emits_one_schema_rejection(
+    tmp_path, malformed
+):
+    logger = EventLogger(tmp_path, session_id="malformed-registration")
+    model = FakeModelProvider(
+        [
+            scripted_tool_call("tool_call", malformed, tool_call_id="malformed"),
+            FakeResponse(text="done"),
+        ]
+    )
+    runtime = make_runtime(
+        model,
+        workspace=Workspace(tmp_path),
+        event_sinks=[logger.log],
+    )
+
+    events = await collect(runtime, "reject malformed bridge")
+
+    rejected = [
+        event for event in events if event.kind == "hypothesis_registration_rejected"
+    ]
+    expected_request_id = (
+        "event-r1" if isinstance(malformed.get("arguments"), dict) else ""
+    )
+    assert [(event.request_id, event.reason_code) for event in rejected] == [
+        (expected_request_id, "SCHEMA_VALIDATION_FAILED")
+    ]
+    assert runtime.scientific_state.material_hypotheses == []
+    assert not any(event.kind == "hypothesis_registered" for event in events)
+    for line in logger.events_path.read_text(encoding="utf-8").splitlines():
+        parse_event(json.loads(line))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_id", "expected_request_id"),
+    [
+        ("unavailable-" + "x" * 200, ("unavailable-" + "x" * 200)[:128]),
+        ("sk-" + "a" * 40, "[REDACTED]"),
+    ],
+)
+async def test_unavailable_registration_bridge_preserves_nested_request_id(
+    tmp_path, request_id: str, expected_request_id: str
+):
+    logger = EventLogger(tmp_path, session_id="unavailable-registration")
+    runtime = make_runtime(
+        FakeModelProvider(
+            [
+                _bridge(_arguments(request_id=request_id), "unavailable"),
+                FakeResponse(text="done"),
+            ]
+        ),
+        workspace=Workspace(tmp_path),
+        event_sinks=[logger.log],
+    )
+    runtime._tools._tools.pop("generation.register_hypothesis")
+
+    events = await collect(runtime, "unavailable registration")
+
+    rejected = [
+        event for event in events if event.kind == "hypothesis_registration_rejected"
+    ]
+    assert [(event.request_id, event.reason_code) for event in rejected] == [
+        (expected_request_id, "TOOL_UNAVAILABLE")
+    ]
+    assert runtime.scientific_state.material_hypotheses == []
+    assert not any(event.kind == "hypothesis_registered" for event in events)
+    raw_log = logger.events_path.read_text(encoding="utf-8")
+    assert request_id not in raw_log
+    for line in raw_log.splitlines():
+        parse_event(json.loads(line))
 
 
 @pytest.mark.asyncio
