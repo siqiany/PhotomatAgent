@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
 from photomatagent.tools.base import Tool
 from photomatagent.workspace import Workspace
+
+if TYPE_CHECKING:
+    from photomatagent.scientific.state import ScientificState
 
 
 def build_scientific_tools(
@@ -15,6 +18,7 @@ def build_scientific_tools(
     workspace: Workspace | None = None,
     *,
     vasp_approval_root: Path | str | None = None,
+    scientific_state: ScientificState | None = None,
 ) -> list[Tool]:
     """Instantiate every capability pack and collect their tools.
 
@@ -71,7 +75,11 @@ def build_scientific_tools(
         vasp_pack(effective_workspace, approval_root=vasp_approval_root),
         namd_pack(effective_workspace),
         magus_pack(effective_workspace),
-        generation_pack(effective_config, effective_workspace),
+        generation_pack(
+            effective_config,
+            effective_workspace,
+            scientific_state=scientific_state,
+        ),
         chemistry_pack(),
         chgnet_pack(effective_config, effective_workspace),
     ]

@@ -32,6 +32,10 @@ from photomatagent.scientific.errors import MissingScientificPrerequisite
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
+from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.capabilities.generation.hypotheses import (
+    RegisterHypothesisTool,
+)
 
 UNSUPPORTED_DEVICE_PROPERTIES = {
     "responsivity",
@@ -118,6 +122,12 @@ class GenerationCapabilitiesTool(Tool):
         executable_path = _mattergen_executable_path(mattergen_executable)
         mattergen_available = executable_path is not None or legacy_script_path is not None
         payload = {
+            "mechanism_reasoning": {
+                "status": "AVAILABLE",
+                "tool": "generation.register_hypothesis",
+                "scope": "structured composition hypothesis registration only",
+                "validation_status": "UNVALIDATED_HYPOTHESIS",
+            },
             "vae_formula": {
                 "status": vae_status,
                 "detail": vae_detail,
@@ -161,6 +171,7 @@ class GenerationCapabilitiesTool(Tool):
                 "seed": config.mattergen_seed,
             },
             "cost_class": {
+                "mechanism_reasoning": "CHEAP",
                 "vae_formula": "CHEAP",
                 "mattergen": "MODERATE",
             },
@@ -664,9 +675,12 @@ class GenerationCapabilityPack(CapabilityPack):
         self,
         config: ScientificConfig | None = None,
         workspace: Workspace | None = None,
+        *,
+        scientific_state: ScientificState | None = None,
     ) -> None:
         self.config = config or ScientificConfig()
         self.workspace = workspace or Workspace(Path.cwd())
+        self.scientific_state = scientific_state
 
     def probe(self) -> ProbeResult:
         torch_available = importlib.util.find_spec("torch") is not None
@@ -700,6 +714,7 @@ class GenerationCapabilityPack(CapabilityPack):
     def tools(self) -> list[Tool]:
         return [
             GenerationCapabilitiesTool(self.config, self.workspace),
+            RegisterHypothesisTool(self.scientific_state),
             VAEFormulaTool(),
             VAERetrieveTool(),
             MatterGenTool(self.config, self.workspace),
@@ -801,5 +816,9 @@ def _mattergen_executable_path(value: str) -> str | None:
 def generation_pack(
     config: ScientificConfig | None = None,
     workspace: Workspace | None = None,
+    *,
+    scientific_state: ScientificState | None = None,
 ) -> GenerationCapabilityPack:
-    return GenerationCapabilityPack(config, workspace)
+    return GenerationCapabilityPack(
+        config, workspace, scientific_state=scientific_state
+    )

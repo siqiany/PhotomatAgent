@@ -115,6 +115,9 @@ async def test_write_ask_allow_changes_file(tmp_path):
 async def test_default_policy_asks_for_new_or_scientific_tools():
     policy = default_permission_policy()
     assert (await policy.check("read", {})).decision is PermissionDecision.ALLOW
+    assert (
+        await policy.check("generation.register_hypothesis", {})
+    ).decision is PermissionDecision.ASK
     assert (await policy.check("vasp.prepare", {})).decision is PermissionDecision.ASK
     assert (await policy.check("future.plugin.mutate", {})).decision is PermissionDecision.ASK
 

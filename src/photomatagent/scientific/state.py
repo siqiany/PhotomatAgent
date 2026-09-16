@@ -8,6 +8,7 @@ from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
+from photomatagent.scientific.discovery.models import ScientificHypothesis
 from photomatagent.scientific.tasks import ScientificTask
 
 
@@ -21,6 +22,7 @@ class ScientificState(BaseModel):
 
     goal: str = ""
     hypotheses: list[str] = Field(default_factory=list)
+    material_hypotheses: list[ScientificHypothesis] = Field(default_factory=list)
     claims: list[ScientificClaim] = Field(default_factory=list)
     evidence: list[Evidence | ScientificEvidence] = Field(default_factory=list)
     calculations: list[CalculationRecord] = Field(default_factory=list)
@@ -45,3 +47,23 @@ class ScientificState(BaseModel):
     def add_task(self, task: ScientificTask) -> ScientificTask:
         self.pending_tasks.append(task)
         return task
+
+    def add_material_hypothesis(
+        self, record: ScientificHypothesis
+    ) -> ScientificHypothesis:
+        existing = next(
+            (
+                item
+                for item in self.material_hypotheses
+                if item.proposal.request_id == record.proposal.request_id
+            ),
+            None,
+        )
+        if existing is None:
+            self.material_hypotheses.append(record)
+            return record
+        if existing.request_payload_sha256 != record.request_payload_sha256:
+            raise ValueError(
+                f"request_id {record.proposal.request_id!r} conflicts with an existing payload"
+            )
+        return existing

@@ -67,6 +67,7 @@ def create_default_registry(
                 scientific_config,
                 boundary,
                 vasp_approval_root=application_approval_root,
+                scientific_state=scientific_state,
             )
         )
     config = surface_config or ToolSurfaceConfig()

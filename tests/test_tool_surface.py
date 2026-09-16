@@ -153,6 +153,26 @@ def test_manifest_never_exceeds_budget_and_degrades():
     assert "tool_search" in manifest.text
 
 
+def test_hypothesis_registration_is_deferred_and_describable(tmp_path):
+    state = ScientificState()
+    registry = create_default_registry(state, Workspace(tmp_path))
+    registration = registry.get("generation.register_hypothesis")
+
+    assert registration.exposure is ToolExposure.DEFERRED
+    assert "generation.register_hypothesis" not in {
+        definition.name for definition in registry.definitions(ToolExposure.DIRECT)
+    }
+    entry = ToolCatalog(registry).get("generation.register_hypothesis")
+    assert entry is not None
+    assert set(entry.required_parameters) == {
+        "request_id",
+        "formula",
+        "statement",
+        "design_operation",
+        "validation_questions",
+    }
+
+
 @pytest.mark.asyncio
 async def test_bridge_executes_underlying_with_protocol_pairing(tmp_path):
     model = FakeModelProvider(

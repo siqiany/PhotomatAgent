@@ -82,6 +82,15 @@ from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.discovery.models import (
+    HypothesisOrigin,
+    HypothesisRegistration,
+    ScientificHypothesis,
+)
+from photomatagent.scientific.discovery.registration import (
+    build_hypothesis,
+    validate_proposal,
+)
 from photomatagent.skills.loader import SkillLoader
 from photomatagent.scientific.tasks import ScientificTask
 from photomatagent.sessions.store import SessionSnapshot
@@ -719,6 +728,33 @@ class AgentRuntime:
                 yield event
             return
 
+        try:
+            prepared_updates = self._prepare_state_updates(
+                result.state_updates,
+                tool_name=name,
+                tool_call_id=tool_call.id,
+            )
+        except (ToolError, ValueError) as exc:
+            observation = self._observation.apply(
+                name, f"{type(exc).__name__}: {exc}"
+            )
+            async for event in self._record_tool_failure(
+                tool_call,
+                iteration,
+                observation.content,
+                duration_ms,
+                error_type=type(exc).__name__,
+                bridge_tool=bridge_tool,
+                protocol_tool_name=protocol_tool_name,
+                observation=observation,
+            ):
+                yield event
+            return
+
+        self._record_innovation_meta(name, registered.namespace, result, bridge_tool)
+        if prepared_updates:
+            for update in prepared_updates:
+                self._apply_state_update(update)
         observation = self._observation.apply(name, result.output)
         yield await self._emit(
             ToolCompleted(
@@ -735,10 +771,7 @@ class AgentRuntime:
                 redacted=observation.redacted,
             )
         )
-        self._record_innovation_meta(name, registered.namespace, result, bridge_tool)
-        if result.state_updates:
-            for update in result.state_updates:
-                self._apply_state_update(update)
+        if prepared_updates:
             yield await self._emit(
                 ScientificStateUpdated(summary=format_scientific_state(self._scientific))
             )
@@ -882,8 +915,62 @@ class AgentRuntime:
             self._scientific.add_calculation(update)
         elif isinstance(update, ScientificTask):
             self._scientific.add_task(update)
+        elif isinstance(update, ScientificHypothesis):
+            self._scientific.add_material_hypothesis(update)
         else:
             raise ToolError(f"unsupported scientific state update: {type(update).__name__}")
+
+    def _prepare_state_updates(
+        self,
+        updates: list[Any],
+        *,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> list[Any]:
+        """Validate a complete update batch against a shadow state before mutation."""
+
+        shadow = self._scientific.model_copy(deep=True)
+        prepared: list[Any] = []
+        for update in updates:
+            if isinstance(update, HypothesisRegistration):
+                validate_proposal(update.proposal, shadow)
+                if self._run_id is None:
+                    raise ToolError("hypothesis registration requires an active runtime run")
+                record = build_hypothesis(
+                    update.proposal,
+                    HypothesisOrigin(
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        session_id=self._session_id,
+                        run_id=self._run_id,
+                        provider=self._model.provider,
+                        model=self._model.model,
+                    ),
+                )
+                shadow.add_material_hypothesis(record)
+                prepared.append(record)
+            elif isinstance(
+                update,
+                (Evidence, ScientificEvidence, ScientificClaim, CalculationRecord, ScientificTask),
+            ):
+                self._apply_state_update_to(shadow, update)
+                prepared.append(update)
+            else:
+                raise ToolError(
+                    f"unsupported scientific state update: {type(update).__name__}"
+                )
+        return prepared
+
+    @staticmethod
+    def _apply_state_update_to(state: ScientificState, update: Any) -> None:
+        if isinstance(update, (Evidence, ScientificEvidence)):
+            state.add_evidence(update)
+        elif isinstance(update, ScientificClaim):
+            state.add_claim(update)
+        elif isinstance(update, CalculationRecord):
+            state.add_calculation(update)
+        elif isinstance(update, ScientificTask):
+            state.add_task(update)
 
     async def _emit_budget(self, iteration: int) -> RuntimeEvent:
         return await self._emit(
