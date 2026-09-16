@@ -125,7 +125,7 @@ def _registered_hypothesis(index: int):
 @pytest.mark.asyncio
 async def test_hypothesis_inspection_is_paginated_and_omits_basis_body():
     state = ScientificState(
-        material_hypotheses=[_registered_hypothesis(index) for index in range(12)]
+        material_hypotheses=[_registered_hypothesis(index) for index in range(60)]
     )
     tool = ScientificStateInspectTool(state)
 
@@ -134,12 +134,41 @@ async def test_hypothesis_inspection_is_paginated_and_omits_basis_body():
 
     assert first.data["offset"] == 0
     assert first.data["limit"] == 10
-    assert first.data["total"] == 12
+    assert first.data["total"] == 60
     assert len(first.data["items"]) == 10
     assert second.data["offset"] == 10
     assert len(second.data["items"]) == 2
     assert state.material_hypotheses[10].id in second.output
     assert "FULL BASIS" not in first.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"section": "hypotheses", "offset": True},
+        {"section": "hypotheses", "offset": "1"},
+        {"section": "hypotheses", "offset": -1},
+        {"section": "hypotheses", "limit": False},
+        {"section": "hypotheses", "limit": 1.5},
+        {"section": "hypotheses", "limit": 0},
+        {"section": "hypotheses", "limit": 51},
+        {"section": "structures"},
+        {"section": 1},
+    ],
+)
+async def test_hypothesis_inspect_execute_rejects_invalid_boundaries(arguments):
+    state = ScientificState(
+        material_hypotheses=[_registered_hypothesis(index) for index in range(60)]
+    )
+
+    result = await ScientificStateInspectTool(state).execute(arguments)
+
+    assert result.is_error is True
+    assert result.data["error_type"] == "INVALID_INSPECT_ARGUMENTS"
+    assert result.state_updates == []
+    assert "FULL BASIS" not in result.output
+    assert state.material_hypotheses[-1].id not in result.output
 
 
 def test_hypothesis_inspection_bounds_offset_limit_and_excludes_structures():

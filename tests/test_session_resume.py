@@ -202,7 +202,15 @@ async def test_hypothesis_roundtrip_restores_in_place_and_retry_is_idempotent(tm
     resumed.restore_session(load_session_snapshot(tmp_path / "hypothesis-session"))
 
     assert resumed.scientific_state is live_state
-    assert len(resumed.scientific_state.material_hypotheses) == 4
+    restored_records = resumed.scientific_state.material_hypotheses
+    assert restored_records == originals
+    assert [record.model_dump(mode="json") for record in restored_records] == [
+        record.model_dump(mode="json") for record in originals
+    ]
+    for restored, original in zip(restored_records, originals, strict=True):
+        assert restored.lineage.candidate_id == original.lineage.candidate_id
+        assert restored.lineage.generated_by == "mechanism_reasoning"
+        assert restored.lineage.validation_status == "UNVALIDATED_HYPOTHESIS"
     inspected = await inspect_tool.execute(
         {"section": "hypotheses", "offset": 0, "limit": 50}
     )

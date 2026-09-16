@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from photomatagent.runtime.context import format_scientific_state
 from photomatagent.scientific.state import ScientificState
@@ -39,13 +40,31 @@ class ScientificStateInspectTool(Tool):
     def __init__(self, scientific_state: ScientificState) -> None:
         self._state = scientific_state
 
-    async def execute(self, arguments: dict) -> ToolResult:
+    @staticmethod
+    def _invalid_arguments(message: str) -> ToolResult:
+        data = {"error_type": "INVALID_INSPECT_ARGUMENTS", "message": message}
+        return ToolResult(
+            output=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            is_error=True,
+            data=data,
+        )
+
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         section = arguments.get("section", "all")
+        valid_sections = {"all", "hypotheses", "evidence", "claims", "calculations"}
+        if not isinstance(section, str) or section not in valid_sections:
+            return self._invalid_arguments("unknown section")
+        offset = arguments.get("offset", 0)
+        limit = arguments.get("limit", 10)
+        if type(offset) is not int or offset < 0:
+            return self._invalid_arguments(
+                "offset must be an integer greater than or equal to 0"
+            )
+        if type(limit) is not int or limit < 1 or limit > 50:
+            return self._invalid_arguments("limit must be an integer between 1 and 50")
         if section == "all":
             text = format_scientific_state(self._state)
         elif section == "hypotheses":
-            offset = int(arguments.get("offset", 0))
-            limit = int(arguments.get("limit", 10))
             records = self._state.material_hypotheses[offset : offset + limit]
             items = [
                 {
@@ -100,6 +119,4 @@ class ScientificStateInspectTool(Tool):
             text = "\n".join(
                 f"- [{c.status}] {c.task_type} -> {c.output_reference}" for c in self._state.calculations
             )
-        else:
-            text = "(invalid section)"
         return ToolResult(output=text or "(empty)", data={"section": section})

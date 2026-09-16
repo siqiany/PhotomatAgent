@@ -33,6 +33,7 @@ from photomatagent.models.types import (
     ToolResultMessage,
     UserMessage,
 )
+from photomatagent.redaction import redact_text
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context import ContextBuilder, format_scientific_state
 from photomatagent.runtime.context_engine import (
@@ -44,6 +45,7 @@ from photomatagent.runtime.context_budget import account_context
 from photomatagent.runtime.events import (
     BudgetUpdated,
     HypothesisRegistered,
+    HypothesisRegistrationReasonCode,
     HypothesisRegistrationRejected,
     LoopCompleted,
     LoopFailed,
@@ -107,6 +109,69 @@ from photomatagent.tools.surface import (
 from photomatagent.workspace import Workspace
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
+_HYPOTHESIS_REGISTRATION_TOOL = "generation.register_hypothesis"
+
+
+def _bounded_event_text(value: object, *, limit: int) -> str:
+    return redact_text(str(value))[:limit]
+
+
+def _is_hypothesis_registration_call(
+    tool_name: str, arguments: dict[str, object]
+) -> bool:
+    if tool_name == _HYPOTHESIS_REGISTRATION_TOOL:
+        return True
+    return (
+        tool_name == "tool_call"
+        and arguments.get("name") == _HYPOTHESIS_REGISTRATION_TOOL
+    )
+
+
+def _hypothesis_event_arguments(arguments: dict[str, object]) -> dict[str, object]:
+    """Project a registration proposal to bounded identifiers for event sinks."""
+
+    basis = arguments.get("basis")
+    basis_items = basis if isinstance(basis, list) else []
+    parent_ids = arguments.get("parent_hypothesis_ids")
+    parent_items = parent_ids if isinstance(parent_ids, list) else []
+    questions = arguments.get("validation_questions")
+    question_items = questions if isinstance(questions, list) else []
+    return {
+        "request_id": _bounded_event_text(arguments.get("request_id", ""), limit=128),
+        "formula": _bounded_event_text(arguments.get("formula", ""), limit=256),
+        "design_operation": _bounded_event_text(
+            arguments.get("design_operation", ""), limit=64
+        ),
+        "parent_hypothesis_ids": [
+            _bounded_event_text(item, limit=128) for item in parent_items[:8]
+        ],
+        "basis_evidence_ids": [
+            _bounded_event_text(item.get("evidence_id", ""), limit=128)
+            for item in basis_items[:16]
+            if isinstance(item, dict)
+        ],
+        "basis_count": len(basis_items),
+        "validation_question_count": len(question_items),
+    }
+
+
+def _event_tool_arguments(
+    tool_name: str, arguments: dict[str, object]
+) -> dict[str, object]:
+    if tool_name == _HYPOTHESIS_REGISTRATION_TOOL:
+        return _hypothesis_event_arguments(arguments)
+    if (
+        tool_name == "tool_call"
+        and arguments.get("name") == _HYPOTHESIS_REGISTRATION_TOOL
+    ):
+        nested = arguments.get("arguments")
+        return {
+            "name": _HYPOTHESIS_REGISTRATION_TOOL,
+            "arguments": _hypothesis_event_arguments(
+                nested if isinstance(nested, dict) else {}
+            ),
+        }
+    return arguments
 
 
 class AgentRuntime:
@@ -322,6 +387,10 @@ class AgentRuntime:
 
                 response: ModelResponse | None = None
                 model_started = time.monotonic()
+                stream_tool_names: dict[str, str] = {}
+                buffered_argument_deltas: dict[
+                    str, list[ModelToolCallArgumentsDelta]
+                ] = {}
                 try:
                     async for model_event in self._model.stream(request):
                         if isinstance(model_event, ProviderStreamStarted):
@@ -338,6 +407,9 @@ class AgentRuntime:
                                 TextDelta(iteration=iteration, text=model_event.text)
                             )
                         elif isinstance(model_event, ModelToolCallStarted):
+                            stream_tool_names[model_event.tool_call_id] = (
+                                model_event.tool_name
+                            )
                             yield await self._emit(
                                 ToolCallStarted(
                                     iteration=iteration,
@@ -347,22 +419,63 @@ class AgentRuntime:
                                 )
                             )
                         elif isinstance(model_event, ModelToolCallArgumentsDelta):
-                            yield await self._emit(
-                                ToolCallArgumentsDelta(
-                                    iteration=iteration,
-                                    tool_call_id=model_event.tool_call_id,
-                                    delta=model_event.delta,
-                                    index=model_event.index,
-                                )
+                            streamed_name = stream_tool_names.get(
+                                model_event.tool_call_id, ""
                             )
+                            if streamed_name in {
+                                "tool_call",
+                                _HYPOTHESIS_REGISTRATION_TOOL,
+                            }:
+                                buffered_argument_deltas.setdefault(
+                                    model_event.tool_call_id, []
+                                ).append(model_event)
+                            else:
+                                yield await self._emit(
+                                    ToolCallArgumentsDelta(
+                                        iteration=iteration,
+                                        tool_call_id=model_event.tool_call_id,
+                                        delta=model_event.delta,
+                                        index=model_event.index,
+                                    )
+                                )
                         elif isinstance(model_event, ModelToolCallCompleted):
                             call = model_event.tool_call
+                            pending_deltas = buffered_argument_deltas.pop(call.id, [])
+                            if pending_deltas and _is_hypothesis_registration_call(
+                                call.name, call.arguments
+                            ):
+                                yield await self._emit(
+                                    ToolCallArgumentsDelta(
+                                        iteration=iteration,
+                                        tool_call_id=call.id,
+                                        delta=json.dumps(
+                                            _event_tool_arguments(
+                                                call.name, call.arguments
+                                            ),
+                                            ensure_ascii=False,
+                                            separators=(",", ":"),
+                                        ),
+                                        index=model_event.index,
+                                    )
+                                )
+                            else:
+                                for pending in pending_deltas:
+                                    yield await self._emit(
+                                        ToolCallArgumentsDelta(
+                                            iteration=iteration,
+                                            tool_call_id=pending.tool_call_id,
+                                            delta=pending.delta,
+                                            index=pending.index,
+                                        )
+                                    )
                             yield await self._emit(
                                 ToolCallCompleted(
                                     iteration=iteration,
                                     tool_call_id=call.id,
                                     tool_name=call.name,
-                                    arguments=call.arguments,
+                                    arguments=_event_tool_arguments(
+                                        call.name, call.arguments
+                                    ),
                                     index=model_event.index,
                                 )
                             )
@@ -525,6 +638,7 @@ class AgentRuntime:
         bridge_tool: str | None = None
         protocol_tool_name = tool_call.name
         if tool_call.name == "tool_call":
+            target_name: str | None = None
             try:
                 bridge_arguments = self._tools.validate_arguments(
                     "tool_call", tool_call.arguments
@@ -544,6 +658,13 @@ class AgentRuntime:
                 )
                 bridge_tool = "tool_call"
             except (ToolValidationError, KeyError) as exc:
+                if target_name == _HYPOTHESIS_REGISTRATION_TOOL:
+                    yield await self._emit_hypothesis_rejection(
+                        tool_call,
+                        "TOOL_UNAVAILABLE"
+                        if isinstance(exc, KeyError)
+                        else "SCHEMA_VALIDATION_FAILED",
+                    )
                 async for event in self._record_tool_failure(
                     tool_call,
                     iteration,
@@ -557,12 +678,20 @@ class AgentRuntime:
         try:
             registered = self._tools.get(name)
         except KeyError as exc:
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "TOOL_UNAVAILABLE"
+                )
             async for event in self._record_tool_failure(
                 tool_call, iteration, str(exc), error_type=type(exc).__name__
             ):
                 yield event
             return
         if registered.exposure is ToolExposure.HIDDEN:
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "TOOL_UNAVAILABLE"
+                )
             async for event in self._record_tool_failure(
                 tool_call,
                 iteration,
@@ -576,6 +705,10 @@ class AgentRuntime:
         try:
             self._sensitive_paths.check_tool_call(name, tool_call.arguments)
         except SensitiveAccessError as exc:
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "SENSITIVE_ACCESS_BLOCKED"
+                )
             yield await self._emit(
                 SensitiveAccessBlocked(
                     iteration=iteration,
@@ -598,7 +731,7 @@ class AgentRuntime:
                 iteration=iteration,
                 tool_call_id=tool_call.id,
                 tool_name=name,
-                arguments=tool_call.arguments,
+                arguments=_event_tool_arguments(name, tool_call.arguments),
                 bridge_tool=bridge_tool,
                 underlying_tool=name if bridge_tool else None,
             )
@@ -608,6 +741,10 @@ class AgentRuntime:
             and bridge_tool is None
             and self._tool_surface.config.mode == "progressive"
         ):
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "DEFERRED_TOOL_REQUIRES_BRIDGE"
+                )
             payload = json.dumps(
                 {
                     "error": "deferred_tool_requires_bridge",
@@ -628,6 +765,10 @@ class AgentRuntime:
 
         permission = await self._permission.check(name, tool_call.arguments)
         if permission.decision is PermissionDecision.DENY:
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "PERMISSION_DENIED"
+                )
             async for event in self._deny_tool(
                 tool_call,
                 iteration,
@@ -643,7 +784,7 @@ class AgentRuntime:
                     iteration=iteration,
                     tool_call_id=tool_call.id,
                     tool_name=name,
-                    arguments=tool_call.arguments,
+                    arguments=_event_tool_arguments(name, tool_call.arguments),
                     reason=permission.reason,
                     bridge_tool=bridge_tool,
                     underlying_tool=name if bridge_tool else None,
@@ -656,6 +797,10 @@ class AgentRuntime:
                 )
             )
             if not approved:
+                if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                    yield await self._emit_hypothesis_rejection(
+                        tool_call, "APPROVAL_REJECTED"
+                    )
                 async for event in self._deny_tool(
                     tool_call,
                     iteration,
@@ -674,12 +819,9 @@ class AgentRuntime:
                 if bridge_tool
                 else str(exc)
             )
-            if name == "generation.register_hypothesis":
-                yield await self._emit(
-                    HypothesisRegistrationRejected(
-                        request_id=str(tool_call.arguments.get("request_id", "")),
-                        reason_code="TOOL_VALIDATION_ERROR",
-                    )
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "SCHEMA_VALIDATION_FAILED"
                 )
             async for event in self._record_tool_failure(
                 tool_call,
@@ -709,6 +851,10 @@ class AgentRuntime:
             observation = self._observation.apply(
                 name, f"{type(exc).__name__}: {exc}"
             )
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "TOOL_EXECUTION_FAILED"
+                )
             async for event in self._record_tool_failure(
                 tool_call,
                 iteration,
@@ -725,14 +871,9 @@ class AgentRuntime:
         duration_ms = (time.monotonic() - tool_started) * 1000
         if result.is_error:
             observation = self._observation.apply(name, result.output)
-            if name == "generation.register_hypothesis":
-                yield await self._emit(
-                    HypothesisRegistrationRejected(
-                        request_id=str(tool_call.arguments.get("request_id", "")),
-                        reason_code=str(
-                            result.data.get("error_type", "REGISTRATION_FAILED")
-                        ),
-                    )
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "TOOL_REJECTED"
                 )
             async for event in self._record_tool_failure(
                 tool_call,
@@ -756,12 +897,9 @@ class AgentRuntime:
             observation = self._observation.apply(
                 name, f"{type(exc).__name__}: {exc}"
             )
-            if name == "generation.register_hypothesis":
-                yield await self._emit(
-                    HypothesisRegistrationRejected(
-                        request_id=str(tool_call.arguments.get("request_id", "")),
-                        reason_code="INVALID_HYPOTHESIS",
-                    )
+            if name == _HYPOTHESIS_REGISTRATION_TOOL:
+                yield await self._emit_hypothesis_rejection(
+                    tool_call, "STATE_UPDATE_VALIDATION_FAILED"
                 )
             async for event in self._record_tool_failure(
                 tool_call,
@@ -806,8 +944,31 @@ class AgentRuntime:
                     )
                 )
         if prepared_updates:
+            state_summary = format_scientific_state(self._scientific)
+            registered_updates = [
+                update
+                for update in prepared_updates
+                if isinstance(update, ScientificHypothesis)
+            ]
+            if registered_updates:
+                state_summary = json.dumps(
+                    {
+                        "material_hypothesis_count": len(
+                            self._scientific.material_hypotheses
+                        ),
+                        "registered": [
+                            {
+                                "hypothesis_id": update.id,
+                                "candidate_id": update.candidate_id,
+                            }
+                            for update in registered_updates
+                        ],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             yield await self._emit(
-                ScientificStateUpdated(summary=format_scientific_state(self._scientific))
+                ScientificStateUpdated(summary=state_summary)
             )
         self._conversation.add(
             ToolResultMessage(
@@ -876,6 +1037,21 @@ class AgentRuntime:
                 tool_name=protocol_tool_name or tool_call.name,
                 content=f"permission denied: {reason}",
                 is_error=True,
+            )
+        )
+
+    async def _emit_hypothesis_rejection(
+        self,
+        tool_call: ToolCall,
+        reason_code: HypothesisRegistrationReasonCode,
+    ) -> RuntimeEvent:
+        request_id = _bounded_event_text(
+            tool_call.arguments.get("request_id", ""), limit=128
+        )
+        return await self._emit(
+            HypothesisRegistrationRejected(
+                request_id=request_id,
+                reason_code=reason_code,
             )
         )
 

@@ -280,6 +280,19 @@ class HypothesisRegistered(RuntimeEvent):
     request_id: str
 
 
+HypothesisRegistrationReasonCode = Literal[
+    "DEFERRED_TOOL_REQUIRES_BRIDGE",
+    "PERMISSION_DENIED",
+    "APPROVAL_REJECTED",
+    "SCHEMA_VALIDATION_FAILED",
+    "TOOL_EXECUTION_FAILED",
+    "TOOL_REJECTED",
+    "STATE_UPDATE_VALIDATION_FAILED",
+    "TOOL_UNAVAILABLE",
+    "SENSITIVE_ACCESS_BLOCKED",
+]
+
+
 class HypothesisRegistrationRejected(RuntimeEvent):
     """A requested hypothesis registration failed before state mutation."""
 
@@ -287,7 +300,7 @@ class HypothesisRegistrationRejected(RuntimeEvent):
         "hypothesis_registration_rejected"
     )
     request_id: str
-    reason_code: str
+    reason_code: HypothesisRegistrationReasonCode
 
 
 class BudgetUpdated(RuntimeEvent):
