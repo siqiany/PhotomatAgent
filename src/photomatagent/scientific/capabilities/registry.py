@@ -115,7 +115,11 @@ def _mcp_gateway_tools(
 
     manager = MCPServerManager(config.mcp_servers, workspace=workspace.root)
     try:
-        return manager.register_tools(builtin_tool_names)
+        gateway_tools = manager.register_tools(builtin_tool_names)
+        authoritative_names = builtin_tool_names or set()
+        return [
+            tool for tool in gateway_tools if tool.name not in authoritative_names
+        ]
     except Exception:
         return []
 

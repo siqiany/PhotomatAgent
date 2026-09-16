@@ -80,4 +80,3 @@ class RegisterHypothesisTool(Tool):
             data=data,
             state_updates=[HypothesisRegistration(proposal=proposal)],
         )
-

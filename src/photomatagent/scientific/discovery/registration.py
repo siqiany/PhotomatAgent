@@ -110,4 +110,3 @@ def build_hypothesis(
         origin=origin,
         created_at=datetime.now(UTC),
     )
-

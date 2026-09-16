@@ -947,8 +947,10 @@ class AgentRuntime:
                         model=self._model.model,
                     ),
                 )
+                hypothesis_count = len(shadow.material_hypotheses)
                 shadow.add_material_hypothesis(record)
-                prepared.append(record)
+                if len(shadow.material_hypotheses) > hypothesis_count:
+                    prepared.append(record)
             elif isinstance(
                 update,
                 (Evidence, ScientificEvidence, ScientificClaim, CalculationRecord, ScientificTask),
