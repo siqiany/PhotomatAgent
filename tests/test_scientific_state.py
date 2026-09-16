@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
+from photomatagent.scientific.discovery.models import HypothesisOrigin, HypothesisProposal
+from photomatagent.scientific.discovery.registration import build_hypothesis
 from photomatagent.scientific.state import ScientificState
 from photomatagent.scientific.tasks import ScientificTask
+from photomatagent.tools.registry import ToolRegistry
+from photomatagent.tools.base import ToolError
+from photomatagent.tools.scientific_state_inspect import ScientificStateInspectTool
 
 
 def test_evidence_roundtrip():
@@ -74,3 +81,86 @@ def test_state_serializes_to_json():
     payload = state.model_dump_json()
     restored = ScientificState.model_validate_json(payload)
     assert restored.goal == "x"
+
+
+def test_legacy_hypothesis_strings_remain_unchanged():
+    restored = ScientificState.model_validate(
+        {
+            "goal": "old goal",
+            "hypotheses": ["a historical free-text hypothesis"],
+        }
+    )
+
+    assert restored.hypotheses == ["a historical free-text hypothesis"]
+    assert restored.material_hypotheses == []
+
+
+def _registered_hypothesis(index: int):
+    return build_hypothesis(
+        HypothesisProposal(
+            request_id=f"inspect-{index}",
+            formula=f"Na{index + 1}BiS2",
+            statement=f"inspect statement {index}",
+            design_operation="isovalent_substitution",
+            basis=[
+                {
+                    "evidence_id": f"ev-{index}",
+                    "relation": "supports",
+                    "anchor": f"FULL BASIS {index}",
+                }
+            ],
+            validation_questions=[f"inspect gap {index}"],
+        ),
+        HypothesisOrigin(
+            tool_name="generation.register_hypothesis",
+            tool_call_id=f"call-{index}",
+            session_id="session",
+            run_id="run",
+            provider="fake",
+            model="fake",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_inspection_is_paginated_and_omits_basis_body():
+    state = ScientificState(
+        material_hypotheses=[_registered_hypothesis(index) for index in range(12)]
+    )
+    tool = ScientificStateInspectTool(state)
+
+    first = await tool.execute({"section": "hypotheses"})
+    second = await tool.execute({"section": "hypotheses", "offset": 10, "limit": 2})
+
+    assert first.data["offset"] == 0
+    assert first.data["limit"] == 10
+    assert first.data["total"] == 12
+    assert len(first.data["items"]) == 10
+    assert second.data["offset"] == 10
+    assert len(second.data["items"]) == 2
+    assert state.material_hypotheses[10].id in second.output
+    assert "FULL BASIS" not in first.output
+
+
+def test_hypothesis_inspection_bounds_offset_limit_and_excludes_structures():
+    registry = ToolRegistry()
+    registry.register(ScientificStateInspectTool(ScientificState()))
+
+    assert "hypotheses" in ScientificStateInspectTool.input_schema["properties"][
+        "section"
+    ]["enum"]
+    assert "structures" not in ScientificStateInspectTool.input_schema["properties"][
+        "section"
+    ]["enum"]
+    registry.validate_arguments(
+        "scientific_state_inspect",
+        {"section": "hypotheses", "offset": 0, "limit": 50},
+    )
+    for invalid in (
+        {"section": "hypotheses", "offset": -1},
+        {"section": "hypotheses", "limit": 0},
+        {"section": "hypotheses", "limit": 51},
+        {"section": "structures"},
+    ):
+        with pytest.raises(ToolError):
+            registry.validate_arguments("scientific_state_inspect", invalid)

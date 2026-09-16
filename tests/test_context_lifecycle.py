@@ -268,6 +268,38 @@ async def test_structured_compaction_replaces_only_old_prefix():
 
 
 @pytest.mark.asyncio
+async def test_compaction_does_not_rewrite_scientific_state():
+    summarizer = StubSummarizer()
+    conversation = ConversationState(
+        messages=[
+            UserMessage(content="old goal"),
+            AssistantMessage(text="old answer"),
+            UserMessage(content="current goal"),
+        ]
+    )
+    scientific = ScientificState(
+        goal="durable science",
+        hypotheses=["historical free text"],
+        open_questions=["What remains unknown?"],
+    )
+    conversation_before = conversation.model_dump(mode="json")
+    scientific_before = scientific.model_dump(mode="json")
+
+    await _engine(summarizer=summarizer).build(
+        conversation=conversation,
+        scientific=scientific,
+        context_builder=ContextBuilder(),
+        capability_manifest="",
+        surface=_surface(),
+        session_id="session-test",
+        force_compaction=True,
+    )
+
+    assert conversation.model_dump(mode="json") == conversation_before
+    assert scientific.model_dump(mode="json") == scientific_before
+
+
+@pytest.mark.asyncio
 async def test_compaction_failure_retains_working_history():
     summarizer = StubSummarizer(fail=True)
     conversation = ConversationState(

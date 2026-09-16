@@ -55,6 +55,16 @@ def format_scientific_state(state: ScientificState) -> str:
     if state.hypotheses:
         lines.append("Hypotheses:")
         lines += [f"- {h}" for h in state.hypotheses]
+    if state.material_hypotheses:
+        lines.append("Material hypotheses (latest 3):")
+        for hypothesis in state.material_hypotheses[-3:]:
+            primary_gap = hypothesis.proposal.validation_questions[0]
+            lines.append(
+                f"- [{hypothesis.id}] candidate={hypothesis.candidate_id}; "
+                f"formula={hypothesis.proposal.formula}; "
+                f"mechanism={hypothesis.proposal.design_operation}; "
+                f"primary_gap={primary_gap}"
+            )
     if state.claims:
         lines.append("Claims:")
         for claim in state.claims:

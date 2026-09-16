@@ -271,6 +271,25 @@ class ScientificStateUpdated(RuntimeEvent):
     summary: str
 
 
+class HypothesisRegistered(RuntimeEvent):
+    """A new structured hypothesis was appended to live scientific state."""
+
+    kind: Literal["hypothesis_registered"] = "hypothesis_registered"
+    hypothesis_id: str
+    candidate_id: str
+    request_id: str
+
+
+class HypothesisRegistrationRejected(RuntimeEvent):
+    """A requested hypothesis registration failed before state mutation."""
+
+    kind: Literal["hypothesis_registration_rejected"] = (
+        "hypothesis_registration_rejected"
+    )
+    request_id: str
+    reason_code: str
+
+
 class BudgetUpdated(RuntimeEvent):
     kind: Literal["budget_updated"] = "budget_updated"
     model_calls: int
@@ -524,6 +543,8 @@ AnyRuntimeEvent = Annotated[
         ToolCompleted,
         ToolFailed,
         ScientificStateUpdated,
+        HypothesisRegistered,
+        HypothesisRegistrationRejected,
         ScientificTraceMeta,
         BudgetUpdated,
         LoopCompleted,

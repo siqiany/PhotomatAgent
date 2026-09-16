@@ -43,6 +43,8 @@ from photomatagent.runtime.context_engine import (
 from photomatagent.runtime.context_budget import account_context
 from photomatagent.runtime.events import (
     BudgetUpdated,
+    HypothesisRegistered,
+    HypothesisRegistrationRejected,
     LoopCompleted,
     LoopFailed,
     LoopIterationStarted,
@@ -672,6 +674,13 @@ class AgentRuntime:
                 if bridge_tool
                 else str(exc)
             )
+            if name == "generation.register_hypothesis":
+                yield await self._emit(
+                    HypothesisRegistrationRejected(
+                        request_id=str(tool_call.arguments.get("request_id", "")),
+                        reason_code="TOOL_VALIDATION_ERROR",
+                    )
+                )
             async for event in self._record_tool_failure(
                 tool_call,
                 iteration,
@@ -716,6 +725,15 @@ class AgentRuntime:
         duration_ms = (time.monotonic() - tool_started) * 1000
         if result.is_error:
             observation = self._observation.apply(name, result.output)
+            if name == "generation.register_hypothesis":
+                yield await self._emit(
+                    HypothesisRegistrationRejected(
+                        request_id=str(tool_call.arguments.get("request_id", "")),
+                        reason_code=str(
+                            result.data.get("error_type", "REGISTRATION_FAILED")
+                        ),
+                    )
+                )
             async for event in self._record_tool_failure(
                 tool_call,
                 iteration,
@@ -738,6 +756,13 @@ class AgentRuntime:
             observation = self._observation.apply(
                 name, f"{type(exc).__name__}: {exc}"
             )
+            if name == "generation.register_hypothesis":
+                yield await self._emit(
+                    HypothesisRegistrationRejected(
+                        request_id=str(tool_call.arguments.get("request_id", "")),
+                        reason_code="INVALID_HYPOTHESIS",
+                    )
+                )
             async for event in self._record_tool_failure(
                 tool_call,
                 iteration,
@@ -771,6 +796,15 @@ class AgentRuntime:
                 redacted=observation.redacted,
             )
         )
+        for update in prepared_updates:
+            if isinstance(update, ScientificHypothesis):
+                yield await self._emit(
+                    HypothesisRegistered(
+                        hypothesis_id=update.id,
+                        candidate_id=update.candidate_id,
+                        request_id=update.proposal.request_id,
+                    )
+                )
         if prepared_updates:
             yield await self._emit(
                 ScientificStateUpdated(summary=format_scientific_state(self._scientific))

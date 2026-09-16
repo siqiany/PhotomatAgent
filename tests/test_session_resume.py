@@ -28,6 +28,16 @@ from photomatagent.sessions.store import (
 from conftest import collect, make_runtime
 
 
+def _hypothesis_arguments() -> dict[str, object]:
+    return {
+        "request_id": "resume-hypothesis-1",
+        "formula": "Na0.75Ag0.25BiS2",
+        "statement": "Preserve this mechanism hypothesis",
+        "design_operation": "isovalent_substitution",
+        "validation_questions": ["Does the ordered phase remain stable?"],
+    }
+
+
 def test_snapshot_roundtrip_preserves_all_resume_state(tmp_path):
     conversation = make_runtime(FakeModelProvider()).conversation_state
     conversation.add(UserMessage(content="compute GaAs"))
@@ -131,6 +141,77 @@ async def test_restored_session_keeps_tool_state_and_continues(tmp_path):
         isinstance(message, UserMessage) and message.content == "follow-up question"
         for message in second_runtime.conversation_state.messages
     )
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_roundtrip_restores_in_place_and_retry_is_idempotent(tmp_path):
+    arguments = _hypothesis_arguments()
+    registrations = [
+        {
+            **arguments,
+            "request_id": f"resume-hypothesis-{index}",
+            "formula": f"Na{index}BiS2",
+        }
+        for index in range(1, 5)
+    ]
+    first_runtime = make_runtime(
+        FakeModelProvider(
+            [
+                *[
+                    scripted_tool_call(
+                        "tool_call",
+                        {
+                            "name": "generation.register_hypothesis",
+                            "arguments": registration,
+                        },
+                        tool_call_id=f"register-before-save-{index}",
+                    )
+                    for index, registration in enumerate(registrations, start=1)
+                ],
+                FakeResponse(text="saved"),
+            ]
+        ),
+        workspace=tmp_path,
+    )
+    await collect(first_runtime, "register before save")
+    originals = list(first_runtime.scientific_state.material_hypotheses)
+    assert len(originals) == 4
+    save_session_snapshot(
+        tmp_path / "hypothesis-session",
+        conversation=first_runtime.conversation_state,
+        scientific=first_runtime.scientific_state,
+        engine=first_runtime.context_engine.snapshot(),
+    )
+
+    retry_model = FakeModelProvider(
+        [
+            scripted_tool_call(
+                "tool_call",
+                    {
+                        "name": "generation.register_hypothesis",
+                        "arguments": registrations[0],
+                },
+                tool_call_id="register-after-restore",
+            ),
+            FakeResponse(text="retried"),
+        ]
+    )
+    resumed = make_runtime(retry_model, workspace=tmp_path)
+    live_state = resumed.scientific_state
+    inspect_tool = resumed._tools.get("scientific_state_inspect")
+    resumed.restore_session(load_session_snapshot(tmp_path / "hypothesis-session"))
+
+    assert resumed.scientific_state is live_state
+    assert len(resumed.scientific_state.material_hypotheses) == 4
+    inspected = await inspect_tool.execute(
+        {"section": "hypotheses", "offset": 0, "limit": 50}
+    )
+    for original in originals:
+        assert original.id in inspected.output
+        assert original.lineage.candidate_id in inspected.output
+    events = await collect(resumed, "retry restored request")
+    assert len(resumed.scientific_state.material_hypotheses) == 4
+    assert not any(event.kind == "hypothesis_registered" for event in events)
 
 
 def test_snapshot_redacts_secrets_before_write(tmp_path, monkeypatch):
