@@ -25,10 +25,12 @@ from photomatagent.scientific.evolution.models import (
     RevisionPlan,
     RewardComponent,
     RubricScoreDelta,
-    validate_managed_id,
 )
 from photomatagent.scientific.evolution.rubric import expert_utility
-from photomatagent.scientific.evidence_refs import opaque_evidence_ref
+from photomatagent.scientific.evidence_refs import (
+    is_canonical_opaque_evidence_ref,
+    opaque_evidence_ref,
+)
 from photomatagent.scientific.loop.evaluation import fidelity_rank
 from photomatagent.scientific.state import ScientificState
 
@@ -602,13 +604,9 @@ def _evidence_map(
 def _comparison_evidence_ref(value: str) -> str:
     """Normalize every comparison-facing evidence ID to one bounded ref."""
 
-    try:
-        managed = validate_managed_id(value)
-    except (TypeError, ValueError):
-        return opaque_evidence_ref(value)
-    if managed.startswith("eref_"):
-        return managed
-    return opaque_evidence_ref(managed)
+    if is_canonical_opaque_evidence_ref(value):
+        return value
+    return opaque_evidence_ref(value)
 
 
 def _evidence_changes(

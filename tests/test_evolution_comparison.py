@@ -490,6 +490,34 @@ def test_comparison_normalizes_legacy_outcome_and_invalidation_ids() -> None:
     assert legacy_managed_id not in report.model_dump_json()
 
 
+def test_comparison_rehashes_malformed_opaque_looking_legacy_id() -> None:
+    malformed_raw_id = "eref_SECRET_TOKEN"
+    reference = opaque_evidence_ref(malformed_raw_id)
+    previous = _episode(
+        "v001",
+        summary=_summary(("band_gap", "PASS", None, (malformed_raw_id,))),
+    )
+    current = _episode(
+        "v002",
+        summary=_summary(("band_gap", "PASS", None, (malformed_raw_id,))),
+    )
+
+    report = compare_episodes(
+        previous=previous,
+        current=current,
+        previous_plan=RevisionPlan(
+            revision_id="rp_compare",
+            evolution_id="evo_compare",
+            source_version="v001",
+            feedback_id="fb_v1",
+            confirmed=True,
+        ),
+    )
+
+    assert report.evidence_changes.carried_ids == [reference]
+    assert malformed_raw_id not in report.model_dump_json()
+
+
 def test_learning_signal_renormalizes_missing_components_and_records_them() -> None:
     reward, used = compute_learning_signal(
         expert_utility_delta=0.5,
