@@ -13,6 +13,7 @@ from photomatagent.scientific.loop.evaluation import (
 )
 from photomatagent.scientific.loop.feedback import build_feedback
 from photomatagent.scientific.loop.policy import ScientificLoopState
+from photomatagent.scientific.loop.observation import stable_observation_identity
 from photomatagent.scientific.loop.progress import progress_from_evaluation
 from photomatagent.scientific.loop.target import ConstraintSpec, TargetSpec
 from photomatagent.scientific.state import EvidenceAttestation, ScientificState
@@ -67,6 +68,33 @@ def test_only_evaluator_manifest_can_create_progress_and_is_not_serialized():
     assert progress_from_evaluation(candidate, report, state).observation_keys
     restored = EvaluationReport.model_validate_json(report.model_dump_json())
     assert progress_from_evaluation(candidate, restored, state).observation_keys == ()
+
+
+def test_same_hash_still_binds_canonical_scientific_fields():
+    base = _evidence(0.1).model_copy(
+        update={"provenance": {"content_sha256": "same-artifact"}}
+    )
+    tiny = base.model_copy(update={"value": 0.1004})
+    repost = base.model_copy(
+        update={
+            "id": "reposted",
+            "provenance": {
+                "content_sha256": "same-artifact",
+                "request_id": "new-request",
+                "reason": "retry",
+                "artifact": {"path": "renamed.cif"},
+            },
+        }
+    )
+    changed_value = base.model_copy(update={"value": 0.9})
+    changed_property = base.model_copy(update={"property": "responsivity", "unit": "A/W"})
+    changed_method = base.model_copy(update={"method": "different method"})
+
+    assert stable_observation_identity(base) == stable_observation_identity(tiny)
+    assert stable_observation_identity(base) == stable_observation_identity(repost)
+    assert stable_observation_identity(base) != stable_observation_identity(changed_value)
+    assert stable_observation_identity(base) != stable_observation_identity(changed_property)
+    assert stable_observation_identity(base) != stable_observation_identity(changed_method)
 
 
 def test_forged_public_report_and_untrusted_policy_do_not_create_progress():

@@ -61,14 +61,7 @@ def stable_observation_identity(evidence: Evidence | ScientificEvidence) -> str:
         except (TypeError, json.JSONDecodeError):
             content_payload = {}
         explicit.update(_hash_values(content_payload))
-    if explicit:
-        payload: Any = {
-            "hashes": sorted(explicit),
-            "fidelity": getattr(evidence, "fidelity", ""),
-            "structure_hash": getattr(evidence, "structure_hash", ""),
-            "conditions": _stable_value(getattr(evidence, "conditions", {})),
-        }
-    elif isinstance(evidence, ScientificEvidence):
+    if isinstance(evidence, ScientificEvidence):
         payload = {
             "property": evidence.property,
             "value": _stable_value(evidence.value),
@@ -79,6 +72,8 @@ def stable_observation_identity(evidence: Evidence | ScientificEvidence) -> str:
             "structure_hash": evidence.structure_hash,
             "conditions": _stable_value(evidence.conditions),
         }
+        if explicit:
+            payload["hashes"] = sorted(explicit)
     else:
         payload = {
             "type": evidence.type,
@@ -86,6 +81,8 @@ def stable_observation_identity(evidence: Evidence | ScientificEvidence) -> str:
             "confidence": _stable_value(evidence.confidence),
             "provenance": _stable_value(evidence.provenance),
         }
+        if explicit:
+            payload["hashes"] = sorted(explicit)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
 
@@ -128,4 +125,3 @@ def _stable_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_stable_value(item) for item in value]
     return str(value)
-
