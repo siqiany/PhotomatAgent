@@ -12,6 +12,7 @@ from photomatagent.scientific.loop.evaluation import (
 from photomatagent.scientific.loop.target import (
     ConstraintSpec,
     TargetSpec,
+    canonical_lwir_detector_target,
 )
 from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 
@@ -44,11 +45,11 @@ def _scientific(*evidence: object) -> ScientificState:
 def _attested_scientific(*evidence: object) -> ScientificState:
     state = _scientific(*evidence)
     for item in state.evidence:
-        state.evidence_attestations[item.id] = EvidenceAttestation(
+        state.evidence_attestations[item.id] = EvidenceAttestation.host_create(
             evidence_id=item.id,
             authority="observation",
             origin="trusted_builtin",
-            tool_name="test.trusted_builtin",
+            tool_name="electronic.band_summary",
             tool_call_id=f"call-{item.id}",
         )
     return state
@@ -252,6 +253,68 @@ def test_fully_laundered_unattested_evidence_cannot_validate() -> None:
     assert "UNATTESTED" in report.constraint_results[0].reason
 
 
+@pytest.mark.parametrize("tamper", ["mismatched_id", "incompatible_origin", "proof"])
+def test_directly_tampered_attestation_remains_unknown(tamper: str) -> None:
+    evidence = ScientificEvidence(
+        id="sev-tampered",
+        subject="HgTe",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+        source="archive",
+        source_type="dft_calculation",
+        method="PBE",
+        fidelity="dft",
+    )
+    state = ScientificState(evidence=[evidence])
+    attestation = EvidenceAttestation.host_create(
+        evidence_id=evidence.id,
+        authority="observation",
+        origin="trusted_builtin",
+        tool_name="electronic.band_summary",
+        tool_call_id="call-1",
+    )
+    if tamper == "mismatched_id":
+        attestation.evidence_id = "different-id"
+    elif tamper == "incompatible_origin":
+        attestation.origin = "untrusted_tool"
+    else:
+        attestation.host_proof = "forged"
+    state.evidence_attestations[evidence.id] = attestation
+
+    report = ScientificEvaluator(_target()).evaluate(_candidate(), state)
+
+    assert report.constraint_results[0].result == "UNKNOWN"
+
+
+def test_host_shaped_attestation_from_untrusted_tool_remains_unknown() -> None:
+    evidence = ScientificEvidence(
+        id="sev-untrusted-tool",
+        subject="HgTe",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+        source="archive",
+        source_type="dft_calculation",
+        method="PBE",
+        fidelity="dft",
+    )
+    state = ScientificState(evidence=[evidence])
+    state.attest_evidence(
+        EvidenceAttestation.host_create(
+            evidence_id=evidence.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="renamed.untrusted",
+            tool_call_id="call-1",
+        )
+    )
+
+    report = ScientificEvaluator(_target()).evaluate(_candidate(), state)
+
+    assert report.constraint_results[0].result == "UNKNOWN"
+
+
 def test_evaluation_without_candidate_is_inconclusive():
     evaluator = _test_evaluator()
     report = evaluator.evaluate(None, _scientific())
@@ -368,7 +431,7 @@ def test_non_finite_constraint_limit_remains_unknown() -> None:
     report = ScientificEvaluator(target).evaluate(_candidate(), _scientific(evidence))
 
     assert report.constraint_results[0].result == "UNKNOWN"
-    assert "finite" in report.constraint_results[0].reason
+    assert report.constraint_results[0].reason == "CONSTRAINT_TARGET_INVALID"
 
 
 def test_requirements_come_from_target_metadata_not_candidate_representation() -> None:
@@ -557,6 +620,82 @@ def test_target_metadata_can_tighten_device_operating_conditions() -> None:
 
     assert report.constraint_results[0].result == "UNKNOWN"
     assert "CONDITION_MISMATCH:temperature_k" in report.constraint_results[0].reason
+
+
+@pytest.mark.parametrize(
+    ("condition_update", "expected_code"),
+    [
+        ({"temperature_k": 300}, "CONDITION_MISMATCH:temperature_k"),
+        ({"wavelength_um": 1.0}, "CONDITION_OUT_OF_RANGE:wavelength_um"),
+        ({"temperature_k": None}, "CONDITION_INVALID:temperature_k"),
+        ({"wavelength_um": float("nan")}, "CONDITION_INVALID:wavelength_um"),
+        ({"bias_v": float("inf")}, "CONDITION_INVALID:bias_v"),
+        ({"measurement_definition": "   "}, "CONDITION_INVALID:measurement_definition"),
+    ],
+)
+def test_canonical_device_target_rejects_invalid_or_out_of_domain_conditions(
+    condition_update: dict[str, object], expected_code: str
+) -> None:
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "sha256:device"}
+    )
+    conditions: dict[str, object] = {
+        "wavelength_um": 10.0,
+        "bias_v": 0.1,
+        "temperature_k": 77,
+        "measurement_definition": "calibrated device responsivity",
+    }
+    conditions.update(condition_update)
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="responsivity",
+        value=2.0,
+        unit="A/W",
+        source="archive",
+        source_type="experimental",
+        method="measurement",
+        fidelity="experimental",
+        structure_hash="sha256:device",
+        conditions=conditions,
+    )
+
+    report = ScientificEvaluator(canonical_lwir_detector_target()).evaluate(
+        candidate, _attested_scientific(evidence)
+    )
+    result = next(item for item in report.constraint_results if item.property == "responsivity")
+
+    assert result.result == "UNKNOWN"
+    assert expected_code in result.reason
+
+
+def test_canonical_device_target_accepts_valid_operating_domain() -> None:
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "sha256:device"}
+    )
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="responsivity",
+        value=2.0,
+        unit="A/W",
+        source="archive",
+        source_type="experimental",
+        method="measurement",
+        fidelity="experimental",
+        structure_hash="sha256:device",
+        conditions={
+            "wavelength_um": 10.0,
+            "bias_v": 0.1,
+            "temperature_k": 77,
+            "measurement_definition": "calibrated device responsivity",
+        },
+    )
+
+    report = ScientificEvaluator(canonical_lwir_detector_target()).evaluate(
+        candidate, _attested_scientific(evidence)
+    )
+
+    result = next(item for item in report.constraint_results if item.property == "responsivity")
+    assert result.result == "PASS"
 
 
 def test_prior_is_background_only_even_when_value_would_pass() -> None:
@@ -767,6 +906,83 @@ def test_contradiction_diagnostics_are_categorical_and_bounded() -> None:
 
     assert report.contradictions == ["band_gap:COMPARABLE_VALUES_DISAGREE"]
     assert "SECRET_TOKEN" not in report.rationale
+
+
+def test_one_evidence_record_cannot_contradict_itself_across_target_units() -> None:
+    target = TargetSpec(
+        goal="same observation in two units",
+        constraints=[
+            ConstraintSpec(property="band_gap", operator="le", value=1.0, unit="eV"),
+            ConstraintSpec(property="band_gap", operator="ge", value=500.0, unit="meV"),
+        ],
+    )
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="band_gap",
+        value=0.8,
+        unit="eV",
+        source="archive",
+        source_type="dft_calculation",
+        method="PBE",
+        fidelity="dft",
+        structure_hash="sha256:phase-a",
+        conditions={"temperature_k": 77},
+    )
+
+    report = ScientificEvaluator(target).evaluate(
+        candidate_from_formula(
+            "HgTe", extra_representation={"structure_hash": "sha256:phase-a"}
+        ),
+        _attested_scientific(evidence),
+    )
+
+    assert [item.result for item in report.constraint_results] == ["PASS", "PASS"]
+    assert report.contradictions == []
+
+
+def test_accepted_evidence_uses_opaque_id_and_categorical_reason() -> None:
+    raw_id = "/private/raw/path/SECRET_TOKEN_" + "x" * 2000
+    evidence = ScientificEvidence(
+        id=raw_id,
+        subject="HgTe",
+        property="band_gap",
+        value=0.123456789,
+        unit="eV",
+        source="archive",
+        source_type="dft_calculation",
+        method="PBE",
+        fidelity="dft",
+    )
+
+    report = ScientificEvaluator(_target()).evaluate(
+        _candidate(), _attested_scientific(evidence)
+    )
+    result = next(item for item in report.constraint_results if item.property == "band_gap")
+
+    assert result.result == "PASS"
+    assert result.reason == "CONSTRAINT_PASS"
+    assert result.evidence_ids[0].startswith("eref_")
+    assert len(result.evidence_ids[0]) <= 32
+    assert "SECRET_TOKEN" not in report.model_dump_json()
+    assert "0.123456789 le" not in report.model_dump_json()
+
+
+def test_rationale_is_bounded_for_many_long_property_names() -> None:
+    long_name = "very_long_property_" + "x" * 5000
+    target = TargetSpec(
+        goal="bounded rationale",
+        constraints=[
+            ConstraintSpec(
+                property=f"{long_name}_{index}", operator="le", value=1.0, unit="eV"
+            )
+            for index in range(20)
+        ],
+    )
+
+    report = ScientificEvaluator(target).evaluate(_candidate(), ScientificState())
+
+    assert len(report.rationale) <= 512
+    assert long_name not in report.rationale
 
 
 @pytest.mark.parametrize(

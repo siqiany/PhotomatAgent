@@ -25,6 +25,7 @@ class EvidenceRequirements(BaseModel):
     allowed_source_types: tuple[str, ...] | None = None
     allowed_sources: tuple[str, ...] | None = None
     conditions: dict[str, object] = Field(default_factory=dict)
+    condition_ranges: dict[str, tuple[float, float]] = Field(default_factory=dict)
     required_conditions: tuple[str, ...] = ()
     require_unit: bool = True
 
@@ -107,12 +108,28 @@ def evidence_applicable(
     for name in requirements.required_conditions:
         if name not in evidence.conditions:
             return False, f"CONDITION_MISSING:{name[:64]}"
+        if not _condition_value_valid(evidence.conditions[name]):
+            return False, f"CONDITION_INVALID:{name[:64]}"
 
     for name, expected in requirements.conditions.items():
         if name not in evidence.conditions:
             return False, f"CONDITION_MISSING:{name[:64]}"
+        if not _condition_value_valid(evidence.conditions[name]):
+            return False, f"CONDITION_INVALID:{name[:64]}"
         if not _condition_equal(evidence.conditions[name], expected):
             return False, f"CONDITION_MISMATCH:{name[:64]}"
+
+    for name, (lower, upper) in requirements.condition_ranges.items():
+        if name not in evidence.conditions:
+            return False, f"CONDITION_MISSING:{name[:64]}"
+        actual = evidence.conditions[name]
+        if not _condition_value_valid(actual) or not isinstance(
+            actual, (int, float)
+        ):
+            return False, f"CONDITION_INVALID:{name[:64]}"
+        numeric = float(actual)
+        if numeric < lower or numeric > upper:
+            return False, f"CONDITION_OUT_OF_RANGE:{name[:64]}"
 
     if requirements.require_unit and not evidence.unit.strip():
         return False, "UNIT_MISSING"
@@ -191,3 +208,13 @@ def _condition_equal(actual: object, expected: object) -> bool:
     if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
         return math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=1e-12)
     return actual == expected
+
+
+def _condition_value_valid(value: object) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return math.isfinite(float(value))
+    if isinstance(value, str):
+        return bool(value.strip())
+    return False

@@ -19,6 +19,7 @@ future optional LLM critic -- this P0 stays fully deterministic.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -47,7 +48,10 @@ from photomatagent.scientific.loop.target import (
     TargetSpec,
     evaluate_constraint,
 )
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.state import (
+    DEFAULT_TRUSTED_EVIDENCE_TOOLS,
+    ScientificState,
+)
 from photomatagent.scientific.discovery.composition import normalize_composition
 
 PropertyResult = Literal["PASS", "FAIL", "UNKNOWN"]
@@ -172,6 +176,7 @@ class EvidenceEvaluationPolicy:
     """Host-owned evaluator switches used by isolated deterministic tests."""
 
     allow_synthetic_evidence: bool = False
+    trusted_attestation_tools: frozenset[str] = DEFAULT_TRUSTED_EVIDENCE_TOOLS
 
 
 class PropertyEvaluation(BaseModel):
@@ -329,7 +334,7 @@ class ScientificEvaluator:
                 unit=constraint.unit,
                 severity=constraint.severity,
                 result="UNKNOWN",
-                reason="constraint target must contain only finite numeric limits",
+                reason="CONSTRAINT_TARGET_INVALID",
             )
         requirements, requirements_error = self._requirements_for(constraint.property)
         if requirements_error:
@@ -340,7 +345,7 @@ class ScientificEvaluator:
                 unit=constraint.unit,
                 severity=constraint.severity,
                 result="UNKNOWN",
-                reason=requirements_error,
+                reason="EVIDENCE_REQUIREMENTS_INVALID",
             )
         resolved, exclusions = self._resolve_evidence(
             constraint, candidate, scientific, requirements
@@ -371,10 +376,10 @@ class ScientificEvaluator:
                 severity=constraint.severity,
                 result="UNKNOWN",
                 evidence_found=True,
-                evidence_ids=[resolved.evidence_id],
+                evidence_ids=[_opaque_evidence_ref(resolved.evidence_id)],
                 fidelity=resolved.fidelity,
                 confidence=resolved.confidence,
-                reason=f"unusable evidence: {check.detail}",
+                reason="CONSTRAINT_UNUSABLE",
             )
         result: PropertyResult = "PASS" if check.passed else "FAIL"
         return ConstraintOutcome(
@@ -386,11 +391,11 @@ class ScientificEvaluator:
             severity=constraint.severity,
             result=result,
             evidence_found=True,
-            evidence_ids=[resolved.evidence_id],
+            evidence_ids=[_opaque_evidence_ref(resolved.evidence_id)],
             fidelity=resolved.fidelity,
             confidence=resolved.confidence,
             soft_score=check.soft_score,
-            reason=check.detail,
+            reason="CONSTRAINT_PASS" if check.passed else "CONSTRAINT_FAIL",
         )
 
     def _resolve_evidence(
@@ -529,9 +534,39 @@ class ScientificEvaluator:
                 f"invalid evidence requirements for property {property_name!r}: {exc.errors()[0]['msg']}"
             )
         if property_name in _DEVICE_ONLY_PROPERTIES:
+            conditions = dict(parsed.conditions)
+            condition_ranges = dict(parsed.condition_ranges)
+            target_temperature = self.target.operating_conditions.get("temperature_k")
+            if (
+                "temperature_k" in self.target.operating_conditions
+                and not _finite_number(target_temperature)
+            ):
+                return EvidenceRequirements(), "invalid target operating temperature"
+            if _finite_number(target_temperature):
+                conditions["temperature_k"] = target_temperature
+            spectral_range = self.target.operating_conditions.get("spectral_range_um")
+            if "spectral_range_um" in self.target.operating_conditions and not (
+                isinstance(spectral_range, (list, tuple))
+                and len(spectral_range) == 2
+                and all(_finite_number(item) for item in spectral_range)
+                and float(spectral_range[0]) <= float(spectral_range[1])
+            ):
+                return EvidenceRequirements(), "invalid target spectral range"
+            if (
+                isinstance(spectral_range, (list, tuple))
+                and len(spectral_range) == 2
+                and all(_finite_number(item) for item in spectral_range)
+                and float(spectral_range[0]) <= float(spectral_range[1])
+            ):
+                condition_ranges["wavelength_um"] = (
+                    float(spectral_range[0]),
+                    float(spectral_range[1]),
+                )
             parsed = parsed.model_copy(
                 update={
                     "scope": "device",
+                    "conditions": conditions,
+                    "condition_ranges": condition_ranges,
                     "required_conditions": tuple(
                         dict.fromkeys(
                             (*_DEVICE_REQUIRED_CONDITIONS, *parsed.required_conditions)
@@ -544,9 +579,18 @@ class ScientificEvaluator:
     def _evidence_authority(
         self, evidence_id: str, scientific: ScientificState
     ) -> EvidenceAuthority:
-        attestation = scientific.evidence_attestations.get(evidence_id)
+        attestation = scientific.verified_attestation(evidence_id)
         if attestation is not None:
-            return attestation.authority
+            if (
+                attestation.origin == "trusted_builtin"
+                and attestation.tool_name in self.policy.trusted_attestation_tools
+            ):
+                return "observation"
+            if (
+                attestation.origin == "synthetic_test"
+                and self.policy.allow_synthetic_evidence
+            ):
+                return "synthetic"
         if self.policy.allow_synthetic_evidence:
             evidence = next(
                 (item for item in scientific.evidence if item.id == evidence_id), None
@@ -561,17 +605,30 @@ class ScientificEvaluator:
     ) -> list[str]:
         """Same-property evidence that disagrees beyond a small tolerance."""
         by_property: dict[str, list[_ResolvedEvidence]] = {}
+        constraints_by_property: dict[str, list[ConstraintSpec]] = {}
         for constraint in self.target.constraints:
-            requirements, error = self._requirements_for(constraint.property)
+            constraints_by_property.setdefault(constraint.property, []).append(constraint)
+        for property_name, constraints in constraints_by_property.items():
+            requirements, error = self._requirements_for(property_name)
             if error:
                 continue
+            canonical_unit = _canonical_property_unit(property_name, constraints)
+            canonical_constraint = constraints[0].model_copy(
+                update={"unit": canonical_unit}
+            )
+            unique: dict[str, _ResolvedEvidence] = {}
             for evidence in scientific.evidence:
                 authority = self._evidence_authority(evidence.id, scientific)
                 resolved, _ = self._evidence_for_property(
-                    evidence, constraint, candidate, requirements, authority
+                    evidence,
+                    canonical_constraint,
+                    candidate,
+                    requirements,
+                    authority,
                 )
                 if resolved is not None:
-                    by_property.setdefault(constraint.property, []).append(resolved)
+                    unique.setdefault(evidence.id, resolved)
+            by_property[property_name] = list(unique.values())
         contradictions: list[str] = []
         for property_name, items in by_property.items():
             by_scope: dict[tuple[str, str, str], list[_ResolvedEvidence]] = {}
@@ -606,7 +663,8 @@ class ScientificEvaluator:
                         scale = max(abs(value), abs(prior_value), 1e-12)
                         if abs(value - prior_value) / scale > 0.05:
                             reason = (
-                                f"{property_name[:64]}:COMPARABLE_VALUES_DISAGREE"
+                                f"{_bounded_property_ref(property_name)}:"
+                                "COMPARABLE_VALUES_DISAGREE"
                             )
                             total_chars = sum(len(item) for item in contradictions)
                             if (
@@ -617,12 +675,12 @@ class ScientificEvaluator:
                             contradictions.append(reason)
                             break
                     if contradictions and contradictions[-1].startswith(
-                        f"{property_name[:64]}:"
+                        f"{_bounded_property_ref(property_name)}:"
                     ):
                         break
                     seen.append(value)
                 if contradictions and contradictions[-1].startswith(
-                    f"{property_name[:64]}:"
+                    f"{_bounded_property_ref(property_name)}:"
                 ):
                     break
         return contradictions
@@ -655,6 +713,14 @@ def _constraint_target_is_finite(constraint: ConstraintSpec) -> bool:
     )
 
 
+def _finite_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
+
+
 def _normalized_condition_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -676,18 +742,14 @@ def _rationale(
     gaps: list[str],
     contradictions: list[str],
 ) -> str:
-    passed = [o.property for o in outcomes if o.result == "PASS"]
-    failed = [o.property for o in outcomes if o.result == "FAIL"]
-    parts = [f"verdict={verdict}"]
-    if passed:
-        parts.append("passed: " + ", ".join(passed))
-    if failed:
-        parts.append("failed: " + ", ".join(failed))
-    if gaps:
-        parts.append("missing evidence: " + ", ".join(gaps))
-    if contradictions:
-        parts.append("contradictions: " + "; ".join(contradictions))
-    return "; ".join(parts)
+    parts = [
+        f"verdict={verdict}",
+        f"passed_count={sum(o.result == 'PASS' for o in outcomes)}",
+        f"failed_count={sum(o.result == 'FAIL' for o in outcomes)}",
+        f"unknown_count={len(gaps)}",
+        f"contradiction_count={len(contradictions)}",
+    ]
+    return ";".join(parts)[:_MAX_REASON_CHARS]
 
 
 def _parse_json_payload(content: str) -> Any:
@@ -734,6 +796,34 @@ def _normalize_property_value(
 
 def _evidence_scope(evidence: Evidence | ScientificEvidence) -> str:
     return f"evidence:{evidence.id[:64]}"
+
+
+def _opaque_evidence_ref(evidence_id: str) -> str:
+    digest = hashlib.sha256(evidence_id.encode("utf-8")).hexdigest()[:20]
+    return f"eref_{digest}"
+
+
+def _bounded_property_ref(property_name: str) -> str:
+    if (
+        len(property_name) <= 64
+        and property_name
+        and all(character.isalnum() or character in "_.-" for character in property_name)
+    ):
+        return property_name
+    digest = hashlib.sha256(property_name.encode("utf-8")).hexdigest()[:16]
+    return f"property_{digest}"
+
+
+def _canonical_property_unit(
+    property_name: str, constraints: list[ConstraintSpec]
+) -> str:
+    known = {
+        "band_gap": "eV",
+        "formation_energy": "eV/atom",
+        "energy_above_hull": "eV/atom",
+        "cutoff_wavelength": "um",
+    }
+    return known.get(property_name, constraints[0].unit)
 
 
 def _composition_identity(subject: str | None) -> tuple[tuple[str, int], ...] | None:

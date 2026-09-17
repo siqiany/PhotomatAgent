@@ -5,24 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from photomatagent.scientific.state import EvidenceAttestation
+from photomatagent.scientific.state import (
+    DEFAULT_TRUSTED_EVIDENCE_TOOLS,
+    EvidenceAttestation,
+)
 from photomatagent.tools.base import Tool
 
-DEFAULT_TRUSTED_BUILTIN_TOOLS = frozenset(
-    {
-        "electronic.band_summary",
-        "electronic.dos_summary",
-        "electronic.effective_mass",
-        "materials.get_summary",
-        "materials.get_structure",
-        "materials.search",
-        "structure.density",
-        "structure.neighbors",
-        "structure.summary",
-        "structure.symmetry",
-        "vasp.inspect_result",
-    }
-)
+DEFAULT_TRUSTED_BUILTIN_TOOLS = DEFAULT_TRUSTED_EVIDENCE_TOOLS
 
 
 @dataclass(frozen=True)
@@ -60,7 +49,7 @@ class EvidenceAttestationPolicy:
         else:
             authority = "background"
             origin = "untrusted_tool"
-        return EvidenceAttestation(
+        return EvidenceAttestation.host_create(
             evidence_id=evidence_id,
             authority=authority,
             origin=origin,

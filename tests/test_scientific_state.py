@@ -91,16 +91,83 @@ def test_evidence_attestation_roundtrip_and_legacy_default() -> None:
     state = ScientificState(evidence=[evidence])
     assert state.evidence_attestations == {}
 
-    state.evidence_attestations[evidence.id] = EvidenceAttestation(
+    state.evidence_attestations[evidence.id] = EvidenceAttestation.host_create(
         evidence_id=evidence.id,
         authority="observation",
         origin="trusted_builtin",
-        tool_name="electronic.band_gap",
+        tool_name="electronic.band_summary",
         tool_call_id="call-1",
     )
     restored = ScientificState.model_validate_json(state.model_dump_json())
 
     assert restored.evidence_attestations[evidence.id].authority == "observation"
+
+
+@pytest.mark.parametrize(
+    "attestation_values",
+    [
+        {
+            "evidence_id": "different-id",
+            "authority": "observation",
+            "origin": "trusted_builtin",
+            "tool_name": "electronic.band_summary",
+            "tool_call_id": "call-1",
+        },
+        {
+            "authority": "observation",
+            "origin": "untrusted_tool",
+            "tool_name": "scientific.untrusted",
+            "tool_call_id": "call-1",
+        },
+        {
+            "authority": "observation",
+            "origin": "trusted_builtin",
+            "tool_name": "renamed.untrusted",
+            "tool_call_id": "call-1",
+        },
+    ],
+)
+def test_tampered_snapshot_attestations_are_dropped_on_deserialization(
+    attestation_values: dict[str, str],
+) -> None:
+    evidence = ScientificEvidence(
+        id="sev-real", subject="HgTe", property="band_gap", value=0.1, unit="eV"
+    )
+    values = {"evidence_id": evidence.id, **attestation_values}
+    state = ScientificState.model_validate(
+        {
+            "evidence": [evidence.model_dump(mode="json")],
+            "evidence_attestations": {evidence.id: values},
+        }
+    )
+
+    assert state.evidence_attestations == {}
+
+
+def test_duplicate_evidence_ids_cannot_reuse_one_attestation() -> None:
+    evidence = ScientificEvidence(
+        id="sev-duplicate",
+        subject="HgTe",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+    )
+    state = ScientificState.model_validate(
+        {
+            "evidence": [evidence, evidence.model_copy()],
+            "evidence_attestations": {
+                evidence.id: {
+                    "evidence_id": evidence.id,
+                    "authority": "observation",
+                    "origin": "trusted_builtin",
+                    "tool_name": "electronic.band_summary",
+                    "tool_call_id": "call-1",
+                }
+            },
+        }
+    )
+
+    assert state.evidence_attestations == {}
 
 
 def test_legacy_hypothesis_strings_remain_unchanged():
