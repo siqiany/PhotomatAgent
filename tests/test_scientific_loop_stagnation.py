@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from photomatagent.scientific.loop.candidate import candidate_from_formula
-from photomatagent.scientific.loop.evaluation import EvaluationReport
+from photomatagent.scientific.loop.evaluation import (
+    EvidenceEvaluationPolicy,
+    EvaluationReport,
+    ScientificEvaluator,
+)
 from photomatagent.scientific.loop.progress import (
     ValidationProgress,
     progress_from_evaluation,
@@ -15,7 +19,7 @@ from photomatagent.scientific.loop.stagnation import (
     gap_signature,
     violation_signature,
 )
-from photomatagent.scientific.loop.target import ConstraintViolation
+from photomatagent.scientific.loop.target import ConstraintSpec, ConstraintViolation, TargetSpec
 
 
 def _report(score: float = 0.5, violations: list[str] | None = None) -> EvaluationReport:
@@ -152,17 +156,6 @@ def test_accepted_failure_is_validation_progress():
         fidelity="dft",
         provenance={"content_sha256": "stable-content"},
     )
-    report = EvaluationReport(
-        candidate_id=candidate.candidate_id,
-        verdict="FAIL",
-        constraint_results=[
-            PropertyEvaluation(
-                property="band_gap",
-                result="FAIL",
-                evidence_ids=["evidence-old-id"],
-            )
-        ],
-    )
     state = ScientificState(evidence=[evidence])
     authority = _RuntimeEvidenceAuthority()
     authority.bind(state)
@@ -176,6 +169,12 @@ def test_accepted_failure_is_validation_progress():
             tool_call_id="call-failure",
         ),
     )
+    report = ScientificEvaluator(
+        TargetSpec(
+            goal="gap",
+            constraints=[ConstraintSpec(property="band_gap", operator="le", value=0.155, unit="eV")],
+        )
+    ).evaluate(candidate, state)
     progress = progress_from_evaluation(candidate, report, state)
     assert progress.resolved_questions == ("band_gap",)
     assert progress.observation_keys
@@ -187,22 +186,12 @@ def test_accepted_unknown_is_progress_but_unresolved_gap_is_not():
         id="evidence-id",
         subject="NaBiS2",
         property="band_gap",
-        value="unparseable",
+        value=0.1,
         unit="eV",
         source="dft",
         source_type="dft_calculation",
         fidelity="dft",
         provenance={"artifact_sha256": "artifact-content"},
-    )
-    accepted = EvaluationReport(
-        candidate_id=candidate.candidate_id,
-        constraint_results=[
-            PropertyEvaluation(
-                property="band_gap",
-                result="UNKNOWN",
-                evidence_ids=["evidence-id"],
-            )
-        ],
     )
     empty = EvaluationReport(
         candidate_id=candidate.candidate_id,
@@ -221,6 +210,12 @@ def test_accepted_unknown_is_progress_but_unresolved_gap_is_not():
             tool_call_id="call-unknown",
         ),
     )
+    accepted = ScientificEvaluator(
+        TargetSpec(
+            goal="invalid target",
+            constraints=[ConstraintSpec(property="band_gap", operator="between", value="invalid", unit="eV")],
+        )
+    ).evaluate(candidate, state)
     assert progress_from_evaluation(candidate, accepted, state).resolved_questions == (
         "band_gap",
     )
@@ -431,13 +426,13 @@ def test_synthetic_attestation_requires_evaluator_policy_opt_in():
             tool_call_id="call-synthetic",
         ),
     )
-    report = EvaluationReport(
-        candidate_id=candidate.candidate_id,
-        constraint_results=[
-            PropertyEvaluation(property="band_gap", result="PASS", evidence_ids=[evidence.id])
-        ],
+    target = TargetSpec(
+        goal="gap",
+        constraints=[ConstraintSpec(property="band_gap", operator="le", value=0.2, unit="eV")],
     )
+    report = ScientificEvaluator(target).evaluate(candidate, state)
     assert progress_from_evaluation(candidate, report, state).observation_keys == ()
-    assert progress_from_evaluation(
-        candidate, report, state, allow_synthetic_evidence=True
-    ).observation_keys
+    allowed = ScientificEvaluator(
+        target, policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True)
+    ).evaluate(candidate, state)
+    assert progress_from_evaluation(candidate, allowed, state).observation_keys

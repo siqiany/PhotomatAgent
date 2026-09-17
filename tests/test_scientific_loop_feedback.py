@@ -174,7 +174,11 @@ def test_same_composition_with_new_attested_accepted_observation_is_not_rejected
     )
     second.representation["structure_hash"] = "synthetic:device"
     report = evaluator.evaluate(second, state)
-    signal = build_feedback(_target(), second, report, [first], scientific=state)
+    prior = evaluator.evaluate(first, ScientificState(evidence=[old]))
+    signal = build_feedback(
+        _target(), second, report, [first], scientific=state,
+        prior_evaluations=[(first, prior)],
+    )
     assert signal is not None
     assert signal.decision != "REJECT"
 
@@ -205,7 +209,11 @@ def test_same_content_hash_with_new_id_is_still_rejected():
             ),
         )
     report = _evaluate(second, new)
-    signal = build_feedback(_target(), second, report, [first], scientific=state)
+    prior = _evaluate(first, old)
+    signal = build_feedback(
+        _target(), second, report, [first], scientific=state,
+        prior_evaluations=[(first, prior)],
+    )
     assert signal is not None
     assert signal.decision == "REJECT"
 

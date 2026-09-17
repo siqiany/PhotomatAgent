@@ -471,6 +471,10 @@ async def test_controller_custom_candidate_extractor_remains_supported(tmp_path)
 
 def test_controller_does_not_treat_unattested_evidence_as_progress(tmp_path):
     controller, _ = build_controller([[]], max_rounds=1, tmp_path=tmp_path)
+    # This regression exercises the production default: a synthetic-looking
+    # evidence item without a permitted evaluator attestation cannot clear
+    # stagnation through the progress projection.
+    controller.evaluator = ScientificEvaluator(controller.target)
     candidate = candidate_from_formula(
         "HgTe", extra_representation={"structure_hash": "synthetic:device"}
     )

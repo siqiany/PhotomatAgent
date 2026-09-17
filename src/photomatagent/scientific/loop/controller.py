@@ -139,9 +139,6 @@ class ScientificLoopController:
         self.target = target
         self.runtime = runtime
         self.evaluator = evaluator or ScientificEvaluator(target)
-        self._allow_synthetic_evidence = bool(
-            getattr(getattr(self.evaluator, "policy", None), "allow_synthetic_evidence", False)
-        )
         self.config = config or ScientificLoopConfig()
         self.policy = policy or ScientificLoopPolicy(
             judge_min_quality=self.config.judge_min_quality,
@@ -238,7 +235,6 @@ class ScientificLoopController:
                     candidate,
                     evaluation,
                     scientific,
-                    allow_synthetic_evidence=self._allow_synthetic_evidence,
                 )
                 self.stagnation.record(candidate, evaluation, progress=progress)
                 self.state.no_progress_rounds = self.stagnation.no_progress_rounds
@@ -283,7 +279,7 @@ class ScientificLoopController:
                     self.state.candidates,
                     judge=judge_report,
                     scientific=scientific,
-                    allow_synthetic_evidence=self._allow_synthetic_evidence,
+                    prior_evaluations=self.state.historical_candidate_evaluations[:-1],
                 )
                 if candidate is not None
                 else None
@@ -444,35 +440,32 @@ class ScientificLoopController:
         candidate: CandidateState,
         scientific: ScientificState,
     ) -> bool:
-        previous = next(
-            (
-                evaluation
-                for evaluation in reversed(self.state.evaluations)
-                if evaluation.candidate_id == candidate.candidate_id
-            ),
-            None,
-        )
-        if previous is None:
+        prior_pairs = [
+            (previous_candidate, previous_evaluation)
+            for previous_candidate, previous_evaluation
+            in self.state.historical_candidate_evaluations
+            if previous_candidate.fingerprint == candidate.fingerprint
+        ]
+        if not prior_pairs:
             return False
         current = self.evaluator.evaluate(candidate, scientific)
         current_progress = progress_from_evaluation(
             candidate,
             current,
             scientific,
-            allow_synthetic_evidence=self._allow_synthetic_evidence,
         )
-        previous_progress = progress_from_evaluation(
-            candidate,
-            previous,
-            scientific,
-            allow_synthetic_evidence=self._allow_synthetic_evidence,
-        )
-        return bool(
-            set(current_progress.observation_keys)
-            - set(previous_progress.observation_keys)
-        ) or bool(
-            set(current_progress.resolved_questions)
-            - set(previous_progress.resolved_questions)
+        previous_observations: set[str] = set()
+        previous_questions: set[str] = set()
+        for previous_candidate, previous in prior_pairs:
+            previous_progress = progress_from_evaluation(
+                previous_candidate,
+                previous,
+                scientific,
+            )
+            previous_observations.update(previous_progress.observation_keys)
+            previous_questions.update(previous_progress.resolved_questions)
+        return bool(set(current_progress.observation_keys) - previous_observations) or bool(
+            set(current_progress.resolved_questions) - previous_questions
         )
 
     def _build_summary(self, decision: ScientificLoopDecision) -> ScientificLoopSummary:

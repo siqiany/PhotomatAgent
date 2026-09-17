@@ -11,6 +11,7 @@ deterministic violations or gaps, and they never convert a PASS into a FAIL.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -21,11 +22,7 @@ from photomatagent.scientific.loop.candidate import (
 )
 from photomatagent.scientific.loop.evaluation import EvaluationReport
 from photomatagent.scientific.loop.judge import JudgeIssue, JudgeReport
-from photomatagent.scientific.loop.progress import (
-    _accepted_evidence,
-    _observation_identity,
-    progress_from_evaluation,
-)
+from photomatagent.scientific.loop.progress import progress_from_evaluation
 from photomatagent.scientific.state import ScientificState
 from photomatagent.scientific.loop.target import (
     ConstraintSpec,
@@ -72,6 +69,9 @@ def build_feedback(
     judge: JudgeReport | None = None,
     *,
     scientific: ScientificState | None = None,
+    prior_evaluations: Sequence[tuple[CandidateState, EvaluationReport]] | None = None,
+    # Kept for source compatibility with the round-1 API.  Evidence policy is
+    # evaluator-owned now, so this flag is intentionally not consulted.
     allow_synthetic_evidence: bool = False,
 ) -> FeedbackSignal | None:
     """Build the next-round feedback for one evaluated candidate.
@@ -90,19 +90,20 @@ def build_feedback(
         return None
 
     prohibited: list[str] = []
-    for previous in history:
-        if (
-            previous.candidate_id != candidate.candidate_id
-            and candidate_fingerprint(previous) == candidate.fingerprint
-        ):
+    comparison_candidates = (
+        [previous for previous, _ in prior_evaluations]
+        if prior_evaluations is not None
+        else history
+    )
+    for previous in comparison_candidates:
+        if previous is not candidate and candidate_fingerprint(previous) == candidate.fingerprint:
             prohibited.append(candidate.label or candidate.candidate_id)
 
     supplemental_evidence = _has_supplemental_evidence(
         candidate,
         evaluation,
-        history,
         scientific,
-        allow_synthetic_evidence=allow_synthetic_evidence,
+        prior_evaluations=prior_evaluations,
     )
     duplicate = bool(prohibited) and not supplemental_evidence
     if supplemental_evidence:
@@ -355,19 +356,22 @@ def _summarize(
 def _has_supplemental_evidence(
     candidate: CandidateState,
     evaluation: EvaluationReport,
-    history: list[CandidateState],
     scientific: ScientificState | None,
     *,
-    allow_synthetic_evidence: bool,
+    prior_evaluations: Sequence[tuple[CandidateState, EvaluationReport]] | None,
 ) -> bool:
-    """Recognize only a newly accepted, applicable observation."""
-    if scientific is None:
+    """Recognize only a newly accepted observation from evaluator history.
+
+    A missing prior manifest is treated as unknown provenance and keeps the
+    candidate rejected.  This is deliberately fail-closed for old snapshots
+    and hand-built historical reports.
+    """
+    if scientific is None or prior_evaluations is None:
         return False
     current_progress = progress_from_evaluation(
         candidate,
         evaluation,
         scientific,
-        allow_synthetic_evidence=allow_synthetic_evidence,
     )
     current_observations = {
         key.rsplit("observation:", 1)[-1]
@@ -376,30 +380,28 @@ def _has_supplemental_evidence(
     if not current_observations:
         return False
     previous_observations: set[str] = set()
-    for previous in history:
-        if (
-            previous.candidate_id == candidate.candidate_id
-            or candidate_fingerprint(previous) != candidate.fingerprint
-        ):
-            continue
-        for result in evaluation.constraint_results:
-            for evidence in _accepted_evidence(
-                property_name=result.property,
-                references=list(_candidate_evidence_ids(previous)),
-                candidate=previous,
-                scientific=scientific,
-                allow_synthetic_evidence=allow_synthetic_evidence,
-            ):
-                previous_observations.add(_observation_identity(evidence))
+    matching_history = [
+        (previous, previous_evaluation)
+        for previous, previous_evaluation in prior_evaluations
+        if candidate_fingerprint(previous) == candidate.fingerprint
+    ]
+    if not matching_history:
+        return False
+    for previous, previous_evaluation in matching_history:
+        previous_progress = progress_from_evaluation(
+            previous,
+            previous_evaluation,
+            scientific,
+        )
+        if not previous_evaluation.accepted_evidence_manifest:
+            return False
+        if not previous_progress.observation_keys:
+            return False
+        previous_observations.update(
+            key.rsplit("observation:", 1)[-1]
+            for key in previous_progress.observation_keys
+        )
     return bool(current_observations - previous_observations)
-
-
-def _candidate_evidence_ids(candidate: CandidateState) -> set[str]:
-    values = set(candidate.evidence_ids)
-    projected = candidate.representation.get("evidence_ids")
-    if isinstance(projected, list):
-        values.update(str(item) for item in projected)
-    return values
 
 
 def _preferred_capability(constraint: ConstraintSpec | None) -> str:

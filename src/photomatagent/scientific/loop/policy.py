@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from photomatagent.scientific.loop.candidate import CandidateState
 from photomatagent.scientific.loop.evaluation import EvaluationReport
@@ -63,6 +63,22 @@ class ScientificLoopState(BaseModel):
     round: int = 0
     no_progress_rounds: int = 0
     status: str = "RUNNING"
+    _candidate_evaluation_history: list[tuple[CandidateState, EvaluationReport]] = PrivateAttr(
+        default_factory=list
+    )
+
+    @property
+    def historical_candidate_evaluations(
+        self,
+    ) -> tuple[tuple[CandidateState, EvaluationReport], ...]:
+        """Runtime-only candidate/evaluation pairs in chronological order.
+
+        The public state snapshot intentionally remains serializable without
+        raw evaluator provenance.  Restoring an old snapshot therefore
+        yields an empty history and duplicate suppression fails closed.
+        """
+
+        return tuple(self._candidate_evaluation_history)
 
     def register_candidates(self, candidates: list[CandidateState]) -> None:
         """Upsert current projections and queue newly discovered identities."""
@@ -129,6 +145,9 @@ class ScientificLoopState(BaseModel):
         else:
             self.candidates[existing_index] = candidate
         self.evaluations.append(evaluation)
+        self._candidate_evaluation_history.append(
+            (candidate.model_copy(deep=True), evaluation)
+        )
         self._recompute_best_candidate()
 
     def _recompute_best_candidate(self) -> None:

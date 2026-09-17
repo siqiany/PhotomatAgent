@@ -25,7 +25,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evidence import Evidence
@@ -181,6 +181,20 @@ class EvidenceEvaluationPolicy:
     trusted_attestation_tools: frozenset[str] = DEFAULT_TRUSTED_EVIDENCE_TOOLS
 
 
+@dataclass(frozen=True)
+class AcceptedEvidenceRecord:
+    """Evaluator-owned evidence adoption record.
+
+    Raw evidence identifiers are intentionally kept in this runtime-only
+    record.  They are needed to project a report back onto the authoritative
+    ``ScientificState`` but must never become part of a serialized report.
+    """
+
+    evidence_id: str
+    property: str
+    outcome: PropertyResult
+
+
 class PropertyEvaluation(BaseModel):
     """One constraint property evaluated against evidence."""
 
@@ -207,6 +221,15 @@ class EvaluationReport(BaseModel):
     confidence: float = 0.0
     verdict: Verdict = "INCONCLUSIVE"
     rationale: str = ""
+    _accepted_evidence_manifest: tuple[AcceptedEvidenceRecord, ...] = PrivateAttr(
+        default=()
+    )
+
+    @property
+    def accepted_evidence_manifest(self) -> tuple[AcceptedEvidenceRecord, ...]:
+        """Return the non-serializable manifest produced by the evaluator."""
+
+        return self._accepted_evidence_manifest
 
     def violation_for(self, property_name: str) -> ConstraintViolation | None:
         for violation in self.violations:
@@ -247,10 +270,16 @@ class ScientificEvaluator:
                 rationale="no candidate could be constructed from structured scientific state",
             )
         outcomes: list[ConstraintOutcome] = []
+        accepted_manifest: list[AcceptedEvidenceRecord] = []
         contradictions: list[str] = []
         used_confidences: list[float] = []
         for constraint in self.target.constraints:
-            outcome = self._evaluate_constraint(constraint, candidate, scientific)
+            outcome = self._evaluate_constraint(
+                constraint,
+                candidate,
+                scientific,
+                accepted_manifest=accepted_manifest,
+            )
             outcomes.append(outcome)
             if outcome.confidence > 0.0:
                 used_confidences.append(outcome.confidence)
@@ -300,7 +329,7 @@ class ScientificEvaluator:
             )
             for o in outcomes
         ]
-        return EvaluationReport(
+        report = EvaluationReport(
             candidate_id=candidate.candidate_id,
             constraint_results=constraint_results,
             violations=violations,
@@ -313,6 +342,8 @@ class ScientificEvaluator:
             verdict=verdict,
             rationale=rationale,
         )
+        report._accepted_evidence_manifest = tuple(accepted_manifest)
+        return report
 
     # ------------------------------------------------------------------ #
     # internals
@@ -327,6 +358,8 @@ class ScientificEvaluator:
         constraint: ConstraintSpec,
         candidate: CandidateState,
         scientific: ScientificState,
+        *,
+        accepted_manifest: list[AcceptedEvidenceRecord] | None = None,
     ) -> ConstraintOutcome:
         if not _constraint_target_is_finite(constraint):
             return ConstraintOutcome(
@@ -369,6 +402,14 @@ class ScientificEvaluator:
             )
         check: ConstraintCheck = evaluate_constraint(constraint, resolved.value)
         if check.passed is None:
+            if accepted_manifest is not None:
+                accepted_manifest.append(
+                    AcceptedEvidenceRecord(
+                        evidence_id=resolved.evidence_id,
+                        property=constraint.property,
+                        outcome="UNKNOWN",
+                    )
+                )
             return ConstraintOutcome(
                 property=constraint.property,
                 operator=constraint.operator,
@@ -384,6 +425,14 @@ class ScientificEvaluator:
                 reason="CONSTRAINT_UNUSABLE",
             )
         result: PropertyResult = "PASS" if check.passed else "FAIL"
+        if accepted_manifest is not None:
+            accepted_manifest.append(
+                AcceptedEvidenceRecord(
+                    evidence_id=resolved.evidence_id,
+                    property=constraint.property,
+                    outcome=result,
+                )
+            )
         return ConstraintOutcome(
             property=constraint.property,
             operator=constraint.operator,
