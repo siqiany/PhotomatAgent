@@ -172,6 +172,23 @@ def discovery_hypothesis(request_id: str, formula: str):
     )
 
 
+def registration_call(request_id: str, formula: str, statement: str) -> FakeResponse:
+    return scripted_tool_call(
+        "tool_call",
+        {
+            "name": "generation.register_hypothesis",
+            "arguments": {
+                "request_id": request_id,
+                "formula": formula,
+                "statement": statement,
+                "design_operation": "other",
+                "validation_questions": ["Does it satisfy the target?"],
+            },
+        },
+        tool_call_id=f"call-{request_id}",
+    )
+
+
 @pytest.mark.asyncio
 async def test_controller_success_trajectory(tmp_path):
     """Two rounds: band gap evidence, then responsivity evidence -> SUCCESS."""
@@ -418,3 +435,108 @@ async def test_controller_custom_candidate_extractor_remains_supported(tmp_path)
     await collect(controller)
 
     assert controller.state.evaluations[0].candidate_id == custom.candidate_id
+
+
+@pytest.mark.asyncio
+async def test_controller_registers_two_candidates_in_first_maker_round(tmp_path):
+    controller, _ = build_controller(
+        [
+            [
+                registration_call("first", "NaBiS2", "first mechanism"),
+                registration_call("second", "HgTe", "second mechanism"),
+            ],
+            [],
+        ],
+        max_rounds=2,
+        tmp_path=tmp_path,
+    )
+    round_one: dict[str, object] = {}
+
+    def capture_round_one(event) -> None:
+        if event.kind == "candidate_evaluated" and event.round == 1:
+            round_one.update(
+                candidates=[item.candidate_id for item in controller.state.candidates],
+                active=controller.state.active_candidate_id,
+                pending=list(controller.state.pending_candidate_ids),
+            )
+
+    controller.event_sinks.append(capture_round_one)
+
+    await collect(controller)
+
+    registered = controller.runtime.scientific_state.material_hypotheses
+    expected = [record.candidate_id for record in registered]
+    assert len(registered) == 2
+    assert round_one == {
+        "candidates": expected,
+        "active": expected[0],
+        "pending": [expected[1]],
+    }
+    assert [report.candidate_id for report in controller.state.evaluations] == expected
+    assert len(controller.state.evaluations) == controller.state.round == 2
+
+
+@pytest.mark.asyncio
+async def test_controller_merges_two_registered_reasons_into_one_budget_slot(tmp_path):
+    controller, _ = build_controller(
+        [
+            [
+                registration_call("first", "Na0.75Ag0.25BiS2", "alloy sites"),
+                registration_call("second", "Na3AgBi4S8", "order sites"),
+            ]
+        ],
+        max_rounds=1,
+        tmp_path=tmp_path,
+    )
+    controller.config.max_candidates = 1
+
+    await collect(controller)
+
+    registered = controller.runtime.scientific_state.material_hypotheses
+    assert len(registered) == 2
+    assert len(controller.state.candidates) == 1
+    assert controller.state.candidates[0].representation["hypothesis_ids"] == [
+        record.id for record in registered
+    ]
+    assert controller.state.pending_candidate_ids == []
+    assert len(controller.state.evaluations) == 1
+
+
+@pytest.mark.asyncio
+async def test_projection_diagnostic_is_visible_in_summary_and_event(tmp_path):
+    controller, _ = build_controller([[]], max_rounds=1, tmp_path=tmp_path)
+    valid = discovery_hypothesis("valid", "NaBiS2")
+    invalid = ScientificEvidence(
+        subject="bad formula",
+        property="candidate_formula",
+        value="bad formula",
+        source="legacy import",
+        source_type="model",
+    )
+    controller.runtime.scientific_state.material_hypotheses.append(valid)
+    controller.runtime.scientific_state.evidence.append(invalid)
+
+    events = await collect(controller)
+
+    assert controller.summary is not None
+    assert len(controller.state.candidates) == 1
+    expected = f"INVALID_LEGACY_CANDIDATE:{invalid.id}"
+    assert any(item.startswith(expected) for item in controller.summary.projection_diagnostics)
+    completed = next(event for event in events if event.kind == "scientific_loop_completed")
+    assert completed.projection_diagnostics == controller.summary.projection_diagnostics
+
+
+@pytest.mark.asyncio
+async def test_custom_extractor_programming_error_propagates(tmp_path):
+    def broken_extractor(scientific, iteration):
+        raise RuntimeError("programming defect")
+
+    controller, _ = build_controller(
+        [[]],
+        max_rounds=1,
+        tmp_path=tmp_path,
+        candidate_extractor=broken_extractor,
+    )
+
+    with pytest.raises(RuntimeError, match="programming defect"):
+        await collect(controller)

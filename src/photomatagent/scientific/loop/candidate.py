@@ -21,6 +21,7 @@ from photomatagent.scientific.capabilities.generation.lineage import (
     CandidateLineage,
 )
 from photomatagent.scientific.discovery.composition import (
+    CompositionCapabilityError,
     composition_key,
     normalize_composition,
 )
@@ -66,6 +67,19 @@ class CandidateState(BaseModel):
     @property
     def fingerprint(self) -> str:
         return candidate_fingerprint(self)
+
+
+class CandidateProjectionDiagnostic(BaseModel):
+    """One recoverable legacy-record problem encountered during projection."""
+
+    code: Literal["INVALID_LEGACY_CANDIDATE", "COMPOSITION_CAPABILITY_UNAVAILABLE"]
+    evidence_id: str
+    message: str
+
+
+class CandidateProjectionResult(BaseModel):
+    candidates: list[CandidateState] = Field(default_factory=list)
+    diagnostics: list[CandidateProjectionDiagnostic] = Field(default_factory=list)
 
 
 def _canonical_formula(formula: str) -> str:
@@ -273,6 +287,56 @@ def extract_candidates_from_state(
     scientific: ScientificState,
     iteration: int = 0,
 ) -> list[CandidateState]:
+    """Compatibility list projection for callers that do not consume diagnostics."""
+
+    return project_candidates_from_state(scientific, iteration).candidates
+
+
+def _legacy_source(evidence: Evidence | ScientificEvidence) -> dict[str, Any]:
+    return {
+        "evidence_id": evidence.id,
+        "source": str(getattr(evidence, "source", "")),
+        "source_type": str(getattr(evidence, "source_type", "")),
+        "method": str(getattr(evidence, "method", "")),
+        "provenance": dict(getattr(evidence, "provenance", {}) or {}),
+    }
+
+
+def _attach_legacy_provenance(
+    candidate: CandidateState,
+    *,
+    sources: list[dict[str, Any]],
+    evidence_ids: list[str],
+) -> CandidateState:
+    candidate.evidence_ids = list(evidence_ids)
+    candidate.generation_parameters = {
+        **candidate.generation_parameters,
+        "legacy_sources": sources,
+    }
+    if candidate.lineage is not None:
+        lineage_parameters = {
+            **candidate.lineage.generation_parameters,
+            "legacy_sources": sources,
+        }
+        source_artifacts = [
+            artifact
+            for artifact in candidate.lineage.source_artifacts
+            if artifact not in evidence_ids
+        ]
+        source_artifacts.extend(evidence_ids)
+        candidate.lineage = candidate.lineage.model_copy(
+            update={
+                "generation_parameters": lineage_parameters,
+                "source_artifacts": source_artifacts,
+            }
+        )
+    return candidate
+
+
+def project_candidates_from_state(
+    scientific: ScientificState,
+    iteration: int = 0,
+) -> CandidateProjectionResult:
     """Project all registered hypotheses and legacy evidence into candidates.
 
     Candidate identity is the normalized composition identity. Multiple
@@ -282,13 +346,14 @@ def extract_candidates_from_state(
     """
 
     candidates: list[CandidateState] = []
+    diagnostics: list[CandidateProjectionDiagnostic] = []
     by_id: dict[str, CandidateState] = {}
     index_by_id: dict[str, int] = {}
 
     for hypothesis in scientific.material_hypotheses:
         candidate = by_id.get(hypothesis.candidate_id)
         if candidate is None:
-            composition = dict(normalize_composition(hypothesis.proposal.formula))
+            composition = dict(hypothesis.normalized_composition)
             candidate = candidate_from_formula(
                 hypothesis.proposal.formula,
                 generation_method="mechanism_reasoning",
@@ -312,9 +377,37 @@ def extract_candidates_from_state(
         formula = _evidence_formula(evidence)
         if not formula:
             continue
-        identity = f"cand_{composition_key(formula)[:24]}"
+        try:
+            identity = f"cand_{composition_key(formula)[:24]}"
+        except CompositionCapabilityError as exc:
+            diagnostics.append(
+                CandidateProjectionDiagnostic(
+                    code="COMPOSITION_CAPABILITY_UNAVAILABLE",
+                    evidence_id=evidence.id,
+                    message=str(exc)[:300],
+                )
+            )
+            continue
+        except ValueError as exc:
+            diagnostics.append(
+                CandidateProjectionDiagnostic(
+                    code="INVALID_LEGACY_CANDIDATE",
+                    evidence_id=evidence.id,
+                    message=str(exc)[:300],
+                )
+            )
+            continue
         existing = by_id.get(identity)
+        source = _legacy_source(evidence)
         if existing is not None and existing.generation_method == "mechanism_reasoning":
+            prior_sources = list(
+                existing.generation_parameters.get("legacy_sources", [])
+            )
+            _attach_legacy_provenance(
+                existing,
+                sources=[*prior_sources, source],
+                evidence_ids=[*existing.evidence_ids, evidence.id],
+            )
             continue
         candidate = _candidate_from_evidence(
             evidence,
@@ -322,10 +415,23 @@ def extract_candidates_from_state(
             iteration=iteration,
         )
         if existing is None:
+            _attach_legacy_provenance(
+                candidate,
+                sources=[source],
+                evidence_ids=[evidence.id],
+            )
             index_by_id[identity] = len(candidates)
             candidates.append(candidate)
         else:
+            prior_sources = list(
+                existing.generation_parameters.get("legacy_sources", [])
+            )
+            _attach_legacy_provenance(
+                candidate,
+                sources=[*prior_sources, source],
+                evidence_ids=[*existing.evidence_ids, evidence.id],
+            )
             candidates[index_by_id[identity]] = candidate
         by_id[identity] = candidate
 
-    return candidates
+    return CandidateProjectionResult(candidates=candidates, diagnostics=diagnostics)

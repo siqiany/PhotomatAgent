@@ -41,7 +41,7 @@ from photomatagent.runtime.loop import AgentRuntime, EventSink
 from photomatagent.scientific.loop.candidate import (
     CandidateState,
     extract_candidate_from_state,
-    extract_candidates_from_state,
+    project_candidates_from_state,
 )
 from photomatagent.scientific.loop.evaluation import (
     EvaluationReport,
@@ -153,7 +153,7 @@ class ScientificLoopController:
         self.run_id: str | None = None
         self.state = ScientificLoopState(target=target)
         self.summary: ScientificLoopSummary | None = None
-        self._note: str | None = None
+        self._projection_diagnostics: list[str] = []
         self._last_judge_report: JudgeReport | None = None
 
     # ------------------------------------------------------------------ #
@@ -176,6 +176,7 @@ class ScientificLoopController:
         self.run_id = uuid4().hex
         self.state = ScientificLoopState(target=self.target)
         self.summary = None
+        self._projection_diagnostics = []
         feedback: FeedbackSignal | None = None
         self.state.status = "RUNNING"
         dry_evidence_rounds = 0
@@ -222,6 +223,7 @@ class ScientificLoopController:
                         label=candidate.label,
                         fingerprint=candidate.fingerprint[:12],
                         generation_method=candidate.generation_method,
+                        projection_diagnostics=list(self._projection_diagnostics),
                     )
                 )
 
@@ -340,6 +342,7 @@ class ScientificLoopController:
                     best_candidate_id=self.summary.best_candidate_id,
                     best_score=self.summary.best_score,
                     termination_reason=self.summary.termination_reason,
+                    projection_diagnostics=self.summary.projection_diagnostics,
                 )
             )
 
@@ -395,11 +398,7 @@ class ScientificLoopController:
             )
 
     def _extract(self, scientific: ScientificState, round_number: int) -> CandidateState | None:
-        try:
-            return self.candidate_extractor(scientific, round_number)
-        except Exception as exc:  # a broken extractor must not kill the loop
-            self._note = f"candidate extraction failed: {type(exc).__name__}: {exc}"
-            return None
+        return self.candidate_extractor(scientific, round_number)
 
     def _extract_candidates(
         self,
@@ -409,11 +408,14 @@ class ScientificLoopController:
         if self.candidate_extractor is not extract_candidate_from_state:
             candidate = self._extract(scientific, round_number)
             return [candidate] if candidate is not None else []
-        try:
-            return extract_candidates_from_state(scientific, round_number)
-        except Exception as exc:  # a broken extractor must not kill the loop
-            self._note = f"candidate extraction failed: {type(exc).__name__}: {exc}"
-            return []
+        projection = project_candidates_from_state(scientific, round_number)
+        for diagnostic in projection.diagnostics:
+            rendered = (
+                f"{diagnostic.code}:{diagnostic.evidence_id}:{diagnostic.message}"
+            )
+            if rendered not in self._projection_diagnostics:
+                self._projection_diagnostics.append(rendered)
+        return projection.candidates
 
     def _select_candidate(self, scientific: ScientificState) -> CandidateState | None:
         active = self.state.candidate(self.state.active_candidate_id)
@@ -474,6 +476,7 @@ class ScientificLoopController:
             ),
             termination_reason=decision.reason,
             judge_report=self._last_judge_report,
+            projection_diagnostics=list(self._projection_diagnostics),
         )
 
     async def _emit(self, event: RuntimeEvent) -> RuntimeEvent:

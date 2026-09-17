@@ -164,6 +164,7 @@ class ScientificLoopSummary(BaseModel):
     unresolved_evidence_gaps: list[str] = Field(default_factory=list)
     termination_reason: str = ""
     judge_report: JudgeReport | None = None
+    projection_diagnostics: list[str] = Field(default_factory=list)
 
 
 class ScientificLoopPolicy:

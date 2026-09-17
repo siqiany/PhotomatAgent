@@ -365,6 +365,7 @@ class CandidateProposed(RuntimeEvent):
     label: str = ""
     fingerprint: str = ""
     generation_method: str = ""
+    projection_diagnostics: list[str] = Field(default_factory=list)
 
 
 class CandidateEvaluated(RuntimeEvent):
@@ -418,6 +419,7 @@ class ScientificLoopCompleted(RuntimeEvent):
     best_candidate_id: str | None = None
     best_score: float = 0.0
     termination_reason: str = ""
+    projection_diagnostics: list[str] = Field(default_factory=list)
 
 
 class ScientificLoopStalled(RuntimeEvent):
