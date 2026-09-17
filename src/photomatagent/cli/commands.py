@@ -319,6 +319,7 @@ class ChatCommandRouter:
         from photomatagent.observability.trace import TraceError, resolve_session_path
         from photomatagent.sessions.store import (
             load_session_snapshot,
+            migration_diagnostic_codes,
             save_session_snapshot,
             session_is_resumable,
         )
@@ -347,6 +348,12 @@ class ChatCommandRouter:
             )
         snapshot = load_session_snapshot(session_dir)
         self.runtime.restore_session(snapshot)
+        diagnostic_codes = migration_diagnostic_codes(snapshot)
+        diagnostic_text = (
+            f" 迁移诊断：{','.join(diagnostic_codes)}。"
+            if diagnostic_codes
+            else ""
+        )
         if self.logger is not None:
             # Follow-up turns continue in the resumed session's trace.
             self.logger.session_id = session_dir.name
@@ -356,7 +363,8 @@ class ChatCommandRouter:
             f"[green]已回溯到 session {session_dir.name}："
             f"{len(snapshot.conversation.messages)} 条消息，"
             f"{len(snapshot.scientific.evidence)} 条证据，"
-            f"{len(snapshot.scientific.claims)} 条结论；可直接继续追问。[/]"
+            f"{len(snapshot.scientific.claims)} 条结论；可直接继续追问。"
+            f"{diagnostic_text}[/]"
         )
 
     async def _run_cli(self, args: list[str]) -> None:

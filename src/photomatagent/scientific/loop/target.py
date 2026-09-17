@@ -133,6 +133,9 @@ def normalize_operating_conditions(
     for name in sorted(set(raw) - recognized):
         safe_name = name if len(name) <= 48 else "unrecognized"
         diagnostics.append(f"OPERATING_CONDITION_UNRECOGNIZED:{safe_name}")
+        # Preserve opaque context fields for evolution feature extraction and
+        # audit snapshots; device evaluation still fails closed on diagnostics.
+        normalized[name] = raw[name]
     return normalized, diagnostics
 
 

@@ -44,6 +44,7 @@ from photomatagent.scientific.evolution.service import (
     InvalidEvolutionTransition,
 )
 from photomatagent.scientific.evolution.revision import build_revision_plan
+from photomatagent.scientific.evidence_refs import opaque_evidence_ref
 from photomatagent.scientific.evolution.store import (
     EvolutionAlreadyExistsError,
     EvolutionStore,
@@ -392,13 +393,13 @@ def test_comparison_reports_scientific_artifact_and_cost_changes() -> None:
 
     assert report.constraint_changes.newly_passed == ["band_gap", "responsivity"]
     assert report.constraint_changes.newly_unknown == ["dark_current"]
-    assert report.evidence_changes.added_ids == ["sev_new"]
-    assert report.evidence_changes.removed_ids == ["sev_removed"]
-    assert report.evidence_changes.carried_ids == ["sev_shared"]
+    assert report.evidence_changes.added_ids == [opaque_evidence_ref("sev_new")]
+    assert report.evidence_changes.removed_ids == [opaque_evidence_ref("sev_removed")]
+    assert report.evidence_changes.carried_ids == [opaque_evidence_ref("sev_shared")]
     assert report.evidence_changes.invalidated_ids == ["sev_removed"]
     assert report.evidence_changes.resolved_gaps == ["responsivity"]
     assert report.evidence_changes.new_gaps == ["dark_current"]
-    assert report.fidelity_changes.upgraded_ids == ["sev_shared"]
+    assert report.fidelity_changes.upgraded_ids == [opaque_evidence_ref("sev_shared")]
     assert report.artifact_diff is not None and report.artifact_diff.changed
     assert report.artifact_diff.size_bytes_delta == (
         len(current_content) - len(previous_content)
@@ -406,6 +407,55 @@ def test_comparison_reports_scientific_artifact_and_cost_changes() -> None:
     assert report.cost_delta.input_tokens == 50
     assert report.cost_delta.output_tokens == -10
     assert report.cost_delta.hpc_cost == pytest.approx(1.0)
+
+
+def test_state_backed_comparison_projects_raw_ids_to_opaque_refs() -> None:
+    raw_id = "/private/results/TOKEN_ID"
+    reference = opaque_evidence_ref(raw_id)
+    previous = _episode(
+        "v001",
+        summary=_summary(("band_gap", "PASS", "analytical", (reference,))),
+    )
+    current = _episode(
+        "v002",
+        summary=_summary(("band_gap", "PASS", "dft", (reference,))),
+    )
+    report = compare_episodes(
+        previous=previous,
+        current=current,
+        previous_plan=RevisionPlan(
+            revision_id="rp_compare",
+            evolution_id="evo_compare",
+            source_version="v001",
+            feedback_id="fb_v1",
+            confirmed=True,
+        ),
+        previous_state=ScientificState(
+            evidence=[
+                ScientificEvidence(
+                    id=raw_id,
+                    subject="InAs",
+                    property="band_gap",
+                    fidelity="analytical",
+                )
+            ]
+        ),
+        current_state=ScientificState(
+            evidence=[
+                ScientificEvidence(
+                    id=raw_id,
+                    subject="InAs",
+                    property="band_gap",
+                    fidelity="dft",
+                )
+            ]
+        ),
+    )
+
+    assert report.evidence_changes.added_ids == []
+    assert report.evidence_changes.removed_ids == []
+    assert report.evidence_changes.carried_ids == [reference]
+    assert report.fidelity_changes.upgraded_ids == [reference]
 
 
 def test_learning_signal_renormalizes_missing_components_and_records_them() -> None:

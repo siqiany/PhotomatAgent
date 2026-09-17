@@ -122,6 +122,18 @@ def session_is_resumable(session_dir: Path | str) -> bool:
     return snapshot_path(session_dir).is_file()
 
 
+def migration_diagnostic_codes(
+    snapshot: SessionSnapshot, *, limit: int = 8
+) -> tuple[str, ...]:
+    """Return bounded diagnostic codes without exposing persisted details."""
+
+    if limit <= 0:
+        return ()
+    return tuple(
+        dict.fromkeys(item.code for item in snapshot.migration_diagnostics)
+    )[:limit]
+
+
 __all__ = [
     "EngineSnapshot",
     "SESSION_STATE_FILENAME",
@@ -129,6 +141,7 @@ __all__ = [
     "SessionMigrationDiagnostic",
     "SessionSnapshot",
     "load_session_snapshot",
+    "migration_diagnostic_codes",
     "save_session_snapshot",
     "session_is_resumable",
     "snapshot_path",

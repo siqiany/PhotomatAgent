@@ -28,6 +28,7 @@ from photomatagent.scientific.evolution.models import (
     validate_managed_id,
 )
 from photomatagent.scientific.evolution.rubric import expert_utility
+from photomatagent.scientific.evidence_refs import opaque_evidence_ref
 from photomatagent.scientific.loop.evaluation import fidelity_rank
 from photomatagent.scientific.state import ScientificState
 
@@ -588,10 +589,7 @@ def _evidence_map(
     values: dict[str, str | None] = {}
     if state is not None:
         for item in state.evidence:
-            try:
-                evidence_id = validate_managed_id(item.id)
-            except (TypeError, ValueError):
-                continue
+            evidence_id = opaque_evidence_ref(item.id)
             values[evidence_id] = getattr(item, "fidelity", "empirical")
         return values
     for outcome in _outcomes(episode).values():

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
@@ -32,6 +33,8 @@ DEFAULT_TRUSTED_EVIDENCE_TOOLS = frozenset(
 
 class EvidenceAttestation(BaseModel):
     """Host-owned authority record, stored separately from producer evidence."""
+
+    model_config = ConfigDict(frozen=True)
 
     evidence_id: str
     authority: Literal["observation", "synthetic", "background"] = "background"
@@ -69,6 +72,19 @@ class ScientificState(BaseModel):
     _runtime_attestations: dict[str, EvidenceAttestation] = PrivateAttr(
         default_factory=dict
     )
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> ScientificState:
+        """Copy durable state without inheriting runtime-only authority."""
+
+        copied = super().model_copy(update=update, deep=deep)
+        copied._runtime_authority_capability = None
+        copied._runtime_attestations = {}
+        return copied
 
     def __eq__(self, other: Any) -> bool:
         """Compare durable scientific content, excluding runtime capabilities."""
@@ -121,9 +137,11 @@ class ScientificState(BaseModel):
             raise ValueError("attested evidence must exist exactly once in scientific state")
         if not attestation.has_compatible_authority():
             raise ValueError("evidence attestation authority is incompatible with origin")
-        self.evidence_attestations[attestation.evidence_id] = attestation
-        self._runtime_attestations[attestation.evidence_id] = attestation
-        return attestation
+        public_record = attestation.model_copy(deep=True)
+        runtime_record = attestation.model_copy(deep=True)
+        self.evidence_attestations[attestation.evidence_id] = public_record
+        self._runtime_attestations[attestation.evidence_id] = runtime_record
+        return public_record
 
     def _copy_runtime_attestations_from(
         self, source: ScientificState, *, capability: object
@@ -133,7 +151,10 @@ class ScientificState(BaseModel):
             or source._runtime_authority_capability is not capability
         ):
             raise ValueError("runtime evidence authority capability is required")
-        self._runtime_attestations = dict(source._runtime_attestations)
+        self._runtime_attestations = {
+            evidence_id: attestation.model_copy(deep=True)
+            for evidence_id, attestation in source._runtime_attestations.items()
+        }
 
     def verified_attestation(self, evidence_id: str) -> EvidenceAttestation | None:
         if sum(item.id == evidence_id for item in self.evidence) != 1:

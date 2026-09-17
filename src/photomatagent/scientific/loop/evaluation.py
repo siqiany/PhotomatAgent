@@ -539,23 +539,23 @@ class ScientificEvaluator:
             operating_diagnostics = self.target.metadata.get(
                 "operating_condition_diagnostics", []
             )
-            _, current_diagnostics = normalize_operating_conditions(
+            normalized_conditions, current_diagnostics = normalize_operating_conditions(
                 self.target.operating_conditions
             )
             if operating_diagnostics or current_diagnostics:
                 return EvidenceRequirements(), "invalid target operating conditions"
             conditions = dict(parsed.conditions)
             condition_ranges = dict(parsed.condition_ranges)
-            target_temperature = self.target.operating_conditions.get("temperature_k")
+            target_temperature = normalized_conditions.get("temperature_k")
             if (
-                "temperature_k" in self.target.operating_conditions
+                "temperature_k" in normalized_conditions
                 and not _finite_number(target_temperature)
             ):
                 return EvidenceRequirements(), "invalid target operating temperature"
             if _finite_number(target_temperature):
                 conditions["temperature_k"] = target_temperature
-            spectral_range = self.target.operating_conditions.get("spectral_range_um")
-            if "spectral_range_um" in self.target.operating_conditions and not (
+            spectral_range = normalized_conditions.get("spectral_range_um")
+            if "spectral_range_um" in normalized_conditions and not (
                 isinstance(spectral_range, (list, tuple))
                 and len(spectral_range) == 2
                 and all(_finite_number(item) for item in spectral_range)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import json
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,8 @@ from photomatagent.runtime.permissions import (
     SwitchablePermissionPolicy,
 )
 from photomatagent.scientific.evidence import Evidence
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.capabilities.contracts import ScientificEvidence
+from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 from photomatagent.sessions.store import load_session_snapshot, save_session_snapshot
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.workspace import Workspace
@@ -137,6 +139,41 @@ async def test_resume_command_switches_logger_into_resumed_session(tmp_path):
     assert logger.events_path == tmp_path / "session_old" / "events.jsonl"
     # The current in-chat session was snapshotted before switching away.
     assert load_session_snapshot(tmp_path / "current_session") is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_command_displays_bounded_migration_diagnostic(tmp_path):
+    session_dir = tmp_path / "legacy_session"
+    evidence = ScientificEvidence(id="sev-resume", subject="HgTe", property="band_gap", value=0.2, unit="eV")
+    (session_dir).mkdir()
+    (session_dir / "session_state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "conversation": {"messages": []},
+                "scientific": {
+                    "evidence": [evidence.model_dump(mode="json")],
+                    "evidence_attestations": {
+                        evidence.id: EvidenceAttestation(
+                            evidence_id=evidence.id,
+                            authority="observation",
+                            origin="trusted_builtin",
+                            tool_name="materials.get_summary",
+                            tool_call_id="SECRET_RAW_CALL_TOKEN",
+                        ).model_dump(mode="json")
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    router, _, stream = _router(tmp_path)
+
+    await router.execute(f"/resume {session_dir}")
+
+    output = stream.getvalue()
+    assert "EVIDENCE_AUTHORITY_DOWNGRADED" in output
+    assert "SECRET_RAW_CALL_TOKEN" not in output
 
 
 @pytest.mark.asyncio

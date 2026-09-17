@@ -256,3 +256,43 @@ def test_evaluator_rechecks_operating_conditions_after_target_update() -> None:
 
     assert report.constraint_results[0].result == "UNKNOWN"
     assert report.constraint_results[0].reason == "EVIDENCE_REQUIREMENTS_INVALID"
+
+
+def test_evaluator_uses_normalized_aliases_after_target_update() -> None:
+    target = _device_draft({}).target.model_copy(
+        update={
+            "operating_conditions": {
+                "temperature": {"kelvin": 77},
+                "spectral_range": {"min_um": 8, "max_um": 14},
+            }
+        }
+    )
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="responsivity",
+        value=2.0,
+        unit="A/W",
+        source="synthetic:test-only",
+        source_type="experimental",
+        method="fixture",
+        fidelity="experimental",
+        structure_hash="sha256:device",
+        conditions={
+            "temperature_k": 300,
+            "wavelength_um": 1.0,
+            "bias_v": 0.1,
+            "measurement_definition": "calibrated responsivity",
+        },
+    )
+
+    report = ScientificEvaluator(
+        target, policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True)
+    ).evaluate(
+        candidate_from_formula(
+            "HgTe", extra_representation={"structure_hash": "sha256:device"}
+        ),
+        ScientificState(evidence=[evidence]),
+    )
+
+    assert report.constraint_results[0].result == "UNKNOWN"
+    assert "CONDITION_MISMATCH:temperature_k" in report.constraint_results[0].reason

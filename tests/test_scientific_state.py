@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from photomatagent.runtime.evidence_attestation import _RuntimeEvidenceAuthority
 from photomatagent.scientific.calculations import CalculationRecord
@@ -123,6 +124,75 @@ def test_runtime_authority_is_not_a_public_scientific_state_api() -> None:
     assert not hasattr(state, "bind_runtime_authority")
     assert not hasattr(state, "attest_evidence")
     assert not hasattr(state, "clear_runtime_authority")
+
+
+def test_runtime_attestation_audit_record_is_immutable_and_private_copy_isolated() -> None:
+    evidence = ScientificEvidence(
+        id="sev-attestation-isolation",
+        subject="HgTe",
+        property="band_gap",
+        value=0.2,
+        unit="eV",
+    )
+    state = ScientificState(evidence=[evidence])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="background",
+            origin="untrusted_tool",
+            tool_name="scientific.untrusted",
+            tool_call_id="call-original",
+        ),
+    )
+
+    public = state.evidence_attestations[evidence.id]
+    private = state._runtime_attestations[evidence.id]
+    assert public is not private
+    with pytest.raises((TypeError, ValidationError)):
+        public.authority = "observation"  # type: ignore[misc]
+
+    state.evidence_attestations[evidence.id] = EvidenceAttestation(
+        evidence_id=evidence.id,
+        authority="observation",
+        origin="trusted_builtin",
+        tool_name="materials.get_summary",
+        tool_call_id="call-forged",
+    )
+    verified = state.verified_attestation(evidence.id)
+    assert verified is not None
+    assert verified.authority == "background"
+    assert verified.tool_call_id == "call-original"
+
+
+def test_public_and_deep_state_copies_do_not_inherit_runtime_authority() -> None:
+    evidence = ScientificEvidence(
+        id="sev-attestation-copy",
+        subject="HgTe",
+        property="band_gap",
+        value=0.2,
+        unit="eV",
+    )
+    state = ScientificState(evidence=[evidence])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="materials.get_summary",
+            tool_call_id="call-original",
+        ),
+    )
+
+    for copied in (state.model_copy(), state.model_copy(deep=True)):
+        assert copied._runtime_authority_capability is None
+        assert copied._runtime_attestations == {}
+        assert copied.verified_attestation(evidence.id) is None
 
 
 @pytest.mark.parametrize(

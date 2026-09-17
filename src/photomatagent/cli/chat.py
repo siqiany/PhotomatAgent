@@ -188,7 +188,11 @@ def _load_resume_snapshot(
 ) -> tuple[Path, SessionSnapshot]:
     """Resolve a resume target and load its snapshot."""
     from photomatagent.observability.trace import resolve_session_path
-    from photomatagent.sessions.store import load_session_snapshot, session_is_resumable
+    from photomatagent.sessions.store import (
+        load_session_snapshot,
+        migration_diagnostic_codes,
+        session_is_resumable,
+    )
 
     session_dir = resolve_session_path(resume, sessions_dir)
     if not session_is_resumable(session_dir):
@@ -198,10 +202,17 @@ def _load_resume_snapshot(
         )
         raise FileNotFoundError(f"session snapshot not found in {session_dir}")
     snapshot = load_session_snapshot(session_dir)
+    diagnostic_codes = migration_diagnostic_codes(snapshot)
+    diagnostic_text = (
+        f" 迁移诊断：{','.join(diagnostic_codes)}。"
+        if diagnostic_codes
+        else ""
+    )
     console.print(
         f"[dim]已加载历史 session {session_dir.name}："
         f"{len(snapshot.conversation.messages)} 条消息，"
-        f"{len(snapshot.scientific.evidence)} 条证据。可直接继续追问。[/]"
+        f"{len(snapshot.scientific.evidence)} 条证据。可直接继续追问。"
+        f"{diagnostic_text}[/]"
     )
     return session_dir, snapshot
 

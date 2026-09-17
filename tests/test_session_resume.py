@@ -337,3 +337,46 @@ async def test_run_chat_resume_continues_into_the_same_session(tmp_path):
         if isinstance(message, UserMessage)
     ]
     assert user_goals == ["first goal", "second goal"]
+
+
+@pytest.mark.asyncio
+async def test_run_chat_resume_displays_bounded_migration_diagnostic(tmp_path, capsys):
+    from photomatagent.cli.chat import run_chat
+
+    session_dir = tmp_path / "legacy_session"
+    evidence = ScientificEvidence(id="sev-chat-resume", subject="HgTe", property="band_gap", value=0.2, unit="eV")
+    session_dir.mkdir()
+    (session_dir / SESSION_STATE_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "conversation": {"messages": []},
+                "scientific": {
+                    "evidence": [evidence.model_dump(mode="json")],
+                    "evidence_attestations": {
+                        evidence.id: EvidenceAttestation(
+                            evidence_id=evidence.id,
+                            authority="observation",
+                            origin="trusted_builtin",
+                            tool_name="materials.get_summary",
+                            tool_call_id="SECRET_RAW_CHAT_TOKEN",
+                        ).model_dump(mode="json")
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    await run_chat(
+        provider="fake",
+        approval="auto",
+        goal="continue legacy session",
+        resume=session_dir.name,
+        log_events=False,
+        sessions_dir=tmp_path,
+    )
+
+    output = capsys.readouterr().out
+    assert "EVIDENCE_AUTHORITY_DOWNGRADED" in output
+    assert "SECRET_RAW_CHAT_TOKEN" not in output
