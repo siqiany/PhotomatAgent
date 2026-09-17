@@ -17,6 +17,10 @@ from photomatagent.scientific.discovery.models import HypothesisOrigin, Hypothes
 from photomatagent.scientific.discovery.registration import build_hypothesis
 from photomatagent.scientific.loop.candidate import candidate_from_formula
 from photomatagent.scientific.loop.controller import ScientificLoopController
+from photomatagent.scientific.loop.evaluation import (
+    EvidenceEvaluationPolicy,
+    ScientificEvaluator,
+)
 from photomatagent.scientific.loop.target import (
     ConstraintSpec,
     TargetSpec,
@@ -130,9 +134,14 @@ def build_controller(
         permission_policy=AllowAllPolicy(),
         budget=BudgetState(max_iterations=20),
     )
+    effective_target = target or _target()
     controller = ScientificLoopController(
-        target=target or _target(),
+        target=effective_target,
         runtime=runtime,
+        evaluator=ScientificEvaluator(
+            effective_target,
+            policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True),
+        ),
         config=__import__(
             "photomatagent.scientific.loop.controller", fromlist=["ScientificLoopConfig"]
         ).ScientificLoopConfig(max_rounds=max_rounds),

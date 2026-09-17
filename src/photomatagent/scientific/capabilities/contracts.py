@@ -23,6 +23,10 @@ class ScientificEvidence(BaseModel):
     """
 
     id: str = Field(default_factory=lambda: f"sev_{uuid4().hex[:12]}")
+    assessment_role: Literal["observation", "prior", "proposal"] = "observation"
+    candidate_id: str = ""
+    structure_hash: str = ""
+    conditions: dict[str, Any] = Field(default_factory=dict)
     subject: str
     property: str
     value: Any = None

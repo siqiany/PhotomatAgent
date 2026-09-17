@@ -8,10 +8,10 @@ Maker's "final answer" never produces a scientific PASS by itself.
 Property -> evidence mapping reads:
   1. ``ScientificEvidence`` in ScientificState whose property matches the
      constraint (with a documented alias table);
-  2. structured JSON payloads stored in ``Evidence.content`` (e.g. mock /
-     capability tool results);
-  3. properties *declared by the candidate itself* (generation-time
-     predictions, always low fidelity).
+  2. eligible legacy structured JSON payloads stored in ``Evidence.content``.
+
+Candidate declarations and generated/mock evidence are retained as background,
+but cannot satisfy constraints.
 
 Only scientific judgement that cannot be reduced to rules is left for a
 future optional LLM critic -- this P0 stays fully deterministic.
@@ -19,18 +19,23 @@ future optional LLM critic -- this P0 stays fully deterministic.
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+import json
+import math
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.loop.candidate import (
     CandidateState,
-    _canonical_formula,
     extract_json_payload,
+)
+from photomatagent.scientific.loop.evidence_scope import (
+    EvidenceRequirements,
+    convert_property_value,
+    evidence_applicable,
 )
 from photomatagent.scientific.loop.scoring import compute_score
 from photomatagent.scientific.loop.target import (
@@ -130,6 +135,16 @@ class _ResolvedEvidence:
     rank: int
     source: str
     subject: str | None = None
+    method: str = ""
+    conditions: dict[str, Any] = field(default_factory=dict)
+    structure_hash: str = ""
+
+
+@dataclass(frozen=True)
+class EvidenceEvaluationPolicy:
+    """Host-owned evaluator switches used by isolated deterministic tests."""
+
+    allow_synthetic_evidence: bool = False
 
 
 class PropertyEvaluation(BaseModel):
@@ -174,8 +189,10 @@ class ScientificEvaluator:
         target: TargetSpec,
         *,
         property_aliases: dict[str, set[str]] | None = None,
+        policy: EvidenceEvaluationPolicy | None = None,
     ) -> None:
         self.target = target
+        self.policy = policy or EvidenceEvaluationPolicy()
         self.aliases = {
             **DEFAULT_PROPERTY_ALIASES,
             **(property_aliases or {}),
@@ -277,8 +294,7 @@ class ScientificEvaluator:
         candidate: CandidateState,
         scientific: ScientificState,
     ) -> ConstraintOutcome:
-        resolved = self._resolve_evidence(constraint, candidate, scientific)
-        if resolved is None:
+        if not _constraint_target_is_finite(constraint):
             return ConstraintOutcome(
                 property=constraint.property,
                 operator=constraint.operator,
@@ -286,7 +302,34 @@ class ScientificEvaluator:
                 unit=constraint.unit,
                 severity=constraint.severity,
                 result="UNKNOWN",
-                reason="no evidence for property",
+                reason="constraint target must contain only finite numeric limits",
+            )
+        requirements, requirements_error = self._requirements_for(constraint.property)
+        if requirements_error:
+            return ConstraintOutcome(
+                property=constraint.property,
+                operator=constraint.operator,
+                target_value=constraint.value,
+                unit=constraint.unit,
+                severity=constraint.severity,
+                result="UNKNOWN",
+                reason=requirements_error,
+            )
+        resolved, exclusions = self._resolve_evidence(
+            constraint, candidate, scientific, requirements
+        )
+        if resolved is None:
+            reason = "no applicable evidence for property"
+            if exclusions:
+                reason += ": " + "; ".join(dict.fromkeys(exclusions))
+            return ConstraintOutcome(
+                property=constraint.property,
+                operator=constraint.operator,
+                target_value=constraint.value,
+                unit=constraint.unit,
+                severity=constraint.severity,
+                result="UNKNOWN",
+                reason=reason,
             )
         check: ConstraintCheck = evaluate_constraint(constraint, resolved.value)
         if check.passed is None:
@@ -326,122 +369,181 @@ class ScientificEvaluator:
         constraint: ConstraintSpec,
         candidate: CandidateState,
         scientific: ScientificState,
-    ) -> _ResolvedEvidence | None:
+        requirements: EvidenceRequirements,
+    ) -> tuple[_ResolvedEvidence | None, list[str]]:
         candidates: list[_ResolvedEvidence] = []
+        exclusions: list[str] = []
         for evidence in scientific.evidence:
-            resolved = self._evidence_for_property(evidence, constraint, candidate)
+            resolved, exclusion = self._evidence_for_property(
+                evidence, constraint, candidate, requirements
+            )
             if resolved is not None:
                 candidates.append(resolved)
-        declared = self._candidate_declared_property(constraint, candidate)
-        if declared is not None:
-            candidates.append(declared)
+            elif exclusion:
+                exclusions.append(exclusion)
+        declarations = candidate.representation.get("properties")
+        if isinstance(declarations, dict) and constraint.property in declarations:
+            exclusions.append("candidate-declared properties are proposals, not observations")
         if not candidates:
-            return None
+            return None, exclusions
         candidates.sort(key=lambda item: (item.rank, _source_priority(item.source)), reverse=True)
-        return candidates[0]
+        return candidates[0], exclusions
 
     def _evidence_for_property(
         self,
         evidence: Evidence | ScientificEvidence,
         constraint: ConstraintSpec,
         candidate: CandidateState,
-    ) -> _ResolvedEvidence | None:
+        requirements: EvidenceRequirements,
+    ) -> tuple[_ResolvedEvidence | None, str]:
         aliases = self._aliases_for(constraint.property)
         value: Any = None
         unit = ""
         fidelity: str | None = None
         subject: str | None = None
+        scoped_evidence: ScientificEvidence
 
         if isinstance(evidence, ScientificEvidence):
             if str(evidence.property) not in aliases or evidence.value is None:
-                return None
+                return None, ""
             value = evidence.value
-            unit = evidence.unit or constraint.unit
+            unit = evidence.unit
             fidelity = evidence.fidelity
             subject = evidence.subject
+            scoped_evidence = evidence
         else:
             payload = _parse_json_payload(evidence.content)
             if payload is None or not isinstance(payload, dict):
-                return None
+                return None, ""
             matched_key = next(
                 (key for key in payload if str(key) in aliases),
                 None,
             )
             if matched_key is None or payload[matched_key] is None:
-                return None
+                return None, ""
             value = payload[matched_key]
-            unit = _infer_unit(str(matched_key)) or constraint.unit
+            unit = _infer_unit(str(matched_key))
             fidelity = "empirical"
             subject = str(payload.get("material") or payload.get("formula") or "")
+            source_type = _legacy_source_type(evidence.type)
+            scoped_evidence = ScientificEvidence(
+                id=evidence.id,
+                subject=subject,
+                property=str(matched_key),
+                value=value,
+                unit=unit,
+                source=evidence.source,
+                source_type=source_type,
+                method=str(evidence.provenance.get("method", evidence.type)),
+                fidelity="empirical",
+                provenance=evidence.provenance,
+            )
 
-        if candidate.formula and not _subject_compatible(candidate.formula, subject):
-            return None
-        return _ResolvedEvidence(
-            value=value,
-            unit=unit,
-            fidelity=fidelity,
-            confidence=evidence_confidence(evidence, fidelity),
-            evidence_id=evidence.id,
-            rank=fidelity_rank(fidelity) if fidelity is not None else fidelity_rank(evidence.fidelity),
-            source=_evidence_scope(evidence),
-            subject=subject,
+        applicable, reason = evidence_applicable(
+            scoped_evidence,
+            candidate,
+            requirements,
+            allow_synthetic_evidence=self.policy.allow_synthetic_evidence,
+        )
+        if not applicable:
+            return None, reason
+        try:
+            normalized_value, normalized_unit = _normalize_property_value(
+                value, unit, constraint.unit
+            )
+        except ValueError as exc:
+            return None, f"unusable evidence unit or value: {exc}"
+        return (
+            _ResolvedEvidence(
+                value=normalized_value,
+                unit=normalized_unit,
+                fidelity=fidelity,
+                confidence=evidence_confidence(evidence, fidelity),
+                evidence_id=evidence.id,
+                rank=(
+                    fidelity_rank(fidelity)
+                    if fidelity is not None
+                    else fidelity_rank(evidence.fidelity)
+                ),
+                source=_evidence_scope(evidence),
+                subject=subject,
+                method=scoped_evidence.method,
+                conditions=dict(scoped_evidence.conditions),
+                structure_hash=scoped_evidence.structure_hash,
+            ),
+            "",
         )
 
-    def _candidate_declared_property(
-        self,
-        constraint: ConstraintSpec,
-        candidate: CandidateState,
-    ) -> _ResolvedEvidence | None:
-        """Properties the candidate itself declares (generation-time predictions).
-
-        Always low fidelity: a generated candidate asserting its own property
-        is a proposal, never a validation (Invariant C + G).
-        """
-        declarations = candidate.representation.get("properties")
-        if not isinstance(declarations, dict):
-            return None
-        entry = declarations.get(constraint.property)
-        if not isinstance(entry, dict) or entry.get("value") is None:
-            return None
-        fidelity = str(entry.get("fidelity", "ml_generated"))
-        confidence = float(entry.get("confidence", FIDELITY_CONFIDENCE.get(fidelity, 0.25)))
-        return _ResolvedEvidence(
-            value=entry.get("value"),
-            unit=str(entry.get("unit", constraint.unit)),
-            fidelity=fidelity,
-            confidence=confidence,
-            evidence_id=f"declared:{candidate.candidate_id}:{constraint.property}",
-            rank=fidelity_rank(fidelity),
-            source="candidate_declared",
-        )
+    def _requirements_for(
+        self, property_name: str
+    ) -> tuple[EvidenceRequirements, str]:
+        raw_all = self.target.metadata.get("evidence_requirements", {})
+        if raw_all is None:
+            raw_all = {}
+        if not isinstance(raw_all, dict):
+            return EvidenceRequirements(), "invalid target evidence_requirements metadata"
+        raw = raw_all.get(property_name, {})
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            return EvidenceRequirements(), (
+                f"invalid evidence requirements for property {property_name!r}"
+            )
+        try:
+            return EvidenceRequirements.model_validate(raw), ""
+        except ValidationError as exc:
+            return EvidenceRequirements(), (
+                f"invalid evidence requirements for property {property_name!r}: {exc.errors()[0]['msg']}"
+            )
 
     def _detect_contradictions(
         self, candidate: CandidateState, scientific: ScientificState
     ) -> list[str]:
         """Same-property evidence that disagrees beyond a small tolerance."""
         by_property: dict[str, list[_ResolvedEvidence]] = {}
-        for evidence in scientific.evidence:
-            for constraint in self.target.constraints:
-                resolved = self._evidence_for_property(evidence, constraint, candidate)
+        for constraint in self.target.constraints:
+            requirements, error = self._requirements_for(constraint.property)
+            if error:
+                continue
+            for evidence in scientific.evidence:
+                resolved, _ = self._evidence_for_property(
+                    evidence, constraint, candidate, requirements
+                )
                 if resolved is not None:
                     by_property.setdefault(constraint.property, []).append(resolved)
         contradictions: list[str] = []
         for property_name, items in by_property.items():
-            numeric = [
-                (item.value, item.source)
-                for item in items
-                if isinstance(item.value, (int, float))
-            ]
-            seen: list[tuple[float, str]] = []
-            for value, source in numeric:
-                for prior_value, prior_source in seen:
-                    scale = max(abs(value), abs(prior_value), 1e-12)
-                    if abs(value - prior_value) / scale > 0.05:
-                        contradictions.append(
-                            f"{property_name}: {prior_source}={prior_value} vs "
-                            f"{source}={value}"
-                        )
-                seen.append((float(value), source))
+            by_scope: dict[tuple[str, str, str], list[_ResolvedEvidence]] = {}
+            for item in items:
+                if not item.method.strip():
+                    continue
+                scope_key = (
+                    item.method.strip().casefold(),
+                    item.structure_hash,
+                    json.dumps(
+                        _normalized_condition_value(item.conditions),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
+                )
+                by_scope.setdefault(scope_key, []).append(item)
+            for comparable in by_scope.values():
+                seen: list[tuple[float, str]] = []
+                for item in comparable:
+                    if isinstance(item.value, bool) or not isinstance(item.value, (int, float)):
+                        continue
+                    value = float(item.value)
+                    if not math.isfinite(value):
+                        continue
+                    for prior_value, prior_source in seen:
+                        scale = max(abs(value), abs(prior_value), 1e-12)
+                        if abs(value - prior_value) / scale > 0.05:
+                            contradictions.append(
+                                f"{property_name}: {prior_source}={prior_value} vs "
+                                f"{item.source}={value}"
+                            )
+                    seen.append((value, item.source))
         return contradictions
 
 
@@ -456,6 +558,35 @@ def _verdict(outcomes: list[ConstraintOutcome]) -> Verdict:
     if hard_unknown:
         return "INCONCLUSIVE"
     return "PASS"
+
+
+def _constraint_target_is_finite(constraint: ConstraintSpec) -> bool:
+    values = constraint.value if constraint.operator == "between" else [constraint.value]
+    if isinstance(values, (str, bytes, bool)):
+        return True
+    try:
+        items = list(values)
+    except TypeError:
+        items = [values]
+    return all(
+        not isinstance(item, (int, float)) or isinstance(item, bool) or math.isfinite(float(item))
+        for item in items
+    )
+
+
+def _normalized_condition_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _normalized_condition_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalized_condition_value(item) for item in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return value
 
 
 def _rationale(
@@ -491,17 +622,33 @@ def _infer_unit(key: str) -> str:
     return ""
 
 
-def _subject_compatible(candidate_formula: str, evidence_subject: str) -> bool:
-    """Reject evidence bound to a different material when the evidence names one."""
-    if not evidence_subject:
-        return True
-    normalized = _canonical_formula(evidence_subject)
-    if not normalized:
-        return True
-    # Underscore names ("generated_candidates") are collections, not formulas.
-    if re.search(r"[^A-Za-z0-9]", evidence_subject):
-        return True
-    return normalized == _canonical_formula(candidate_formula)
+def _legacy_source_type(
+    evidence_type: str,
+) -> Literal["database", "literature", "experimental", "calculation"]:
+    normalized = evidence_type.strip().casefold()
+    if normalized == "database":
+        return "database"
+    if normalized == "literature":
+        return "literature"
+    if normalized in {"experiment", "experimental"}:
+        return "experimental"
+    return "calculation"
+
+
+def _normalize_property_value(
+    value: Any, evidence_unit: str, target_unit: str
+) -> tuple[float, str]:
+    """Return a finite value expressed in the constraint's supported unit."""
+
+    if evidence_unit.strip() and evidence_unit.strip() == target_unit.strip():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("property value must be numeric")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError("property value must be finite")
+        return numeric, target_unit.strip()
+    normalized = convert_property_value(value, evidence_unit, target_unit)
+    return normalized, target_unit.strip()
 
 
 def _evidence_scope(evidence: Evidence | ScientificEvidence) -> str:
