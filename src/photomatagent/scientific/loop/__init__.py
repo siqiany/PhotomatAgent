@@ -10,6 +10,7 @@ if TYPE_CHECKING:
         CandidateState,
         candidate_fingerprint,
         extract_candidate_from_state,
+        extract_candidates_from_state,
     )
     from photomatagent.scientific.loop.controller import (
         ScientificLoopConfig,
@@ -59,6 +60,7 @@ _EXPORT_MODULE = {
     "CandidateState": "candidate",
     "candidate_fingerprint": "candidate",
     "extract_candidate_from_state": "candidate",
+    "extract_candidates_from_state": "candidate",
     "ScientificLoopConfig": "controller",
     "ScientificLoopController": "controller",
     "format_loop_state_snapshot": "controller",

@@ -13,6 +13,9 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
 )
+from photomatagent.scientific.discovery.models import HypothesisOrigin, HypothesisProposal
+from photomatagent.scientific.discovery.registration import build_hypothesis
+from photomatagent.scientific.loop.candidate import candidate_from_formula
 from photomatagent.scientific.loop.controller import ScientificLoopController
 from photomatagent.scientific.loop.target import (
     ConstraintSpec,
@@ -106,6 +109,7 @@ def build_controller(
     target: TargetSpec | None = None,
     events: list | None = None,
     tmp_path=None,
+    candidate_extractor=None,
 ) -> tuple[ScientificLoopController, FakeModelProvider]:
     script: list[FakeResponse] = []
     for round_responses in responses_per_round:
@@ -132,6 +136,7 @@ def build_controller(
         config=__import__(
             "photomatagent.scientific.loop.controller", fromlist=["ScientificLoopConfig"]
         ).ScientificLoopConfig(max_rounds=max_rounds),
+        candidate_extractor=candidate_extractor,
         event_sinks=[],
     )
     if events is not None:
@@ -145,6 +150,26 @@ async def collect(controller: ScientificLoopController) -> list:
     async for event in controller.run():
         events.append(event)
     return events
+
+
+def discovery_hypothesis(request_id: str, formula: str):
+    return build_hypothesis(
+        HypothesisProposal(
+            request_id=request_id,
+            formula=formula,
+            statement=f"investigate {formula}",
+            design_operation="other",
+            validation_questions=["Does it satisfy the target?"],
+        ),
+        HypothesisOrigin(
+            tool_name="generation.register_hypothesis",
+            tool_call_id=f"call-{request_id}",
+            session_id="session",
+            run_id="run",
+            provider="fake",
+            model="fake",
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -170,7 +195,9 @@ async def test_controller_success_trajectory(tmp_path):
     assert "scientific_loop_completed" in kinds
     assert controller.summary is not None
     assert controller.summary.status == "SUCCESS"
-    assert controller.summary.candidate_count == 2
+    # Re-evaluating the same stable composition updates its projection rather
+    # than consuming another candidate-budget slot.
+    assert controller.summary.candidate_count == 1
     assert controller.summary.best_candidate_id is not None
     final_eval = controller.summary.final_evaluation
     assert final_eval is not None and final_eval.verdict == "PASS"
@@ -314,3 +341,80 @@ async def test_controller_default_runtime_pathway_uses_mock_calculation(tmp_path
     # Mock evidence is 0.31 eV empirical -> hard band-gap violation, no success.
     assert controller.summary.status in {"BUDGET_EXHAUSTED", "INCONCLUSIVE"}
     assert "band_gap" in [v.property for v in controller.summary.unresolved_violations]
+
+
+@pytest.mark.asyncio
+async def test_controller_queues_two_registered_candidates_across_rounds(tmp_path):
+    controller, _ = build_controller([[], []], max_rounds=2, tmp_path=tmp_path)
+    first = discovery_hypothesis("first", "NaBiS2")
+    second = discovery_hypothesis("second", "HgTe")
+    controller.runtime.scientific_state.material_hypotheses.extend([first, second])
+
+    await collect(controller)
+
+    assert [report.candidate_id for report in controller.state.evaluations] == [
+        first.candidate_id,
+        second.candidate_id,
+    ]
+    assert {item.candidate_id for item in controller.state.candidates} == {
+        first.candidate_id,
+        second.candidate_id,
+    }
+    assert controller.state.pending_candidate_ids == []
+    assert controller.state.active_candidate_id == second.candidate_id
+
+
+@pytest.mark.asyncio
+async def test_controller_keeps_active_candidate_when_new_applicable_evidence_arrives(
+    tmp_path,
+):
+    controller, _ = build_controller(
+        [
+            [],
+            [propose_with_property("NaBiS2", "band_gap", 0.10, unit="eV")],
+            [],
+        ],
+        max_rounds=3,
+        tmp_path=tmp_path,
+    )
+    first = discovery_hypothesis("first", "NaBiS2")
+    second = discovery_hypothesis("second", "HgTe")
+    controller.runtime.scientific_state.material_hypotheses.extend([first, second])
+
+    await collect(controller)
+
+    assert [report.candidate_id for report in controller.state.evaluations] == [
+        first.candidate_id,
+        first.candidate_id,
+        second.candidate_id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_controller_preserves_pending_candidates_when_budget_is_reached(tmp_path):
+    controller, _ = build_controller([[]], max_rounds=3, tmp_path=tmp_path)
+    controller.config.max_candidates = 1
+    first = discovery_hypothesis("first", "NaBiS2")
+    second = discovery_hypothesis("second", "HgTe")
+    controller.runtime.scientific_state.material_hypotheses.extend([first, second])
+
+    await collect(controller)
+
+    assert controller.summary is not None
+    assert controller.summary.status == "BUDGET_EXHAUSTED"
+    assert controller.state.pending_candidate_ids == [second.candidate_id]
+
+
+@pytest.mark.asyncio
+async def test_controller_custom_candidate_extractor_remains_supported(tmp_path):
+    custom = candidate_from_formula("PbTe")
+    controller, _ = build_controller(
+        [[]],
+        max_rounds=1,
+        tmp_path=tmp_path,
+        candidate_extractor=lambda scientific, iteration: custom,
+    )
+
+    await collect(controller)
+
+    assert controller.state.evaluations[0].candidate_id == custom.candidate_id

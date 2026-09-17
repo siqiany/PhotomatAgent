@@ -56,11 +56,49 @@ class ScientificLoopState(BaseModel):
     candidates: list[CandidateState] = Field(default_factory=list)
     evaluations: list[EvaluationReport] = Field(default_factory=list)
     feedback_history: list[FeedbackSignal] = Field(default_factory=list)
+    pending_candidate_ids: list[str] = Field(default_factory=list)
+    active_candidate_id: str | None = None
     best_candidate_id: str | None = None
     best_score: float = 0.0
     round: int = 0
     no_progress_rounds: int = 0
     status: str = "RUNNING"
+
+    def register_candidates(self, candidates: list[CandidateState]) -> None:
+        """Upsert current projections and queue newly discovered identities."""
+
+        indexes = {
+            candidate.candidate_id: index
+            for index, candidate in enumerate(self.candidates)
+        }
+        for candidate in candidates:
+            index = indexes.get(candidate.candidate_id)
+            if index is None:
+                indexes[candidate.candidate_id] = len(self.candidates)
+                self.candidates.append(candidate)
+                if (
+                    candidate.candidate_id != self.active_candidate_id
+                    and candidate.candidate_id not in self.pending_candidate_ids
+                ):
+                    self.pending_candidate_ids.append(candidate.candidate_id)
+                continue
+            previous = self.candidates[index]
+            candidate.score = previous.score
+            candidate.status = previous.status
+            candidate.rejection_reasons = list(previous.rejection_reasons)
+            self.candidates[index] = candidate
+
+    def candidate(self, candidate_id: str | None) -> CandidateState | None:
+        if candidate_id is None:
+            return None
+        return next(
+            (
+                candidate
+                for candidate in self.candidates
+                if candidate.candidate_id == candidate_id
+            ),
+            None,
+        )
 
     def add_candidate(
         self, candidate: CandidateState | None, evaluation: EvaluationReport
@@ -71,18 +109,46 @@ class ScientificLoopState(BaseModel):
             self.evaluations.append(evaluation)
             return
         candidate.score = evaluation.score
-        candidate.status = (
-            "PASS"
-            if evaluation.verdict == "PASS"
-            else "REVISE"
-            if evaluation.verdict == "REVISE"
-            else "FAIL"
+        status_by_verdict = {
+            "PASS": "PASS",
+            "FAIL": "FAIL",
+            "REVISE": "REVISE",
+            "INCONCLUSIVE": "INCONCLUSIVE",
+        }
+        candidate.status = status_by_verdict[evaluation.verdict]  # type: ignore[assignment]
+        existing_index = next(
+            (
+                index
+                for index, existing in enumerate(self.candidates)
+                if existing.candidate_id == candidate.candidate_id
+            ),
+            None,
         )
-        self.candidates.append(candidate)
+        if existing_index is None:
+            self.candidates.append(candidate)
+        else:
+            self.candidates[existing_index] = candidate
         self.evaluations.append(evaluation)
-        if evaluation.score > self.best_score:
-            self.best_score = evaluation.score
-            self.best_candidate_id = candidate.candidate_id
+        self._recompute_best_candidate()
+
+    def _recompute_best_candidate(self) -> None:
+        latest_scores = {
+            evaluation.candidate_id: evaluation.score
+            for evaluation in self.evaluations
+            if evaluation.candidate_id
+        }
+        ranked = [
+            candidate
+            for candidate in self.candidates
+            if candidate.candidate_id in latest_scores
+        ]
+        if not ranked:
+            self.best_candidate_id = None
+            self.best_score = 0.0
+            return
+        best = max(ranked, key=lambda item: latest_scores[item.candidate_id])
+        self.best_candidate_id = best.candidate_id
+        self.best_score = latest_scores[best.candidate_id]
 
 
 class ScientificLoopSummary(BaseModel):
@@ -136,6 +202,12 @@ class ScientificLoopPolicy:
                     f"max rounds {max_rounds} / max candidates "
                     f"{max_candidates} exceeded"
                 ),
+                best_candidate_id=state.best_candidate_id,
+            )
+        if state.pending_candidate_ids and evaluation is not None:
+            return ScientificLoopDecision(
+                action="CONTINUE",
+                reason="registered candidates remain pending evaluation",
                 best_candidate_id=state.best_candidate_id,
             )
         if stagnation.stalled:

@@ -20,11 +20,21 @@ from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.capabilities.generation.lineage import (
     CandidateLineage,
 )
+from photomatagent.scientific.discovery.composition import (
+    composition_key,
+    normalize_composition,
+)
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.state import ScientificState
 
 CandidateStatus = Literal[
-    "PROPOSED", "EVALUATING", "PASS", "FAIL", "REVISE", "REJECTED"
+    "PROPOSED",
+    "EVALUATING",
+    "PASS",
+    "FAIL",
+    "REVISE",
+    "INCONCLUSIVE",
+    "REJECTED",
 ]
 
 # Evidence properties that carry a structured candidate proposal.
@@ -82,14 +92,17 @@ def candidate_fingerprint(candidate: CandidateState) -> str:
     signature: dict[str, Any] = {}
     formula = representation.get("formula")
     if formula:
-        signature["formula"] = _canonical_formula(str(formula))
+        try:
+            signature["composition"] = normalize_composition(str(formula))
+        except (ValueError, RuntimeError):
+            signature["formula"] = _canonical_formula(str(formula))
     composition = representation.get("composition")
-    if isinstance(composition, dict):
+    if "composition" not in signature and isinstance(composition, dict):
         signature["composition"] = sorted(
             (str(element), _rounded(value))
             for element, value in composition.items()
         )
-    elif formula:
+    elif "composition" not in signature and formula:
         signature["composition"] = _composition_from_formula(str(formula))
     for key in ("structure_identifier", "structure_id", "cif_hash"):
         if representation.get(key):
@@ -216,23 +229,103 @@ def extract_candidate_from_state(
         formula = _evidence_formula(evidence)
         if not formula:
             continue
-        provenance = getattr(evidence, "provenance", {}) or {}
-        method = generation_method or str(provenance.get("tool", ""))
-        lineage = CandidateLineage(
-            generated_by=method or "unknown",
-            generation_parameters=provenance,
-            source_artifacts=[evidence.id],
-            validation_status="UNVALIDATED_GENERATED_STRUCTURE",
-        )
-        return candidate_from_formula(
+        return _candidate_from_evidence(
+            evidence,
             formula,
-            generation_method=method,
-            generation_parameters=provenance,
-            extra_representation={
-                "evidence_ids": [evidence.id],
-                "evidence_type": str(getattr(evidence, "source_type", "")),
-            },
-            created_iteration=iteration,
-            lineage=lineage,
+            iteration=iteration,
+            generation_method=generation_method,
         )
     return None
+
+
+def _candidate_from_evidence(
+    evidence: Evidence | ScientificEvidence,
+    formula: str,
+    *,
+    iteration: int,
+    generation_method: str = "",
+) -> CandidateState:
+    provenance = getattr(evidence, "provenance", {}) or {}
+    method = generation_method or str(provenance.get("tool", ""))
+    lineage = CandidateLineage(
+        generated_by=method or "unknown",
+        generation_parameters=provenance,
+        source_artifacts=[evidence.id],
+        validation_status="UNVALIDATED_GENERATED_STRUCTURE",
+    )
+    candidate = candidate_from_formula(
+        formula,
+        generation_method=method,
+        generation_parameters=provenance,
+        extra_representation={
+            "evidence_ids": [evidence.id],
+            "evidence_type": str(getattr(evidence, "source_type", "")),
+        },
+        created_iteration=iteration,
+        lineage=lineage,
+    )
+    candidate.candidate_id = f"cand_{composition_key(formula)[:24]}"
+    candidate.evidence_ids = [evidence.id]
+    return candidate
+
+
+def extract_candidates_from_state(
+    scientific: ScientificState,
+    iteration: int = 0,
+) -> list[CandidateState]:
+    """Project all registered hypotheses and legacy evidence into candidates.
+
+    Candidate identity is the normalized composition identity. Multiple
+    hypotheses for the same composition remain traceable through their IDs but
+    consume one candidate slot. Legacy structured evidence is retained and may
+    coexist with mechanism candidates.
+    """
+
+    candidates: list[CandidateState] = []
+    by_id: dict[str, CandidateState] = {}
+    index_by_id: dict[str, int] = {}
+
+    for hypothesis in scientific.material_hypotheses:
+        candidate = by_id.get(hypothesis.candidate_id)
+        if candidate is None:
+            composition = dict(normalize_composition(hypothesis.proposal.formula))
+            candidate = candidate_from_formula(
+                hypothesis.proposal.formula,
+                generation_method="mechanism_reasoning",
+                extra_representation={
+                    "composition": composition,
+                    "hypothesis_ids": [hypothesis.id],
+                },
+                created_iteration=iteration,
+                lineage=hypothesis.lineage,
+            )
+            candidate.candidate_id = hypothesis.candidate_id
+            index_by_id[candidate.candidate_id] = len(candidates)
+            candidates.append(candidate)
+            by_id[candidate.candidate_id] = candidate
+        else:
+            hypothesis_ids = candidate.representation["hypothesis_ids"]
+            if hypothesis.id not in hypothesis_ids:
+                hypothesis_ids.append(hypothesis.id)
+
+    for evidence in scientific.evidence:
+        formula = _evidence_formula(evidence)
+        if not formula:
+            continue
+        identity = f"cand_{composition_key(formula)[:24]}"
+        existing = by_id.get(identity)
+        if existing is not None and existing.generation_method == "mechanism_reasoning":
+            continue
+        candidate = _candidate_from_evidence(
+            evidence,
+            formula,
+            iteration=iteration,
+        )
+        if existing is None:
+            index_by_id[identity] = len(candidates)
+            candidates.append(candidate)
+        else:
+            candidates[index_by_id[identity]] = candidate
+        by_id[identity] = candidate
+
+    return candidates

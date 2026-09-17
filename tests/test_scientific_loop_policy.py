@@ -88,6 +88,23 @@ def test_policy_success_requires_confidence_threshold():
     assert decision.action == "CONTINUE"
 
 
+def test_policy_does_not_finish_before_pending_candidates_are_evaluated():
+    report = _passing_report()
+    state = _state()
+    state.pending_candidate_ids = ["cand_pending"]
+
+    decision = ScientificLoopPolicy().decide(
+        evaluation=report,
+        state=state,
+        stagnation=StagnationDetector(),
+        max_rounds=6,
+        max_candidates=12,
+        min_confidence=0.6,
+    )
+
+    assert decision.action == "CONTINUE"
+
+
 def test_policy_continues_on_resolvable_gap():
     candidate = candidate_from_formula("HgTe")
     evaluator = ScientificEvaluator(_target())
@@ -148,6 +165,58 @@ def test_policy_inconclusive_without_evaluation():
         min_confidence=0.6,
     )
     assert decision.action == "INCONCLUSIVE"
+
+
+def test_inconclusive_candidate_is_not_failed():
+    state = ScientificLoopState(target=TargetSpec(goal="check a hypothesis"))
+    candidate = candidate_from_formula("NaBiS2")
+    state.add_candidate(
+        candidate,
+        EvaluationReport(
+            candidate_id=candidate.candidate_id,
+            verdict="INCONCLUSIVE",
+            score=0,
+        ),
+    )
+
+    assert state.candidates[0].status == "INCONCLUSIVE"
+    assert state.best_candidate_id == candidate.candidate_id
+
+
+def test_loop_state_defaults_queue_fields_for_legacy_snapshots():
+    restored = ScientificLoopState.model_validate(
+        {"target": TargetSpec(goal="legacy").model_dump(mode="json")}
+    )
+
+    assert restored.pending_candidate_ids == []
+    assert restored.active_candidate_id is None
+
+
+def test_candidate_projection_is_updated_while_evaluations_remain_history():
+    state = ScientificLoopState(target=TargetSpec(goal="rank candidates"))
+    first = candidate_from_formula("HgTe")
+    second = candidate_from_formula("PbTe")
+    state.add_candidate(
+        first,
+        EvaluationReport(candidate_id=first.candidate_id, verdict="PASS", score=0.9),
+    )
+    state.add_candidate(
+        second,
+        EvaluationReport(candidate_id=second.candidate_id, verdict="PASS", score=0.6),
+    )
+    contradicted = first.model_copy(update={"label": "HgTe re-evaluated"})
+
+    state.add_candidate(
+        contradicted,
+        EvaluationReport(candidate_id=first.candidate_id, verdict="FAIL", score=0.1),
+    )
+
+    assert len(state.candidates) == 2
+    assert len(state.evaluations) == 3
+    assert state.candidates[0].label == "HgTe re-evaluated"
+    assert state.candidates[0].status == "FAIL"
+    assert state.best_candidate_id == second.candidate_id
+    assert state.best_score == 0.6
 
 
 def test_policy_budget_exhausted_on_rounds():

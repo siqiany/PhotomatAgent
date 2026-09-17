@@ -41,6 +41,7 @@ from photomatagent.runtime.loop import AgentRuntime, EventSink
 from photomatagent.scientific.loop.candidate import (
     CandidateState,
     extract_candidate_from_state,
+    extract_candidates_from_state,
 )
 from photomatagent.scientific.loop.evaluation import (
     EvaluationReport,
@@ -207,7 +208,9 @@ class ScientificLoopController:
                 yield event
 
             scientific = self.runtime.scientific_state
-            candidate = self._extract(scientific, self.state.round)
+            projected = self._extract_candidates(scientific, self.state.round)
+            self.state.register_candidates(projected)
+            candidate = self._select_candidate(scientific)
             if candidate is None:
                 dry_evidence_rounds += 1
             else:
@@ -397,6 +400,58 @@ class ScientificLoopController:
         except Exception as exc:  # a broken extractor must not kill the loop
             self._note = f"candidate extraction failed: {type(exc).__name__}: {exc}"
             return None
+
+    def _extract_candidates(
+        self,
+        scientific: ScientificState,
+        round_number: int,
+    ) -> list[CandidateState]:
+        if self.candidate_extractor is not extract_candidate_from_state:
+            candidate = self._extract(scientific, round_number)
+            return [candidate] if candidate is not None else []
+        try:
+            return extract_candidates_from_state(scientific, round_number)
+        except Exception as exc:  # a broken extractor must not kill the loop
+            self._note = f"candidate extraction failed: {type(exc).__name__}: {exc}"
+            return []
+
+    def _select_candidate(self, scientific: ScientificState) -> CandidateState | None:
+        active = self.state.candidate(self.state.active_candidate_id)
+        if active is not None and self._has_new_applicable_evidence(active, scientific):
+            return active
+        if self.state.pending_candidate_ids:
+            self.state.active_candidate_id = self.state.pending_candidate_ids.pop(0)
+            return self.state.candidate(self.state.active_candidate_id)
+        return active
+
+    def _has_new_applicable_evidence(
+        self,
+        candidate: CandidateState,
+        scientific: ScientificState,
+    ) -> bool:
+        previous = next(
+            (
+                evaluation
+                for evaluation in reversed(self.state.evaluations)
+                if evaluation.candidate_id == candidate.candidate_id
+            ),
+            None,
+        )
+        if previous is None:
+            return False
+        current = self.evaluator.evaluate(candidate, scientific)
+        return bool(
+            self._evaluation_evidence_ids(current)
+            - self._evaluation_evidence_ids(previous)
+        )
+
+    @staticmethod
+    def _evaluation_evidence_ids(evaluation: EvaluationReport) -> set[str]:
+        return {
+            evidence_id
+            for result in evaluation.constraint_results
+            for evidence_id in result.evidence_ids
+        }
 
     def _build_summary(self, decision: ScientificLoopDecision) -> ScientificLoopSummary:
         final_evaluation: EvaluationReport | None = (
