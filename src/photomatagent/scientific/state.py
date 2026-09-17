@@ -86,6 +86,24 @@ class ScientificState(BaseModel):
         copied._runtime_attestations = {}
         return copied
 
+    def __copy__(self) -> ScientificState:
+        """Keep standard shallow copies outside the runtime authority."""
+
+        copied = super().__copy__()
+        copied._runtime_authority_capability = None
+        copied._runtime_attestations = {}
+        return copied
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ScientificState:
+        """Keep standard deep copies outside the runtime authority."""
+
+        copied = super().__deepcopy__(memo)
+        copied._runtime_authority_capability = None
+        copied._runtime_attestations = {}
+        if memo is not None:
+            memo[id(self)] = copied
+        return copied
+
     def __eq__(self, other: Any) -> bool:
         """Compare durable scientific content, excluding runtime capabilities."""
 

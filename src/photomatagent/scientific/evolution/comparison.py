@@ -589,17 +589,26 @@ def _evidence_map(
     values: dict[str, str | None] = {}
     if state is not None:
         for item in state.evidence:
-            evidence_id = opaque_evidence_ref(item.id)
+            evidence_id = _comparison_evidence_ref(item.id)
             values[evidence_id] = getattr(item, "fidelity", "empirical")
         return values
     for outcome in _outcomes(episode).values():
         for raw_id in getattr(outcome, "evidence_ids"):
-            try:
-                evidence_id = validate_managed_id(raw_id)
-            except (TypeError, ValueError):
-                continue
-            values[evidence_id] = getattr(outcome, "fidelity")
+            evidence_id = _comparison_evidence_ref(raw_id)
+            values[evidence_id] = getattr(outcome, "fidelity", None)
     return values
+
+
+def _comparison_evidence_ref(value: str) -> str:
+    """Normalize every comparison-facing evidence ID to one bounded ref."""
+
+    try:
+        managed = validate_managed_id(value)
+    except (TypeError, ValueError):
+        return opaque_evidence_ref(value)
+    if managed.startswith("eref_"):
+        return managed
+    return opaque_evidence_ref(managed)
 
 
 def _evidence_changes(
@@ -635,7 +644,12 @@ def _evidence_changes(
             added_ids=sorted(new_ids - old_ids),
             removed_ids=sorted(old_ids - new_ids),
             carried_ids=sorted(shared),
-            invalidated_ids=sorted(set(plan.invalidated_evidence_ids)),
+            invalidated_ids=sorted(
+                {
+                    _comparison_evidence_ref(evidence_id)
+                    for evidence_id in plan.invalidated_evidence_ids
+                }
+            ),
             resolved_gaps=sorted(old_gaps - new_gaps),
             new_gaps=sorted(new_gaps - old_gaps),
         ),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import copy, deepcopy
+
 import pytest
 from pydantic import ValidationError
 
@@ -190,6 +192,34 @@ def test_public_and_deep_state_copies_do_not_inherit_runtime_authority() -> None
     )
 
     for copied in (state.model_copy(), state.model_copy(deep=True)):
+        assert copied._runtime_authority_capability is None
+        assert copied._runtime_attestations == {}
+        assert copied.verified_attestation(evidence.id) is None
+
+
+def test_standard_library_copies_do_not_inherit_runtime_authority() -> None:
+    evidence = ScientificEvidence(
+        id="sev-attestation-stdlib-copy",
+        subject="HgTe",
+        property="band_gap",
+        value=0.2,
+        unit="eV",
+    )
+    state = ScientificState(evidence=[evidence])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="materials.get_summary",
+            tool_call_id="call-original",
+        ),
+    )
+
+    for copied in (copy(state), deepcopy(state)):
         assert copied._runtime_authority_capability is None
         assert copied._runtime_attestations == {}
         assert copied.verified_attestation(evidence.id) is None

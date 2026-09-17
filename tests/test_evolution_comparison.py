@@ -396,7 +396,7 @@ def test_comparison_reports_scientific_artifact_and_cost_changes() -> None:
     assert report.evidence_changes.added_ids == [opaque_evidence_ref("sev_new")]
     assert report.evidence_changes.removed_ids == [opaque_evidence_ref("sev_removed")]
     assert report.evidence_changes.carried_ids == [opaque_evidence_ref("sev_shared")]
-    assert report.evidence_changes.invalidated_ids == ["sev_removed"]
+    assert report.evidence_changes.invalidated_ids == [opaque_evidence_ref("sev_removed")]
     assert report.evidence_changes.resolved_gaps == ["responsivity"]
     assert report.evidence_changes.new_gaps == ["dark_current"]
     assert report.fidelity_changes.upgraded_ids == [opaque_evidence_ref("sev_shared")]
@@ -456,6 +456,38 @@ def test_state_backed_comparison_projects_raw_ids_to_opaque_refs() -> None:
     assert report.evidence_changes.removed_ids == []
     assert report.evidence_changes.carried_ids == [reference]
     assert report.fidelity_changes.upgraded_ids == [reference]
+
+
+def test_comparison_normalizes_legacy_outcome_and_invalidation_ids() -> None:
+    raw_id = "/private/results/LEGACY_TOKEN"
+    legacy_managed_id = "legacy_raw_id"
+    reference = opaque_evidence_ref(raw_id)
+    legacy_reference = opaque_evidence_ref(legacy_managed_id)
+    previous = _episode(
+        "v001",
+        summary=_summary(("band_gap", "PASS", "analytical", (raw_id,))),
+    )
+    current = _episode(
+        "v002",
+        summary=_summary(("band_gap", "PASS", "dft", (raw_id,))),
+    )
+    report = compare_episodes(
+        previous=previous,
+        current=current,
+        previous_plan=RevisionPlan(
+            revision_id="rp_compare",
+            evolution_id="evo_compare",
+            source_version="v001",
+            feedback_id="fb_v1",
+            invalidated_evidence_ids=[legacy_managed_id],
+            confirmed=True,
+        ),
+    )
+
+    assert report.evidence_changes.carried_ids == [reference]
+    assert report.evidence_changes.invalidated_ids == [legacy_reference]
+    assert raw_id not in report.model_dump_json()
+    assert legacy_managed_id not in report.model_dump_json()
 
 
 def test_learning_signal_renormalizes_missing_components_and_records_them() -> None:
