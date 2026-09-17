@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
@@ -40,39 +38,6 @@ class EvidenceAttestation(BaseModel):
     origin: Literal["trusted_builtin", "synthetic_test", "untrusted_tool"]
     tool_name: str
     tool_call_id: str
-    host_proof: str = Field(default="", repr=False)
-
-    @classmethod
-    def host_create(
-        cls,
-        *,
-        evidence_id: str,
-        authority: Literal["observation", "synthetic", "background"],
-        origin: Literal["trusted_builtin", "synthetic_test", "untrusted_tool"],
-        tool_name: str,
-        tool_call_id: str,
-    ) -> EvidenceAttestation:
-        values = (evidence_id, authority, origin, tool_name, tool_call_id)
-        return cls(
-            evidence_id=evidence_id,
-            authority=authority,
-            origin=origin,
-            tool_name=tool_name,
-            tool_call_id=tool_call_id,
-            host_proof=_attestation_proof(values),
-        )
-
-    def is_host_valid(self) -> bool:
-        expected = _attestation_proof(
-            (
-                self.evidence_id,
-                self.authority,
-                self.origin,
-                self.tool_name,
-                self.tool_call_id,
-            )
-        )
-        return hmac.compare_digest(self.host_proof, expected)
 
     def has_compatible_authority(self) -> bool:
         return self.authority == {
@@ -80,15 +45,6 @@ class EvidenceAttestation(BaseModel):
             "synthetic_test": "synthetic",
             "untrusted_tool": "background",
         }[self.origin]
-
-
-def _attestation_proof(values: tuple[str, ...]) -> str:
-    payload = "\x1f".join(values).encode("utf-8")
-    return hmac.new(
-        b"photomatagent-host-attestation-v1",
-        payload,
-        hashlib.sha256,
-    ).hexdigest()
 
 
 class ScientificState(BaseModel):
@@ -109,6 +65,17 @@ class ScientificState(BaseModel):
     open_questions: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     pending_tasks: list[ScientificTask] = Field(default_factory=list)
+    _runtime_authority_capability: object | None = PrivateAttr(default=None)
+    _runtime_attestations: dict[str, EvidenceAttestation] = PrivateAttr(
+        default_factory=dict
+    )
+
+    def __eq__(self, other: Any) -> bool:
+        """Compare durable scientific content, excluding runtime capabilities."""
+
+        if not isinstance(other, ScientificState):
+            return False
+        return self.model_dump(mode="python") == other.model_dump(mode="python")
 
     @model_validator(mode="after")
     def validate_evidence_attestations(self) -> ScientificState:
@@ -121,7 +88,6 @@ class ScientificState(BaseModel):
             if key == attestation.evidence_id
             and evidence_counts.get(key) == 1
             and attestation.has_compatible_authority()
-            and attestation.is_host_valid()
         }
         return self
 
@@ -131,24 +97,52 @@ class ScientificState(BaseModel):
         self.evidence.append(evidence)
         return evidence
 
-    def attest_evidence(self, attestation: EvidenceAttestation) -> EvidenceAttestation:
+    def _bind_runtime_authority(
+        self, capability: object, *, replace: bool = False
+    ) -> None:
+        """Bind host-internal authority; model/tool payloads must not call this."""
+        if (
+            self._runtime_authority_capability is not None
+            and self._runtime_authority_capability is not capability
+            and not replace
+        ):
+            raise ValueError("scientific state is bound to another runtime authority")
+        self._runtime_authority_capability = capability
+        if replace:
+            self._runtime_attestations = {}
+
+    def _attest_evidence(
+        self, attestation: EvidenceAttestation, *, capability: object
+    ) -> EvidenceAttestation:
+        if self._runtime_authority_capability is not capability:
+            raise ValueError("runtime evidence authority capability is required")
         matches = sum(item.id == attestation.evidence_id for item in self.evidence)
         if matches != 1:
             raise ValueError("attested evidence must exist exactly once in scientific state")
-        if not attestation.has_compatible_authority() or not attestation.is_host_valid():
-            raise ValueError("evidence attestation is not host-valid")
+        if not attestation.has_compatible_authority():
+            raise ValueError("evidence attestation authority is incompatible with origin")
         self.evidence_attestations[attestation.evidence_id] = attestation
+        self._runtime_attestations[attestation.evidence_id] = attestation
         return attestation
+
+    def _copy_runtime_attestations_from(
+        self, source: ScientificState, *, capability: object
+    ) -> None:
+        if (
+            self._runtime_authority_capability is not capability
+            or source._runtime_authority_capability is not capability
+        ):
+            raise ValueError("runtime evidence authority capability is required")
+        self._runtime_attestations = dict(source._runtime_attestations)
 
     def verified_attestation(self, evidence_id: str) -> EvidenceAttestation | None:
         if sum(item.id == evidence_id for item in self.evidence) != 1:
             return None
-        attestation = self.evidence_attestations.get(evidence_id)
+        attestation = self._runtime_attestations.get(evidence_id)
         if (
             attestation is None
             or attestation.evidence_id != evidence_id
             or not attestation.has_compatible_authority()
-            or not attestation.is_host_valid()
         ):
             return None
         return attestation

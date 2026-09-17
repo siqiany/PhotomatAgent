@@ -13,6 +13,9 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificToolResult,
 )
 from photomatagent.scientific.state import EvidenceAttestation, ScientificState
+from photomatagent.scientific.loop.candidate import candidate_from_formula
+from photomatagent.scientific.loop.evaluation import ScientificEvaluator
+from photomatagent.scientific.loop.target import ConstraintSpec, TargetSpec
 from photomatagent.tools.base import Tool
 from photomatagent.tools.bridges import ToolCallBridge
 from photomatagent.tools.exposure import ToolExposure
@@ -179,6 +182,18 @@ async def test_default_policy_has_a_narrow_trusted_builtin_path() -> None:
     attestation = runtime.scientific_state.evidence_attestations[stored.id]
     assert attestation.authority == "observation"
     assert attestation.origin == "trusted_builtin"
+
+    report = ScientificEvaluator(
+        TargetSpec(
+            goal="density",
+            constraints=[
+                ConstraintSpec(
+                    property="density", operator="le", value=6.0, unit="g/cm3"
+                )
+            ],
+        )
+    ).evaluate(candidate_from_formula("GaAs"), runtime.scientific_state)
+    assert report.constraint_results[0].result == "PASS"
 
 
 @pytest.mark.asyncio

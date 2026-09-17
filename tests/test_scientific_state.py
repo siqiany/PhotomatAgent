@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from photomatagent.runtime.evidence_attestation import _RuntimeEvidenceAuthority
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
@@ -91,16 +92,37 @@ def test_evidence_attestation_roundtrip_and_legacy_default() -> None:
     state = ScientificState(evidence=[evidence])
     assert state.evidence_attestations == {}
 
-    state.evidence_attestations[evidence.id] = EvidenceAttestation.host_create(
-        evidence_id=evidence.id,
-        authority="observation",
-        origin="trusted_builtin",
-        tool_name="electronic.band_summary",
-        tool_call_id="call-1",
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="electronic.band_summary",
+            tool_call_id="call-1",
+        ),
     )
-    restored = ScientificState.model_validate_json(state.model_dump_json())
+    payload = state.model_dump_json()
+    restored = ScientificState.model_validate_json(payload)
 
+    assert "host_proof" not in payload
+    assert "runtime_authority" not in payload
     assert restored.evidence_attestations[evidence.id].authority == "observation"
+    assert restored.verified_attestation(evidence.id) is None
+    assert state == restored
+
+    restored.goal = "different durable content"
+    assert state != restored
+
+
+def test_runtime_authority_is_not_a_public_scientific_state_api() -> None:
+    state = ScientificState()
+
+    assert not hasattr(state, "bind_runtime_authority")
+    assert not hasattr(state, "attest_evidence")
+    assert not hasattr(state, "clear_runtime_authority")
 
 
 @pytest.mark.parametrize(
@@ -117,12 +139,6 @@ def test_evidence_attestation_roundtrip_and_legacy_default() -> None:
             "authority": "observation",
             "origin": "untrusted_tool",
             "tool_name": "scientific.untrusted",
-            "tool_call_id": "call-1",
-        },
-        {
-            "authority": "observation",
-            "origin": "trusted_builtin",
-            "tool_name": "renamed.untrusted",
             "tool_call_id": "call-1",
         },
     ],

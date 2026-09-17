@@ -466,8 +466,9 @@ def test_target_snapshot_is_recursive_across_constraints_and_conditions():
         episode.target_snapshot.constraints[0].value["allowed"].append("B")
     with pytest.raises(TypeError):
         episode.target_snapshot.objectives.append("changed")
+    assert episode.target_snapshot.operating_conditions["temperature_k"] == 77.0
     with pytest.raises(TypeError):
-        episode.target_snapshot.operating_conditions["temperature"]["kelvin"] = 300
+        episode.target_snapshot.operating_conditions["temperature_k"] = 300
 
 
 def test_immutable_episode_snapshots_round_trip_as_clean_json():

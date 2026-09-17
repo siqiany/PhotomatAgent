@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from photomatagent.runtime.evidence_attestation import _RuntimeEvidenceAuthority
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.loop.candidate import candidate_from_formula
@@ -44,13 +45,18 @@ def _scientific(*evidence: object) -> ScientificState:
 
 def _attested_scientific(*evidence: object) -> ScientificState:
     state = _scientific(*evidence)
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
     for item in state.evidence:
-        state.evidence_attestations[item.id] = EvidenceAttestation.host_create(
-            evidence_id=item.id,
-            authority="observation",
-            origin="trusted_builtin",
-            tool_name="electronic.band_summary",
-            tool_call_id=f"call-{item.id}",
+        authority.attest(
+            state,
+            EvidenceAttestation(
+                evidence_id=item.id,
+                authority="observation",
+                origin="trusted_builtin",
+                tool_name="electronic.band_summary",
+                tool_call_id=f"call-{item.id}",
+            ),
         )
     return state
 
@@ -253,8 +259,7 @@ def test_fully_laundered_unattested_evidence_cannot_validate() -> None:
     assert "UNATTESTED" in report.constraint_results[0].reason
 
 
-@pytest.mark.parametrize("tamper", ["mismatched_id", "incompatible_origin", "proof"])
-def test_directly_tampered_attestation_remains_unknown(tamper: str) -> None:
+def test_snapshot_visible_attestation_fields_cannot_create_authority() -> None:
     evidence = ScientificEvidence(
         id="sev-tampered",
         subject="HgTe",
@@ -266,21 +271,18 @@ def test_directly_tampered_attestation_remains_unknown(tamper: str) -> None:
         method="PBE",
         fidelity="dft",
     )
-    state = ScientificState(evidence=[evidence])
-    attestation = EvidenceAttestation.host_create(
-        evidence_id=evidence.id,
-        authority="observation",
-        origin="trusted_builtin",
-        tool_name="electronic.band_summary",
-        tool_call_id="call-1",
+    state = ScientificState(
+        evidence=[evidence],
+        evidence_attestations={
+            evidence.id: EvidenceAttestation(
+                evidence_id=evidence.id,
+                authority="observation",
+                origin="trusted_builtin",
+                tool_name="electronic.band_summary",
+                tool_call_id="call-1",
+            )
+        },
     )
-    if tamper == "mismatched_id":
-        attestation.evidence_id = "different-id"
-    elif tamper == "incompatible_origin":
-        attestation.origin = "untrusted_tool"
-    else:
-        attestation.host_proof = "forged"
-    state.evidence_attestations[evidence.id] = attestation
 
     report = ScientificEvaluator(_target()).evaluate(_candidate(), state)
 
@@ -300,14 +302,17 @@ def test_host_shaped_attestation_from_untrusted_tool_remains_unknown() -> None:
         fidelity="dft",
     )
     state = ScientificState(evidence=[evidence])
-    state.attest_evidence(
-        EvidenceAttestation.host_create(
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
             evidence_id=evidence.id,
             authority="observation",
             origin="trusted_builtin",
             tool_name="renamed.untrusted",
             tool_call_id="call-1",
-        )
+        ),
     )
 
     report = ScientificEvaluator(_target()).evaluate(_candidate(), state)

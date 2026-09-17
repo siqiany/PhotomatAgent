@@ -37,6 +37,10 @@ Rules:
 - Create at least one constraint. If the goal has no numeric requirement, propose
   a conservative SOFT proxy and warn that the expert must confirm it.
 - Do not claim a source was verified unless the supplied context establishes it.
+- Use canonical operating-condition keys temperature_k, spectral_range_um,
+  bias_v, and wavelength_um. Nested aliases temperature.kelvin and
+  spectral_range.min_um/max_um are accepted and normalized.
+- Temperatures and wavelengths must be finite and positive.
 - Return strict JSON only, with no markdown.
 
 Schema:
@@ -56,7 +60,7 @@ Schema:
     "requires_confirmation": true
   }],
   "objectives": ["<non-boolean objective>"],
-  "operating_conditions": {},
+  "operating_conditions": {"temperature_k": 77, "spectral_range_um": [8, 14]},
   "warnings": ["<uncertainty or missing requirement>"]
 }
 """

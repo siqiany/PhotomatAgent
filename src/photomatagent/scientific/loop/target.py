@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ConstraintOperator = Literal["lt", "le", "gt", "ge", "eq", "between"]
 ConstraintSeverity = Literal["HARD", "SOFT"]
@@ -44,6 +44,29 @@ class TargetSpec(BaseModel):
     operating_conditions: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_operating_condition_contract(cls, value: Any) -> Any:
+        # Nested evolution snapshots may validate an already-created, frozen
+        # TargetSpec.  It has crossed this boundary already and must not be
+        # mutated during parent-model validation.
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        normalized, diagnostics = normalize_operating_conditions(
+            data.get("operating_conditions", {})
+        )
+        data["operating_conditions"] = normalized
+        metadata = dict(data.get("metadata") or {})
+        if diagnostics:
+            metadata["operating_condition_diagnostics"] = diagnostics
+        else:
+            metadata.pop("operating_condition_diagnostics", None)
+        data["metadata"] = metadata
+        return data
+
     def hard_constraints(self) -> list[ConstraintSpec]:
         return [c for c in self.constraints if c.severity == "HARD"]
 
@@ -55,6 +78,112 @@ class TargetSpec(BaseModel):
             if constraint.property == property_name:
                 return constraint
         return None
+
+
+def normalize_operating_conditions(
+    raw: object,
+) -> tuple[dict[str, Any], list[str]]:
+    """Normalize supported target aliases and retain typed invalid-target codes."""
+
+    normalized: dict[str, Any] = {}
+    diagnostics: list[str] = []
+    recognized: set[str] = set()
+    if not isinstance(raw, dict):
+        return normalized, ["OPERATING_CONDITIONS_INVALID"]
+
+    if "temperature_k" in raw:
+        recognized.add("temperature_k")
+        _set_positive_condition(
+            normalized, diagnostics, "temperature_k", raw["temperature_k"]
+        )
+    if "temperature" in raw:
+        recognized.add("temperature")
+        value = raw["temperature"]
+        if isinstance(value, dict) and set(value) == {"kelvin"}:
+            _set_positive_condition(
+                normalized, diagnostics, "temperature_k", value["kelvin"]
+            )
+        else:
+            diagnostics.append("OPERATING_CONDITION_INVALID:temperature")
+
+    if "spectral_range_um" in raw:
+        recognized.add("spectral_range_um")
+        _set_spectral_range(
+            normalized, diagnostics, raw["spectral_range_um"]
+        )
+    if "spectral_range" in raw:
+        recognized.add("spectral_range")
+        value = raw["spectral_range"]
+        if isinstance(value, dict) and set(value) == {"min_um", "max_um"}:
+            _set_spectral_range(
+                normalized, diagnostics, [value["min_um"], value["max_um"]]
+            )
+        else:
+            diagnostics.append("OPERATING_CONDITION_INVALID:spectral_range")
+
+    for name in ("bias_v", "wavelength_um"):
+        if name in raw:
+            recognized.add(name)
+            value = raw[name]
+            if _finite_number(value) and (name == "bias_v" or float(value) > 0):
+                normalized[name] = float(value)
+            else:
+                diagnostics.append(f"OPERATING_CONDITION_INVALID:{name}")
+
+    for name in sorted(set(raw) - recognized):
+        safe_name = name if len(name) <= 48 else "unrecognized"
+        diagnostics.append(f"OPERATING_CONDITION_UNRECOGNIZED:{safe_name}")
+    return normalized, diagnostics
+
+
+def _set_positive_condition(
+    normalized: dict[str, Any],
+    diagnostics: list[str],
+    name: str,
+    value: object,
+) -> None:
+    if _finite_number(value) and float(value) > 0:
+        numeric = float(value)
+        if name in normalized and normalized[name] != numeric:
+            diagnostics.append(f"OPERATING_CONDITION_CONFLICT:{name}")
+        else:
+            normalized[name] = numeric
+    else:
+        diagnostics.append(f"OPERATING_CONDITION_INVALID:{name}")
+
+
+def _set_spectral_range(
+    normalized: dict[str, Any], diagnostics: list[str], value: object
+) -> None:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        lower, upper = value
+    else:
+        lower, upper = None, None
+    if (
+        _finite_number(lower)
+        and _finite_number(upper)
+        and lower > 0
+        and upper > 0
+        and lower <= upper
+    ):
+        spectral = [float(lower), float(upper)]
+        if (
+            "spectral_range_um" in normalized
+            and normalized["spectral_range_um"] != spectral
+        ):
+            diagnostics.append("OPERATING_CONDITION_CONFLICT:spectral_range_um")
+        else:
+            normalized["spectral_range_um"] = spectral
+    else:
+        diagnostics.append("OPERATING_CONDITION_INVALID:spectral_range_um")
+
+
+def _finite_number(value: object) -> TypeGuard[int | float]:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
 
 
 def canonical_lwir_detector_target() -> TargetSpec:

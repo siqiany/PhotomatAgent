@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evidence import Evidence
+from photomatagent.scientific.evidence_refs import opaque_evidence_ref
 from photomatagent.scientific.loop.candidate import (
     CandidateState,
     extract_json_payload,
@@ -47,6 +48,7 @@ from photomatagent.scientific.loop.target import (
     ConstraintViolation,
     TargetSpec,
     evaluate_constraint,
+    normalize_operating_conditions,
 )
 from photomatagent.scientific.state import (
     DEFAULT_TRUSTED_EVIDENCE_TOOLS,
@@ -376,7 +378,7 @@ class ScientificEvaluator:
                 severity=constraint.severity,
                 result="UNKNOWN",
                 evidence_found=True,
-                evidence_ids=[_opaque_evidence_ref(resolved.evidence_id)],
+                evidence_ids=[opaque_evidence_ref(resolved.evidence_id)],
                 fidelity=resolved.fidelity,
                 confidence=resolved.confidence,
                 reason="CONSTRAINT_UNUSABLE",
@@ -391,7 +393,7 @@ class ScientificEvaluator:
             severity=constraint.severity,
             result=result,
             evidence_found=True,
-            evidence_ids=[_opaque_evidence_ref(resolved.evidence_id)],
+            evidence_ids=[opaque_evidence_ref(resolved.evidence_id)],
             fidelity=resolved.fidelity,
             confidence=resolved.confidence,
             soft_score=check.soft_score,
@@ -534,6 +536,14 @@ class ScientificEvaluator:
                 f"invalid evidence requirements for property {property_name!r}: {exc.errors()[0]['msg']}"
             )
         if property_name in _DEVICE_ONLY_PROPERTIES:
+            operating_diagnostics = self.target.metadata.get(
+                "operating_condition_diagnostics", []
+            )
+            _, current_diagnostics = normalize_operating_conditions(
+                self.target.operating_conditions
+            )
+            if operating_diagnostics or current_diagnostics:
+                return EvidenceRequirements(), "invalid target operating conditions"
             conditions = dict(parsed.conditions)
             condition_ranges = dict(parsed.condition_ranges)
             target_temperature = self.target.operating_conditions.get("temperature_k")
@@ -796,11 +806,6 @@ def _normalize_property_value(
 
 def _evidence_scope(evidence: Evidence | ScientificEvidence) -> str:
     return f"evidence:{evidence.id[:64]}"
-
-
-def _opaque_evidence_ref(evidence_id: str) -> str:
-    digest = hashlib.sha256(evidence_id.encode("utf-8")).hexdigest()[:20]
-    return f"eref_{digest}"
 
 
 def _bounded_property_ref(property_name: str) -> str:

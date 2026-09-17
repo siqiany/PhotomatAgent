@@ -81,6 +81,16 @@ _FRESH_STRATEGY_GUIDANCE = {
     "DIVERSITY_FIRST": "Prioritize diverse independently checked candidates.",
     "UNCERTAINTY_FIRST": "Prioritize resolving the largest scientific uncertainty.",
 }
+
+
+def _scientific_state_is_persistently_blank(state: ScientificState) -> bool:
+    """Ignore runtime-only private capabilities when checking reusable content."""
+
+    return state.model_dump(mode="python") == ScientificState().model_dump(
+        mode="python"
+    )
+
+
 _FRESH_TOOL_TYPES: dict[str, type[object]] = {
     "echo": EchoTool,
     "calculator": CalculatorTool,
@@ -207,7 +217,7 @@ def _build_trusted_fresh_runtime(
         value != 0 for value in supplied.budget.snapshot().values()
     ):
         raise ValueError("runtime_factory returned a reused budget")
-    if supplied.scientific_state != ScientificState():
+    if not _scientific_state_is_persistently_blank(supplied.scientific_state):
         raise ValueError("runtime_factory returned reused scientific state")
     if not isinstance(supplied.session_id, str) or not supplied.session_id:
         raise ValueError("runtime_factory returned an invalid session ID")
@@ -595,7 +605,7 @@ class ScientificEpisodeExecutor:
             raise ValueError("evolution episodes require a fresh runtime budget")
         if (
             episode.execution_mode == "FRESH_EVALUATION"
-            and runtime.scientific_state != ScientificState()
+            and not _scientific_state_is_persistently_blank(runtime.scientific_state)
         ):
             raise ValueError("fresh evaluation requires a blank ScientificState")
         if task.evolution_id != episode.evolution_id:

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evidence import Evidence
+from photomatagent.scientific.evidence_refs import matches_evidence_ref
 from photomatagent.scientific.state import ScientificState
 
 CarryableEvidence = Evidence | ScientificEvidence
@@ -100,7 +101,7 @@ def _rejection_reason(
         return "missing stable evidence ID"
     if item.id in seen_ids:
         return "duplicate evidence ID"
-    if item.id in invalidated:
+    if any(matches_evidence_ref(reference, item.id) for reference in invalidated):
         return "invalidated by confirmed revision"
     if isinstance(item, ScientificEvidence):
         if item.provenance.get("validated") is False:

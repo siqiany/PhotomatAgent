@@ -17,9 +17,11 @@ from photomatagent.runtime.context_engine import (
     RelevantResource,
 )
 from photomatagent.scientific.evidence import Evidence
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.capabilities.contracts import ScientificEvidence
+from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 from photomatagent.sessions.store import (
     SESSION_STATE_FILENAME,
+    SESSION_STATE_SCHEMA_VERSION,
     load_session_snapshot,
     save_session_snapshot,
     session_is_resumable,
@@ -75,6 +77,44 @@ def test_snapshot_roundtrip_preserves_all_resume_state(tmp_path):
     assert restored.engine.compaction_state.progress == ["inspected"]
 
 
+def test_schema_v1_snapshot_loads_with_typed_authority_downgrade(tmp_path) -> None:
+    evidence = ScientificEvidence(
+        id="sev-v1",
+        subject="HgTe",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+    )
+    legacy = {
+        "schema_version": 1,
+        "conversation": {"messages": []},
+        "scientific": {
+            "evidence": [evidence.model_dump(mode="json")],
+            "evidence_attestations": {
+                evidence.id: EvidenceAttestation(
+                    evidence_id=evidence.id,
+                    authority="observation",
+                    origin="trusted_builtin",
+                    tool_name="electronic.band_summary",
+                    tool_call_id="call-v1",
+                ).model_dump(mode="json")
+            },
+        },
+    }
+    path = tmp_path / SESSION_STATE_FILENAME
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    restored = load_session_snapshot(tmp_path)
+
+    assert restored.schema_version == SESSION_STATE_SCHEMA_VERSION
+    assert restored.scientific.evidence[0].id == evidence.id
+    assert restored.scientific.verified_attestation(evidence.id) is None
+    assert [item.code for item in restored.migration_diagnostics] == [
+        "EVIDENCE_AUTHORITY_DOWNGRADED"
+    ]
+    assert restored.migration_diagnostics[0].from_schema_version == 1
+
+
 @pytest.mark.asyncio
 async def test_restored_session_keeps_tool_state_and_continues(tmp_path):
     first_model = FakeModelProvider(
@@ -106,6 +146,9 @@ async def test_restored_session_keeps_tool_state_and_continues(tmp_path):
         engine=runtime.context_engine.snapshot(),
     )
     snapshot = load_session_snapshot(tmp_path / "session-state")
+    assert [item.code for item in snapshot.migration_diagnostics] == [
+        "EVIDENCE_AUTHORITY_DOWNGRADED"
+    ]
 
     # A brand-new runtime (fresh scientific state) resumes the old session.
     second_runtime = make_runtime(

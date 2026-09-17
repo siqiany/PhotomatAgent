@@ -20,7 +20,10 @@ from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.events import RuntimeEvent
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
-from photomatagent.scientific.evolution.executor import ScientificEpisodeExecutor
+from photomatagent.scientific.evolution.executor import (
+    ScientificEpisodeExecutor,
+    _scientific_state_is_persistently_blank,
+)
 from photomatagent.scientific.evolution.artifacts import (
     EpisodeResultAlreadyExistsError,
 )
@@ -250,6 +253,19 @@ def test_agent_runtime_exposes_read_only_session_id(tmp_path: Path) -> None:
     assert runtime.session_id == "session_public"
     with pytest.raises(AttributeError):
         runtime.session_id = "changed"  # type: ignore[misc]
+
+
+def test_fresh_state_check_ignores_runtime_authority_but_not_public_state(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        Workspace(tmp_path), FakeModelProvider([FakeResponse(text="unused")])
+    )
+
+    assert _scientific_state_is_persistently_blank(runtime.scientific_state)
+
+    runtime.scientific_state.goal = "reused"
+    assert not _scientific_state_is_persistently_blank(runtime.scientific_state)
 
 
 @pytest.mark.asyncio

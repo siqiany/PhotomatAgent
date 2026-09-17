@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from photomatagent.scientific.state import (
     DEFAULT_TRUSTED_EVIDENCE_TOOLS,
@@ -11,7 +11,36 @@ from photomatagent.scientific.state import (
 )
 from photomatagent.tools.base import Tool
 
+if TYPE_CHECKING:
+    from photomatagent.scientific.state import ScientificState
+
 DEFAULT_TRUSTED_BUILTIN_TOOLS = DEFAULT_TRUSTED_EVIDENCE_TOOLS
+
+
+class _RuntimeEvidenceAuthority:
+    """Host-internal capability for one runtime's nonpersistent authority ledger.
+
+    Host application code is trusted. Model output, tool state-update payloads,
+    and serialized snapshots never receive this object or its capability.
+    """
+
+    def __init__(self) -> None:
+        self.__capability = object()
+
+    def bind(self, state: ScientificState, *, replace: bool = False) -> None:
+        state._bind_runtime_authority(self.__capability, replace=replace)
+
+    def attest(
+        self, state: ScientificState, attestation: EvidenceAttestation
+    ) -> EvidenceAttestation:
+        return state._attest_evidence(attestation, capability=self.__capability)
+
+    def copy_ledger(
+        self, source: ScientificState, destination: ScientificState
+    ) -> None:
+        destination._copy_runtime_attestations_from(
+            source, capability=self.__capability
+        )
 
 
 @dataclass(frozen=True)
@@ -49,7 +78,7 @@ class EvidenceAttestationPolicy:
         else:
             authority = "background"
             origin = "untrusted_tool"
-        return EvidenceAttestation.host_create(
+        return EvidenceAttestation(
             evidence_id=evidence_id,
             authority=authority,
             origin=origin,

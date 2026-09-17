@@ -14,6 +14,9 @@ from photomatagent.scientific.evolution.revision import (
     build_revision_plan,
     format_revision_instruction,
 )
+from photomatagent.scientific.capabilities.contracts import ScientificEvidence
+from photomatagent.scientific.evidence_refs import opaque_evidence_ref
+from photomatagent.scientific.evolution.evidence import build_inherited_scientific_state
 from photomatagent.scientific.loop import (
     ConstraintSpec,
     EvaluationReport,
@@ -21,6 +24,7 @@ from photomatagent.scientific.loop import (
     ScientificLoopSummary,
     TargetSpec,
 )
+from photomatagent.scientific.state import ScientificState
 
 
 def _feedback(*, raw_input: str = "RAW EXPERT PROSE 9f0b") -> ExpertFeedbackRecord:
@@ -342,6 +346,67 @@ def test_revision_plan_uses_frozen_target_and_known_previous_evidence_ids() -> N
         previous_summary=summary,
     )
     assert other.revision_id != plan.revision_id
+
+
+def test_opaque_evaluation_reference_invalidates_raw_evidence_during_carry_forward() -> None:
+    raw_id = "sev-private-source-id"
+    reference = opaque_evidence_ref(raw_id)
+    summary = ScientificLoopSummary(
+        status="INCONCLUSIVE",
+        rounds=1,
+        candidate_count=1,
+        best_candidate_id="cand_opaque",
+        best_score=0.0,
+        final_evaluation=EvaluationReport(
+            constraint_results=[
+                PropertyEvaluation(
+                    property="band_gap", result="PASS", evidence_ids=[reference]
+                )
+            ]
+        ),
+    )
+    compilation = _compilation(
+        FeedbackDelta(
+            item_id="item_opaque",
+            category="EVIDENCE_SUFFICIENCY",
+            status="CORRECTION",
+            severity="HIGH",
+            responsible_module="evidence",
+            problem="invalidate the prior observation",
+            requested_actions=(f"Invalidate evidence_id:{reference}",),
+            acceptance_test="collect replacement evidence",
+            confidence=1.0,
+            source_span="source",
+        )
+    )
+    plan = build_revision_plan(
+        feedback=_feedback(), compilation=compilation, previous_summary=summary
+    )
+    previous = ScientificState(
+        evidence=[
+            ScientificEvidence(
+                id=raw_id,
+                subject="InAs",
+                property="band_gap",
+                value=0.15,
+                unit="eV",
+                source_type="dft_calculation",
+                fidelity="dft",
+                provenance={"validated": True},
+            )
+        ]
+    )
+
+    inherited, decisions = build_inherited_scientific_state(
+        previous,
+        source_episode="v001",
+        invalidated_evidence_ids=plan.invalidated_evidence_ids,
+        subject="InAs",
+    )
+
+    assert plan.invalidated_evidence_ids == [reference]
+    assert inherited.evidence == []
+    assert decisions[0].reason == "invalidated by confirmed revision"
 
 
 def test_unknown_explicit_evidence_reference_is_warned_and_never_added() -> None:

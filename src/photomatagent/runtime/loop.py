@@ -18,7 +18,10 @@ from typing import Any
 from uuid import uuid4
 
 from photomatagent.errors import ProviderError, ToolError, ToolValidationError
-from photomatagent.runtime.evidence_attestation import EvidenceAttestationPolicy
+from photomatagent.runtime.evidence_attestation import (
+    EvidenceAttestationPolicy,
+    _RuntimeEvidenceAuthority,
+)
 from photomatagent.models.base import ModelProvider
 from photomatagent.models.types import (
     AssistantMessage,
@@ -224,6 +227,8 @@ class AgentRuntime:
             else Workspace(workspace or Path.cwd())
         )
         self._scientific = scientific_state or ScientificState()
+        self._evidence_authority = _RuntimeEvidenceAuthority()
+        self._evidence_authority.bind(self._scientific, replace=True)
         self._evidence_attestation = (
             evidence_attestation_policy or EvidenceAttestationPolicy()
         )
@@ -309,6 +314,7 @@ class AgentRuntime:
         restored_scientific = snapshot.scientific
         self._scientific.__dict__.clear()
         self._scientific.__dict__.update(restored_scientific.__dict__)
+        self._evidence_authority.bind(self._scientific, replace=True)
         self._conversation = snapshot.conversation
         if snapshot.engine is not None:
             self._context_engine.restore(**snapshot.engine.model_dump(mode="json"))
@@ -1219,7 +1225,7 @@ class AgentRuntime:
         elif isinstance(update, ScientificHypothesis):
             self._scientific.add_material_hypothesis(update)
         elif isinstance(update, EvidenceAttestation):
-            self._scientific.attest_evidence(update)
+            self._evidence_authority.attest(self._scientific, update)
         else:
             raise ToolError(f"unsupported scientific state update: {type(update).__name__}")
 
@@ -1233,6 +1239,8 @@ class AgentRuntime:
         """Validate a complete update batch against a shadow state before mutation."""
 
         shadow = self._scientific.model_copy(deep=True)
+        self._evidence_authority.bind(shadow, replace=True)
+        self._evidence_authority.copy_ledger(self._scientific, shadow)
         prepared: list[Any] = []
         for update in updates:
             if isinstance(update, HypothesisRegistration):
@@ -1274,8 +1282,7 @@ class AgentRuntime:
                 )
         return prepared
 
-    @staticmethod
-    def _apply_state_update_to(state: ScientificState, update: Any) -> None:
+    def _apply_state_update_to(self, state: ScientificState, update: Any) -> None:
         if isinstance(update, (Evidence, ScientificEvidence)):
             state.add_evidence(update)
         elif isinstance(update, ScientificClaim):
@@ -1285,7 +1292,7 @@ class AgentRuntime:
         elif isinstance(update, ScientificTask):
             state.add_task(update)
         elif isinstance(update, EvidenceAttestation):
-            state.attest_evidence(update)
+            self._evidence_authority.attest(state, update)
 
     async def _emit_budget(self, iteration: int) -> RuntimeEvent:
         return await self._emit(
