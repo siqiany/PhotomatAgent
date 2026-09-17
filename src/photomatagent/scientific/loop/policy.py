@@ -14,6 +14,8 @@ violation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel, Field, PrivateAttr
@@ -79,6 +81,28 @@ class ScientificLoopState(BaseModel):
         """
 
         return tuple(self._candidate_evaluation_history)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> ScientificLoopState:
+        copied = super().model_copy(update=update, deep=deep)
+        copied._candidate_evaluation_history = []
+        return copied
+
+    def __copy__(self) -> ScientificLoopState:
+        copied = super().__copy__()
+        copied._candidate_evaluation_history = []
+        return copied
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> ScientificLoopState:
+        copied = super().__deepcopy__(memo)
+        copied._candidate_evaluation_history = []
+        if memo is not None:
+            memo[id(self)] = copied
+        return copied
 
     def register_candidates(self, candidates: list[CandidateState]) -> None:
         """Upsert current projections and queue newly discovered identities."""

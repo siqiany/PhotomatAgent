@@ -166,7 +166,7 @@ def test_same_composition_with_new_attested_accepted_observation_is_not_rejected
                 authority="observation",
                 origin="trusted_builtin",
                 tool_name="electronic.band_summary",
-                tool_call_id=f"call-{item.id}",
+                tool_call_id="call-old" if item.id == "old-evidence" else f"call-{item.id}",
             ),
         )
     evaluator = ScientificEvaluator(
@@ -174,7 +174,20 @@ def test_same_composition_with_new_attested_accepted_observation_is_not_rejected
     )
     second.representation["structure_hash"] = "synthetic:device"
     report = evaluator.evaluate(second, state)
-    prior = evaluator.evaluate(first, ScientificState(evidence=[old]))
+    prior_state = ScientificState(evidence=[old])
+    prior_authority = _RuntimeEvidenceAuthority()
+    prior_authority.bind(prior_state)
+    prior_authority.attest(
+        prior_state,
+        EvidenceAttestation(
+            evidence_id=old.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="electronic.band_summary",
+            tool_call_id="call-old",
+        ),
+    )
+    prior = evaluator.evaluate(first, prior_state)
     signal = build_feedback(
         _target(), second, report, [first], scientific=state,
         prior_evaluations=[(first, prior)],

@@ -96,7 +96,10 @@ def build_feedback(
         else history
     )
     for previous in comparison_candidates:
-        if previous is not candidate and candidate_fingerprint(previous) == candidate.fingerprint:
+        if (
+            previous.candidate_id != candidate.candidate_id
+            and candidate_fingerprint(previous) == candidate.fingerprint
+        ):
             prohibited.append(candidate.label or candidate.candidate_id)
 
     supplemental_evidence = _has_supplemental_evidence(
@@ -383,7 +386,10 @@ def _has_supplemental_evidence(
     matching_history = [
         (previous, previous_evaluation)
         for previous, previous_evaluation in prior_evaluations
-        if candidate_fingerprint(previous) == candidate.fingerprint
+        if (
+            previous.candidate_id != candidate.candidate_id
+            and candidate_fingerprint(previous) == candidate.fingerprint
+        )
     ]
     if not matching_history:
         return False

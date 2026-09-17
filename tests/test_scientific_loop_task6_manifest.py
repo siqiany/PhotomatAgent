@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from photomatagent.runtime.evidence_attestation import _RuntimeEvidenceAuthority
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.loop.candidate import candidate_from_formula
@@ -10,6 +12,7 @@ from photomatagent.scientific.loop.evaluation import (
     ScientificEvaluator,
 )
 from photomatagent.scientific.loop.feedback import build_feedback
+from photomatagent.scientific.loop.policy import ScientificLoopState
 from photomatagent.scientific.loop.progress import progress_from_evaluation
 from photomatagent.scientific.loop.target import ConstraintSpec, TargetSpec
 from photomatagent.scientific.state import EvidenceAttestation, ScientificState
@@ -129,13 +132,59 @@ def test_real_evaluator_rejections_have_no_manifest():
     assert custom_policy_report.accepted_evidence_manifest == ()
 
 
-def test_duplicate_uses_prior_evaluator_history_when_prior_candidate_has_no_ids():
+def test_report_and_state_copies_clear_runtime_authority():
+    candidate = candidate_from_formula("HgTe")
+    state = _state(_evidence())
+    report = ScientificEvaluator(_target()).evaluate(candidate, state)
+    assert progress_from_evaluation(candidate, report, state).observation_keys
+
+    for copied_report in (
+        report.model_copy(),
+        report.model_copy(deep=True),
+        copy.copy(report),
+        copy.deepcopy(report),
+    ):
+        assert copied_report.accepted_evidence_manifest == ()
+        assert progress_from_evaluation(candidate, copied_report, state).observation_keys == ()
+
+    for copied_state in (state.model_copy(), state.model_copy(deep=True), copy.copy(state), copy.deepcopy(state)):
+        assert copied_state.verified_attestation(state.evidence[0].id) is None
+        assert progress_from_evaluation(candidate, report, copied_state).observation_keys == ()
+
+    loop_state = ScientificLoopState(target=_target())
+    loop_state.add_candidate(candidate, report)
+    assert loop_state.historical_candidate_evaluations
+    for copied_loop_state in (
+        loop_state.model_copy(),
+        loop_state.model_copy(deep=True),
+        copy.copy(loop_state),
+        copy.deepcopy(loop_state),
+    ):
+        assert copied_loop_state.historical_candidate_evaluations == ()
+
+
+def test_mutated_or_replaced_current_evidence_cannot_reuse_manifest():
+    candidate = candidate_from_formula("HgTe")
+    evidence = _evidence()
+    state = _state(evidence)
+    report = ScientificEvaluator(_target()).evaluate(candidate, state)
+
+    evidence.provenance["content_sha256"] = "changed-content"
+    assert progress_from_evaluation(candidate, report, state).observation_keys == ()
+
+    duplicate = evidence.model_copy(update={"id": evidence.id})
+    state.evidence.append(duplicate)
+    assert state.verified_attestation(evidence.id) is None
+    assert progress_from_evaluation(candidate, report, state).observation_keys == ()
+
+
+def test_same_candidate_id_is_continuation_but_different_id_requires_new_observation():
     candidate = candidate_from_formula("HgTe")
     state = _state(_evidence())
     evaluator = ScientificEvaluator(_target())
     prior = evaluator.evaluate(candidate, state)
     current = evaluator.evaluate(candidate.model_copy(deep=True), state)
-    signal = build_feedback(
+    continuation = build_feedback(
         _target(),
         candidate,
         current,
@@ -143,5 +192,18 @@ def test_duplicate_uses_prior_evaluator_history_when_prior_candidate_has_no_ids(
         scientific=state,
         prior_evaluations=[(candidate.model_copy(update={"evidence_ids": []}), prior)],
     )
-    assert signal is not None
-    assert signal.decision == "REJECT"
+    assert continuation is not None
+    assert continuation.decision != "REJECT"
+
+    prior_candidate = candidate.model_copy(update={"candidate_id": "prior-candidate", "evidence_ids": []})
+    prior_report = evaluator.evaluate(prior_candidate, state)
+    duplicate = build_feedback(
+        _target(),
+        candidate,
+        current,
+        [],
+        scientific=state,
+        prior_evaluations=[(prior_candidate, prior_report)],
+    )
+    assert duplicate is not None
+    assert duplicate.decision == "REJECT"

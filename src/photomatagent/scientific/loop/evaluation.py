@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -40,6 +41,7 @@ from photomatagent.scientific.loop.evidence_scope import (
     convert_property_value,
     evidence_applicable,
 )
+from photomatagent.scientific.loop.observation import stable_observation_identity
 from photomatagent.scientific.loop.scoring import compute_score
 from photomatagent.scientific.loop.target import (
     ConstraintCheck,
@@ -193,6 +195,11 @@ class AcceptedEvidenceRecord:
     evidence_id: str
     property: str
     outcome: PropertyResult
+    observation_identity: str
+    attestation_authority: str
+    attestation_origin: str
+    attestation_tool_name: str
+    attestation_tool_call_id: str
 
 
 class PropertyEvaluation(BaseModel):
@@ -230,6 +237,28 @@ class EvaluationReport(BaseModel):
         """Return the non-serializable manifest produced by the evaluator."""
 
         return self._accepted_evidence_manifest
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> EvaluationReport:
+        copied = super().model_copy(update=update, deep=deep)
+        copied._accepted_evidence_manifest = ()
+        return copied
+
+    def __copy__(self) -> EvaluationReport:
+        copied = super().__copy__()
+        copied._accepted_evidence_manifest = ()
+        return copied
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> EvaluationReport:
+        copied = super().__deepcopy__(memo)
+        copied._accepted_evidence_manifest = ()
+        if memo is not None:
+            memo[id(self)] = copied
+        return copied
 
     def violation_for(self, property_name: str) -> ConstraintViolation | None:
         for violation in self.violations:
@@ -402,14 +431,13 @@ class ScientificEvaluator:
             )
         check: ConstraintCheck = evaluate_constraint(constraint, resolved.value)
         if check.passed is None:
-            if accepted_manifest is not None:
-                accepted_manifest.append(
-                    AcceptedEvidenceRecord(
-                        evidence_id=resolved.evidence_id,
-                        property=constraint.property,
-                        outcome="UNKNOWN",
-                    )
-                )
+            self._append_manifest_record(
+                accepted_manifest,
+                scientific,
+                resolved,
+                constraint.property,
+                "UNKNOWN",
+            )
             return ConstraintOutcome(
                 property=constraint.property,
                 operator=constraint.operator,
@@ -425,14 +453,13 @@ class ScientificEvaluator:
                 reason="CONSTRAINT_UNUSABLE",
             )
         result: PropertyResult = "PASS" if check.passed else "FAIL"
-        if accepted_manifest is not None:
-            accepted_manifest.append(
-                AcceptedEvidenceRecord(
-                    evidence_id=resolved.evidence_id,
-                    property=constraint.property,
-                    outcome=result,
-                )
-            )
+        self._append_manifest_record(
+            accepted_manifest,
+            scientific,
+            resolved,
+            constraint.property,
+            result,
+        )
         return ConstraintOutcome(
             property=constraint.property,
             operator=constraint.operator,
@@ -447,6 +474,40 @@ class ScientificEvaluator:
             confidence=resolved.confidence,
             soft_score=check.soft_score,
             reason="CONSTRAINT_PASS" if check.passed else "CONSTRAINT_FAIL",
+        )
+
+    def _append_manifest_record(
+        self,
+        accepted_manifest: list[AcceptedEvidenceRecord] | None,
+        scientific: ScientificState,
+        resolved: _ResolvedEvidence,
+        property_name: str,
+        outcome: PropertyResult,
+    ) -> None:
+        if accepted_manifest is None:
+            return
+        attestation = scientific.verified_attestation(resolved.evidence_id)
+        matching = [
+            evidence
+            for evidence in scientific.evidence
+            if evidence.id == resolved.evidence_id
+        ]
+        # Synthetic source fallback may satisfy the evaluator's legacy policy
+        # without a runtime attestation.  It is deliberately not progress.
+        if attestation is None or len(matching) != 1:
+            return
+        evidence = matching[0]
+        accepted_manifest.append(
+            AcceptedEvidenceRecord(
+                evidence_id=resolved.evidence_id,
+                property=property_name,
+                outcome=outcome,
+                observation_identity=stable_observation_identity(evidence),
+                attestation_authority=attestation.authority,
+                attestation_origin=attestation.origin,
+                attestation_tool_name=attestation.tool_name,
+                attestation_tool_call_id=attestation.tool_call_id,
+            )
         )
 
     def _resolve_evidence(
