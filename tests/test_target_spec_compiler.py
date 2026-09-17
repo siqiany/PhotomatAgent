@@ -11,6 +11,7 @@ from photomatagent.scientific.evolution.targeting import (
     TargetSpecCompiler,
     TargetSpecDraft,
 )
+from photomatagent.scientific.discovery import DiscoveryConstraints
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.loop.candidate import candidate_from_formula
 from photomatagent.scientific.loop.evaluation import (
@@ -60,6 +61,144 @@ async def test_target_compiler_is_tool_free_and_does_not_receive_result() -> Non
     request_text = "\n".join(message.content for message in model.requests[0].messages)
     assert "SECRET_RESULT_SENTINEL" not in request_text
     assert "需要验证中红外透过率" in request_text
+
+
+@pytest.mark.asyncio
+async def test_proposal_target_preserves_empty_constraints_and_discovery_contract() -> None:
+    response = {
+        "goal": "提出三种硫化物候选和验证计划，不填写性能数字",
+        "constraints": [],
+        "objectives": ["比较三种机制假设"],
+        "operating_conditions": {},
+        "warnings": ["尚无独立物性验证"],
+    }
+    model = FakeModelProvider([FakeResponse(text=json.dumps(response, ensure_ascii=False))])
+    discovery = DiscoveryConstraints(
+        required_elements=["Na", "Ag", "Bi", "S"],
+        forbidden_elements=["Se", "Te", "Pb", "Cd"],
+        allow_isovalent_alloy=True,
+        allow_donor_acceptor_doping=False,
+    )
+
+    draft = await TargetSpecCompiler(model).compile(
+        goal="提出三种硫化物候选和验证计划，不填写性能数字",
+        scientific_state=ScientificState(goal="提出三种硫化物候选和验证计划，不填写性能数字"),
+        task_kind="proposal",
+        discovery_constraints=discovery,
+    )
+
+    assert draft.task_kind == "proposal"
+    assert draft.constraints == ()
+    assert draft.target.goal == "提出三种硫化物候选和验证计划，不填写性能数字"
+    assert draft.target.metadata["task_kind"] == "proposal"
+    assert draft.target.metadata["discovery"] == discovery.model_dump(mode="json")
+    assert "value" not in draft.target.metadata
+
+
+@pytest.mark.asyncio
+async def test_validation_target_empty_constraints_returns_typed_diagnostic() -> None:
+    response = {
+        "goal": "验证候选材料",
+        "constraints": [],
+        "objectives": [],
+        "operating_conditions": {},
+        "warnings": [],
+    }
+    model = FakeModelProvider([FakeResponse(text=json.dumps(response))])
+
+    with pytest.raises(ValueError, match="VALIDATION_TARGET_EMPTY_CONSTRAINTS"):
+        await TargetSpecCompiler(model).compile(
+            goal="验证候选材料",
+            scientific_state=ScientificState(goal="验证候选材料"),
+            task_kind="validation",
+        )
+
+
+def test_empty_validation_target_cannot_vacuously_pass() -> None:
+    from photomatagent.scientific.loop.candidate import candidate_from_formula
+    from photomatagent.scientific.loop.evaluation import ScientificEvaluator
+    from photomatagent.scientific.loop.target import TargetSpec
+
+    target = TargetSpec(
+        goal="验证候选材料",
+        constraints=[],
+        metadata={"task_kind": "validation"},
+    )
+    report = ScientificEvaluator(target).evaluate(
+        candidate_from_formula("NaBiS2"), ScientificState()
+    )
+
+    assert report.verdict == "INCONCLUSIVE"
+    assert report.diagnostics == ["VALIDATION_TARGET_EMPTY_CONSTRAINTS"]
+
+
+def test_confirmed_target_store_persists_empty_proposal_target_metadata(tmp_path: Path) -> None:
+    store = ConfirmedTargetStore(Workspace(tmp_path))
+    state = ScientificState(goal="proposal")
+    target = TargetSpec(
+        goal="proposal",
+        constraints=[],
+        metadata={"task_kind": "proposal", "discovery": {"required_elements": ["S"]}},
+    )
+
+    record = store.save(
+        session_id="proposal-session",
+        goal="proposal",
+        scientific_state=state,
+        target=target,
+        provider="fake",
+        model="fake",
+        task_kind="proposal",
+    )
+
+    restored = store.load(
+        "proposal-session",
+        goal="proposal",
+        scientific_state=state,
+        task_kind="proposal",
+    )
+    assert restored == record
+    assert restored is not None
+    assert restored.target.constraints == []
+    assert restored.target.metadata["task_kind"] == "proposal"
+
+
+def test_confirmed_target_store_cache_is_bound_to_expected_task_kind(tmp_path: Path) -> None:
+    store = ConfirmedTargetStore(Workspace(tmp_path))
+    state = ScientificState(goal="same goal")
+    target = TargetSpec(
+        goal="same goal",
+        constraints=[],
+        metadata={"task_kind": "proposal"},
+    )
+    store.save(
+        session_id="same-session",
+        goal="same goal",
+        scientific_state=state,
+        target=target,
+        provider="fake",
+        model="fake",
+        task_kind="proposal",
+    )
+
+    assert (
+        store.load(
+            "same-session",
+            goal="same goal",
+            scientific_state=state,
+            task_kind="proposal",
+        )
+        is not None
+    )
+    assert (
+        store.load(
+            "same-session",
+            goal="same goal",
+            scientific_state=state,
+            task_kind="validation",
+        )
+        is None
+    )
 
 
 def test_confirmed_target_store_reloads_only_matching_history_context(tmp_path: Path) -> None:

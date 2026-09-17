@@ -246,3 +246,27 @@ async def test_expert_route_imports_scores_and_keeps_chat_state_clean(tmp_path: 
     assert runtime.conversation_state.messages == []
     assert runtime.run_calls == 0
     assert all(message.startswith("[EXPERT MODE |") for message in prompt.prompts)
+
+
+@pytest.mark.asyncio
+async def test_expert_command_passes_explicit_task_kind_to_wizard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_expert_mode(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("photomatagent.cli.expert.run_expert_mode", fake_run_expert_mode)
+    runtime = SimpleNamespace(permission_policy=None, session_id=None)
+    router = ChatCommandRouter(
+        Console(record=True),
+        runtime,
+        Workspace(tmp_path),
+        prompt_session=_Prompt([]),
+    )
+
+    await router.execute("/expert history --task-kind proposal")
+
+    assert captured["source"] == "history"
+    assert captured["task_kind"] == "proposal"

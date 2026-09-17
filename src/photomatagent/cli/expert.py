@@ -26,7 +26,9 @@ from photomatagent.scientific.evolution.targeting import (
     ConfirmedTargetStore,
     TargetSpecCompiler,
     TargetSpecDraft,
+    TargetTaskKind,
 )
+from photomatagent.scientific.discovery import DiscoveryConstraints
 from photomatagent.scientific.loop import TargetSpec
 from photomatagent.scientific.state import ScientificState
 from photomatagent.sessions.store import save_session_snapshot
@@ -87,11 +89,18 @@ async def _automatic_target(
     goal: str,
     scientific_state: ScientificState,
     compiler: TargetSpecCompiler,
+    task_kind: TargetTaskKind = "validation",
+    discovery_constraints: DiscoveryConstraints | None = None,
 ) -> TargetSpec | None:
     """Load or generate a target, require confirmation, and cache it."""
 
     store = ConfirmedTargetStore(boundary)
-    cached = store.load(session_id, goal=goal, scientific_state=scientific_state)
+    cached = store.load(
+        session_id,
+        goal=goal,
+        scientific_state=scientific_state,
+        task_kind=task_kind,
+    )
     draft: TargetSpecDraft | None = None
     if cached is not None:
         target = cached.target
@@ -109,6 +118,8 @@ async def _automatic_target(
                     goal=goal,
                     scientific_state=scientific_state,
                     correction=correction,
+                    task_kind=task_kind,
+                    discovery_constraints=discovery_constraints,
                 )
                 target = draft.target
             except ValueError as exc:
@@ -125,7 +136,7 @@ async def _automatic_target(
                 target = TargetSpec.model_validate_json(target_path.read_text(encoding="utf-8"))
                 draft = None
         target = target.model_copy(update={"goal": goal})
-        if not target.constraints:
+        if task_kind == "validation" and not target.constraints:
             raise ValueError("TargetSpec must contain at least one constraint")
         _render_target(output, target, draft)
         choice = (
@@ -144,6 +155,7 @@ async def _automatic_target(
                 draft=draft,
                 provider=str(getattr(model_provider, "provider", "unknown")),
                 model=str(getattr(model_provider, "model", "unknown")),
+                task_kind=task_kind,
             )
             output.print("[EXPERT MODE | TARGET] 已确认并自动保存；下次评价该任务会直接加载。")
             return target
@@ -241,6 +253,8 @@ async def run_expert_mode(
     compile_runner: Callable[..., Awaitable[object]] = run_compile_command,
     iterate_callback: Callable[[str], Awaitable[object]] | None = None,
     target_compiler: TargetSpecCompiler | None = None,
+    task_kind: TargetTaskKind = "validation",
+    discovery_constraints: DiscoveryConstraints | None = None,
 ) -> None:
     """Run the bounded expert wizard; all input is consumed by this function."""
     boundary = Workspace(workspace)
@@ -341,6 +355,8 @@ async def run_expert_mode(
             goal=goal,
             scientific_state=scientific_state,
             compiler=target_compiler,
+            task_kind=task_kind,
+            discovery_constraints=discovery_constraints,
         )
         if target is None:
             return

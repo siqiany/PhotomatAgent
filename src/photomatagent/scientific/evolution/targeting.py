@@ -15,12 +15,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from photomatagent.models.base import ModelProvider
 from photomatagent.models.types import ModelCompleted, ModelRequest, SystemMessage, UserMessage
 from photomatagent.redaction import redact_secrets, redact_text
+from photomatagent.scientific.discovery import DiscoveryConstraints
 from photomatagent.scientific.loop import ConstraintSpec, TargetSpec
 from photomatagent.scientific.state import ScientificState
 from photomatagent.workspace import Workspace
 
 MAX_TARGET_CONTEXT_CHARS = 16_000
 MAX_TARGET_RESPONSE_CHARS = 48_000
+TargetTaskKind = Literal["proposal", "validation"]
 
 TARGET_COMPILER_SYSTEM_PROMPT = """You draft a machine-verifiable TargetSpec for a
 scientific expert-review workflow. This is criteria construction, not evaluation.
@@ -34,8 +36,11 @@ Rules:
   requires_confirmation=true. Never present an inferred threshold as user-given.
 - Do not copy candidate-specific calculated or predicted values into thresholds.
 - Use only lt, le, gt, ge, eq, or between operators.
-- Create at least one constraint. If the goal has no numeric requirement, propose
-  a conservative SOFT proxy and warn that the expert must confirm it.
+- For validation tasks, create at least one constraint from an explicit user
+  requirement or a reviewable proposed criterion. An empty validation target is
+  invalid and must not be made to pass vacuously.
+- For proposal tasks, an empty constraints list is valid. Do not invent a
+  numeric threshold merely to populate that list.
 - Do not claim a source was verified unless the supplied context establishes it.
 - Use canonical operating-condition keys temperature_k, spectral_range_um,
   bias_v, and wavelength_um. Nested aliases temperature.kelvin and
@@ -91,10 +96,18 @@ class TargetSpecDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     goal: str = Field(min_length=1, max_length=20_000)
-    constraints: tuple[TargetConstraintDraft, ...] = Field(min_length=1, max_length=50)
+    constraints: tuple[TargetConstraintDraft, ...] = Field(max_length=50)
     objectives: tuple[str, ...] = Field(default_factory=tuple, max_length=50)
     operating_conditions: dict[str, Any] = Field(default_factory=dict)
     warnings: tuple[str, ...] = Field(default_factory=tuple, max_length=50)
+    task_kind: TargetTaskKind = "validation"
+    discovery_constraints: DiscoveryConstraints = Field(default_factory=DiscoveryConstraints)
+
+    @model_validator(mode="after")
+    def validation_requires_constraints(self) -> "TargetSpecDraft":
+        if self.task_kind == "validation" and not self.constraints:
+            raise ValueError("VALIDATION_TARGET_EMPTY_CONSTRAINTS")
+        return self
 
     @property
     def target(self) -> TargetSpec:
@@ -109,7 +122,11 @@ class TargetSpecDraft(BaseModel):
             constraints=constraints,
             objectives=list(self.objectives),
             operating_conditions=self.operating_conditions,
-            metadata={"target_origin": "AUTO_DRAFT_CONFIRMED"},
+            metadata={
+                "target_origin": "AUTO_DRAFT_CONFIRMED",
+                "task_kind": self.task_kind,
+                "discovery": self.discovery_constraints.model_dump(mode="json"),
+            },
         )
 
 
@@ -141,17 +158,29 @@ class TargetSpecCompiler:
         goal: str,
         scientific_state: ScientificState,
         correction: str | None = None,
+        task_kind: TargetTaskKind = "validation",
+        discovery_constraints: DiscoveryConstraints | dict[str, Any] | None = None,
     ) -> TargetSpecDraft:
+        if task_kind not in {"proposal", "validation"}:
+            raise ValueError(f"unsupported target task_kind: {task_kind!r}")
+        try:
+            discovery = DiscoveryConstraints.model_validate(discovery_constraints or {})
+        except Exception as exc:
+            raise ValueError(
+                f"invalid discovery constraints (DISCOVERY_CONSTRAINTS_INVALID): {exc}"
+            ) from exc
         context_json = _scientific_context_json(scientific_state)[:MAX_TARGET_CONTEXT_CHARS]
         payload = redact_secrets({
             "goal": goal,
             "scientific_context_json": context_json,
             "expert_correction": correction or "",
+            "task_kind": task_kind,
+            "discovery_constraints": discovery.model_dump(mode="json"),
             "important": "No candidate answer is included. Do not infer it.",
         })
         request = ModelRequest(
             messages=[
-                SystemMessage(content=TARGET_COMPILER_SYSTEM_PROMPT),
+                SystemMessage(content=_target_compiler_prompt(task_kind)),
                 UserMessage(content=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
             ],
             tools=[],
@@ -173,15 +202,35 @@ class TargetSpecCompiler:
         if len(completed_text) > MAX_TARGET_RESPONSE_CHARS:
             raise ValueError("automatic TargetSpec generation response was too large")
         try:
-            draft = TargetSpecDraft.model_validate(
-                redact_secrets(json.loads(_extract_json_object(completed_text)))
-            )
+            raw_draft = redact_secrets(json.loads(_extract_json_object(completed_text)))
+            if not isinstance(raw_draft, dict):
+                raise ValueError("draft must be a JSON object")
+            # Bind these fields before validation so a proposal can legally be
+            # empty while a validation draft gets a typed diagnostic. Both are
+            # caller-owned and cannot be rewritten by the model response.
+            raw_draft["task_kind"] = task_kind
+            raw_draft["discovery_constraints"] = discovery.model_dump(mode="json")
+            draft = TargetSpecDraft.model_validate(raw_draft)
         except Exception as exc:
+            if "VALIDATION_TARGET_EMPTY_CONSTRAINTS" in str(exc):
+                raise ValueError("VALIDATION_TARGET_EMPTY_CONSTRAINTS") from exc
             raise ValueError(
                 f"automatic TargetSpec output did not match the required schema ({type(exc).__name__})"
             ) from exc
-        if draft.goal != goal:
-            draft = draft.model_copy(update={"goal": goal})
+        # The user-selected mode and hard discovery constraints are runtime
+        # authority. Never accept a model rewrite of either field.
+        draft = draft.model_copy(
+            update={
+                "goal": goal,
+                "task_kind": task_kind,
+                "discovery_constraints": discovery,
+            }
+        )
+        if task_kind == "validation" and not draft.constraints:
+            raise ValueError(
+                "VALIDATION_TARGET_EMPTY_CONSTRAINTS: validation requires at least one "
+                "numeric constraint"
+            )
         return draft
 
 
@@ -197,6 +246,7 @@ class ConfirmedTargetStore:
         *,
         goal: str,
         scientific_state: ScientificState,
+        task_kind: TargetTaskKind = "validation",
     ) -> ConfirmedTargetRecord | None:
         path = self._path(session_id)
         if not path.is_file():
@@ -210,11 +260,16 @@ class ConfirmedTargetStore:
             return None
         if record.session_id != session_id:
             return None
+        if record.target.metadata.get("task_kind", "validation") != task_kind:
+            return None
         if record.goal_sha256 != _sha_text(goal):
             return None
         if record.scientific_context_sha256 != _sha_text(_scientific_context_json(scientific_state)):
             return None
-        if not record.target.constraints:
+        if (
+            record.target.metadata.get("task_kind", "validation") == "validation"
+            and not record.target.constraints
+        ):
             return None
         return record
 
@@ -228,15 +283,29 @@ class ConfirmedTargetStore:
         draft: TargetSpecDraft | None = None,
         provider: str,
         model: str,
+        task_kind: TargetTaskKind | None = None,
     ) -> ConfirmedTargetRecord:
         validated = target if isinstance(target, TargetSpec) else TargetSpec.model_validate(target)
-        if not validated.constraints:
-            raise ValueError("TargetSpec must contain at least one constraint")
+        resolved_kind = task_kind or str(
+            validated.metadata.get(
+                "task_kind", draft.task_kind if draft is not None else "validation"
+            )
+        )
+        if resolved_kind not in {"proposal", "validation"}:
+            raise ValueError(f"unsupported target task_kind: {resolved_kind!r}")
+        if resolved_kind == "validation" and not validated.constraints:
+            raise ValueError(
+                "VALIDATION_TARGET_EMPTY_CONSTRAINTS: cannot save empty validation target"
+            )
+        metadata = dict(validated.metadata)
+        metadata["task_kind"] = resolved_kind
+        if draft is not None:
+            metadata["discovery"] = draft.discovery_constraints.model_dump(mode="json")
         record = ConfirmedTargetRecord(
             session_id=session_id,
             goal_sha256=_sha_text(goal),
             scientific_context_sha256=_sha_text(_scientific_context_json(scientific_state)),
-            target=validated.model_copy(update={"goal": goal}),
+            target=validated.model_copy(update={"goal": goal, "metadata": metadata}),
             draft=draft,
             provider=redact_text(provider)[:200] or "unknown",
             model=redact_text(model)[:200] or "unknown",
@@ -299,6 +368,18 @@ def _extract_json_object(text: str) -> str:
     raise ValueError("unbalanced JSON object")
 
 
+def _target_compiler_prompt(task_kind: TargetTaskKind) -> str:
+    """Bind the user-selected task kind without making it model-controlled."""
+
+    return TARGET_COMPILER_SYSTEM_PROMPT.replace(
+        "This is criteria construction, not evaluation.",
+        (
+            "This is criteria construction, not evaluation. The runtime-selected "
+            f"task_kind is {task_kind!r}; preserve it and do not infer another mode."
+        ),
+    )
+
+
 __all__ = [
     "ConfirmedTargetRecord",
     "ConfirmedTargetStore",
@@ -306,4 +387,5 @@ __all__ = [
     "TargetConstraintDraft",
     "TargetSpecCompiler",
     "TargetSpecDraft",
+    "TargetTaskKind",
 ]

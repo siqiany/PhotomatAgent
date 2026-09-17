@@ -28,6 +28,12 @@ Answer these four questions explicitly:
 
 Do not start the next tool call until question 4 has a concrete answer.
 
+When the user asks for mechanism-based candidate design, route to
+`mechanism-guided-material-design` and register hypotheses before validation.
+When the user explicitly asks for VAE sampling, route to the VAE composition
+skill. When the user asks for known materials, use retrieval. Keep these three
+sources distinct in the report.
+
 ## Multi-fidelity escalation (cheap evidence first)
 
 Prefer, in order, only when justified by the current gap:
@@ -61,4 +67,3 @@ Never escalate to expensive evidence when cheap evidence can close the gap.
 3. Cross-check candidates with structure/electronic analysis when inputs exist.
 4. State known / uncertain / missing; pick the next capability.
 5. Produce an evidence-grounded recommendation with explicit gaps.
-

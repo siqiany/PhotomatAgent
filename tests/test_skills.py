@@ -72,6 +72,27 @@ def test_native_composition_generation_skill_routes_to_vae_tool():
     assert "vasp" in body.lower()
 
 
+def test_native_mechanism_skill_is_indexed_and_loadable():
+    loader = SkillLoader()
+    entry = next(
+        item
+        for item in loader.load_index()
+        if item.name == "mechanism-guided-material-design"
+    )
+    assert entry.category == "materials-discovery"
+    assert entry.description.startswith("Use when")
+    assert "mechanism" in entry.description
+    body, resolved = loader.view(entry.name)
+    assert resolved == "SKILL.md"
+    for marker in (
+        "generation.register_hypothesis",
+        "NO_EXTERNAL_BASIS",
+        "UNVALIDATED_GENERATED_STRUCTURE",
+        "Known-material route",
+    ):
+        assert marker in body
+
+
 def test_native_infrared_skill_routes_through_mattergen_chgnet_and_vasp():
     loader = SkillLoader()
     body, _ = loader.view("infrared-material-screening")

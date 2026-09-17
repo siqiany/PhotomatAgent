@@ -8,7 +8,7 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from rich.console import Console
 
@@ -60,6 +60,9 @@ class PromptSessionLike(Protocol):
     async def prompt_async(self, message: str) -> str: ...
 
 
+ExpertTaskKind = Literal["proposal", "validation"]
+
+
 COMMANDS = (
     CommandSpec("/help", "显示所有聊天命令及功能"),
     CommandSpec("/approve -o", "本次聊天任务完全允许所有工具"),
@@ -90,7 +93,10 @@ COMMANDS = (
         "/evolve [list|status|history|start|feedback|compile|iterate]",
         "管理专家反馈驱动的持久演化任务；feedback/compile 复用当前交互会话",
     ),
-    CommandSpec("/expert [session-id|history]", "在当前或历史 session 中启动内部专家评审向导"),
+    CommandSpec(
+        "/expert [session-id|history] [--task-kind proposal|validation]",
+        "启动内部专家评审向导；默认 validation，模式由命令参数明确选择",
+    ),
     CommandSpec("/configure [options]", "配置工作区 LLM（可能交互询问）"),
     CommandSpec("/compact", "压缩较早的工作上下文"),
     CommandSpec("/resume <id|目录|latest>", "回溯加载历史 session，并在其基础上继续追问"),
@@ -246,25 +252,33 @@ class ChatCommandRouter:
 
     async def _expert(self, args: list[str]) -> None:
         """Intercept the complete expert wizard so entries never reach the model."""
-        if len(args) > 1:
-            self.console.print("[EXPERT MODE | ERROR] 用法：/expert [session-id|history]")
+        if "--help" in args:
+            self.console.print(
+                "用法：/expert [session-id|history] "
+                "[--task-kind proposal|validation]（默认 validation）"
+            )
+            return
+        try:
+            parsed = _parse_expert_args(args)
+        except ValueError as exc:
+            self.console.print(f"[EXPERT MODE | ERROR] {exc}")
             return
         if self.prompt_session is None:
             self.console.print("[EXPERT MODE | ERROR] 当前聊天未提供交互 PromptSession。")
             return
         from photomatagent.cli.expert import run_expert_mode
 
-        source = args[0] if args else None
         try:
             await run_expert_mode(
                 session=self.prompt_session,
                 output=self.console,
                 workspace=self.workspace.root,
-                source=source,
+                source=parsed.source,
                 sessions_dir=self.sessions_dir,
                 logger=self.logger,
                 runtime=self.runtime,
                 iterate_callback=self._run_expert_iterate,
+                task_kind=parsed.task_kind,
             )
         except (OSError, UnicodeError, ValueError, ToolExecutionError,
                 EvolutionServiceError, EvolutionStoreError) as exc:
@@ -400,6 +414,50 @@ class ChatCommandRouter:
 class _ParsedEvolveFormArgs:
     evolution_id: str
     options: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _ParsedExpertArgs:
+    source: str | None
+    task_kind: ExpertTaskKind
+
+
+def _parse_expert_args(args: list[str]) -> _ParsedExpertArgs:
+    """Parse the explicit expert target mode without consulting model output."""
+
+    usage = (
+        "用法：/expert [session-id|history] "
+        "[--task-kind proposal|validation]（默认 validation）"
+    )
+    source: str | None = None
+    task_kind: ExpertTaskKind = "validation"
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--task-kind" or token.startswith("--task-kind="):
+            if task_kind != "validation" or any(
+                item == "--task-kind" or item.startswith("--task-kind=")
+                for item in args[:index]
+            ):
+                raise ValueError(f"选项 --task-kind 重复。{usage}")
+            if token == "--task-kind":
+                index += 1
+                if index >= len(args):
+                    raise ValueError(f"选项 --task-kind 缺少值。{usage}")
+                value = args[index]
+            else:
+                value = token.partition("=")[2]
+            if value not in {"proposal", "validation"}:
+                raise ValueError(f"--task-kind 必须是 proposal 或 validation。{usage}")
+            task_kind = value  # type: ignore[assignment]
+        elif token.startswith("--"):
+            raise ValueError(f"未知选项：{token}。{usage}")
+        elif source is None:
+            source = token
+        else:
+            raise ValueError(usage)
+        index += 1
+    return _ParsedExpertArgs(source=source, task_kind=task_kind)
 
 
 def _parse_evolve_form_args(

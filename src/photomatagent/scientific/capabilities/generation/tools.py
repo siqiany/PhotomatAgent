@@ -58,7 +58,8 @@ PACKAGED_VAE_ASSET_ROOT = (
 class GenerationCapabilitiesTool(Tool):
     name = "generation.capabilities"
     description = (
-        "List candidate-generation capabilities: multi-property VAE formula "
+        "List candidate-generation capabilities: mechanism hypothesis "
+        "registration (available independently), multi-property VAE formula "
         "generation (composition prior / formula proposal) and "
         "MatterGen structure generation (dft_band_gap / chemical_system "
         "modes, isolated environment). Reports dependency state; generated "
@@ -667,7 +668,10 @@ class MatterGenTool(Tool):
 
 class GenerationCapabilityPack(CapabilityPack):
     name = "generation"
-    description = "Candidate generation: VAE formula proposals + MatterGen."
+    description = (
+        "Candidate generation: mechanism hypothesis registration, explicit VAE "
+        "formula proposals, and MatterGen structures."
+    )
     execution_mode = "subprocess/local"
     backend_name = "isolated environments (torch/conda)"
 

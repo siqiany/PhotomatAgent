@@ -1,14 +1,17 @@
 ---
 name: material-composition-generation
-description: Generate new inorganic compositions and chemical formulas from one or more target material properties with the deployed multi-property conditional VAE, then optionally hand selected formulas to MatterGen for structure generation. Use for 成分生成、组分生成、化学式生成、VAE 多性质逆向生成、候选材料生成 and property-conditioned materials discovery; do not substitute database retrieval for generation or claim device performance.
+description: Use when the user explicitly requests VAE-based inverse generation of inorganic compositions or chemical formulas from trained material properties, with optional MatterGen structure generation; use for 成分生成、组分生成、化学式生成 and do not substitute retrieval or mechanism reasoning for the requested model route.
 ---
 
 # Material Composition Generation
 
-Generate new formula candidates with the real multi-property
+Generate new formula candidates only when the user explicitly requests the
+deployed multi-property
 `generation.vae_formula` model tool. This is inverse generation, not nearest
-neighbour or database retrieval. Preserve model provenance and keep composition
-proposal, structure generation, and property validation as separate stages.
+neighbour, database retrieval, or mechanism reasoning. Preserve model
+provenance and keep composition proposal, structure generation, and property
+validation as separate stages. For mechanism-based requests, use
+`generation.register_hypothesis` through the mechanism-guided skill.
 
 ## Workflow
 

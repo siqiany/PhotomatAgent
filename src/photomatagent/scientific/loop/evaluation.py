@@ -222,6 +222,7 @@ class EvaluationReport(BaseModel):
     violations: list[ConstraintViolation] = Field(default_factory=list)
     evidence_gaps: list[str] = Field(default_factory=list)
     critical_evidence_gaps: list[str] = Field(default_factory=list)
+    diagnostics: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     hard_constraints_passed: bool = False
     score: float = 0.0
@@ -289,6 +290,25 @@ class ScientificEvaluator:
         candidate: CandidateState | None,
         scientific: ScientificState,
     ) -> EvaluationReport:
+        if not self.target.constraints:
+            task_kind = self.target.metadata.get("task_kind", "validation")
+            diagnostic = (
+                "VALIDATION_TARGET_EMPTY_CONSTRAINTS"
+                if task_kind == "validation"
+                else "PROPOSAL_TARGET_NO_NUMERIC_CONSTRAINTS"
+            )
+            return EvaluationReport(
+                candidate_id=candidate.candidate_id if candidate is not None else "",
+                evidence_gaps=[diagnostic],
+                critical_evidence_gaps=[diagnostic],
+                diagnostics=[diagnostic],
+                hard_constraints_passed=False,
+                verdict="INCONCLUSIVE",
+                rationale=(
+                    f"{task_kind} target has no constraints; scientific success "
+                    "cannot be inferred vacuously"
+                ),
+            )
         if candidate is None:
             gaps = sorted({c.property for c in self.target.constraints})
             return EvaluationReport(

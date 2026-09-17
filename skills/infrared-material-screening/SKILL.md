@@ -1,6 +1,6 @@
 ---
 name: infrared-material-screening
-description: Screen infrared candidates with a bounded MatterGen → CHGNet → VASP funnel, explicit evidence hierarchy, and no unsupported detector claims.
+description: Use when screening infrared candidates and choosing among known-material retrieval, mechanism hypotheses, or explicit model generation before a bounded MatterGen → CHGNet → VASP evidence funnel.
 category: ir
 tags: [infrared, screening, materials project, band gap]
 license: MIT
@@ -11,6 +11,15 @@ license: MIT
 ## When to use
 
 A spectral band and a need to shortlist candidate materials.
+
+## Route before the funnel
+
+- Explicit mechanism request: load `mechanism-guided-material-design`, register
+  hypotheses, and keep them unvalidated until evidence exists.
+- Explicit VAE request: load `material-composition-generation` and call the VAE
+  route; do not represent mechanism reasoning as model sampling.
+- Known-material request: search materials/literature and label results as
+  known priors, never as new candidates or validation.
 
 ## Evidence hierarchy and funnel
 
