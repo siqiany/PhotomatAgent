@@ -59,6 +59,7 @@ from photomatagent.scientific.loop.policy import (
     ScientificLoopState,
     ScientificLoopSummary,
 )
+from photomatagent.scientific.loop.progress import progress_from_evaluation
 from photomatagent.scientific.loop.stagnation import StagnationDetector
 from photomatagent.scientific.loop.target import TargetSpec
 from photomatagent.scientific.state import ScientificState
@@ -230,7 +231,9 @@ class ScientificLoopController:
             evaluation = self.evaluator.evaluate(candidate, scientific)
             self.state.add_candidate(candidate, evaluation)
             if candidate is not None:
-                self.stagnation.record(candidate, evaluation)
+                progress = progress_from_evaluation(candidate, evaluation, scientific)
+                self.stagnation.record(candidate, evaluation, progress=progress)
+                self.state.no_progress_rounds = self.stagnation.no_progress_rounds
 
             yield await self._emit(
                 CandidateEvaluated(
@@ -442,18 +445,15 @@ class ScientificLoopController:
         if previous is None:
             return False
         current = self.evaluator.evaluate(candidate, scientific)
+        current_progress = progress_from_evaluation(candidate, current, scientific)
+        previous_progress = progress_from_evaluation(candidate, previous, scientific)
         return bool(
-            self._evaluation_evidence_ids(current)
-            - self._evaluation_evidence_ids(previous)
+            set(current_progress.observation_keys)
+            - set(previous_progress.observation_keys)
+        ) or bool(
+            set(current_progress.resolved_questions)
+            - set(previous_progress.resolved_questions)
         )
-
-    @staticmethod
-    def _evaluation_evidence_ids(evaluation: EvaluationReport) -> set[str]:
-        return {
-            evidence_id
-            for result in evaluation.constraint_results
-            for evidence_id in result.evidence_ids
-        }
 
     def _build_summary(self, decision: ScientificLoopDecision) -> ScientificLoopSummary:
         final_evaluation: EvaluationReport | None = (

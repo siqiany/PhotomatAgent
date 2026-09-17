@@ -88,7 +88,10 @@ def build_feedback(
         ):
             prohibited.append(candidate.label or candidate.candidate_id)
 
-    duplicate = bool(prohibited)
+    supplemental_evidence = _has_supplemental_evidence(candidate, history)
+    duplicate = bool(prohibited) and not supplemental_evidence
+    if supplemental_evidence:
+        prohibited = []
     hard_violations = [v for v in evaluation.violations if v.severity == "HARD"]
     soft_violations = [v for v in evaluation.violations if v.severity == "SOFT"]
     low_fidelity_critical = _low_fidelity_critical(target, evaluation)
@@ -189,6 +192,19 @@ def _recommended_actions(
         )
         priority += 1
 
+    for gap in evaluation.critical_evidence_gaps:
+        constraint = target.constraint(gap)
+        actions.append(
+            RecommendedAction(
+                action_type="CALCULATE",
+                description=f"obtain evidence for {gap}",
+                target_property=gap,
+                preferred_capability=_preferred_capability(constraint),
+                priority=priority,
+            )
+        )
+        priority += 1
+
     for violation in hard_violations:
         actions.append(
             RecommendedAction(
@@ -199,19 +215,6 @@ def _recommended_actions(
                 ),
                 target_property=violation.property,
                 preferred_capability="generation",
-                priority=priority,
-            )
-        )
-        priority += 1
-
-    for gap in evaluation.critical_evidence_gaps:
-        constraint = target.constraint(gap)
-        actions.append(
-            RecommendedAction(
-                action_type="CALCULATE",
-                description=f"obtain evidence for {gap}",
-                target_property=gap,
-                preferred_capability=_preferred_capability(constraint),
                 priority=priority,
             )
         )
@@ -294,8 +297,14 @@ def _summarize(
     actions: list[RecommendedAction],
     judge: JudgeReport | None = None,
 ) -> str:
+    if evaluation.verdict == "INCONCLUSIVE":
+        opening = "has not yet been verified against"
+    elif evaluation.verdict == "FAIL":
+        opening = "fails"
+    else:
+        opening = "does not satisfy"
     lines: list[str] = [
-        f"Candidate {candidate.label or candidate.candidate_id} does not satisfy "
+        f"Candidate {candidate.label or candidate.candidate_id} {opening} "
         f"the target (verdict={evaluation.verdict}, score={evaluation.score:.3f})."
     ]
     if evaluation.violations:
@@ -328,6 +337,29 @@ def _summarize(
     return " ".join(lines)
 
 
+def _has_supplemental_evidence(
+    candidate: CandidateState, history: list[CandidateState]
+) -> bool:
+    """Recognize a same-composition proposal carrying additional evidence."""
+    current = _candidate_evidence_ids(candidate)
+    if not current:
+        return False
+    return any(
+        previous.candidate_id != candidate.candidate_id
+        and candidate_fingerprint(previous) == candidate.fingerprint
+        and current != _candidate_evidence_ids(previous)
+        for previous in history
+    )
+
+
+def _candidate_evidence_ids(candidate: CandidateState) -> set[str]:
+    values = set(candidate.evidence_ids)
+    projected = candidate.representation.get("evidence_ids")
+    if isinstance(projected, list):
+        values.update(str(item) for item in projected)
+    return values
+
+
 def _preferred_capability(constraint: ConstraintSpec | None) -> str:
     """Map a property to the capability most likely to produce its evidence."""
     if constraint is None:
@@ -350,6 +382,10 @@ def format_feedback_for_model(signal: FeedbackSignal, *, round_number: int) -> s
         "",
         f"Decision: {signal.decision}",
     ]
+    if "verdict=INCONCLUSIVE" in signal.summary:
+        lines.append("Status: the target has not yet been verified.")
+    elif "verdict=FAIL" in signal.summary:
+        lines.append("Status: the candidate fails at least one target constraint.")
     if signal.violations:
         lines.append("Hard constraint violations:")
         lines += [f"- {v.message}" for v in signal.violations if v.severity == "HARD"]

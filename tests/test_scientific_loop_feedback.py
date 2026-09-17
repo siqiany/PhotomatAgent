@@ -129,6 +129,24 @@ def test_repeated_candidate_is_rejected_with_change_strategy():
     assert signal.prohibited_repeats == ["HgTe"]
 
 
+def test_same_composition_with_new_evidence_is_not_rejected():
+    first = candidate_from_formula("HgTe")
+    second = candidate_from_formula("HgTe")
+    second.evidence_ids = ["new-evidence-id"]
+    report = _evaluate(second, _gap(0.14))
+    signal = build_feedback(_target(), second, report, [first])
+    assert signal is not None
+    assert signal.decision != "REJECT"
+
+
+def test_inconclusive_feedback_says_not_yet_verified():
+    candidate = candidate_from_formula("HgTe")
+    report = _evaluate(candidate)
+    signal = build_feedback(_target(), candidate, report, [])
+    assert signal is not None
+    assert "not yet" in signal.summary.lower()
+
+
 def test_format_feedback_is_a_research_instruction():
     candidate = candidate_from_formula("HgTe")
     report = _evaluate(candidate, _gap(0.21))

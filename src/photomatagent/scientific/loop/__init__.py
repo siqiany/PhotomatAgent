@@ -40,6 +40,10 @@ if TYPE_CHECKING:
         ScientificLoopState,
         ScientificLoopSummary,
     )
+    from photomatagent.scientific.loop.progress import (
+        ValidationProgress,
+        progress_from_evaluation,
+    )
     from photomatagent.scientific.loop.scoring import compute_score, score_breakdown
     from photomatagent.scientific.loop.stagnation import (
         StagnationDetector,
@@ -79,6 +83,8 @@ _EXPORT_MODULE = {
     "ScientificLoopPolicy": "policy",
     "ScientificLoopState": "policy",
     "ScientificLoopSummary": "policy",
+    "ValidationProgress": "progress",
+    "progress_from_evaluation": "progress",
     "compute_score": "scoring",
     "score_breakdown": "scoring",
     "StagnationDetector": "stagnation",

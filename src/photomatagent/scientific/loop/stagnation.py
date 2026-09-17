@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from photomatagent.scientific.loop.candidate import CandidateState
 from photomatagent.scientific.loop.evaluation import EvaluationReport
+from photomatagent.scientific.loop.progress import ValidationProgress
 
 
 def violation_signature(report: EvaluationReport) -> tuple[str, ...]:
@@ -45,6 +46,7 @@ class StagnationDetector:
     _last_violations: tuple[str, ...] = ()
     _last_gaps: tuple[str, ...] = ()
     _repeated_candidate_ids: list[str] = field(default_factory=list)
+    _progress_keys: set[str] = field(default_factory=set)
 
     @property
     def best_score(self) -> float:
@@ -69,6 +71,7 @@ class StagnationDetector:
         self._last_violations = ()
         self._last_gaps = ()
         self._repeated_candidate_ids = []
+        self._progress_keys = set()
 
     def is_duplicate(self, candidate: CandidateState) -> bool:
         """True when this exact candidate (fingerprint) was already proposed."""
@@ -78,6 +81,8 @@ class StagnationDetector:
         self,
         candidate: CandidateState,
         report: EvaluationReport,
+        *,
+        progress: ValidationProgress | None = None,
     ) -> None:
         """Feed one evaluated candidate; updates the no-progress counter.
 
@@ -92,8 +97,23 @@ class StagnationDetector:
             self._fingerprints.add(fingerprint)
 
         score = float(report.score or 0.0)
-        if score - self._best_score >= self.epsilon:
+        score_progress = score - self._best_score >= self.epsilon
+        validation_progress = False
+        if progress is not None and progress.candidate_id == candidate.candidate_id:
+            prefix = candidate.fingerprint + "|"
+            current_keys = {
+                prefix + f"question:{question}"
+                for question in progress.resolved_questions
+            }
+            current_keys.update(prefix + key for key in progress.observation_keys)
+            new_keys = current_keys - self._progress_keys
+            if new_keys:
+                self._progress_keys.update(new_keys)
+                validation_progress = True
+        if score_progress:
             self._best_score = score
+            self._no_progress_rounds = 0
+        elif validation_progress:
             self._no_progress_rounds = 0
         else:
             self._no_progress_rounds += 1
