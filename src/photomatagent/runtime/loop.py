@@ -10,7 +10,9 @@ from __future__ import annotations
 import inspect
 import json
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -110,6 +112,18 @@ from photomatagent.workspace import Workspace
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _HYPOTHESIS_REGISTRATION_TOOL = "generation.register_hypothesis"
+_UNCONFIRMED_ARGUMENTS_PLACEHOLDER = (
+    "[tool arguments withheld: completion unavailable]"
+)
+
+
+@dataclass
+class _BufferedArgumentDelta:
+    """One argument fragment awaiting the authoritative completed call."""
+
+    event: ModelToolCallArgumentsDelta
+    resolved: bool = False
+    replacement: ToolCallArgumentsDelta | None = None
 
 
 def _bounded_event_text(value: object, *, limit: int) -> str:
@@ -172,48 +186,6 @@ def _event_tool_arguments(
             ),
         }
     return arguments
-
-
-def _partial_bridge_target(payload: str) -> str | None:
-    """Return a complete outer ``name`` value without parsing nested arguments."""
-
-    decoder = json.JSONDecoder()
-    index = 0
-    length = len(payload)
-
-    def skip_whitespace(position: int) -> int:
-        while position < length and payload[position].isspace():
-            position += 1
-        return position
-
-    index = skip_whitespace(index)
-    if index >= length or payload[index] != "{":
-        return None
-    index += 1
-    while True:
-        index = skip_whitespace(index)
-        if index >= length or payload[index] == "}":
-            return None
-        try:
-            key, index = decoder.raw_decode(payload, index)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(key, str):
-            return None
-        index = skip_whitespace(index)
-        if index >= length or payload[index] != ":":
-            return None
-        index = skip_whitespace(index + 1)
-        try:
-            value, index = decoder.raw_decode(payload, index)
-        except json.JSONDecodeError:
-            return None
-        if key == "name":
-            return value if isinstance(value, str) else None
-        index = skip_whitespace(index)
-        if index >= length or payload[index] != ",":
-            return None
-        index += 1
 
 
 class AgentRuntime:
@@ -430,143 +402,153 @@ class AgentRuntime:
                 response: ModelResponse | None = None
                 model_started = time.monotonic()
                 stream_tool_names: dict[str, str] = {}
-                buffered_argument_deltas: dict[
-                    str, list[ModelToolCallArgumentsDelta]
+                ordered_stream_buffer: deque[
+                    RuntimeEvent | _BufferedArgumentDelta
+                ] = deque()
+                pending_argument_deltas: dict[
+                    str, list[_BufferedArgumentDelta]
                 ] = {}
-                bridge_delta_targets: dict[str, str] = {}
+
+                def queue_stream_event(event: RuntimeEvent) -> list[RuntimeEvent]:
+                    if ordered_stream_buffer:
+                        ordered_stream_buffer.append(event)
+                        return []
+                    return [event]
+
+                def drain_resolved_stream_events() -> list[RuntimeEvent]:
+                    ready: list[RuntimeEvent] = []
+                    while ordered_stream_buffer:
+                        item = ordered_stream_buffer[0]
+                        if isinstance(item, _BufferedArgumentDelta):
+                            if not item.resolved:
+                                break
+                            ordered_stream_buffer.popleft()
+                            if item.replacement is not None:
+                                ready.append(item.replacement)
+                        else:
+                            ordered_stream_buffer.popleft()
+                            ready.append(item)
+                    return ready
+
+                def resolve_pending_arguments(
+                    call: ToolCall,
+                    *,
+                    index: int,
+                ) -> None:
+                    pending = pending_argument_deltas.pop(call.id, [])
+                    if not pending:
+                        return
+                    if _is_hypothesis_registration_call(call.name, call.arguments):
+                        first, *remaining = pending
+                        first.replacement = ToolCallArgumentsDelta(
+                            iteration=iteration,
+                            tool_call_id=call.id,
+                            delta=json.dumps(
+                                _event_tool_arguments(call.name, call.arguments),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                            index=index,
+                        )
+                        first.resolved = True
+                        for buffered in remaining:
+                            buffered.resolved = True
+                        return
+                    for buffered in pending:
+                        streamed = buffered.event
+                        buffered.replacement = ToolCallArgumentsDelta(
+                            iteration=iteration,
+                            tool_call_id=streamed.tool_call_id,
+                            delta=streamed.delta,
+                            index=streamed.index,
+                        )
+                        buffered.resolved = True
+
+                def withhold_unconfirmed_arguments() -> list[RuntimeEvent]:
+                    for pending in pending_argument_deltas.values():
+                        if not pending:
+                            continue
+                        first, *remaining = pending
+                        first.replacement = ToolCallArgumentsDelta(
+                            iteration=iteration,
+                            tool_call_id=first.event.tool_call_id,
+                            delta=_UNCONFIRMED_ARGUMENTS_PLACEHOLDER,
+                            index=first.event.index,
+                        )
+                        first.resolved = True
+                        for buffered in remaining:
+                            buffered.resolved = True
+                    pending_argument_deltas.clear()
+                    return drain_resolved_stream_events()
+
+                stream_event: RuntimeEvent
                 try:
                     async for model_event in self._model.stream(request):
                         if isinstance(model_event, ProviderStreamStarted):
-                            yield await self._emit(
-                                ModelStreamStarted(
-                                    iteration=iteration,
-                                    provider=model_event.provider,
-                                    model=model_event.model,
-                                    response_id=model_event.response_id,
-                                )
+                            stream_event = ModelStreamStarted(
+                                iteration=iteration,
+                                provider=model_event.provider,
+                                model=model_event.model,
+                                response_id=model_event.response_id,
                             )
+                            for ready in queue_stream_event(stream_event):
+                                yield await self._emit(ready)
                         elif isinstance(model_event, ModelTextDelta):
-                            yield await self._emit(
-                                TextDelta(iteration=iteration, text=model_event.text)
+                            stream_event = TextDelta(
+                                iteration=iteration, text=model_event.text
                             )
+                            for ready in queue_stream_event(stream_event):
+                                yield await self._emit(ready)
                         elif isinstance(model_event, ModelToolCallStarted):
                             stream_tool_names[model_event.tool_call_id] = (
                                 model_event.tool_name
                             )
-                            yield await self._emit(
-                                ToolCallStarted(
-                                    iteration=iteration,
-                                    tool_call_id=model_event.tool_call_id,
-                                    tool_name=model_event.tool_name,
-                                    index=model_event.index,
-                                )
+                            stream_event = ToolCallStarted(
+                                iteration=iteration,
+                                tool_call_id=model_event.tool_call_id,
+                                tool_name=model_event.tool_name,
+                                index=model_event.index,
                             )
+                            for ready in queue_stream_event(stream_event):
+                                yield await self._emit(ready)
                         elif isinstance(model_event, ModelToolCallArgumentsDelta):
                             streamed_name = stream_tool_names.get(
                                 model_event.tool_call_id, ""
                             )
-                            if streamed_name == _HYPOTHESIS_REGISTRATION_TOOL:
-                                buffered_argument_deltas.setdefault(
+                            if streamed_name in {
+                                "tool_call",
+                                _HYPOTHESIS_REGISTRATION_TOOL,
+                            }:
+                                buffered = _BufferedArgumentDelta(event=model_event)
+                                ordered_stream_buffer.append(buffered)
+                                pending_argument_deltas.setdefault(
                                     model_event.tool_call_id, []
-                                ).append(model_event)
-                            elif streamed_name == "tool_call":
-                                known_target = bridge_delta_targets.get(
-                                    model_event.tool_call_id
-                                )
-                                if known_target == _HYPOTHESIS_REGISTRATION_TOOL:
-                                    buffered_argument_deltas.setdefault(
-                                        model_event.tool_call_id, []
-                                    ).append(model_event)
-                                elif known_target is not None:
-                                    yield await self._emit(
-                                        ToolCallArgumentsDelta(
-                                            iteration=iteration,
-                                            tool_call_id=model_event.tool_call_id,
-                                            delta=model_event.delta,
-                                            index=model_event.index,
-                                        )
-                                    )
-                                else:
-                                    pending = buffered_argument_deltas.setdefault(
-                                        model_event.tool_call_id, []
-                                    )
-                                    pending.append(model_event)
-                                    partial_target = _partial_bridge_target(
-                                        "".join(item.delta for item in pending)
-                                    )
-                                    if partial_target is not None:
-                                        bridge_delta_targets[
-                                            model_event.tool_call_id
-                                        ] = partial_target
-                                        if (
-                                            partial_target
-                                            != _HYPOTHESIS_REGISTRATION_TOOL
-                                        ):
-                                            for buffered in pending:
-                                                yield await self._emit(
-                                                    ToolCallArgumentsDelta(
-                                                        iteration=iteration,
-                                                        tool_call_id=(
-                                                            buffered.tool_call_id
-                                                        ),
-                                                        delta=buffered.delta,
-                                                        index=buffered.index,
-                                                    )
-                                                )
-                                            buffered_argument_deltas.pop(
-                                                model_event.tool_call_id, None
-                                            )
+                                ).append(buffered)
                             else:
-                                yield await self._emit(
-                                    ToolCallArgumentsDelta(
-                                        iteration=iteration,
-                                        tool_call_id=model_event.tool_call_id,
-                                        delta=model_event.delta,
-                                        index=model_event.index,
-                                    )
-                                )
-                        elif isinstance(model_event, ModelToolCallCompleted):
-                            call = model_event.tool_call
-                            pending_deltas = buffered_argument_deltas.pop(call.id, [])
-                            bridge_delta_targets.pop(call.id, None)
-                            if pending_deltas and _is_hypothesis_registration_call(
-                                call.name, call.arguments
-                            ):
-                                yield await self._emit(
-                                    ToolCallArgumentsDelta(
-                                        iteration=iteration,
-                                        tool_call_id=call.id,
-                                        delta=json.dumps(
-                                            _event_tool_arguments(
-                                                call.name, call.arguments
-                                            ),
-                                            ensure_ascii=False,
-                                            separators=(",", ":"),
-                                        ),
-                                        index=model_event.index,
-                                    )
-                                )
-                            else:
-                                for buffered_delta in pending_deltas:
-                                    yield await self._emit(
-                                        ToolCallArgumentsDelta(
-                                            iteration=iteration,
-                                            tool_call_id=buffered_delta.tool_call_id,
-                                            delta=buffered_delta.delta,
-                                            index=buffered_delta.index,
-                                        )
-                                    )
-                            yield await self._emit(
-                                ToolCallCompleted(
+                                stream_event = ToolCallArgumentsDelta(
                                     iteration=iteration,
-                                    tool_call_id=call.id,
-                                    tool_name=call.name,
-                                    arguments=_event_tool_arguments(
-                                        call.name, call.arguments
-                                    ),
+                                    tool_call_id=model_event.tool_call_id,
+                                    delta=model_event.delta,
                                     index=model_event.index,
                                 )
+                                for ready in queue_stream_event(stream_event):
+                                    yield await self._emit(ready)
+                        elif isinstance(model_event, ModelToolCallCompleted):
+                            call = model_event.tool_call
+                            resolve_pending_arguments(call, index=model_event.index)
+                            completed = ToolCallCompleted(
+                                iteration=iteration,
+                                tool_call_id=call.id,
+                                tool_name=call.name,
+                                arguments=_event_tool_arguments(
+                                    call.name, call.arguments
+                                ),
+                                index=model_event.index,
                             )
+                            for ready in queue_stream_event(completed):
+                                yield await self._emit(ready)
+                            for ready in drain_resolved_stream_events():
+                                yield await self._emit(ready)
                         elif isinstance(model_event, ModelUsageUpdated):
                             # The final aggregate is booked once below to avoid
                             # double-counting incremental usage snapshots.
@@ -574,6 +556,8 @@ class AgentRuntime:
                         elif isinstance(model_event, ModelCompleted):
                             response = model_event.response
                 except ProviderError as exc:
+                    for ready in withhold_unconfirmed_arguments():
+                        yield await self._emit(ready)
                     yield await self._emit(
                         ProviderFailed(
                             iteration=iteration,
@@ -590,6 +574,8 @@ class AgentRuntime:
                     no_completion_error = ProviderError(
                         self._model.provider, "stream ended without ModelCompleted"
                     )
+                    for ready in withhold_unconfirmed_arguments():
+                        yield await self._emit(ready)
                     yield await self._emit(
                         ProviderFailed(
                             iteration=iteration,

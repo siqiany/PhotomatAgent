@@ -135,11 +135,20 @@ class _InterleavedBridgeProvider:
         )
         yield ModelToolCallArgumentsDelta(
             tool_call_id=first.id,
-            delta='{"name":"mock.run_calculation",',
+            delta='{"na',
             index=0,
         )
+        yield ModelTextDelta(text="inside split bridge name")
         if self.fail_before_completed:
-            raise ProviderError(self.provider, "failed after safe delta")
+            yield ModelToolCallArgumentsDelta(
+                tool_call_id=first.id,
+                delta=(
+                    'me":"mock.run_calculation","arguments":'
+                    '{"statement":"PRIVATE FAILURE BODY"}}'
+                ),
+                index=0,
+            )
+            raise ProviderError(self.provider, "failed before authoritative completion")
         yield ModelToolCallStarted(
             tool_call_id=second.id, tool_name="tool_call", index=1
         )
@@ -147,6 +156,11 @@ class _InterleavedBridgeProvider:
             tool_call_id=second.id,
             delta='{"name":"mock.run_calculation",',
             index=1,
+        )
+        yield ModelToolCallArgumentsDelta(
+            tool_call_id=first.id,
+            delta='me":"mock.run_calculation",',
+            index=0,
         )
         yield ModelToolCallArgumentsDelta(
             tool_call_id=first.id,
@@ -170,6 +184,43 @@ class _InterleavedBridgeProvider:
         yield ModelCompleted(
             response=ModelResponse(
                 tool_calls=[first, second], finish_reason="tool_calls"
+            )
+        )
+
+
+class _OverriddenBridgeProvider:
+    provider = "overridden"
+    model = "bridge-stream"
+
+    def __init__(self, streamed_payload: dict[str, object], completed: ToolCall) -> None:
+        self.calls = 0
+        self.streamed_payload = streamed_payload
+        self.completed = completed
+
+    async def stream(
+        self, request: ModelRequest
+    ) -> AsyncIterator[ModelStreamEvent]:
+        self.calls += 1
+        yield ProviderStreamStarted(provider=self.provider, model=self.model)
+        if self.calls > 1:
+            yield ModelCompleted(
+                response=ModelResponse(text="done", finish_reason="stop")
+            )
+            return
+        yield ModelToolCallStarted(
+            tool_call_id=self.completed.id,
+            tool_name="tool_call",
+            index=0,
+        )
+        yield ModelToolCallArgumentsDelta(
+            tool_call_id=self.completed.id,
+            delta=json.dumps(self.streamed_payload, ensure_ascii=False),
+            index=0,
+        )
+        yield ModelToolCallCompleted(tool_call=self.completed, index=0)
+        yield ModelCompleted(
+            response=ModelResponse(
+                tool_calls=[self.completed], finish_reason="tool_calls"
             )
         )
 
@@ -208,16 +259,22 @@ async def test_non_registration_bridge_deltas_keep_interleaved_arrival_order():
             "tool_call_completed",
         }
     ]
-    assert streamed[:7] == [
+    assert streamed[:8] == [
         (
             "tool_call_arguments_delta",
             "bridge-a",
-            '{"name":"mock.run_calculation",',
+            '{"na',
         ),
+        ("text_delta", None, None),
         (
             "tool_call_arguments_delta",
             "bridge-b",
             '{"name":"mock.run_calculation",',
+        ),
+        (
+            "tool_call_arguments_delta",
+            "bridge-a",
+            'me":"mock.run_calculation",',
         ),
         (
             "tool_call_arguments_delta",
@@ -231,12 +288,12 @@ async def test_non_registration_bridge_deltas_keep_interleaved_arrival_order():
             '"arguments":{"material":"InAs","calculation_type":"dos"}}',
         ),
         ("tool_call_completed", "bridge-b", None),
-        ("tool_call_completed", "bridge-a", None),
     ]
+    assert streamed[8] == ("tool_call_completed", "bridge-a", None)
 
 
 @pytest.mark.asyncio
-async def test_confirmed_non_registration_delta_survives_provider_failure():
+async def test_unconfirmed_bridge_arguments_are_replaced_on_provider_failure():
     runtime = make_runtime(_InterleavedBridgeProvider(fail_before_completed=True))
     seen = []
 
@@ -244,10 +301,82 @@ async def test_confirmed_non_registration_delta_survives_provider_failure():
         async for event in runtime.run("provider fails after safe bridge delta"):
             seen.append(event)
 
-    delta = next(event for event in seen if event.kind == "tool_call_arguments_delta")
+    streamed = [
+        event for event in seen if event.kind in {"tool_call_arguments_delta", "text_delta"}
+    ]
+    delta = streamed[0]
     assert delta.tool_call_id == "bridge-a"
-    assert delta.delta == '{"name":"mock.run_calculation",'
+    assert delta.delta == "[tool arguments withheld: completion unavailable]"
+    assert streamed[1].kind == "text_delta"
+    assert "{\"na" not in "".join(
+        getattr(event, "delta", "") for event in seen
+    )
+    assert "PRIVATE FAILURE BODY" not in "".join(
+        event.model_dump_json() for event in seen
+    )
     assert [event.kind for event in seen][-2:] == ["provider_failed", "loop_failed"]
+
+
+@pytest.mark.asyncio
+async def test_completed_registration_overrides_safe_looking_stream_without_leak(
+    tmp_path,
+):
+    private_statement = "PRIVATE OVERRIDDEN STATEMENT"
+    private_anchor = "PRIVATE OVERRIDDEN ANCHOR"
+    private_question = "PRIVATE OVERRIDDEN QUESTION"
+    payload = _arguments(
+        statement=private_statement,
+        basis=[
+            {
+                "evidence_id": "basis-override",
+                "relation": "supports",
+                "anchor": private_anchor,
+            }
+        ],
+        validation_questions=[private_question],
+    )
+    completed = ToolCall(
+        id="overridden-bridge",
+        name="tool_call",
+        arguments={
+            "name": "generation.register_hypothesis",
+            "arguments": payload,
+        },
+    )
+    streamed_payload = {
+        "name": "mock.run_calculation",
+        "arguments": payload,
+    }
+    logger = EventLogger(tmp_path, session_id="overridden-registration")
+    runtime = make_runtime(
+        _OverriddenBridgeProvider(streamed_payload, completed),
+        workspace=Workspace(tmp_path),
+        event_sinks=[logger.log],
+    )
+    runtime.scientific_state.add_evidence(
+        Evidence(
+            id="basis-override",
+            type="literature",
+            source="paper",
+            content="bounded evidence",
+            confidence=0.5,
+        )
+    )
+
+    events = await collect(runtime, "override streamed bridge target")
+
+    raw_log = logger.events_path.read_text(encoding="utf-8")
+    assert private_statement not in raw_log
+    assert private_anchor not in raw_log
+    assert private_question not in raw_log
+    deltas = [
+        event for event in events if event.kind == "tool_call_arguments_delta"
+    ]
+    assert len(deltas) == 1
+    projected = json.loads(deltas[0].delta)
+    assert projected["name"] == "generation.register_hypothesis"
+    assert projected["arguments"]["request_id"] == "event-r1"
+    assert len(runtime.scientific_state.material_hypotheses) == 1
 
 
 @pytest.mark.asyncio
