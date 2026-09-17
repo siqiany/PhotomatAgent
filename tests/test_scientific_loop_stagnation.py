@@ -6,9 +6,10 @@ from photomatagent.scientific.loop.progress import (
     ValidationProgress,
     progress_from_evaluation,
 )
+from photomatagent.runtime.evidence_attestation import _RuntimeEvidenceAuthority
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.loop.evaluation import PropertyEvaluation
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 from photomatagent.scientific.loop.stagnation import (
     StagnationDetector,
     gap_signature,
@@ -162,7 +163,20 @@ def test_accepted_failure_is_validation_progress():
             )
         ],
     )
-    progress = progress_from_evaluation(candidate, report, ScientificState(evidence=[evidence]))
+    state = ScientificState(evidence=[evidence])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="electronic.band_summary",
+            tool_call_id="call-failure",
+        ),
+    )
+    progress = progress_from_evaluation(candidate, report, state)
     assert progress.resolved_questions == ("band_gap",)
     assert progress.observation_keys
 
@@ -195,6 +209,18 @@ def test_accepted_unknown_is_progress_but_unresolved_gap_is_not():
         constraint_results=[PropertyEvaluation(property="band_gap", result="UNKNOWN")],
     )
     state = ScientificState(evidence=[evidence])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="electronic.band_summary",
+            tool_call_id="call-unknown",
+        ),
+    )
     assert progress_from_evaluation(candidate, accepted, state).resolved_questions == (
         "band_gap",
     )
@@ -244,12 +270,24 @@ def test_content_hash_survives_id_and_cif_filename_changes():
             ]
         }
     )
-    progress_a = progress_from_evaluation(
-        candidate, report_a, ScientificState(evidence=[first])
-    )
-    progress_b = progress_from_evaluation(
-        candidate, report_b, ScientificState(evidence=[second])
-    )
+    def attested(item: ScientificEvidence) -> ScientificState:
+        state = ScientificState(evidence=[item])
+        authority = _RuntimeEvidenceAuthority()
+        authority.bind(state)
+        authority.attest(
+            state,
+            EvidenceAttestation(
+                evidence_id=item.id,
+                authority="observation",
+                origin="trusted_builtin",
+                tool_name="electronic.band_summary",
+                tool_call_id=f"call-{item.id}",
+            ),
+        )
+        return state
+
+    progress_a = progress_from_evaluation(candidate, report_a, attested(first))
+    progress_b = progress_from_evaluation(candidate, report_b, attested(second))
     assert progress_a.observation_keys == progress_b.observation_keys
 
 
@@ -273,3 +311,133 @@ def test_progress_ignores_report_for_another_candidate():
     )
     progress = progress_from_evaluation(candidate, report, ScientificState(evidence=[evidence]))
     assert progress.observation_keys == ()
+
+
+def test_progress_requires_nonempty_exact_report_candidate_id():
+    candidate = candidate_from_formula("NaBiS2")
+    evidence = ScientificEvidence(
+        id="evidence-id",
+        subject="NaBiS2",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+        source="dft",
+        source_type="dft_calculation",
+        fidelity="dft",
+    )
+    state = ScientificState(evidence=[evidence])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="electronic.band_summary",
+            tool_call_id="call-candidate-id",
+        ),
+    )
+    report = EvaluationReport(
+        candidate_id="",
+        constraint_results=[
+            PropertyEvaluation(property="band_gap", result="PASS", evidence_ids=[evidence.id])
+        ],
+    )
+    assert progress_from_evaluation(candidate, report, state).observation_keys == ()
+
+
+def test_progress_rejects_unattested_wrong_property_and_subject():
+    candidate = candidate_from_formula("NaBiS2")
+    wrong_property = ScientificEvidence(
+        id="wrong-property",
+        subject="NaBiS2",
+        property="responsivity",
+        value=1.1,
+        unit="A/W",
+        source="dft",
+        source_type="dft_calculation",
+        fidelity="dft",
+    )
+    wrong_subject = ScientificEvidence(
+        id="wrong-subject",
+        subject="HgTe",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+        source="dft",
+        source_type="dft_calculation",
+        fidelity="dft",
+    )
+    state = ScientificState(evidence=[wrong_property, wrong_subject])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=wrong_property.id,
+            authority="background",
+            origin="untrusted_tool",
+            tool_name="untrusted",
+            tool_call_id="call-background",
+        ),
+    )
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=wrong_subject.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="electronic.band_summary",
+            tool_call_id="call-wrong-subject",
+        ),
+    )
+    report = EvaluationReport(
+        candidate_id=candidate.candidate_id,
+        constraint_results=[
+            PropertyEvaluation(
+                property="band_gap", result="PASS", evidence_ids=[wrong_property.id]
+            ),
+            PropertyEvaluation(
+                property="band_gap", result="PASS", evidence_ids=[wrong_subject.id]
+            ),
+        ],
+    )
+    assert progress_from_evaluation(candidate, report, state).observation_keys == ()
+
+
+def test_synthetic_attestation_requires_evaluator_policy_opt_in():
+    candidate = candidate_from_formula("NaBiS2")
+    evidence = ScientificEvidence(
+        id="synthetic-evidence",
+        subject="NaBiS2",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+        source="test-only provider",
+        source_type="dft_calculation",
+        fidelity="dft",
+    )
+    state = ScientificState(evidence=[evidence])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    authority.attest(
+        state,
+        EvidenceAttestation(
+            evidence_id=evidence.id,
+            authority="synthetic",
+            origin="synthetic_test",
+            tool_name="test.report_property",
+            tool_call_id="call-synthetic",
+        ),
+    )
+    report = EvaluationReport(
+        candidate_id=candidate.candidate_id,
+        constraint_results=[
+            PropertyEvaluation(property="band_gap", result="PASS", evidence_ids=[evidence.id])
+        ],
+    )
+    assert progress_from_evaluation(candidate, report, state).observation_keys == ()
+    assert progress_from_evaluation(
+        candidate, report, state, allow_synthetic_evidence=True
+    ).observation_keys

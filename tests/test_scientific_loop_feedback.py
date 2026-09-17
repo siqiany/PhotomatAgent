@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from photomatagent.runtime.evidence_attestation import _RuntimeEvidenceAuthority
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.loop.candidate import candidate_from_formula
 from photomatagent.scientific.loop.evaluation import (
@@ -14,7 +15,7 @@ from photomatagent.scientific.loop.target import (
     ConstraintSpec,
     TargetSpec,
 )
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 
 
 def _target() -> TargetSpec:
@@ -129,14 +130,84 @@ def test_repeated_candidate_is_rejected_with_change_strategy():
     assert signal.prohibited_repeats == ["HgTe"]
 
 
-def test_same_composition_with_new_evidence_is_not_rejected():
+def test_same_composition_with_forged_evidence_id_is_rejected():
     first = candidate_from_formula("HgTe")
     second = candidate_from_formula("HgTe")
     second.evidence_ids = ["new-evidence-id"]
     report = _evaluate(second, _gap(0.14))
     signal = build_feedback(_target(), second, report, [first])
     assert signal is not None
+    assert signal.decision == "REJECT"
+
+
+def test_same_composition_with_new_attested_accepted_observation_is_not_rejected():
+    first = candidate_from_formula("HgTe")
+    second = candidate_from_formula("HgTe")
+    old = _gap(0.14).model_copy(
+        update={"id": "old-evidence", "provenance": {"content_sha256": "old"}}
+    )
+    new = _gap(0.13, fidelity="experimental").model_copy(
+        update={
+            "id": "new-evidence",
+            "source_type": "experimental",
+            "provenance": {"content_sha256": "new"},
+        }
+    )
+    first.evidence_ids = [old.id]
+    second.evidence_ids = [new.id]
+    state = ScientificState(evidence=[old, new])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    for item in state.evidence:
+        authority.attest(
+            state,
+            EvidenceAttestation(
+                evidence_id=item.id,
+                authority="observation",
+                origin="trusted_builtin",
+                tool_name="electronic.band_summary",
+                tool_call_id=f"call-{item.id}",
+            ),
+        )
+    evaluator = ScientificEvaluator(
+        _target(), policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True)
+    )
+    second.representation["structure_hash"] = "synthetic:device"
+    report = evaluator.evaluate(second, state)
+    signal = build_feedback(_target(), second, report, [first], scientific=state)
+    assert signal is not None
     assert signal.decision != "REJECT"
+
+
+def test_same_content_hash_with_new_id_is_still_rejected():
+    first = candidate_from_formula("HgTe")
+    second = candidate_from_formula("HgTe")
+    old = _gap(0.14).model_copy(
+        update={"id": "old-evidence", "provenance": {"content_sha256": "same"}}
+    )
+    new = _gap(0.14).model_copy(
+        update={"id": "new-evidence", "provenance": {"content_sha256": "same"}}
+    )
+    first.evidence_ids = [old.id]
+    second.evidence_ids = [new.id]
+    state = ScientificState(evidence=[old, new])
+    authority = _RuntimeEvidenceAuthority()
+    authority.bind(state)
+    for item in state.evidence:
+        authority.attest(
+            state,
+            EvidenceAttestation(
+                evidence_id=item.id,
+                authority="observation",
+                origin="trusted_builtin",
+                tool_name="electronic.band_summary",
+                tool_call_id=f"call-{item.id}",
+            ),
+        )
+    report = _evaluate(second, new)
+    signal = build_feedback(_target(), second, report, [first], scientific=state)
+    assert signal is not None
+    assert signal.decision == "REJECT"
 
 
 def test_inconclusive_feedback_says_not_yet_verified():

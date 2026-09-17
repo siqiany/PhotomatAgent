@@ -17,8 +17,15 @@ from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.evidence_refs import matches_evidence_ref
 from photomatagent.scientific.loop.candidate import CandidateState
-from photomatagent.scientific.loop.evaluation import EvaluationReport
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.loop.evaluation import (
+    DEFAULT_PROPERTY_ALIASES,
+    EvaluationReport,
+)
+from photomatagent.scientific.discovery.composition import normalize_composition
+from photomatagent.scientific.state import (
+    DEFAULT_TRUSTED_EVIDENCE_TOOLS,
+    ScientificState,
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,8 @@ def progress_from_evaluation(
     candidate: CandidateState,
     report: EvaluationReport,
     scientific: ScientificState,
+    *,
+    allow_synthetic_evidence: bool = False,
 ) -> ValidationProgress:
     """Project accepted evaluator outcomes onto stable progress identities.
 
@@ -76,7 +85,7 @@ def progress_from_evaluation(
     bounded semantic digest is used with small numeric changes quantized.
     """
 
-    if report.candidate_id and report.candidate_id != candidate.candidate_id:
+    if not report.candidate_id or report.candidate_id != candidate.candidate_id:
         return ValidationProgress(
             candidate_id=candidate.candidate_id,
             resolved_questions=(),
@@ -90,23 +99,125 @@ def progress_from_evaluation(
         if result.result in {"PASS", "FAIL", "UNKNOWN"} and result.evidence_ids
     }
     for property_name, result in evidence_by_result.items():
-        matches = [
-            evidence
-            for evidence in scientific.evidence
-            if any(matches_evidence_ref(reference, evidence.id) for reference in result.evidence_ids)
-        ]
+        matches = _accepted_evidence(
+            property_name=property_name,
+            references=result.evidence_ids,
+            candidate=candidate,
+            scientific=scientific,
+            allow_synthetic_evidence=allow_synthetic_evidence,
+        )
         if not matches:
             continue
         for evidence in matches:
             resolved.add(property_name)
-            identity = _observation_identity(evidence)
-            observations.add(
-                f"question:{property_name}|outcome:{result.result}|observation:{identity}"
-            )
+            observations.add(_observation_key(evidence, property_name, result.result))
     return ValidationProgress(
         candidate_id=candidate.candidate_id,
         resolved_questions=tuple(sorted(resolved)),
         observation_keys=tuple(sorted(observations)),
+    )
+
+
+def _accepted_evidence(
+    *,
+    property_name: str,
+    references: list[str],
+    candidate: CandidateState,
+    scientific: ScientificState,
+    allow_synthetic_evidence: bool,
+) -> list[Evidence | ScientificEvidence]:
+    accepted: list[Evidence | ScientificEvidence] = []
+    aliases = {property_name, *DEFAULT_PROPERTY_ALIASES.get(property_name, set())}
+    for evidence in scientific.evidence:
+        if not any(matches_evidence_ref(reference, evidence.id) for reference in references):
+            continue
+        attestation = scientific.verified_attestation(evidence.id)
+        if attestation is None or not _accepted_attestation(
+            attestation, allow_synthetic_evidence=allow_synthetic_evidence
+        ):
+            continue
+        if not _property_matches(evidence, aliases):
+            continue
+        if not _subject_matches(evidence, candidate):
+            continue
+        evidence_candidate_id = str(getattr(evidence, "candidate_id", ""))
+        if evidence_candidate_id and evidence_candidate_id != candidate.candidate_id:
+            continue
+        evidence_structure = str(getattr(evidence, "structure_hash", ""))
+        candidate_structure = _candidate_structure_hash(candidate)
+        if evidence_structure and candidate_structure and evidence_structure != candidate_structure:
+            continue
+        accepted.append(evidence)
+    return accepted
+
+
+def _accepted_attestation(
+    attestation: Any, *, allow_synthetic_evidence: bool
+) -> bool:
+    return (
+        attestation.authority == "observation"
+        and attestation.origin == "trusted_builtin"
+        and attestation.tool_name in DEFAULT_TRUSTED_EVIDENCE_TOOLS
+    ) or (allow_synthetic_evidence and (
+        attestation.authority == "synthetic"
+        and attestation.origin == "synthetic_test"
+    ))
+
+
+def _property_matches(
+    evidence: Evidence | ScientificEvidence, aliases: set[str]
+) -> bool:
+    if isinstance(evidence, ScientificEvidence):
+        return str(evidence.property) in aliases and evidence.value is not None
+    payload = _json_payload(evidence.content)
+    return isinstance(payload, dict) and any(
+        str(key) in aliases and value is not None for key, value in payload.items()
+    )
+
+
+def _subject_matches(
+    evidence: Evidence | ScientificEvidence, candidate: CandidateState
+) -> bool:
+    subject: str | object
+    if isinstance(evidence, ScientificEvidence):
+        subject = evidence.subject
+    else:
+        payload = _json_payload(evidence.content)
+        subject = (
+            payload.get("material") or payload.get("formula")
+            if isinstance(payload, dict)
+            else ""
+        )
+    if not isinstance(subject, str) or not subject.strip() or not candidate.formula.strip():
+        return False
+    try:
+        return normalize_composition(subject) == normalize_composition(candidate.formula)
+    except (ValueError, RuntimeError):
+        return False
+
+
+def _candidate_structure_hash(candidate: CandidateState) -> str:
+    for key in ("structure_hash", "cif_hash", "structure_identifier", "structure_id"):
+        value = candidate.representation.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _json_payload(content: str) -> Any:
+    try:
+        parsed = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed
+
+
+def _observation_key(
+    evidence: Evidence | ScientificEvidence, property_name: str, outcome: str
+) -> str:
+    return (
+        f"question:{property_name}|outcome:{outcome}|"
+        f"observation:{_observation_identity(evidence)}"
     )
 
 

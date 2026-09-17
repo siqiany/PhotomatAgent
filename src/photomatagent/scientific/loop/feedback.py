@@ -21,6 +21,12 @@ from photomatagent.scientific.loop.candidate import (
 )
 from photomatagent.scientific.loop.evaluation import EvaluationReport
 from photomatagent.scientific.loop.judge import JudgeIssue, JudgeReport
+from photomatagent.scientific.loop.progress import (
+    _accepted_evidence,
+    _observation_identity,
+    progress_from_evaluation,
+)
+from photomatagent.scientific.state import ScientificState
 from photomatagent.scientific.loop.target import (
     ConstraintSpec,
     ConstraintViolation,
@@ -64,6 +70,9 @@ def build_feedback(
     evaluation: EvaluationReport,
     history: list[CandidateState],
     judge: JudgeReport | None = None,
+    *,
+    scientific: ScientificState | None = None,
+    allow_synthetic_evidence: bool = False,
 ) -> FeedbackSignal | None:
     """Build the next-round feedback for one evaluated candidate.
 
@@ -88,7 +97,13 @@ def build_feedback(
         ):
             prohibited.append(candidate.label or candidate.candidate_id)
 
-    supplemental_evidence = _has_supplemental_evidence(candidate, history)
+    supplemental_evidence = _has_supplemental_evidence(
+        candidate,
+        evaluation,
+        history,
+        scientific,
+        allow_synthetic_evidence=allow_synthetic_evidence,
+    )
     duplicate = bool(prohibited) and not supplemental_evidence
     if supplemental_evidence:
         prohibited = []
@@ -338,18 +353,45 @@ def _summarize(
 
 
 def _has_supplemental_evidence(
-    candidate: CandidateState, history: list[CandidateState]
+    candidate: CandidateState,
+    evaluation: EvaluationReport,
+    history: list[CandidateState],
+    scientific: ScientificState | None,
+    *,
+    allow_synthetic_evidence: bool,
 ) -> bool:
-    """Recognize a same-composition proposal carrying additional evidence."""
-    current = _candidate_evidence_ids(candidate)
-    if not current:
+    """Recognize only a newly accepted, applicable observation."""
+    if scientific is None:
         return False
-    return any(
-        previous.candidate_id != candidate.candidate_id
-        and candidate_fingerprint(previous) == candidate.fingerprint
-        and current != _candidate_evidence_ids(previous)
-        for previous in history
+    current_progress = progress_from_evaluation(
+        candidate,
+        evaluation,
+        scientific,
+        allow_synthetic_evidence=allow_synthetic_evidence,
     )
+    current_observations = {
+        key.rsplit("observation:", 1)[-1]
+        for key in current_progress.observation_keys
+    }
+    if not current_observations:
+        return False
+    previous_observations: set[str] = set()
+    for previous in history:
+        if (
+            previous.candidate_id == candidate.candidate_id
+            or candidate_fingerprint(previous) != candidate.fingerprint
+        ):
+            continue
+        for result in evaluation.constraint_results:
+            for evidence in _accepted_evidence(
+                property_name=result.property,
+                references=list(_candidate_evidence_ids(previous)),
+                candidate=previous,
+                scientific=scientific,
+                allow_synthetic_evidence=allow_synthetic_evidence,
+            ):
+                previous_observations.add(_observation_identity(evidence))
+    return bool(current_observations - previous_observations)
 
 
 def _candidate_evidence_ids(candidate: CandidateState) -> set[str]:

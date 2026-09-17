@@ -20,8 +20,10 @@ from photomatagent.scientific.loop.candidate import candidate_from_formula
 from photomatagent.scientific.loop.controller import ScientificLoopController
 from photomatagent.scientific.loop.evaluation import (
     EvidenceEvaluationPolicy,
+    EvaluationReport,
     ScientificEvaluator,
 )
+from photomatagent.scientific.loop.progress import progress_from_evaluation
 from photomatagent.scientific.loop.target import (
     ConstraintSpec,
     TargetSpec,
@@ -465,6 +467,49 @@ async def test_controller_custom_candidate_extractor_remains_supported(tmp_path)
     await collect(controller)
 
     assert controller.state.evaluations[0].candidate_id == custom.candidate_id
+
+
+def test_controller_does_not_treat_unattested_evidence_as_progress(tmp_path):
+    controller, _ = build_controller([[]], max_rounds=1, tmp_path=tmp_path)
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "synthetic:device"}
+    )
+    controller.state.candidates = [candidate]
+    controller.state.active_candidate_id = candidate.candidate_id
+    controller.runtime.scientific_state.add_evidence(
+        ScientificEvidence(
+            subject="HgTe",
+            property="band_gap",
+            value=0.1,
+            unit="eV",
+            source="synthetic",
+            source_type="dft_calculation",
+            fidelity="dft",
+            structure_hash="synthetic:device",
+        )
+    )
+    current = controller.evaluator.evaluate(
+        candidate, controller.runtime.scientific_state
+    )
+    previous = EvaluationReport(
+        candidate_id=candidate.candidate_id,
+        verdict="INCONCLUSIVE",
+        score=current.score,
+    )
+    controller.state.evaluations = [previous]
+    controller.stagnation.record(candidate, previous)
+
+    assert not controller._has_new_applicable_evidence(
+        candidate, controller.runtime.scientific_state
+    )
+    controller.stagnation.record(
+        candidate,
+        current,
+        progress=progress_from_evaluation(
+            candidate, current, controller.runtime.scientific_state
+        ),
+    )
+    assert controller.stagnation.no_progress_rounds == 1
 
 
 @pytest.mark.asyncio

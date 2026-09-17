@@ -139,6 +139,9 @@ class ScientificLoopController:
         self.target = target
         self.runtime = runtime
         self.evaluator = evaluator or ScientificEvaluator(target)
+        self._allow_synthetic_evidence = bool(
+            getattr(getattr(self.evaluator, "policy", None), "allow_synthetic_evidence", False)
+        )
         self.config = config or ScientificLoopConfig()
         self.policy = policy or ScientificLoopPolicy(
             judge_min_quality=self.config.judge_min_quality,
@@ -231,7 +234,12 @@ class ScientificLoopController:
             evaluation = self.evaluator.evaluate(candidate, scientific)
             self.state.add_candidate(candidate, evaluation)
             if candidate is not None:
-                progress = progress_from_evaluation(candidate, evaluation, scientific)
+                progress = progress_from_evaluation(
+                    candidate,
+                    evaluation,
+                    scientific,
+                    allow_synthetic_evidence=self._allow_synthetic_evidence,
+                )
                 self.stagnation.record(candidate, evaluation, progress=progress)
                 self.state.no_progress_rounds = self.stagnation.no_progress_rounds
 
@@ -274,6 +282,8 @@ class ScientificLoopController:
                     evaluation,
                     self.state.candidates,
                     judge=judge_report,
+                    scientific=scientific,
+                    allow_synthetic_evidence=self._allow_synthetic_evidence,
                 )
                 if candidate is not None
                 else None
@@ -445,8 +455,18 @@ class ScientificLoopController:
         if previous is None:
             return False
         current = self.evaluator.evaluate(candidate, scientific)
-        current_progress = progress_from_evaluation(candidate, current, scientific)
-        previous_progress = progress_from_evaluation(candidate, previous, scientific)
+        current_progress = progress_from_evaluation(
+            candidate,
+            current,
+            scientific,
+            allow_synthetic_evidence=self._allow_synthetic_evidence,
+        )
+        previous_progress = progress_from_evaluation(
+            candidate,
+            previous,
+            scientific,
+            allow_synthetic_evidence=self._allow_synthetic_evidence,
+        )
         return bool(
             set(current_progress.observation_keys)
             - set(previous_progress.observation_keys)
