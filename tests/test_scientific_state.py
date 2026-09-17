@@ -5,9 +5,10 @@ import pytest
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
+from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.discovery.models import HypothesisOrigin, HypothesisProposal
 from photomatagent.scientific.discovery.registration import build_hypothesis
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 from photomatagent.scientific.tasks import ScientificTask
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.base import ToolError
@@ -81,6 +82,25 @@ def test_state_serializes_to_json():
     payload = state.model_dump_json()
     restored = ScientificState.model_validate_json(payload)
     assert restored.goal == "x"
+
+
+def test_evidence_attestation_roundtrip_and_legacy_default() -> None:
+    evidence = ScientificEvidence(
+        subject="HgTe", property="band_gap", value=0.2, unit="eV"
+    )
+    state = ScientificState(evidence=[evidence])
+    assert state.evidence_attestations == {}
+
+    state.evidence_attestations[evidence.id] = EvidenceAttestation(
+        evidence_id=evidence.id,
+        authority="observation",
+        origin="trusted_builtin",
+        tool_name="electronic.band_gap",
+        tool_call_id="call-1",
+    )
+    restored = ScientificState.model_validate_json(state.model_dump_json())
+
+    assert restored.evidence_attestations[evidence.id].authority == "observation"
 
 
 def test_legacy_hypothesis_strings_remain_unchanged():

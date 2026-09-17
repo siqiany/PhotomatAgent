@@ -96,6 +96,8 @@ async def test_restored_session_keeps_tool_state_and_continues(tmp_path):
     runtime = make_runtime(first_model, workspace=tmp_path)
     await collect(runtime, "compute GaAs band gap")
     assert len(runtime.scientific_state.evidence) == 1
+    evidence_id = runtime.scientific_state.evidence[0].id
+    assert runtime.scientific_state.evidence_attestations[evidence_id].authority == "background"
 
     save_session_snapshot(
         tmp_path / "session-state",
@@ -113,6 +115,10 @@ async def test_restored_session_keeps_tool_state_and_continues(tmp_path):
     assert len(second_runtime.scientific_state.evidence) == 0
     second_runtime.restore_session(snapshot)
     assert len(second_runtime.scientific_state.evidence) == 1
+    assert (
+        second_runtime.scientific_state.evidence_attestations[evidence_id].authority
+        == "background"
+    )
 
     # Tools registered against the live scientific instance must see the
     # restored evidence (in-place mutation, not instance replacement).

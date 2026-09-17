@@ -28,6 +28,19 @@ def _evidence(**overrides: object) -> ScientificEvidence:
     return ScientificEvidence(**values)
 
 
+def _applicable(
+    evidence: ScientificEvidence,
+    candidate: object,
+    requirements: EvidenceRequirements,
+) -> tuple[bool, str]:
+    return evidence_applicable(
+        evidence,
+        candidate,  # type: ignore[arg-type]
+        requirements,
+        authority="observation",
+    )
+
+
 def test_scientific_evidence_scope_fields_have_legacy_defaults() -> None:
     evidence = _evidence()
 
@@ -39,20 +52,20 @@ def test_scientific_evidence_scope_fields_have_legacy_defaults() -> None:
 
 @pytest.mark.parametrize("role", ["proposal", "prior"])
 def test_non_observation_roles_cannot_validate_constraints(role: str) -> None:
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(assessment_role=role),
         candidate_from_formula("Na0.75Ag0.25BiS2"),
         EvidenceRequirements(),
     )
 
     assert applicable is False
-    assert role in reason
+    assert reason == "ROLE_BACKGROUND"
 
 
 @pytest.mark.parametrize(
     ("overrides", "reason_fragment"),
     [
-        ({"source_type": "generative_model", "assessment_role": "observation"}, "generative"),
+        ({"source_type": "generative_model", "assessment_role": "observation"}, "generated"),
         ({"fidelity": "ml_generated", "assessment_role": "observation"}, "generated"),
         (
             {
@@ -60,7 +73,7 @@ def test_non_observation_roles_cannot_validate_constraints(role: str) -> None:
                 "assessment_role": "observation",
                 "fidelity": "dft",
             },
-            "candidate-declared",
+            "candidate_declared",
         ),
         (
             {
@@ -68,7 +81,7 @@ def test_non_observation_roles_cannot_validate_constraints(role: str) -> None:
                 "assessment_role": "observation",
                 "fidelity": "experimental",
             },
-            "generation",
+            "generated",
         ),
         ({"source": "synthetic", "assessment_role": "observation"}, "synthetic"),
         ({"source": "mock", "provenance": {"tool": "mock.run_calculation"}}, "mock"),
@@ -77,7 +90,7 @@ def test_non_observation_roles_cannot_validate_constraints(role: str) -> None:
 def test_generation_and_mock_sources_cannot_self_promote_to_observation(
     overrides: dict[str, object], reason_fragment: str
 ) -> None:
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(**overrides),
         candidate_from_formula("Na0.75Ag0.25BiS2"),
         EvidenceRequirements(),
@@ -88,7 +101,7 @@ def test_generation_and_mock_sources_cannot_self_promote_to_observation(
 
 
 def test_applicability_rejects_role_before_identity_conditions_and_unit() -> None:
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(
             assessment_role="proposal",
             subject="NaBiS2",
@@ -105,11 +118,11 @@ def test_applicability_rejects_role_before_identity_conditions_and_unit() -> Non
     )
 
     assert applicable is False
-    assert "proposal" in reason
+    assert reason == "ROLE_BACKGROUND"
 
 
 def test_applicability_rejects_identity_before_conditions_and_unit() -> None:
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(subject="NaBiS2", conditions={}, unit=""),
         candidate_from_formula("Na3AgBi4S8"),
         EvidenceRequirements(
@@ -118,7 +131,7 @@ def test_applicability_rejects_identity_before_conditions_and_unit() -> None:
     )
 
     assert applicable is False
-    assert "composition" in reason
+    assert reason == "COMPOSITION_MISMATCH"
 
 
 def test_unknown_legacy_subject_cannot_establish_device_identity() -> None:
@@ -126,7 +139,7 @@ def test_unknown_legacy_subject_cannot_establish_device_identity() -> None:
         "Na3AgBi4S8", extra_representation={"structure_hash": "sha256:device"}
     )
 
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(
             subject="legacy sample A",
             structure_hash="sha256:device",
@@ -137,22 +150,33 @@ def test_unknown_legacy_subject_cannot_establish_device_identity() -> None:
     )
 
     assert applicable is False
-    assert "legacy" in reason
+    assert reason == "SUBJECT_UNRESOLVED"
+
+
+def test_opaque_subject_cannot_establish_composition_identity() -> None:
+    applicable, reason = _applicable(
+        _evidence(subject="legacy sample A"),
+        candidate_from_formula("Na3AgBi4S8"),
+        EvidenceRequirements(scope="composition"),
+    )
+
+    assert applicable is False
+    assert reason == "SUBJECT_UNRESOLVED"
 
 
 def test_explicit_candidate_id_must_match() -> None:
     candidate = candidate_from_formula("Na3AgBi4S8")
 
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(candidate_id="cand_other"), candidate, EvidenceRequirements()
     )
 
     assert applicable is False
-    assert "candidate_id" in reason
+    assert reason == "CANDIDATE_ID_MISMATCH"
 
 
 def test_decimal_and_integer_formulas_share_composition_identity() -> None:
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(subject="Na3AgBi4S8"),
         candidate_from_formula("Na0.75Ag0.25BiS2"),
         EvidenceRequirements(scope="composition"),
@@ -162,14 +186,14 @@ def test_decimal_and_integer_formulas_share_composition_identity() -> None:
 
 
 def test_endpoint_literature_does_not_validate_a_different_composition() -> None:
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(subject="NaBiS2", source_type="literature"),
         candidate_from_formula("Na0.75Ag0.25BiS2"),
         EvidenceRequirements(scope="composition"),
     )
 
     assert applicable is False
-    assert "composition" in reason
+    assert reason == "COMPOSITION_MISMATCH"
 
 
 def test_structure_scope_requires_matching_explicit_structure_hash() -> None:
@@ -177,22 +201,22 @@ def test_structure_scope_requires_matching_explicit_structure_hash() -> None:
         "Na3AgBi4S8", extra_representation={"structure_hash": "sha256:target"}
     )
 
-    missing, missing_reason = evidence_applicable(
+    missing, missing_reason = _applicable(
         _evidence(), candidate, EvidenceRequirements(scope="structure")
     )
-    wrong, wrong_reason = evidence_applicable(
+    wrong, wrong_reason = _applicable(
         _evidence(structure_hash="sha256:other"),
         candidate,
         EvidenceRequirements(scope="structure"),
     )
-    matching, matching_reason = evidence_applicable(
+    matching, matching_reason = _applicable(
         _evidence(structure_hash="sha256:target"),
         candidate,
         EvidenceRequirements(scope="structure"),
     )
 
-    assert missing is False and "structure" in missing_reason
-    assert wrong is False and "structure" in wrong_reason
+    assert missing is False and missing_reason == "EVIDENCE_STRUCTURE_MISSING"
+    assert wrong is False and wrong_reason == "STRUCTURE_MISMATCH"
     assert (matching, matching_reason) == (True, "applicable")
 
 
@@ -205,7 +229,7 @@ def test_device_scope_requires_structure_and_all_declared_conditions() -> None:
         conditions={"temperature_k": 77, "bias_v": 0.1, "wavelength_um": 10.0},
     )
 
-    applicable, reason = evidence_applicable(
+    applicable, reason = _applicable(
         _evidence(
             structure_hash="sha256:device",
             conditions={"temperature_k": 77, "bias_v": 0.1},
@@ -221,17 +245,17 @@ def test_device_scope_requires_structure_and_all_declared_conditions() -> None:
 def test_allowed_fidelity_and_unit_presence_are_checked_after_identity() -> None:
     candidate = candidate_from_formula("Na3AgBi4S8")
 
-    fidelity_ok, fidelity_reason = evidence_applicable(
+    fidelity_ok, fidelity_reason = _applicable(
         _evidence(fidelity="analytical"),
         candidate,
         EvidenceRequirements(allowed_fidelities=("dft",)),
     )
-    unit_ok, unit_reason = evidence_applicable(
+    unit_ok, unit_reason = _applicable(
         _evidence(unit=""), candidate, EvidenceRequirements(require_unit=True)
     )
 
-    assert fidelity_ok is False and "fidelity" in fidelity_reason
-    assert unit_ok is False and "unit" in unit_reason
+    assert fidelity_ok is False and fidelity_reason == "FIDELITY_NOT_ALLOWED"
+    assert unit_ok is False and unit_reason == "UNIT_MISSING"
 
 
 @pytest.mark.parametrize(

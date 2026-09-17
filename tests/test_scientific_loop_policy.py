@@ -15,6 +15,7 @@ from photomatagent.scientific.loop.target import (
     TargetSpec,
 )
 from photomatagent.scientific.loop.evaluation import (
+    EvidenceEvaluationPolicy,
     EvaluationReport,
     ScientificEvaluator,
 )
@@ -33,19 +34,28 @@ def _target() -> TargetSpec:
 
 
 def _passing_report() -> EvaluationReport:
-    candidate = candidate_from_formula("HgTe")
-    evaluator = ScientificEvaluator(_target())
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "synthetic:device"}
+    )
+    evaluator = ScientificEvaluator(
+        _target(), policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True)
+    )
     state = ScientificState()
     state.add_evidence(
         ScientificEvidence(
             subject="HgTe", property="band_gap", value=0.14, unit="eV",
-            source="s", source_type="dft_calculation", fidelity="dft",
+            source="synthetic", source_type="dft_calculation", fidelity="dft",
+            method="synthetic method", structure_hash="synthetic:device",
+            conditions={"temperature_k": 77},
         )
     )
     state.add_evidence(
         ScientificEvidence(
             subject="HgTe", property="responsivity", value=1.4, unit="A/W",
-            source="s2", source_type="experimental", fidelity="experimental",
+            source="synthetic", source_type="experimental", fidelity="experimental",
+            method="synthetic device measurement", structure_hash="synthetic:device",
+            conditions={"wavelength_um": 10.0, "bias_v": 0.1, "temperature_k": 77,
+                        "measurement_definition": "synthetic calibrated response"},
         )
     )
     return evaluator.evaluate(candidate, state)

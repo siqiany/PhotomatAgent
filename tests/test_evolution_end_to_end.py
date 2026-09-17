@@ -83,11 +83,11 @@ class OfflineEvidenceTool(Tool):
                 subject=material,
                 property="candidate_formula",
                 value=material,
-                source="offline test fixture",
+                source="test-only:offline fixture",
                 source_type=source_type,
                 method="fixed deterministic fixture",
                 fidelity=fidelity,
-                provenance={"validated": True, "offline": True},
+                provenance={"validated": True, "offline": True, "synthetic": True},
             ),
             ScientificEvidence(
                 id=f"sev_band_gap_{suffix}",
@@ -95,11 +95,11 @@ class OfflineEvidenceTool(Tool):
                 property="band_gap",
                 value=band_gap,
                 unit="eV",
-                source="offline test fixture",
+                source="test-only:offline fixture",
                 source_type=source_type,
                 method="fixed deterministic fixture",
                 fidelity=fidelity,
-                provenance={"validated": True, "offline": True},
+                provenance={"validated": True, "offline": True, "synthetic": True},
             ),
         ]
         return ScientificToolResult(output="offline evidence recorded", evidence=evidence)
@@ -425,7 +425,9 @@ async def test_async_expert_feedback_iteration_round_trip(tmp_path: Path) -> Non
     assert v1.runtime_session_id is not None
     assert v1.summary is not None
     assert v1.summary.final_evaluation is not None
-    assert v1.summary.final_evaluation.verdict == "FAIL"
+    # The deterministic fixture remains traceable but has no production
+    # attestation, so it cannot establish a real scientific failure.
+    assert v1.summary.final_evaluation.verdict == "INCONCLUSIVE"
 
     second_process = EvolutionHarness(tmp_path, compiler_response())
     compilation = await second_process.record_and_compile_feedback(
@@ -526,7 +528,7 @@ async def test_normal_expert_sentence_does_not_update_evolution_store(
 
 
 @pytest.mark.asyncio
-async def test_five_star_feedback_cannot_override_deterministic_fail(
+async def test_five_star_feedback_cannot_override_deterministic_uncertainty(
     tmp_path: Path,
 ) -> None:
     first_process = EvolutionHarness(tmp_path, episode_v1_responses())
@@ -536,7 +538,7 @@ async def test_five_star_feedback_cannot_override_deterministic_fail(
     before = first_process.store.load_episode(task.evolution_id, "v001")
     assert before.summary is not None
     assert before.summary.final_evaluation is not None
-    assert before.summary.final_evaluation.verdict == "FAIL"
+    assert before.summary.final_evaluation.verdict == "INCONCLUSIVE"
 
     feedback_process = EvolutionHarness(tmp_path, compiler_response())
     await feedback_process.record_feedback(task.evolution_id, expert_review())
@@ -546,7 +548,7 @@ async def test_five_star_feedback_cannot_override_deterministic_fail(
     assert feedback.scores.overall == 5
     assert after.summary is not None
     assert after.summary.final_evaluation is not None
-    assert after.summary.final_evaluation.verdict == "FAIL"
+    assert after.summary.final_evaluation.verdict == "INCONCLUSIVE"
 
 
 def test_workflow_event_matcher_rejects_duplicate_selector_matches() -> None:

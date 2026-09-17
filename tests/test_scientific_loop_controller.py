@@ -7,6 +7,7 @@ import pytest
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
 from photomatagent.models.types import ToolCall
 from photomatagent.runtime.budget import BudgetState
+from photomatagent.runtime.evidence_attestation import EvidenceAttestationPolicy
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
 from photomatagent.scientific.capabilities.contracts import (
@@ -64,7 +65,15 @@ class PropertyReportTool(Tool):
             unit=str(arguments.get("unit", "")),
             source="test-only provider",
             source_type="dft_calculation",
+            method="synthetic method",
             fidelity=str(arguments.get("fidelity", "dft")),
+            structure_hash="synthetic:device",
+            conditions={
+                "wavelength_um": 10.0,
+                "bias_v": 0.1,
+                "temperature_k": 77,
+                "measurement_definition": "synthetic calibrated response",
+            },
             summary=f"{arguments['property']}={arguments['value']}",
         )
         return ScientificToolResult(
@@ -133,12 +142,24 @@ def build_controller(
         scientific_state=scientific,
         permission_policy=AllowAllPolicy(),
         budget=BudgetState(max_iterations=20),
+        evidence_attestation_policy=EvidenceAttestationPolicy(
+            synthetic_test_tools=frozenset({PropertyReportTool.name})
+        ),
     )
     effective_target = target or _target()
+
+    class _SyntheticScopedEvaluator(ScientificEvaluator):
+        def evaluate(self, candidate, scientific):
+            if candidate is not None:
+                candidate.representation.setdefault(
+                    "structure_hash", "synthetic:device"
+                )
+            return super().evaluate(candidate, scientific)
+
     controller = ScientificLoopController(
         target=effective_target,
         runtime=runtime,
-        evaluator=ScientificEvaluator(
+        evaluator=_SyntheticScopedEvaluator(
             effective_target,
             policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True),
         ),
@@ -364,9 +385,9 @@ async def test_controller_default_runtime_pathway_uses_mock_calculation(tmp_path
     )
     await collect(controller)
     assert controller.summary is not None
-    # Mock evidence is 0.31 eV empirical -> hard band-gap violation, no success.
+    # Mock evidence is retained for traceability but cannot validate the hard gap.
     assert controller.summary.status in {"BUDGET_EXHAUSTED", "INCONCLUSIVE"}
-    assert "band_gap" in [v.property for v in controller.summary.unresolved_violations]
+    assert "band_gap" in controller.summary.unresolved_evidence_gaps
 
 
 @pytest.mark.asyncio

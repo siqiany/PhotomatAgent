@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from photomatagent.scientific.calculations import CalculationRecord
@@ -10,6 +12,16 @@ from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.discovery.models import ScientificHypothesis
 from photomatagent.scientific.tasks import ScientificTask
+
+
+class EvidenceAttestation(BaseModel):
+    """Host-owned authority record, stored separately from producer evidence."""
+
+    evidence_id: str
+    authority: Literal["observation", "synthetic", "background"] = "background"
+    origin: Literal["trusted_builtin", "synthetic_test", "untrusted_tool"]
+    tool_name: str
+    tool_call_id: str
 
 
 class ScientificState(BaseModel):
@@ -25,6 +37,7 @@ class ScientificState(BaseModel):
     material_hypotheses: list[ScientificHypothesis] = Field(default_factory=list)
     claims: list[ScientificClaim] = Field(default_factory=list)
     evidence: list[Evidence | ScientificEvidence] = Field(default_factory=list)
+    evidence_attestations: dict[str, EvidenceAttestation] = Field(default_factory=dict)
     calculations: list[CalculationRecord] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
@@ -35,6 +48,12 @@ class ScientificState(BaseModel):
     ) -> Evidence | ScientificEvidence:
         self.evidence.append(evidence)
         return evidence
+
+    def attest_evidence(self, attestation: EvidenceAttestation) -> EvidenceAttestation:
+        if not any(item.id == attestation.evidence_id for item in self.evidence):
+            raise ValueError("cannot attest evidence that is absent from scientific state")
+        self.evidence_attestations[attestation.evidence_id] = attestation
+        return attestation
 
     def add_claim(self, claim: ScientificClaim) -> ScientificClaim:
         self.claims.append(claim)

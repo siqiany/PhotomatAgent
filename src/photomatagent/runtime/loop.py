@@ -18,6 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 from photomatagent.errors import ProviderError, ToolError, ToolValidationError
+from photomatagent.runtime.evidence_attestation import EvidenceAttestationPolicy
 from photomatagent.models.base import ModelProvider
 from photomatagent.models.types import (
     AssistantMessage,
@@ -87,7 +88,7 @@ from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 from photomatagent.scientific.discovery.models import (
     HypothesisOrigin,
     HypothesisRegistration,
@@ -213,6 +214,7 @@ class AgentRuntime:
         session_id: str | None = None,
         fresh_approval: bool = False,
         application_approval_root: Path | None = None,
+        evidence_attestation_policy: EvidenceAttestationPolicy | None = None,
     ) -> None:
         self._model = model
         self._tools = tools
@@ -222,6 +224,9 @@ class AgentRuntime:
             else Workspace(workspace or Path.cwd())
         )
         self._scientific = scientific_state or ScientificState()
+        self._evidence_attestation = (
+            evidence_attestation_policy or EvidenceAttestationPolicy()
+        )
         if context_builder is None and fresh_approval:
             fresh_skills_dir = self._workspace.resolve(
                 ".photomatagent/fresh-context/skills",
@@ -1213,6 +1218,8 @@ class AgentRuntime:
             self._scientific.add_task(update)
         elif isinstance(update, ScientificHypothesis):
             self._scientific.add_material_hypothesis(update)
+        elif isinstance(update, EvidenceAttestation):
+            self._scientific.attest_evidence(update)
         else:
             raise ToolError(f"unsupported scientific state update: {type(update).__name__}")
 
@@ -1253,6 +1260,14 @@ class AgentRuntime:
             ):
                 self._apply_state_update_to(shadow, update)
                 prepared.append(update)
+                if isinstance(update, (Evidence, ScientificEvidence)):
+                    attestation = self._evidence_attestation.attest(
+                        tool=self._tools.get(tool_name),
+                        evidence_id=update.id,
+                        tool_call_id=tool_call_id,
+                    )
+                    self._apply_state_update_to(shadow, attestation)
+                    prepared.append(attestation)
             else:
                 raise ToolError(
                     f"unsupported scientific state update: {type(update).__name__}"
@@ -1269,6 +1284,8 @@ class AgentRuntime:
             state.add_calculation(update)
         elif isinstance(update, ScientificTask):
             state.add_task(update)
+        elif isinstance(update, EvidenceAttestation):
+            state.attest_evidence(update)
 
     async def _emit_budget(self, iteration: int) -> RuntimeEvent:
         return await self._emit(

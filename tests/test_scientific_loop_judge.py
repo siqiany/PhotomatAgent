@@ -15,7 +15,10 @@ from photomatagent.scientific.loop.controller import (
     ScientificLoopConfig,
     ScientificLoopController,
 )
-from photomatagent.scientific.loop.evaluation import ScientificEvaluator
+from photomatagent.scientific.loop.evaluation import (
+    EvidenceEvaluationPolicy,
+    ScientificEvaluator,
+)
 from photomatagent.scientific.loop.feedback import build_feedback
 from photomatagent.scientific.loop.judge import (
     JudgeIssue,
@@ -41,7 +44,9 @@ def _target() -> TargetSpec:
 
 
 def _evaluated(band_gap: float | None, responsivity: float | None):
-    candidate = candidate_from_formula("HgTe")
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "synthetic:device"}
+    )
     state = ScientificState()
     if band_gap is not None:
         state.add_evidence(
@@ -50,9 +55,12 @@ def _evaluated(band_gap: float | None, responsivity: float | None):
                 property="band_gap",
                 value=band_gap,
                 unit="eV",
-                source="s",
+                source="synthetic",
                 source_type="dft_calculation",
+                method="synthetic method",
                 fidelity="dft",
+                structure_hash="synthetic:device",
+                conditions={"temperature_k": 77},
             )
         )
     if responsivity is not None:
@@ -62,12 +70,23 @@ def _evaluated(band_gap: float | None, responsivity: float | None):
                 property="responsivity",
                 value=responsivity,
                 unit="A/W",
-                source="s2",
+                source="synthetic",
                 source_type="experimental",
+                method="synthetic device measurement",
                 fidelity="experimental",
+                structure_hash="synthetic:device",
+                conditions={
+                    "wavelength_um": 10.0,
+                    "bias_v": 0.1,
+                    "temperature_k": 77,
+                    "measurement_definition": "synthetic calibrated response",
+                },
             )
         )
-    return candidate, state, ScientificEvaluator(_target()).evaluate(candidate, state)
+    evaluator = ScientificEvaluator(
+        _target(), policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True)
+    )
+    return candidate, state, evaluator.evaluate(candidate, state)
 
 
 def _judge_report_json(

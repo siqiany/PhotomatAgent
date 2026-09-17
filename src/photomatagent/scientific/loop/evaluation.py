@@ -33,6 +33,7 @@ from photomatagent.scientific.loop.candidate import (
     extract_json_payload,
 )
 from photomatagent.scientific.loop.evidence_scope import (
+    EvidenceAuthority,
     EvidenceRequirements,
     convert_property_value,
     evidence_applicable,
@@ -47,6 +48,7 @@ from photomatagent.scientific.loop.target import (
     evaluate_constraint,
 )
 from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.discovery.composition import normalize_composition
 
 PropertyResult = Literal["PASS", "FAIL", "UNKNOWN"]
 Verdict = Literal["PASS", "FAIL", "REVISE", "INCONCLUSIVE"]
@@ -88,8 +90,16 @@ DEFAULT_PROPERTY_ALIASES: dict[str, set[str]] = {
     "band_gap": {"band_gap", "gap", "gap_selected_eV", "band_gap_eV", "bulk_band_gap_eV"},
     "responsivity": {"responsivity", "responsivity_a_w"},
     "quantum_efficiency": {"quantum_efficiency", "eqe", "eqe_fraction", "eqe_percent"},
-    "formation_energy": {"formation_energy", "formation_energy_eV_per_atom"},
-    "energy_above_hull": {"energy_above_hull", "energy_above_hull_eV_per_atom"},
+    "formation_energy": {
+        "formation_energy",
+        "formation_energy_eV_per_atom",
+        "formation_energy_meV_per_atom",
+    },
+    "energy_above_hull": {
+        "energy_above_hull",
+        "energy_above_hull_eV_per_atom",
+        "energy_above_hull_meV_per_atom",
+    },
     "density": {"density", "density_g_cm3"},
     "cutoff_wavelength": {"cutoff_wavelength", "cutoff_wavelength_um"},
     "detectivity": {"detectivity", "detectivity_jones"},
@@ -103,13 +113,29 @@ DEFAULT_PROPERTY_ALIASES: dict[str, set[str]] = {
 }
 
 _UNIT_SUFFIX = {
-    "_eV": "eV",
+    "_mev_per_atom": "meV/atom",
+    "_ev_per_atom": "eV/atom",
+    "_mev": "meV",
+    "_ev": "eV",
     "_um": "um",
     "_a_w": "A/W",
     "_g_cm3": "g/cm3",
     "_k": "K",
     "_jones": "cm Hz^1/2/W",
 }
+
+_DEVICE_ONLY_PROPERTIES = frozenset(
+    {"responsivity", "detectivity", "dark_current", "quantum_efficiency"}
+)
+_DEVICE_REQUIRED_CONDITIONS = (
+    "wavelength_um",
+    "bias_v",
+    "temperature_k",
+    "measurement_definition",
+)
+_MAX_EXCLUSION_REASONS = 8
+_MAX_REASON_CHARS = 512
+_MAX_CONTRADICTION_REASONS = 8
 
 
 def fidelity_rank(fidelity: str | None) -> int:
@@ -138,6 +164,7 @@ class _ResolvedEvidence:
     method: str = ""
     conditions: dict[str, Any] = field(default_factory=dict)
     structure_hash: str = ""
+    composition_identity: tuple[tuple[str, int], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -319,9 +346,11 @@ class ScientificEvaluator:
             constraint, candidate, scientific, requirements
         )
         if resolved is None:
-            reason = "no applicable evidence for property"
+            reason = "NO_APPLICABLE_EVIDENCE"
             if exclusions:
-                reason += ": " + "; ".join(dict.fromkeys(exclusions))
+                unique = list(dict.fromkeys(exclusions))[:_MAX_EXCLUSION_REASONS]
+                reason += ":" + ",".join(unique)
+            reason = reason[:_MAX_REASON_CHARS]
             return ConstraintOutcome(
                 property=constraint.property,
                 operator=constraint.operator,
@@ -374,8 +403,9 @@ class ScientificEvaluator:
         candidates: list[_ResolvedEvidence] = []
         exclusions: list[str] = []
         for evidence in scientific.evidence:
+            authority = self._evidence_authority(evidence.id, scientific)
             resolved, exclusion = self._evidence_for_property(
-                evidence, constraint, candidate, requirements
+                evidence, constraint, candidate, requirements, authority
             )
             if resolved is not None:
                 candidates.append(resolved)
@@ -383,7 +413,7 @@ class ScientificEvaluator:
                 exclusions.append(exclusion)
         declarations = candidate.representation.get("properties")
         if isinstance(declarations, dict) and constraint.property in declarations:
-            exclusions.append("candidate-declared properties are proposals, not observations")
+            exclusions.append("CANDIDATE_DECLARED_PROPERTY")
         if not candidates:
             return None, exclusions
         candidates.sort(key=lambda item: (item.rank, _source_priority(item.source)), reverse=True)
@@ -395,6 +425,7 @@ class ScientificEvaluator:
         constraint: ConstraintSpec,
         candidate: CandidateState,
         requirements: EvidenceRequirements,
+        authority: EvidenceAuthority,
     ) -> tuple[_ResolvedEvidence | None, str]:
         aliases = self._aliases_for(constraint.property)
         value: Any = None
@@ -443,6 +474,7 @@ class ScientificEvaluator:
             scoped_evidence,
             candidate,
             requirements,
+            authority=authority,
             allow_synthetic_evidence=self.policy.allow_synthetic_evidence,
         )
         if not applicable:
@@ -451,8 +483,8 @@ class ScientificEvaluator:
             normalized_value, normalized_unit = _normalize_property_value(
                 value, unit, constraint.unit
             )
-        except ValueError as exc:
-            return None, f"unusable evidence unit or value: {exc}"
+        except ValueError:
+            return None, "UNIT_OR_VALUE_UNUSABLE"
         return (
             _ResolvedEvidence(
                 value=normalized_value,
@@ -470,6 +502,7 @@ class ScientificEvaluator:
                 method=scoped_evidence.method,
                 conditions=dict(scoped_evidence.conditions),
                 structure_hash=scoped_evidence.structure_hash,
+                composition_identity=_composition_identity(subject),
             ),
             "",
         )
@@ -490,11 +523,38 @@ class ScientificEvaluator:
                 f"invalid evidence requirements for property {property_name!r}"
             )
         try:
-            return EvidenceRequirements.model_validate(raw), ""
+            parsed = EvidenceRequirements.model_validate(raw)
         except ValidationError as exc:
             return EvidenceRequirements(), (
                 f"invalid evidence requirements for property {property_name!r}: {exc.errors()[0]['msg']}"
             )
+        if property_name in _DEVICE_ONLY_PROPERTIES:
+            parsed = parsed.model_copy(
+                update={
+                    "scope": "device",
+                    "required_conditions": tuple(
+                        dict.fromkeys(
+                            (*_DEVICE_REQUIRED_CONDITIONS, *parsed.required_conditions)
+                        )
+                    ),
+                }
+            )
+        return parsed, ""
+
+    def _evidence_authority(
+        self, evidence_id: str, scientific: ScientificState
+    ) -> EvidenceAuthority:
+        attestation = scientific.evidence_attestations.get(evidence_id)
+        if attestation is not None:
+            return attestation.authority
+        if self.policy.allow_synthetic_evidence:
+            evidence = next(
+                (item for item in scientific.evidence if item.id == evidence_id), None
+            )
+            source = str(getattr(evidence, "source", "")).strip().casefold()
+            if source == "synthetic" or source.startswith(("synthetic:", "test-only")):
+                return "synthetic"
+        return "background"
 
     def _detect_contradictions(
         self, candidate: CandidateState, scientific: ScientificState
@@ -506,8 +566,9 @@ class ScientificEvaluator:
             if error:
                 continue
             for evidence in scientific.evidence:
+                authority = self._evidence_authority(evidence.id, scientific)
                 resolved, _ = self._evidence_for_property(
-                    evidence, constraint, candidate, requirements
+                    evidence, constraint, candidate, requirements, authority
                 )
                 if resolved is not None:
                     by_property.setdefault(constraint.property, []).append(resolved)
@@ -515,7 +576,12 @@ class ScientificEvaluator:
         for property_name, items in by_property.items():
             by_scope: dict[tuple[str, str, str], list[_ResolvedEvidence]] = {}
             for item in items:
-                if not item.method.strip():
+                if (
+                    item.composition_identity is None
+                    or not item.method.strip()
+                    or not item.structure_hash
+                    or not item.conditions
+                ):
                     continue
                 scope_key = (
                     item.method.strip().casefold(),
@@ -529,21 +595,36 @@ class ScientificEvaluator:
                 )
                 by_scope.setdefault(scope_key, []).append(item)
             for comparable in by_scope.values():
-                seen: list[tuple[float, str]] = []
+                seen: list[float] = []
                 for item in comparable:
                     if isinstance(item.value, bool) or not isinstance(item.value, (int, float)):
                         continue
                     value = float(item.value)
                     if not math.isfinite(value):
                         continue
-                    for prior_value, prior_source in seen:
+                    for prior_value in seen:
                         scale = max(abs(value), abs(prior_value), 1e-12)
                         if abs(value - prior_value) / scale > 0.05:
-                            contradictions.append(
-                                f"{property_name}: {prior_source}={prior_value} vs "
-                                f"{item.source}={value}"
+                            reason = (
+                                f"{property_name[:64]}:COMPARABLE_VALUES_DISAGREE"
                             )
-                    seen.append((value, item.source))
+                            total_chars = sum(len(item) for item in contradictions)
+                            if (
+                                len(contradictions) >= _MAX_CONTRADICTION_REASONS
+                                or total_chars + len(reason) > _MAX_REASON_CHARS
+                            ):
+                                return contradictions
+                            contradictions.append(reason)
+                            break
+                    if contradictions and contradictions[-1].startswith(
+                        f"{property_name[:64]}:"
+                    ):
+                        break
+                    seen.append(value)
+                if contradictions and contradictions[-1].startswith(
+                    f"{property_name[:64]}:"
+                ):
+                    break
         return contradictions
 
 
@@ -617,7 +698,7 @@ def _parse_json_payload(content: str) -> Any:
 def _infer_unit(key: str) -> str:
     lowered = key.lower()
     for suffix, unit in _UNIT_SUFFIX.items():
-        if lowered.endswith(suffix):
+        if lowered.endswith(suffix.lower()):
             return unit
     return ""
 
@@ -652,9 +733,16 @@ def _normalize_property_value(
 
 
 def _evidence_scope(evidence: Evidence | ScientificEvidence) -> str:
-    if isinstance(evidence, Evidence):
-        return f"evidence:{evidence.source}"
-    return f"evidence:{evidence.source}:{evidence.fidelity}"
+    return f"evidence:{evidence.id[:64]}"
+
+
+def _composition_identity(subject: str | None) -> tuple[tuple[str, int], ...] | None:
+    if not subject:
+        return None
+    try:
+        return normalize_composition(subject)
+    except (ValueError, RuntimeError):
+        return None
 
 
 def _source_priority(source: str) -> int:

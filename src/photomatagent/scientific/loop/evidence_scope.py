@@ -12,6 +12,7 @@ from photomatagent.scientific.discovery.composition import normalize_composition
 from photomatagent.scientific.loop.candidate import CandidateState
 
 EvidenceScope = Literal["composition", "structure", "device"]
+EvidenceAuthority = Literal["observation", "synthetic", "background"]
 
 
 class EvidenceRequirements(BaseModel):
@@ -24,6 +25,7 @@ class EvidenceRequirements(BaseModel):
     allowed_source_types: tuple[str, ...] | None = None
     allowed_sources: tuple[str, ...] | None = None
     conditions: dict[str, object] = Field(default_factory=dict)
+    required_conditions: tuple[str, ...] = ()
     require_unit: bool = True
 
 
@@ -32,6 +34,7 @@ def evidence_applicable(
     candidate: CandidateState,
     requirements: EvidenceRequirements,
     *,
+    authority: EvidenceAuthority = "background",
     allow_synthetic_evidence: bool = False,
 ) -> tuple[bool, str]:
     """Check authority and scope before an evidence value is inspected.
@@ -40,23 +43,27 @@ def evidence_applicable(
     supplying a plausible identity, unit, fidelity, or numeric value.
     """
 
+    if authority == "synthetic" and allow_synthetic_evidence:
+        pass
+    elif authority != "observation":
+        return False, "EVIDENCE_UNATTESTED"
     if evidence.assessment_role != "observation":
-        return False, f"assessment role {evidence.assessment_role!r} is background only"
+        return False, "ROLE_BACKGROUND"
 
     source_type = evidence.source_type.casefold()
     fidelity = evidence.fidelity.casefold()
     source = evidence.source.strip().casefold()
     tool_name = str(evidence.provenance.get("tool", "")).strip().casefold()
     if source_type == "generative_model":
-        return False, "generative_model evidence is a proposal"
+        return False, "SOURCE_GENERATED"
     if fidelity == "ml_generated":
-        return False, "ml_generated evidence is generated, not observed"
+        return False, "SOURCE_GENERATED"
     if source == "candidate_declared" or source.startswith("candidate_declared:"):
-        return False, "candidate-declared evidence is a proposal"
+        return False, "SOURCE_CANDIDATE_DECLARED"
     if source == "generation" or source.startswith("generation."):
-        return False, f"generation source {evidence.source!r} is a proposal"
+        return False, "SOURCE_GENERATED"
     if tool_name.startswith(("generation.", "vae.")):
-        return False, f"generation source {tool_name!r} is a proposal"
+        return False, "SOURCE_GENERATED"
 
     synthetic_reason = _synthetic_source_reason(evidence)
     if synthetic_reason and (
@@ -69,42 +76,46 @@ def evidence_applicable(
             item.strip().casefold() for item in requirements.allowed_source_types
         }
         if source_type not in allowed_types:
-            return False, f"evidence source_type {evidence.source_type!r} is not allowed"
+            return False, "SOURCE_TYPE_NOT_ALLOWED"
     if requirements.allowed_sources is not None:
         allowed_sources = {item.strip().casefold() for item in requirements.allowed_sources}
         if evidence.source.strip().casefold() not in allowed_sources:
-            return False, f"evidence source {evidence.source!r} is not allowed"
+            return False, "SOURCE_NOT_ALLOWED"
     if requirements.allowed_fidelities is not None:
         allowed = {item.strip().casefold() for item in requirements.allowed_fidelities}
         if fidelity not in allowed:
-            return False, f"evidence fidelity {evidence.fidelity!r} is not allowed"
+            return False, "FIDELITY_NOT_ALLOWED"
 
     if evidence.candidate_id and evidence.candidate_id != candidate.candidate_id:
-        return False, "candidate_id does not match the evaluated candidate"
+        return False, "CANDIDATE_ID_MISMATCH"
 
     subject_result = _subject_matches_candidate(evidence.subject, candidate)
     if subject_result is False:
-        return False, "evidence subject composition does not match candidate composition"
-    if subject_result is None and requirements.scope != "composition":
-        return False, "legacy evidence subject cannot establish structure or device identity"
+        return False, "COMPOSITION_MISMATCH"
+    if subject_result is None:
+        return False, "SUBJECT_UNRESOLVED"
 
     if requirements.scope in {"structure", "device"}:
         candidate_structure = _candidate_structure_hash(candidate)
         if not candidate_structure:
-            return False, "candidate has no structure hash required by evidence scope"
+            return False, "CANDIDATE_STRUCTURE_MISSING"
         if not evidence.structure_hash:
-            return False, "evidence has no structure hash required by evidence scope"
+            return False, "EVIDENCE_STRUCTURE_MISSING"
         if evidence.structure_hash != candidate_structure:
-            return False, "evidence structure hash does not match candidate structure"
+            return False, "STRUCTURE_MISMATCH"
+
+    for name in requirements.required_conditions:
+        if name not in evidence.conditions:
+            return False, f"CONDITION_MISSING:{name[:64]}"
 
     for name, expected in requirements.conditions.items():
         if name not in evidence.conditions:
-            return False, f"evidence condition {name!r} is missing"
+            return False, f"CONDITION_MISSING:{name[:64]}"
         if not _condition_equal(evidence.conditions[name], expected):
-            return False, f"evidence condition {name!r} does not match requirement"
+            return False, f"CONDITION_MISMATCH:{name[:64]}"
 
     if requirements.require_unit and not evidence.unit.strip():
-        return False, "evidence unit is required"
+        return False, "UNIT_MISSING"
     return True, "applicable"
 
 
@@ -138,13 +149,13 @@ def _synthetic_source_reason(evidence: ScientificEvidence) -> str:
     source = evidence.source.strip().casefold()
     tool_name = str(evidence.provenance.get("tool", "")).strip().casefold()
     if source == "synthetic" or source.startswith("synthetic:"):
-        return "synthetic evidence is excluded from production evaluation"
+        return "SOURCE_SYNTHETIC"
     if source == "mock" or source.startswith("mock:") or tool_name.startswith("mock."):
-        return "mock evidence is excluded from production evaluation"
+        return "SOURCE_MOCK"
     if source.startswith("test-only") or tool_name.startswith("test."):
-        return "synthetic test evidence is excluded from production evaluation"
+        return "SOURCE_SYNTHETIC"
     if evidence.provenance.get("synthetic") is True:
-        return "synthetic evidence is excluded from production evaluation"
+        return "SOURCE_SYNTHETIC"
     return ""
 
 

@@ -13,7 +13,7 @@ from photomatagent.scientific.loop.target import (
     ConstraintSpec,
     TargetSpec,
 )
-from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 
 
 def _target() -> TargetSpec:
@@ -38,6 +38,19 @@ def _scientific(*evidence: object) -> ScientificState:
     state = ScientificState()
     for item in evidence:
         state.add_evidence(item)  # type: ignore[arg-type]
+    return state
+
+
+def _attested_scientific(*evidence: object) -> ScientificState:
+    state = _scientific(*evidence)
+    for item in state.evidence:
+        state.evidence_attestations[item.id] = EvidenceAttestation(
+            evidence_id=item.id,
+            authority="observation",
+            origin="trusted_builtin",
+            tool_name="test.trusted_builtin",
+            tool_call_id=f"call-{item.id}",
+        )
     return state
 
 
@@ -131,24 +144,30 @@ def test_all_constraints_pass_verdict():
 
 
 def test_matching_nonconvertible_units_do_not_require_conversion() -> None:
+    target = TargetSpec(
+        goal="density",
+        constraints=[
+            ConstraintSpec(property="density", operator="ge", value=5.0, unit="g/cm3")
+        ],
+    )
     evidence = ScientificEvidence(
         subject="HgTe",
-        property="responsivity",
-        value=1.4,
-        unit="A/W",
-        source="independent measurement archive",
-        source_type="experimental",
-        method="calibrated measurement",
-        fidelity="experimental",
+        property="density",
+        value=8.1,
+        unit="g/cm3",
+        source="structure parser",
+        source_type="calculation",
+        method="pymatgen density",
+        fidelity="analytical",
     )
 
-    report = ScientificEvaluator(_target()).evaluate(
-        _candidate(), _scientific(evidence)
+    report = ScientificEvaluator(target).evaluate(
+        _candidate(), _attested_scientific(evidence)
     )
 
-    result = next(r for r in report.constraint_results if r.property == "responsivity")
+    result = report.constraint_results[0]
     assert result.result == "PASS"
-    assert result.observed_value == 1.4
+    assert result.observed_value == 8.1
 
 
 def test_json_payload_evidence_from_free_text_evidence():
@@ -211,6 +230,28 @@ def test_declared_dft_is_not_measurement():
     assert report.verdict == "INCONCLUSIVE"
 
 
+def test_fully_laundered_unattested_evidence_cannot_validate() -> None:
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+        source="innocent independent archive",
+        source_type="dft_calculation",
+        method="claimed PBE",
+        fidelity="dft",
+        assessment_role="observation",
+        provenance={"tool": "innocent.validator", "trusted": True},
+    )
+
+    report = ScientificEvaluator(_target()).evaluate(
+        _candidate(), _scientific(evidence)
+    )
+
+    assert report.constraint_results[0].result == "UNKNOWN"
+    assert "UNATTESTED" in report.constraint_results[0].reason
+
+
 def test_evaluation_without_candidate_is_inconclusive():
     evaluator = _test_evaluator()
     report = evaluator.evaluate(None, _scientific())
@@ -218,14 +259,14 @@ def test_evaluation_without_candidate_is_inconclusive():
     assert set(report.critical_evidence_gaps) == {"band_gap", "responsivity"}
 
 
-def test_contradicting_evidence_detected():
+def test_missing_structure_and_conditions_prevent_contradiction():
     evaluator = _test_evaluator()
     state = _scientific(
         _gap_evidence(0.14, subject="HgTe", fidelity="dft"),
         _gap_evidence(0.31, subject="HgTe", fidelity="experimental"),
     )
     report = evaluator.evaluate(_candidate(), state)
-    assert any("band_gap" in item for item in report.contradictions)
+    assert report.contradictions == []
 
 
 def test_soft_constraint_unknown_does_not_block_pass():
@@ -265,7 +306,9 @@ def test_equivalent_energy_units_are_converted_before_threshold_comparison():
         fidelity="dft",
     )
 
-    report = ScientificEvaluator(target).evaluate(_candidate(), _scientific(evidence))
+    report = ScientificEvaluator(target).evaluate(
+        _candidate(), _attested_scientific(evidence)
+    )
 
     assert report.constraint_results[0].result == "PASS"
     assert report.constraint_results[0].observed_value == 1.0
@@ -358,10 +401,162 @@ def test_requirements_come_from_target_metadata_not_candidate_representation() -
         fidelity="dft",
     )
 
-    report = ScientificEvaluator(target).evaluate(candidate, _scientific(evidence))
+    report = ScientificEvaluator(target).evaluate(
+        candidate, _attested_scientific(evidence)
+    )
 
     assert report.constraint_results[0].result == "UNKNOWN"
-    assert "structure" in report.constraint_results[0].reason
+    assert "EVIDENCE_STRUCTURE_MISSING" in report.constraint_results[0].reason
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "structure_hash",
+        "wavelength_um",
+        "bias_v",
+        "temperature_k",
+        "measurement_definition",
+    ],
+)
+def test_device_property_safe_defaults_require_complete_scope(missing: str) -> None:
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "sha256:device"}
+    )
+    conditions: dict[str, object] = {
+        "wavelength_um": 10.0,
+        "bias_v": 0.1,
+        "temperature_k": 77,
+        "measurement_definition": "external quantum efficiency calibrated",
+    }
+    evidence_values: dict[str, object] = {
+        "subject": "HgTe",
+        "property": "responsivity",
+        "value": 1.4,
+        "unit": "A/W",
+        "source": "device measurement archive",
+        "source_type": "experimental",
+        "method": "calibrated device measurement",
+        "fidelity": "experimental",
+        "structure_hash": "sha256:device",
+        "conditions": conditions,
+    }
+    if missing == "structure_hash":
+        evidence_values["structure_hash"] = ""
+    else:
+        conditions.pop(missing)
+    evidence = ScientificEvidence(**evidence_values)
+
+    report = ScientificEvaluator(_target()).evaluate(
+        candidate, _attested_scientific(evidence)
+    )
+
+    result = next(item for item in report.constraint_results if item.property == "responsivity")
+    assert result.result == "UNKNOWN"
+    expected_code = (
+        "EVIDENCE_STRUCTURE_MISSING"
+        if missing == "structure_hash"
+        else f"CONDITION_MISSING:{missing}"
+    )
+    assert expected_code in result.reason
+
+
+def test_fully_scoped_attested_device_observation_can_pass() -> None:
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "sha256:device"}
+    )
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="responsivity",
+        value=1.4,
+        unit="A/W",
+        source="device measurement archive",
+        source_type="experimental",
+        method="calibrated device measurement",
+        fidelity="experimental",
+        structure_hash="sha256:device",
+        conditions={
+            "wavelength_um": 10.0,
+            "bias_v": 0.1,
+            "temperature_k": 77,
+            "measurement_definition": "external quantum efficiency calibrated",
+        },
+    )
+
+    report = ScientificEvaluator(_target()).evaluate(
+        candidate, _attested_scientific(evidence)
+    )
+
+    result = next(item for item in report.constraint_results if item.property == "responsivity")
+    assert result.result == "PASS"
+
+
+def test_target_metadata_cannot_relax_device_safe_defaults() -> None:
+    target = TargetSpec(
+        goal="device",
+        constraints=[
+            ConstraintSpec(property="responsivity", operator="ge", value=1.0, unit="A/W")
+        ],
+        metadata={"evidence_requirements": {"responsivity": {"scope": "composition"}}},
+    )
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="responsivity",
+        value=2.0,
+        unit="A/W",
+        source="archive",
+        source_type="experimental",
+        method="measurement",
+        fidelity="experimental",
+    )
+
+    report = ScientificEvaluator(target).evaluate(
+        _candidate(), _attested_scientific(evidence)
+    )
+
+    assert report.constraint_results[0].result == "UNKNOWN"
+    assert "CANDIDATE_STRUCTURE_MISSING" in report.constraint_results[0].reason
+
+
+def test_target_metadata_can_tighten_device_operating_conditions() -> None:
+    target = TargetSpec(
+        goal="device",
+        constraints=[
+            ConstraintSpec(property="responsivity", operator="ge", value=1.0, unit="A/W")
+        ],
+        metadata={
+            "evidence_requirements": {
+                "responsivity": {"conditions": {"temperature_k": 77}}
+            }
+        },
+    )
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "sha256:device"}
+    )
+    evidence = ScientificEvidence(
+        subject="HgTe",
+        property="responsivity",
+        value=2.0,
+        unit="A/W",
+        source="archive",
+        source_type="experimental",
+        method="measurement",
+        fidelity="experimental",
+        structure_hash="sha256:device",
+        conditions={
+            "wavelength_um": 10.0,
+            "bias_v": 0.1,
+            "temperature_k": 300,
+            "measurement_definition": "external quantum efficiency calibrated",
+        },
+    )
+
+    report = ScientificEvaluator(target).evaluate(
+        candidate, _attested_scientific(evidence)
+    )
+
+    assert report.constraint_results[0].result == "UNKNOWN"
+    assert "CONDITION_MISMATCH:temperature_k" in report.constraint_results[0].reason
 
 
 def test_prior_is_background_only_even_when_value_would_pass() -> None:
@@ -377,12 +572,12 @@ def test_prior_is_background_only_even_when_value_would_pass() -> None:
     )
 
     report = ScientificEvaluator(_target()).evaluate(
-        _candidate(), _scientific(evidence)
+        _candidate(), _attested_scientific(evidence)
     )
 
     result = next(r for r in report.constraint_results if r.property == "band_gap")
     assert result.result == "UNKNOWN"
-    assert "prior" in result.reason
+    assert "ROLE_BACKGROUND" in result.reason
 
 
 def test_different_conditions_and_methods_do_not_create_false_contradictions() -> None:
@@ -422,13 +617,17 @@ def test_same_method_conditions_and_units_can_form_a_contradiction() -> None:
         method="PBE",
         fidelity="dft",
         conditions={"temperature_k": 77},
+        structure_hash="sha256:phase-a",
     )
     second = first.model_copy(
         update={"id": "same-scope-2", "source": "archive-2", "value": 300.0, "unit": "meV"}
     )
 
     report = ScientificEvaluator(_target()).evaluate(
-        _candidate(), _scientific(first, second)
+        candidate_from_formula(
+            "HgTe", extra_representation={"structure_hash": "sha256:phase-a"}
+        ),
+        _attested_scientific(first, second),
     )
 
     assert len(report.contradictions) == 1
@@ -446,6 +645,7 @@ def test_numerically_equal_conditions_share_conflict_scope() -> None:
         method="PBE",
         fidelity="dft",
         conditions={"temperature_k": 77},
+        structure_hash="sha256:phase-a",
     )
     second = first.model_copy(
         update={
@@ -457,7 +657,178 @@ def test_numerically_equal_conditions_share_conflict_scope() -> None:
     )
 
     report = ScientificEvaluator(_target()).evaluate(
-        _candidate(), _scientific(first, second)
+        candidate_from_formula(
+            "HgTe", extra_representation={"structure_hash": "sha256:phase-a"}
+        ),
+        _attested_scientific(first, second),
     )
 
     assert len(report.contradictions) == 1
+
+
+@pytest.mark.parametrize("missing", ["structure", "conditions"])
+def test_missing_comparability_fields_do_not_form_contradictions(missing: str) -> None:
+    values: dict[str, object] = {
+        "subject": "HgTe",
+        "property": "band_gap",
+        "value": 0.1,
+        "unit": "eV",
+        "source": "archive-1",
+        "source_type": "dft_calculation",
+        "method": "PBE",
+        "fidelity": "dft",
+        "structure_hash": "sha256:phase-a",
+        "conditions": {"temperature_k": 77},
+    }
+    if missing == "structure":
+        values["structure_hash"] = ""
+    else:
+        values["conditions"] = {}
+    first = ScientificEvidence(**values)
+    second = first.model_copy(update={"id": "second", "value": 0.3})
+
+    report = ScientificEvaluator(_target()).evaluate(
+        _candidate(), _attested_scientific(first, second)
+    )
+
+    assert report.contradictions == []
+
+
+def test_opaque_subjects_do_not_form_contradictions() -> None:
+    first = ScientificEvidence(
+        subject="sample alpha",
+        property="band_gap",
+        value=0.1,
+        unit="eV",
+        source="archive-1",
+        source_type="dft_calculation",
+        method="PBE",
+        fidelity="dft",
+        structure_hash="sha256:phase-a",
+        conditions={"temperature_k": 77},
+    )
+    second = first.model_copy(update={"id": "opaque-2", "value": 0.3})
+
+    report = ScientificEvaluator(_target()).evaluate(
+        _candidate(), _attested_scientific(first, second)
+    )
+
+    assert report.contradictions == []
+
+
+def test_exclusion_reason_is_bounded_and_does_not_echo_untrusted_fields() -> None:
+    secret = "SECRET_TOKEN_" + "x" * 1000
+    state = ScientificState(
+        evidence=[
+            ScientificEvidence(
+                subject="HgTe",
+                property="band_gap",
+                value=0.1,
+                unit="eV",
+                source=secret,
+                source_type="dft_calculation",
+                method=secret,
+                fidelity="dft",
+                provenance={"tool": secret},
+            )
+            for _ in range(100)
+        ]
+    )
+
+    report = ScientificEvaluator(_target()).evaluate(_candidate(), state)
+    reason = report.constraint_results[0].reason
+
+    assert "SECRET_TOKEN" not in reason
+    assert len(reason) <= 512
+
+
+def test_contradiction_diagnostics_are_categorical_and_bounded() -> None:
+    evidence = [
+        ScientificEvidence(
+            id=f"SECRET_TOKEN_{index}_" + "x" * 200,
+            subject="HgTe",
+            property="band_gap",
+            value=0.1 + index,
+            unit="eV",
+            source="synthetic",
+            source_type="dft_calculation",
+            method="PBE",
+            fidelity="dft",
+            structure_hash="sha256:phase-a",
+            conditions={"temperature_k": 77},
+        )
+        for index in range(30)
+    ]
+    candidate = candidate_from_formula(
+        "HgTe", extra_representation={"structure_hash": "sha256:phase-a"}
+    )
+
+    report = _test_evaluator().evaluate(candidate, _scientific(*evidence))
+
+    assert report.contradictions == ["band_gap:COMPARABLE_VALUES_DISAGREE"]
+    assert "SECRET_TOKEN" not in report.rationale
+
+
+@pytest.mark.parametrize(
+    ("property_name", "payload_key", "payload_value", "target_unit", "expected"),
+    [
+        ("band_gap", "band_gap_eV", 0.2, "eV", 0.2),
+        (
+            "formation_energy",
+            "formation_energy_meV_per_atom",
+            200.0,
+            "eV/atom",
+            0.2,
+        ),
+    ],
+)
+def test_attested_legacy_explicit_unit_suffixes_are_inferred(
+    property_name: str,
+    payload_key: str,
+    payload_value: float,
+    target_unit: str,
+    expected: float,
+) -> None:
+    target = TargetSpec(
+        goal="legacy",
+        constraints=[
+            ConstraintSpec(
+                property=property_name, operator="le", value=expected, unit=target_unit
+            )
+        ],
+    )
+    evidence = Evidence(
+        type="calculation",
+        source="host verified legacy adapter",
+        content=(
+            '{"material":"HgTe","'
+            + payload_key
+            + '":'
+            + str(payload_value)
+            + "}"
+        ),
+        confidence=0.8,
+    )
+
+    report = ScientificEvaluator(target).evaluate(
+        _candidate(), _attested_scientific(evidence)
+    )
+
+    assert report.constraint_results[0].result == "PASS"
+    assert report.constraint_results[0].observed_value == expected
+
+
+@pytest.mark.parametrize("legacy_type", ["candidate_prediction", "model", "literature"])
+def test_unattested_legacy_records_cannot_validate(legacy_type: str) -> None:
+    evidence = Evidence(
+        type=legacy_type,
+        source="renamed innocent source",
+        content='{"material":"HgTe","band_gap_eV":0.1}',
+        confidence=1.0,
+    )
+
+    report = ScientificEvaluator(_target()).evaluate(
+        _candidate(), _scientific(evidence)
+    )
+
+    assert report.constraint_results[0].result == "UNKNOWN"

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.loop.candidate import candidate_from_formula
-from photomatagent.scientific.loop.evaluation import ScientificEvaluator
+from photomatagent.scientific.loop.evaluation import (
+    EvidenceEvaluationPolicy,
+    ScientificEvaluator,
+)
 from photomatagent.scientific.loop.feedback import (
     build_feedback,
     format_feedback_for_model,
@@ -29,7 +32,10 @@ def _target() -> TargetSpec:
 
 
 def _evaluate(candidate, *evidence) -> object:
-    evaluator = ScientificEvaluator(_target())
+    evaluator = ScientificEvaluator(
+        _target(), policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True)
+    )
+    candidate.representation.setdefault("structure_hash", "synthetic:device")
     state = ScientificState()
     for item in evidence:
         state.add_evidence(item)  # type: ignore[arg-type]
@@ -44,7 +50,10 @@ def _gap(value: float, *, fidelity: str = "dft") -> ScientificEvidence:
         unit="eV",
         source="synthetic",
         source_type="dft_calculation",
+        method="synthetic method",
         fidelity=fidelity,
+        structure_hash="synthetic:device",
+        conditions={"temperature_k": 77},
     )
 
 
@@ -60,7 +69,15 @@ def test_pass_produces_no_feedback():
             unit="A/W",
             source="synthetic",
             source_type="experimental",
+            method="synthetic device measurement",
             fidelity="experimental",
+            structure_hash="synthetic:device",
+            conditions={
+                "wavelength_um": 10.0,
+                "bias_v": 0.1,
+                "temperature_k": 77,
+                "measurement_definition": "synthetic calibrated response",
+            },
         ),
     )
     signal = build_feedback(_target(), candidate, report, [])
@@ -126,7 +143,10 @@ def test_format_feedback_is_a_research_instruction():
 
 def test_contradictions_produce_validate_action():
     candidate = candidate_from_formula("HgTe")
-    evaluator = ScientificEvaluator(_target())
+    evaluator = ScientificEvaluator(
+        _target(), policy=EvidenceEvaluationPolicy(allow_synthetic_evidence=True)
+    )
+    candidate.representation["structure_hash"] = "synthetic:device"
     state = ScientificState()
     state.add_evidence(_gap(0.14, fidelity="dft"))
     state.add_evidence(
@@ -135,9 +155,12 @@ def test_contradictions_produce_validate_action():
             property="band_gap",
             value=0.4,
             unit="eV",
-            source="other",
+            source="synthetic:other",
             source_type="experimental",
+            method="synthetic method",
             fidelity="experimental",
+            structure_hash="synthetic:device",
+            conditions={"temperature_k": 77},
         )
     )
     report = evaluator.evaluate(candidate, state)
