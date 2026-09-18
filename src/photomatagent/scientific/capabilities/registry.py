@@ -64,7 +64,11 @@ def build_scientific_tools(
     packs = [
         materials_pack(effective_config),
         literature_pack(effective_config, effective_workspace),
-        structure_pack(effective_config, effective_workspace),
+        structure_pack(
+            effective_config,
+            effective_workspace,
+            scientific_state=scientific_state,
+        ),
         electronic_pack(effective_config, effective_workspace),
         defects_pack(effective_config, effective_workspace),
         transport_pack(effective_config, effective_workspace),

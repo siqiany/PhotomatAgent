@@ -8,7 +8,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from photomatagent.scientific.capabilities.base import (
     CapabilityPack,
@@ -24,6 +24,14 @@ from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 from photomatagent.scientific.capabilities.structure.artifacts import load_structure_input
+from photomatagent.scientific.capabilities.structure.construction_models import ConstructionLimits
+from photomatagent.scientific.capabilities.structure.construction_tools import (
+    MakeSupercellTool,
+    SubstituteSitesTool,
+)
+
+if TYPE_CHECKING:
+    from photomatagent.scientific.state import ScientificState
 
 
 class StructureProbe(CapabilityPack):
@@ -44,17 +52,34 @@ class StructureProbe(CapabilityPack):
         )
 
     def tools(self) -> list[Tool]:
+        limits = ConstructionLimits(
+            max_atoms=self._config.structure_max_atoms,
+            max_raw_configurations=self._config.structure_max_raw_configurations,
+            max_outputs=self._config.structure_max_outputs,
+        )
         return [
             StructureSummaryTool(self._workspace),
             StructureSymmetryTool(self._workspace),
             StructureDensityTool(self._workspace),
             StructureNeighborsTool(self._workspace),
             StructureConvertTool(self._config, self._workspace),
+            MakeSupercellTool(self._workspace, limits=limits),
+            SubstituteSitesTool(
+                self._workspace,
+                scientific_state=self._scientific_state,
+                limits=limits,
+            ),
         ]
 
-    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+    def __init__(
+        self,
+        config: ScientificConfig,
+        workspace: Workspace,
+        scientific_state: ScientificState | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
+        self._scientific_state = scientific_state
 
 
 def _load_structure(path_value: str, workspace: Workspace) -> Any:
@@ -402,5 +427,9 @@ class StructureConvertTool(Tool):
         )
 
 
-def structure_pack(config: ScientificConfig, workspace: Workspace) -> CapabilityPack:
-    return StructureProbe(config, workspace)
+def structure_pack(
+    config: ScientificConfig,
+    workspace: Workspace,
+    scientific_state: ScientificState | None = None,
+) -> CapabilityPack:
+    return StructureProbe(config, workspace, scientific_state)

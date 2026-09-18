@@ -173,6 +173,17 @@ def test_hypothesis_registration_is_deferred_and_describable(tmp_path):
     }
 
 
+def test_structure_construction_tools_are_deferred_and_describe_input_indices(tmp_path):
+    registry = create_default_registry(ScientificState(), Workspace(tmp_path))
+    direct_names = {definition.name for definition in registry.definitions(ToolExposure.DIRECT)}
+    for name in ("structure.make_supercell", "structure.substitute_sites"):
+        tool = registry.get(name)
+        assert tool.exposure is ToolExposure.DEFERRED
+        assert name not in direct_names
+    schema = registry.get("structure.substitute_sites").input_schema
+    assert "input-structure" in schema["properties"]["replacements"]["description"]
+
+
 @pytest.mark.asyncio
 async def test_bridge_executes_underlying_with_protocol_pairing(tmp_path):
     model = FakeModelProvider(

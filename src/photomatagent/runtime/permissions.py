@@ -89,6 +89,8 @@ def default_permission_policy() -> PermissionPolicy:
             "bash": PermissionDecision.ASK,
             "mock.run_calculation": PermissionDecision.ASK,
             "generation.register_hypothesis": PermissionDecision.ASK,
+            "structure.make_supercell": PermissionDecision.ASK,
+            "structure.substitute_sites": PermissionDecision.ASK,
         },
         # New tools must be classified deliberately.  Falling back to ASK
         # keeps newly installed scientific/MCP tools from silently gaining
