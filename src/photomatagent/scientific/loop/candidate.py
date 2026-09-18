@@ -150,6 +150,11 @@ def _sorted_json(value: Any) -> Any:
     return value
 
 
+def _trusted_file_hash(value: Any) -> str:
+    text = str(value or "")
+    return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
+
+
 def candidate_from_formula(
     formula: str,
     *,
@@ -212,6 +217,16 @@ def _evidence_formula(evidence: Evidence | ScientificEvidence) -> str | None:
         formula = _as_formula(getattr(evidence, "value", None))
         if formula:
             return formula
+    structure_hash = str(getattr(evidence, "structure_hash", "") or "")
+    if structure_hash:
+        subject = _as_formula(getattr(evidence, "subject", ""))
+        if subject:
+            try:
+                normalize_composition(subject)
+            except (ValueError, RuntimeError):
+                pass
+            else:
+                return subject
     if isinstance(evidence, Evidence):
         # Structured JSON payloads (e.g. mock.run_calculation results) carry
         # the material/formula the maker actually worked on.
@@ -263,6 +278,22 @@ def _candidate_from_evidence(
     provenance = getattr(evidence, "provenance", {}) or {}
     method = generation_method or str(provenance.get("tool", ""))
     structure_hash = str(getattr(evidence, "structure_hash", "") or "")
+    parent_structure_hash = str(
+        provenance.get("parent_structure_hash", "") or ""
+    )
+    parent_candidate_id = str(
+        provenance.get("parent_candidate_id", "") or ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", parent_structure_hash):
+        parent_structure_hash = ""
+    expected_parent_id = (
+        f"cand_{parent_structure_hash[:24]}" if parent_structure_hash else ""
+    )
+    if parent_candidate_id != expected_parent_id or parent_structure_hash == structure_hash:
+        parent_candidate_id = ""
+    output_sha = _trusted_file_hash(
+        provenance.get("output_sha256") or provenance.get("input_sha256")
+    )
     structure_representation: dict[str, Any] = {}
     if structure_hash:
         structure_representation = {
@@ -286,15 +317,19 @@ def _candidate_from_evidence(
     )
     candidate = candidate_from_formula(
         formula,
+        parent_candidate_id=parent_candidate_id or None,
         generation_method=method,
         generation_parameters=provenance,
         extra_representation={
             "evidence_ids": [evidence.id],
             "evidence_type": str(getattr(evidence, "source_type", "")),
+            "cif_hash": output_sha,
             **structure_representation,
         },
         created_iteration=iteration,
-        lineage=lineage,
+        lineage=lineage.model_copy(
+            update={"parent_candidate_id": parent_candidate_id or None}
+        ),
     )
     candidate.candidate_id = (
         f"cand_{structure_hash[:24]}"
@@ -396,6 +431,9 @@ def _structure_candidate(
         extra_representation={
             "structure_identifier": derivation.structure_hash,
             "structure_hash": derivation.structure_hash,
+            "cif_hash": _trusted_file_hash(
+                derivation.origin.get("output_sha256", "")
+            ),
             "path": derivation.output_path,
             "hypothesis_ids": (
                 [derivation.hypothesis_id] if derivation.hypothesis_id else []

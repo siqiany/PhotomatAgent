@@ -85,6 +85,10 @@ claim. CHGNet relaxation output with changed geometry is a new structure
 identity. VASP evidence must come from the existing prepare, validation, and
 `SubmitOnceSession` gates; a successful command or Slurm `COMPLETED` state alone
 does not establish a scientific observation.
+Energy/force evidence with a valid structure scope also projects to a structure
+candidate. Changed CHGNet/VASP geometries carry the attested input candidate as
+parent; unchanged geometry omits a self-parent. `cif_hash` means the trusted
+published file-byte SHA-256, while `structure_hash` means canonical geometry.
 
 ## Case boundary
 

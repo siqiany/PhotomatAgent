@@ -1396,6 +1396,7 @@ class AgentRuntime:
         lineage = dict(payload.get("lineage", {}))
         lineage["parent_candidate_id"] = parent_candidate_id
         payload["lineage"] = lineage
+        output = self._workspace.resolve(trusted.output_path, must_exist=True)
         payload["origin"] = {
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
@@ -1403,6 +1404,7 @@ class AgentRuntime:
             "run_id": self._run_id,
             "provider": self._model.provider,
             "model": self._model.model,
+            "output_sha256": file_sha256(output),
         }
         return StructureDerivation.model_validate(payload)
 

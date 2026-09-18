@@ -63,7 +63,11 @@ the source and fidelity of every result:
 - Structure evidence must carry both `candidate_id` and `structure_hash` from
   the bytes actually read. Reject model-supplied identity claims that disagree
   with those hashes. File renames preserve identity, while different ordered
-  structures of one composition remain separately checkable.
+structures of one composition remain separately checkable.
+Energy/force evidence with a valid chemical-formula subject is projected into
+that structure candidate. Changed CHGNet/VASP results retain the attested input
+candidate as parent; `cif_hash` is the trusted file-byte SHA-256, not the
+canonical geometry hash.
 - A fixture, fake CHGNet result, x=0.25 ratio check, or local VASP simulation
   validates software boundaries only. It does not predict performance or
   establish DFT, experimental, stability, or synthesizability conclusions.

@@ -24,6 +24,7 @@ from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
 from photomatagent.scientific.state import ScientificState
+from photomatagent.scientific.loop.candidate import extract_candidates_from_state
 from photomatagent.tools.factory import create_default_registry
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.errors import ToolValidationError
@@ -110,6 +111,14 @@ async def test_chgnet_relax_changed_geometry_gets_fresh_structure_identity(
     ).hexdigest()
     assert "hull" in after.limitations.casefold()
     assert "stability" in after.limitations.casefold()
+    projected = extract_candidates_from_state(ScientificState(evidence=result.evidence))
+    after_candidate = next(
+        item for item in projected if item.candidate_id == after.candidate_id
+    )
+    assert after_candidate.parent_candidate_id == before.candidate_id
+    assert after_candidate.lineage is not None
+    assert after_candidate.lineage.generated_by == "chgnet.relax"
+    assert after_candidate.representation["cif_hash"] == after.provenance["output_sha256"]
 
 
 @pytest.mark.asyncio
@@ -328,6 +337,14 @@ async def test_unified_periodic_valid_collect_scopes_evidence_to_final_geometry_
     assert evidence.provenance["input_sha256"] == hashlib.sha256(
         Path(evidence.provenance["input_structure_path"]).read_bytes()
     ).hexdigest()
+    parent_hash = structure_hash(Structure.from_file(str(tmp_path / source)))
+    assert evidence.provenance["parent_candidate_id"] == "cand_" + parent_hash[:24]
+    projected = extract_candidates_from_state(ScientificState(evidence=result.evidence))
+    final_candidate = projected[0]
+    assert final_candidate.parent_candidate_id == "cand_" + parent_hash[:24]
+    assert final_candidate.lineage is not None
+    assert final_candidate.lineage.generated_by == "vasp.collect"
+    assert final_candidate.representation["cif_hash"] == evidence.provenance["input_sha256"]
 
     class Service:
         async def collect(self, workflow_id):

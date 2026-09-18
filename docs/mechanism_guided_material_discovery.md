@@ -45,6 +45,11 @@ forces are ML-potential observations for same-composition screening or
 pre-relaxation. They cannot be relabeled as `E_hull`, formation energy,
 stability, or detector performance. If relaxation changes geometry, the output
 gets a new structure identity and downstream evidence must use that identity.
+Downstream CHGNet and VASP evidence projects to structure candidates even when
+its property is an energy or force. Candidate lineage uses the attested input
+structure as parent for changed geometries; unchanged results omit a
+self-parent. `representation.cif_hash` is the actual published file-byte
+SHA-256, while `structure_hash` remains the canonical geometry identity.
 
 VASP continues through the existing preparation, input validation, resource and
 approval gates, and `SubmitOnceSession`. Slurm `COMPLETED` and command success

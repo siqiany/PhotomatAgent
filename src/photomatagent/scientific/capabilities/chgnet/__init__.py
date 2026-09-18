@@ -619,6 +619,8 @@ class CHGNetRelaxTool(_CHGNetTool):
                 candidate_id=str(before["candidate_id"]),
                 input_sha256=input_sha256,
                 output_sha256=None,
+                parent_candidate_id=None,
+                parent_structure_hash=None,
             ),
             _relax_evidence(
                 after,
@@ -636,6 +638,16 @@ class CHGNetRelaxTool(_CHGNetTool):
                 candidate_id=str(after["candidate_id"]),
                 input_sha256=input_sha256,
                 output_sha256=file_sha256(output_path),
+                parent_candidate_id=(
+                    f"cand_{input_structure_hash[:24]}"
+                    if str(after["structure_hash"]) != input_structure_hash
+                    else None
+                ),
+                parent_structure_hash=(
+                    input_structure_hash
+                    if str(after["structure_hash"]) != input_structure_hash
+                    else None
+                ),
             ),
         ]
         return ScientificToolResult(
@@ -1101,6 +1113,8 @@ def _relax_evidence(
     candidate_id: str,
     input_sha256: str,
     output_sha256: str | None,
+    parent_candidate_id: str | None,
+    parent_structure_hash: str | None,
 ) -> ScientificEvidence:
     limitations = (
         "ML-potential pre-relaxation only; the CIF requires downstream "
@@ -1146,6 +1160,8 @@ def _relax_evidence(
             "output_sha256": output_sha256,
             "candidate_id": candidate_id,
             "structure_hash": structure_hash,
+            "parent_candidate_id": parent_candidate_id,
+            "parent_structure_hash": parent_structure_hash,
         },
     )
 

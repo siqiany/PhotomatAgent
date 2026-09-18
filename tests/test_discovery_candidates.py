@@ -283,7 +283,10 @@ def _structure_derivation(
             generated_by="structure_construction",
             transformation="substitute_sites",
         ).model_dump(mode="python"),
-        origin={"tool_name": "structure.substitute_sites"},
+        origin={
+            "tool_name": "structure.substitute_sites",
+            "output_sha256": "e" * 64,
+        },
     )
 
 
@@ -314,6 +317,7 @@ def test_projects_structure_derivations_as_distinct_structure_candidates() -> No
         "formula": "AgBi4Na3S8",
         "structure_identifier": first.structure_hash,
         "structure_hash": first.structure_hash,
+        "cif_hash": "e" * 64,
         "path": first.output_path,
         "hypothesis_ids": ["hyp_a"],
     }
@@ -337,7 +341,84 @@ def test_structure_evidence_ignores_forged_candidate_id() -> None:
     assert len(candidates) == 1
     assert candidates[0].candidate_id == "cand_" + "e" * 24
     assert candidates[0].representation["structure_hash"] == "e" * 64
-    assert "cif_hash" not in candidates[0].representation
+    assert candidates[0].representation["cif_hash"] == ""
+
+
+def test_structure_scoped_energy_evidence_projects_to_a_structure_candidate() -> None:
+    evidence = ScientificEvidence(
+        subject="Na3AgBi4S8",
+        property="total_energy",
+        value=-12.3,
+        unit="eV",
+        source="VASP",
+        source_type="dft_calculation",
+        structure_hash="a" * 64,
+        candidate_id="cand_" + "a" * 24,
+        provenance={"input_sha256": "b" * 64, "tool": "vasp.collect"},
+    )
+
+    candidates = extract_candidates_from_state(ScientificState(evidence=[evidence]))
+
+    assert len(candidates) == 1
+    assert candidates[0].candidate_id == "cand_" + "a" * 24
+    assert candidates[0].candidate_type == "structure"
+    assert candidates[0].representation["cif_hash"] == "b" * 64
+
+
+def test_structure_evidence_parent_creates_lineage_node() -> None:
+    evidence = ScientificEvidence(
+        subject="Na3AgBi4S8",
+        property="chgnet_relax_after",
+        value={"energy_eV_per_atom": -1.2},
+        source="CHGNet",
+        source_type="ml_interatomic_potential",
+        structure_hash="c" * 64,
+        candidate_id="cand_" + "c" * 24,
+        provenance={
+            "tool": "chgnet.relax",
+            "parent_candidate_id": "cand_" + "d" * 24,
+            "parent_structure_hash": "d" * 64,
+            "output_sha256": "e" * 64,
+        },
+    )
+
+    candidate = extract_candidates_from_state(ScientificState(evidence=[evidence]))[0]
+
+    assert candidate.parent_candidate_id == "cand_" + "d" * 24
+    assert candidate.lineage is not None
+    assert candidate.lineage.parent_candidate_id == "cand_" + "d" * 24
+    assert candidate.lineage.generated_by == "chgnet.relax"
+    assert candidate.representation["cif_hash"] == "e" * 64
+
+
+def test_validation_evidence_merges_without_replacing_construction_lineage() -> None:
+    derivation = _structure_derivation(
+        structure_hash="f" * 64,
+        derivation_id="der_lineage",
+        output_path="user_output/task/structures/op_" + "5" * 32 + "/structure_0000.cif",
+        parent_candidate_id="cand_" + "a" * 24,
+    )
+    evidence = ScientificEvidence(
+        subject="Na3AgBi4S8",
+        property="total_energy",
+        value=-4.0,
+        unit="eV",
+        source="VASP",
+        source_type="dft_calculation",
+        structure_hash="f" * 64,
+        candidate_id="cand_" + "f" * 24,
+        provenance={"tool": "vasp.collect", "input_sha256": "1" * 64},
+    )
+
+    candidate = project_candidates_from_state(
+        ScientificState(structure_derivations=[derivation], evidence=[evidence])
+    ).candidates[0]
+
+    assert candidate.lineage is not None
+    assert candidate.lineage.generated_by == "structure_construction"
+    assert candidate.lineage.transformation == "substitute_sites"
+    assert candidate.parent_candidate_id == "cand_" + "a" * 24
+    assert candidate.evidence_ids == [evidence.id]
 
 
 def test_same_structure_hash_merges_sources_and_renaming_does_not_change_identity() -> None:

@@ -181,6 +181,9 @@ async def test_runtime_applies_structure_registrations_atomically_and_injects_or
 
     assert len(runtime.scientific_state.structure_derivations) == 1
     saved = runtime.scientific_state.structure_derivations[0]
+    assert saved.origin["output_sha256"] == __import__("hashlib").sha256(
+        (workspace / saved.output_path).read_bytes()
+    ).hexdigest()
     assert saved.origin["tool_name"] == "structure.enumerate_orderings"
     assert saved.origin["tool_call_id"] == "structure-call"
     assert saved.origin["session_id"] == runtime.session_id

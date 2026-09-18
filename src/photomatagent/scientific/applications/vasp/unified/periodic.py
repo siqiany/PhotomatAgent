@@ -448,7 +448,12 @@ class PeriodicVaspExecutor:
                     f"{stage.name}: " + "; ".join(report.get("validation_problems", []))
                 )
                 continue
+            spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
             try:
+                parent_path = self._workspace_path(spec.structure_path)
+                parent_structure = _load_trusted_structure(parent_path)
+                parent_digest = structure_hash(parent_structure)
+                parent_sha256 = _sha256_file(parent_path)
                 structure_path = _trusted_result_structure(local_dir)
                 structure = _load_trusted_structure(structure_path)
             except Exception as exc:
@@ -466,7 +471,10 @@ class PeriodicVaspExecutor:
                 continue
             digest = structure_hash(structure)
             input_sha256 = _sha256_file(structure_path)
-            spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
+            parent_candidate_id = (
+                f"cand_{parent_digest[:24]}" if digest != parent_digest else None
+            )
+            parent_structure_hash = parent_digest if parent_candidate_id else None
             evidence.append(
                 ScientificEvidence(
                     subject=structure.composition.reduced_formula,
@@ -493,7 +501,11 @@ class PeriodicVaspExecutor:
                         "scheduler_state": report.get("scheduler_state"),
                         "input_structure_path": str(structure_path),
                         "input_sha256": input_sha256,
+                        "output_sha256": input_sha256,
                         "structure_hash": digest,
+                        "parent_candidate_id": parent_candidate_id,
+                        "parent_structure_hash": parent_structure_hash,
+                        "parent_input_sha256": parent_sha256,
                     },
                 )
             )
