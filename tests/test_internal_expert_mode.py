@@ -15,7 +15,9 @@ from photomatagent.scientific.evolution.models import ExecutionMode
 from photomatagent.scientific.evolution.service import EvolutionService
 from photomatagent.scientific.evolution.service import EvolutionOperationConflict
 from photomatagent.scientific.evolution.store import EvolutionStore
+from photomatagent.scientific.evolution.targeting import ConfirmedTargetStore
 from photomatagent.scientific.loop import TargetSpec
+from photomatagent.scientific.discovery import DiscoveryConstraints
 from photomatagent.scientific.state import ScientificState
 from photomatagent.sessions.store import save_session_snapshot
 from photomatagent.runtime.state import ConversationState
@@ -27,7 +29,7 @@ from photomatagent.workspace import Workspace
 from photomatagent.cli.chat import build_runtime
 from rich.console import Console
 from photomatagent.cli.commands import ChatCommandRouter
-from photomatagent.cli.expert import _resume_linked
+from photomatagent.cli.expert import _automatic_target, _resume_linked
 
 
 class _Prompt:
@@ -38,6 +40,115 @@ class _Prompt:
     async def prompt_async(self, message: str) -> str:
         self.prompts.append(message)
         return next(self.answers)
+
+
+def _imported_target_json(*, metadata: dict[str, object] | None = None) -> str:
+    return json.dumps({
+        "goal": "attacker goal",
+        "constraints": [],
+        "objectives": [],
+        "operating_conditions": {},
+        "metadata": metadata or {"task_kind": "validation", "discovery": {}},
+    })
+
+
+def _authoritative_discovery() -> DiscoveryConstraints:
+    return DiscoveryConstraints(
+        required_elements=["S"],
+        forbidden_elements=["Pb"],
+        allow_isovalent_alloy=True,
+        allow_donor_acceptor_doping=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_target_file_fallback_rebinds_runtime_authority(tmp_path: Path) -> None:
+    target_path = tmp_path / "fallback-target.json"
+    target_path.write_text(_imported_target_json(), encoding="utf-8")
+
+    class _FailingCompiler:
+        model = SimpleNamespace(provider="fake", model="fake")
+
+        async def compile(self, **kwargs: object) -> object:
+            raise ValueError("compiler unavailable")
+
+    discovery = _authoritative_discovery()
+    target = await _automatic_target(
+        session=_Prompt([str(target_path), "y"]),
+        output=Console(record=True),
+        boundary=Workspace(tmp_path),
+        session_id="fallback-session",
+        goal="runtime goal",
+        scientific_state=ScientificState(goal="runtime goal"),
+        compiler=_FailingCompiler(),  # type: ignore[arg-type]
+        task_kind="proposal",
+        discovery_constraints=discovery,
+    )
+
+    assert target is not None
+    assert target.goal == "runtime goal"
+    assert target.metadata["task_kind"] == "proposal"
+    assert target.metadata["discovery"] == discovery.model_dump(mode="json")
+    assert target.metadata["discovery"]["required_elements"] == ["S"]
+    assert target.metadata["discovery"]["forbidden_elements"] == ["Pb"]
+    assert target.metadata["discovery"]["allow_isovalent_alloy"] is True
+    assert target.metadata["discovery"]["allow_donor_acceptor_doping"] is False
+    restored = ConfirmedTargetStore(Workspace(tmp_path)).load(
+        "fallback-session",
+        goal="runtime goal",
+        scientific_state=ScientificState(goal="runtime goal"),
+        task_kind="proposal",
+        discovery_constraints=discovery,
+    )
+    assert restored is not None
+    assert restored.target.metadata["discovery"] == discovery.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_target_file_choice_f_rebinds_runtime_authority(tmp_path: Path) -> None:
+    target_path = tmp_path / "choice-target.json"
+    target_path.write_text(
+        _imported_target_json(
+            metadata={
+                "task_kind": "validation",
+                "discovery": {"required_elements": ["Pb"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    generated = SimpleNamespace(
+        target=TargetSpec(
+            goal="wrong generated goal",
+            constraints=[],
+            metadata={"task_kind": "validation", "discovery": {}},
+        ),
+        warnings=(),
+    )
+
+    class _Compiler:
+        model = SimpleNamespace(provider="fake", model="fake")
+
+        async def compile(self, **kwargs: object) -> object:
+            return generated
+
+    discovery = _authoritative_discovery()
+    target = await _automatic_target(
+        session=_Prompt(["f", str(target_path), "y"]),
+        output=Console(record=True),
+        boundary=Workspace(tmp_path),
+        session_id="choice-session",
+        goal="runtime goal",
+        scientific_state=ScientificState(goal="runtime goal"),
+        compiler=_Compiler(),  # type: ignore[arg-type]
+        task_kind="proposal",
+        discovery_constraints=discovery,
+    )
+
+    assert target is not None
+    assert target.goal == "runtime goal"
+    assert target.metadata["task_kind"] == "proposal"
+    assert target.metadata["discovery"] == discovery.model_dump(mode="json")
 
 
 def test_import_historical_session_materializes_provenance_bound_v001(tmp_path: Path) -> None:

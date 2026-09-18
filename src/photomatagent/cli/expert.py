@@ -53,6 +53,21 @@ class _ExpertPrompt:
         return await self._session.prompt_async(prompt)
 
 
+def _bind_authoritative_target(
+    target: TargetSpec,
+    *,
+    goal: str,
+    task_kind: TargetTaskKind,
+    discovery_constraints: DiscoveryConstraints,
+) -> TargetSpec:
+    """Bind caller-owned target fields after every non-compiler target load."""
+
+    metadata = dict(target.metadata)
+    metadata["task_kind"] = task_kind
+    metadata["discovery"] = discovery_constraints.model_dump(mode="json")
+    return target.model_copy(update={"goal": goal, "metadata": metadata})
+
+
 async def _ask(session: PromptSessionLike, label: str) -> str:
     return await session.prompt_async(f"[EXPERT MODE | {label}] ")
 
@@ -95,15 +110,22 @@ async def _automatic_target(
     """Load or generate a target, require confirmation, and cache it."""
 
     store = ConfirmedTargetStore(boundary)
+    discovery = DiscoveryConstraints.model_validate(discovery_constraints or {})
     cached = store.load(
         session_id,
         goal=goal,
         scientific_state=scientific_state,
         task_kind=task_kind,
+        discovery_constraints=discovery,
     )
     draft: TargetSpecDraft | None = None
     if cached is not None:
-        target = cached.target
+        target = _bind_authoritative_target(
+            cached.target,
+            goal=goal,
+            task_kind=task_kind,
+            discovery_constraints=discovery,
+        )
         draft = cached.draft
         output.print("[EXPERT MODE | TARGET] 已自动加载该历史任务确认过的 TargetSpec。")
     else:
@@ -133,9 +155,19 @@ async def _automatic_target(
                 target_path = boundary.resolve(fallback, must_exist=True)
                 if not target_path.is_file():
                     raise ValueError("TargetSpec path must be a regular file")
-                target = TargetSpec.model_validate_json(target_path.read_text(encoding="utf-8"))
+                target = _bind_authoritative_target(
+                    TargetSpec.model_validate_json(target_path.read_text(encoding="utf-8")),
+                    goal=goal,
+                    task_kind=task_kind,
+                    discovery_constraints=discovery,
+                )
                 draft = None
-        target = target.model_copy(update={"goal": goal})
+        target = _bind_authoritative_target(
+            target,
+            goal=goal,
+            task_kind=task_kind,
+            discovery_constraints=discovery,
+        )
         if task_kind == "validation" and not target.constraints:
             raise ValueError("TargetSpec must contain at least one constraint")
         _render_target(output, target, draft)
@@ -156,6 +188,7 @@ async def _automatic_target(
                 provider=str(getattr(model_provider, "provider", "unknown")),
                 model=str(getattr(model_provider, "model", "unknown")),
                 task_kind=task_kind,
+                discovery_constraints=discovery,
             )
             output.print("[EXPERT MODE | TARGET] 已确认并自动保存；下次评价该任务会直接加载。")
             return target
@@ -182,7 +215,12 @@ async def _automatic_target(
             target_path = boundary.resolve(target_name, must_exist=True)
             if not target_path.is_file():
                 raise ValueError("TargetSpec path must be a regular file")
-            target = TargetSpec.model_validate_json(target_path.read_text(encoding="utf-8"))
+            target = _bind_authoritative_target(
+                TargetSpec.model_validate_json(target_path.read_text(encoding="utf-8")),
+                goal=goal,
+                task_kind=task_kind,
+                discovery_constraints=discovery,
+            )
             draft = None
             correction = None
             continue

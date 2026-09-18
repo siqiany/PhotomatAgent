@@ -247,6 +247,7 @@ class ConfirmedTargetStore:
         goal: str,
         scientific_state: ScientificState,
         task_kind: TargetTaskKind = "validation",
+        discovery_constraints: DiscoveryConstraints | dict[str, Any] | None = None,
     ) -> ConfirmedTargetRecord | None:
         path = self._path(session_id)
         if not path.is_file():
@@ -260,14 +261,25 @@ class ConfirmedTargetStore:
             return None
         if record.session_id != session_id:
             return None
-        if record.target.metadata.get("task_kind", "validation") != task_kind:
+        if record.target.metadata.get("task_kind") != task_kind:
             return None
+        if discovery_constraints is not None:
+            try:
+                expected_discovery = DiscoveryConstraints.model_validate(
+                    discovery_constraints
+                )
+            except Exception:
+                return None
+            if record.target.metadata.get("discovery") != expected_discovery.model_dump(
+                mode="json"
+            ):
+                return None
         if record.goal_sha256 != _sha_text(goal):
             return None
         if record.scientific_context_sha256 != _sha_text(_scientific_context_json(scientific_state)):
             return None
         if (
-            record.target.metadata.get("task_kind", "validation") == "validation"
+            record.target.metadata.get("task_kind") == "validation"
             and not record.target.constraints
         ):
             return None
@@ -284,6 +296,7 @@ class ConfirmedTargetStore:
         provider: str,
         model: str,
         task_kind: TargetTaskKind | None = None,
+        discovery_constraints: DiscoveryConstraints | dict[str, Any] | None = None,
     ) -> ConfirmedTargetRecord:
         validated = target if isinstance(target, TargetSpec) else TargetSpec.model_validate(target)
         resolved_kind = task_kind or str(
@@ -299,7 +312,10 @@ class ConfirmedTargetStore:
             )
         metadata = dict(validated.metadata)
         metadata["task_kind"] = resolved_kind
-        if draft is not None:
+        if discovery_constraints is not None:
+            discovery = DiscoveryConstraints.model_validate(discovery_constraints)
+            metadata["discovery"] = discovery.model_dump(mode="json")
+        elif draft is not None:
             metadata["discovery"] = draft.discovery_constraints.model_dump(mode="json")
         record = ConfirmedTargetRecord(
             session_id=session_id,
