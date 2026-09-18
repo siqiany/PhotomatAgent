@@ -136,7 +136,9 @@ def get_evidence_fixture(fixture_id: str) -> EvidenceFixture:
     if not fixture_id:
         return EvidenceFixture(fixture_id="empty")
     try:
-        return _FIXTURES[fixture_id]
+        # Never expose the authoritative registry object.  ``ScientificEvidence``
+        # has mutable nested provenance, so a shallow Pydantic copy is unsafe.
+        return _FIXTURES[fixture_id].model_copy(deep=True)
     except KeyError as exc:
         raise ValueError(f"unknown evidence fixture: {fixture_id}") from exc
 
@@ -151,7 +153,15 @@ def inject_evidence_fixture(state: ScientificState, fixture_id: str) -> Evidence
 
 
 def fixture_snapshot_sha256(fixture_ids: Sequence[str]) -> str:
-    fixtures = [get_evidence_fixture(identifier) for identifier in fixture_ids]
+    # Hash the private authoritative templates, independent of caller-owned
+    # copies returned by ``get_evidence_fixture`` or ``inject_evidence_fixture``.
+    unknown = [identifier for identifier in fixture_ids if identifier and identifier not in _FIXTURES]
+    if unknown:
+        raise ValueError(f"unknown evidence fixture: {unknown[0]}")
+    fixtures = [
+        _FIXTURES[identifier] if identifier else EvidenceFixture(fixture_id="empty")
+        for identifier in fixture_ids
+    ]
     payload = [(fixture.fixture_id, fixture.content_sha256) for fixture in fixtures]
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()

@@ -10,6 +10,8 @@ from photomatagent.experiments.discovery import (
     DiscoveryMetrics,
     compute_discovery_metrics,
     EvidenceFixture,
+    fixture_snapshot_sha256,
+    get_evidence_fixture,
     inject_evidence_fixture,
 )
 from photomatagent.experiments.models import ConfigurationSnapshot, ExperimentSummary
@@ -102,8 +104,6 @@ def test_forged_validity_provenance_stays_unavailable() -> None:
 
 
 def test_typed_fixture_injection_is_prior_only_and_fresh() -> None:
-    from photomatagent.experiments.discovery import get_evidence_fixture
-
     state = ScientificState()
     fixture = inject_evidence_fixture(state, "forged-fidelity-v1")
     assert fixture.evidence[0].assessment_role == "prior"
@@ -115,6 +115,31 @@ def test_typed_fixture_injection_is_prior_only_and_fresh() -> None:
     assert second.evidence == []
     assert state.evidence is not second.evidence
     assert get_evidence_fixture("known-materials-v1").content_sha256
+
+
+def test_getter_mutation_cannot_change_authoritative_fixture_or_hash() -> None:
+    before = fixture_snapshot_sha256(["known-materials-v1"])
+    fixture = get_evidence_fixture("known-materials-v1")
+    fixture.evidence[0].value = 999
+    fixture.evidence[0].provenance["tampered"] = True
+    fixture_again = get_evidence_fixture("known-materials-v1")
+    assert fixture_again.evidence[0].value == 1.42
+    assert "tampered" not in fixture_again.evidence[0].provenance
+    assert fixture_snapshot_sha256(["known-materials-v1"]) == before
+
+
+def test_injected_state_mutation_cannot_change_next_state_or_snapshot() -> None:
+    before = fixture_snapshot_sha256(["known-materials-v1"])
+    state1 = ScientificState()
+    returned = inject_evidence_fixture(state1, "known-materials-v1")
+    state1.evidence[0].value = -1
+    state1.evidence[0].provenance["tampered"] = True
+    returned.evidence[0].value = -2
+    state2 = ScientificState()
+    inject_evidence_fixture(state2, "known-materials-v1")
+    assert state2.evidence[0].value == 1.42
+    assert "tampered" not in state2.evidence[0].provenance
+    assert fixture_snapshot_sha256(["known-materials-v1"]) == before
 
 
 def test_fixture_content_hash_binds_ablation_comparison(monkeypatch: pytest.MonkeyPatch) -> None:
