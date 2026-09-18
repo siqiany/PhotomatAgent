@@ -137,6 +137,140 @@ def _operation_id_from_manifest_fields(
     ).hexdigest()
     return "op_" + digest[:32]
 
+def _validate_output_cap(max_outputs: int) -> int:
+    if isinstance(max_outputs, bool) or not isinstance(max_outputs, int):
+        raise StructureArtifactError(
+            "OUTPUT_LIMIT_EXCEEDED", "max_outputs must be an integer between 1 and 32"
+        )
+    if not 1 <= max_outputs <= MAX_OUTPUTS:
+        raise StructureArtifactError(
+            "OUTPUT_LIMIT_EXCEEDED", "max_outputs must be between 1 and 32"
+        )
+    return max_outputs
+
+
+def verify_operation_manifest(
+    workspace: Workspace,
+    directory: Path,
+    *,
+    operation_id: str,
+    operation: str,
+    input_sha256: str,
+    parameters: dict[str, Any],
+    structure_matcher: dict[str, float] | None,
+    max_outputs: int = MAX_OUTPUTS,
+) -> list[dict[str, Any]]:
+    """Verify one complete, immutable operation directory and all outputs."""
+
+    _validate_output_cap(max_outputs)
+    if (
+        directory.is_symlink()
+        or not directory.is_dir()
+        or not workspace.contains(directory)
+        or directory.resolve(strict=False) != directory
+    ):
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "operation directory is not a regular workspace directory")
+    manifest_path = directory / "manifest.json"
+    if manifest_path.is_symlink():
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "manifest must not be a symlink")
+    if not manifest_path.exists():
+        raise StructureArtifactError(ARTIFACT_INCOMPLETE, "operation manifest is missing")
+    if not manifest_path.is_file():
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "operation manifest must be a regular file")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "operation manifest is invalid") from exc
+    required = {
+        "status", "operation_id", "operation", "input_sha256", "parameters",
+        "algorithm_version", "hash_version", "hash_precision", "structure_matcher", "outputs",
+    }
+    if not isinstance(manifest, dict) or not required <= manifest.keys():
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "operation manifest is incomplete")
+    expected_operation_id = _operation_id_from_manifest_fields(
+        operation, input_sha256, parameters
+    )
+    if (
+        manifest.get("status") != "complete"
+        or manifest.get("operation_id") != expected_operation_id
+        or operation_id != expected_operation_id
+        or directory.name != expected_operation_id
+        or manifest.get("operation") != operation
+        or manifest.get("input_sha256") != input_sha256
+        or manifest.get("parameters") != parameters
+        or manifest.get("algorithm_version") != HASH_VERSION
+        or manifest.get("hash_version") != HASH_VERSION
+        or manifest.get("hash_precision") != HASH_PRECISION
+        or manifest.get("structure_matcher") != structure_matcher
+    ):
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "operation manifest does not match the requested operation")
+    entries = manifest.get("outputs")
+    if not isinstance(entries, list) or not 1 <= len(entries) <= max_outputs:
+        code = (
+            "OUTPUT_LIMIT_EXCEEDED"
+            if isinstance(entries, list) and len(entries) > max_outputs
+            else ARTIFACT_CONFLICT
+        )
+        raise StructureArtifactError(code, "operation output count exceeds the current cap")
+
+    filenames: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise StructureArtifactError(ARTIFACT_CONFLICT, "operation output entry is invalid")
+        filename = entry.get("filename")
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".cif")
+            or filename in filenames
+        ):
+            raise StructureArtifactError(ARTIFACT_CONFLICT, "operation output filenames must be unique safe CIF names")
+        filenames.append(filename)
+
+    for filename in filenames:
+        path = directory / filename
+        if not path.exists() and not path.is_symlink():
+            raise StructureArtifactError(ARTIFACT_INCOMPLETE, "declared structure output is missing")
+    allowed = {"manifest.json", *filenames}
+    try:
+        directory_items = list(directory.iterdir())
+    except OSError as exc:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "operation directory cannot be enumerated") from exc
+    if {item.name for item in directory_items} != allowed:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "operation directory contains unlisted files")
+    for filename in filenames:
+        path = directory / filename
+        if path.is_symlink():
+            raise StructureArtifactError(ARTIFACT_CONFLICT, "declared structure output must not be a symlink")
+        if not path.is_file():
+            raise StructureArtifactError(ARTIFACT_CONFLICT, "declared structure output must be a regular file")
+        try:
+            resolved_path = path.resolve(strict=True)
+        except OSError as exc:
+            raise StructureArtifactError(
+                ARTIFACT_CONFLICT, "declared structure output cannot be resolved"
+            ) from exc
+        if resolved_path != path or not workspace.contains(path):
+            raise StructureArtifactError(ARTIFACT_CONFLICT, "declared structure output escapes workspace")
+        try:
+            reparsed, _ = _parse_structure_file(path)
+            actual = {
+                "sha256": _sha256_file(path),
+                "structure_hash": structure_hash(reparsed),
+                "formula": reparsed.composition.reduced_formula,
+                "normalized_composition": [
+                    list(item) for item in normalize_composition(reparsed.composition.formula)
+                ],
+                "n_atoms": len(reparsed),
+            }
+        except (OSError, StructureArtifactError) as exc:
+            raise StructureArtifactError(ARTIFACT_CONFLICT, "declared structure output is invalid") from exc
+        entry = next(item for item in entries if item["filename"] == filename)
+        if any(entry.get(key) != value for key, value in actual.items()):
+            raise StructureArtifactError(ARTIFACT_CONFLICT, "declared structure output does not match its manifest entry")
+    return entries
+
+
 def _manifest_state(
     workspace: Workspace,
     directory: Path,
@@ -144,75 +278,22 @@ def _manifest_state(
     input_sha256: str,
     op_id: str,
     structure_matcher: dict[str, float] | None = None,
+    *,
+    max_outputs: int = MAX_OUTPUTS,
 ) -> tuple[str, list[dict[str, Any]]]:
-    manifest_path = directory / "manifest.json"
-    if manifest_path.is_symlink():
-        return ARTIFACT_CONFLICT, []
     try:
-        resolved_manifest = manifest_path.resolve(strict=True)
-    except OSError:
-        return ARTIFACT_CONFLICT, []
-    if resolved_manifest != manifest_path or not workspace.contains(resolved_manifest):
-        return ARTIFACT_CONFLICT, []
-    if not manifest_path.is_file():
-        return ARTIFACT_INCOMPLETE, []
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError): return ARTIFACT_CONFLICT, []
-    required = {"status", "operation_id", "operation", "input_sha256", "parameters", "algorithm_version", "hash_version", "hash_precision", "structure_matcher", "outputs"}
-    if not required <= manifest.keys() or manifest.get("status") != "complete":
-        return ARTIFACT_CONFLICT, []
-    operation = _OPERATION_NAMES[type(request).__name__]
-    actual_header = (manifest["operation_id"], manifest["operation"], manifest["input_sha256"], manifest["parameters"], manifest["algorithm_version"])
-    expected_header = (op_id, operation, input_sha256, _request_parameters(request), HASH_VERSION)
-    if actual_header != expected_header:
-        return ARTIFACT_CONFLICT, []
-    entries = manifest["outputs"]
-    valid_manifest = (
-        manifest["hash_version"] == HASH_VERSION
-        and manifest["hash_precision"] == HASH_PRECISION
-        and manifest["structure_matcher"] == structure_matcher
-        and isinstance(entries, list)
-        and 1 <= len(entries) <= MAX_OUTPUTS
-    )
-    if not valid_manifest:
-        return ARTIFACT_CONFLICT, []
-    seen: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            return ARTIFACT_CONFLICT, []
-        filename = entry.get("filename")
-        valid_filename = (
-            isinstance(filename, str)
-            and filename not in seen
-            and Path(filename).name == filename
-            and filename.endswith(".cif")
+        return "valid", verify_operation_manifest(
+            workspace,
+            directory,
+            operation_id=op_id,
+            operation=_OPERATION_NAMES[type(request).__name__],
+            input_sha256=input_sha256,
+            parameters=_request_parameters(request),
+            structure_matcher=structure_matcher,
+            max_outputs=max_outputs,
         )
-        if not valid_filename:
-            return ARTIFACT_CONFLICT, []
-        assert isinstance(filename, str)
-        seen.add(filename)
-        path = directory / filename
-        if not path.exists() and not path.is_symlink():
-            return ARTIFACT_INCOMPLETE, []
-        if path.is_symlink():
-            return ARTIFACT_CONFLICT, []
-        try:
-            resolved_output = path.resolve(strict=True)
-        except OSError:
-            return ARTIFACT_CONFLICT, []
-        if resolved_output != path or not workspace.contains(resolved_output):
-            return ARTIFACT_CONFLICT, []
-        if not path.is_file():
-            return ARTIFACT_INCOMPLETE, []
-        try:
-            reparsed, _ = _parse_structure_file(path)
-            actual = {"sha256": _sha256_file(path), "structure_hash": structure_hash(reparsed), "formula": reparsed.composition.reduced_formula, "normalized_composition": [list(x) for x in normalize_composition(reparsed.composition.formula)], "n_atoms": len(reparsed)}
-        except StructureArtifactError:
-            return ARTIFACT_CONFLICT, []
-        if any(entry.get(key) != value for key, value in actual.items()):
-            return ARTIFACT_CONFLICT, []
-    return "valid", entries
+    except StructureArtifactError as exc:
+        return exc.code, []
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
@@ -240,11 +321,16 @@ def publish_structures(
     structures: Sequence["Structure"],
     *,
     structure_matcher: dict[str, float] | None = None,
+    max_outputs: int = MAX_OUTPUTS,
 ) -> list[StructureDerivation]:
+    _validate_output_cap(max_outputs)
     if not _SHA.fullmatch(input_sha256):
         raise ValueError("input_sha256 must be a lowercase SHA-256 digest")
-    if not 1 <= len(structures) <= MAX_OUTPUTS:
-        raise StructureArtifactError("OUTPUT_LIMIT_EXCEEDED", "at most 32 structures may be published")
+    if not 1 <= len(structures) <= max_outputs:
+        raise StructureArtifactError(
+            "OUTPUT_LIMIT_EXCEEDED",
+            f"at most {max_outputs} structures may be published",
+        )
     for structure in structures:
         if len(structure) > MAX_ATOMS:
             raise StructureArtifactError("ATOM_LIMIT_EXCEEDED", "structure exceeds publication boundary")
@@ -265,7 +351,13 @@ def publish_structures(
         raise ValueError("structure output path escapes workspace")
     if destination.exists():
         state, entries = _manifest_state(
-            workspace, destination, request, input_sha256, op_id, structure_matcher
+            workspace,
+            destination,
+            request,
+            input_sha256,
+            op_id,
+            structure_matcher,
+            max_outputs=max_outputs,
         )
         if state == "valid":
             return _derivations_from_manifest(entries, destination, request, input_sha256, op_id)
@@ -351,107 +443,151 @@ def _derivations_from_manifest(entries: list[dict[str, Any]], destination: Path,
     return result
 
 
-def verify_structure_derivation(
+def _resolve_derivation_output(
     workspace: Workspace, record: StructureDerivation
-) -> StructureDerivation:
-    """Rebuild a derivation only after verifying its published artifact.
-
-    Tool state updates are untrusted.  This verifier follows the record's
-    workspace-relative output path without accepting symlinks, then checks the
-    complete manifest header and the reparsed CIF against the record.  It is
-    intentionally kept in the artifact layer so runtime state never trusts a
-    tool-reported hash or composition on its own.
-    """
-
+) -> Path:
     raw_path = Path(record.output_path)
     if raw_path.is_absolute() or ".." in raw_path.parts:
         raise StructureArtifactError(ARTIFACT_CONFLICT, "structure output path is not workspace-relative")
     try:
         output = workspace.resolve(record.output_path, must_exist=True)
     except Exception as exc:
-        raise StructureArtifactError(ARTIFACT_INCOMPLETE, "structure output is missing or outside workspace") from exc
+        raise StructureArtifactError(
+            ARTIFACT_INCOMPLETE, "structure output is missing or outside workspace"
+        ) from exc
     if output.is_symlink() or not output.is_file() or not workspace.contains(output):
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure output must be a regular workspace file")
+        raise StructureArtifactError(
+            ARTIFACT_CONFLICT, "structure output must be a regular workspace file"
+        )
     if workspace.relative(output) != record.output_path:
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure output path resolves differently")
+        raise StructureArtifactError(
+            ARTIFACT_CONFLICT, "structure output path resolves differently"
+        )
+    return output
 
-    manifest_path = output.parent / "manifest.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise StructureArtifactError(ARTIFACT_INCOMPLETE, "structure manifest is missing")
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest is invalid") from exc
-    required = {
-        "status", "operation_id", "operation", "input_sha256", "parameters",
-        "algorithm_version", "hash_version", "hash_precision", "structure_matcher", "outputs",
-    }
-    if not required <= manifest.keys() or manifest.get("status") != "complete":
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest is incomplete")
-    operation = str(record.operation)
-    expected_matcher = {"ltol": 0.2, "stol": 0.3, "angle_tol": 5} if operation == "enumerate_orderings" else None
-    expected_operation_id = _operation_id_from_manifest_fields(
-        operation, record.input_sha256, record.parameters
-    )
-    if (
-        manifest.get("operation_id") != expected_operation_id
-        or output.parent.name != expected_operation_id
-        or not output.parent.name.startswith("op_")
-        or manifest.get("operation") != operation
-        or manifest.get("input_sha256") != record.input_sha256
-        or manifest.get("parameters") != record.parameters
-        or manifest.get("algorithm_version") != HASH_VERSION
-        or manifest.get("hash_version") != HASH_VERSION
-        or manifest.get("hash_precision") != HASH_PRECISION
-        or manifest.get("structure_matcher") != expected_matcher
-    ):
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest does not match derivation")
-    entries = manifest.get("outputs")
-    if not isinstance(entries, list):
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest outputs are invalid")
-    filename = output.name
+
+def _rebuild_verified_derivation(
+    workspace: Workspace,
+    record: StructureDerivation,
+    output: Path,
+    entries: list[dict[str, Any]],
+) -> StructureDerivation:
     matches = [
         (ordinal, item)
         for ordinal, item in enumerate(entries)
-        if isinstance(item, dict) and item.get("filename") == filename
+        if item.get("filename") == output.name
     ]
     if len(matches) != 1:
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "derivation output is not uniquely listed in manifest")
+        raise StructureArtifactError(
+            ARTIFACT_CONFLICT,
+            "derivation output is not uniquely listed in manifest",
+        )
     ordinal, entry = matches[0]
-    try:
-        reparsed, _ = _parse_structure_file(output)
-        normalized = [list(item) for item in normalize_composition(reparsed.composition.formula)]
-        actual = {
-            "sha256": _sha256_file(output),
-            "structure_hash": structure_hash(reparsed),
-            "formula": reparsed.composition.reduced_formula,
-            "normalized_composition": normalized,
-            "n_atoms": len(reparsed),
-        }
-    except Exception as exc:
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "published structure cannot be reparsed") from exc
-    if any(entry.get(key) != value for key, value in actual.items()):
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "published structure does not match manifest")
+    actual_hash = entry["structure_hash"]
+    normalized = tuple(tuple(item) for item in entry["normalized_composition"])
+    candidate_id = f"cand_{actual_hash[:24]}"
+    operation = str(record.operation)
+    manifest_hypothesis_id = record.parameters.get("hypothesis_id")
+    if record.hypothesis_id != manifest_hypothesis_id:
+        raise StructureArtifactError(
+            ARTIFACT_CONFLICT,
+            "derivation hypothesis_id does not match verified manifest parameters",
+        )
     if (
-        record.structure_hash != actual["structure_hash"]
-        or [list(item) for item in record.normalized_composition] != normalized
-        or record.id != f"der_{output.parent.name[3:]}_{actual['structure_hash'][:16]}_{ordinal:04d}"
-        or record.candidate_id != f"cand_{actual['structure_hash'][:24]}"
+        record.structure_hash != actual_hash
+        or tuple(record.normalized_composition) != normalized
+        or record.id
+        != f"der_{output.parent.name[3:]}_{actual_hash[:16]}_{ordinal:04d}"
+        or record.candidate_id != candidate_id
     ):
-        raise StructureArtifactError(ARTIFACT_CONFLICT, "derivation identity does not match published structure")
+        raise StructureArtifactError(
+            ARTIFACT_CONFLICT,
+            "derivation identity does not match published structure",
+        )
+    lineage = CandidateLineage(
+        candidate_id=candidate_id,
+        parent_candidate_id=None,
+        generated_by="structure_construction",
+        generation_parameters={},
+        source_artifacts=[],
+        transformation=operation,
+        validation_status="UNVALIDATED_GENERATED_STRUCTURE",
+    )
     payload = record.model_dump(mode="python")
     payload.update(
         {
+            "parent_candidate_id": None,
+            "hypothesis_id": manifest_hypothesis_id,
             "operation": operation,
-            "input_sha256": manifest["input_sha256"],
-            "parameters": manifest["parameters"],
-            "structure_hash": actual["structure_hash"],
-            "normalized_composition": tuple(tuple(item) for item in normalized),
+            "input_sha256": record.input_sha256,
+            "parameters": record.parameters,
+            "structure_hash": actual_hash,
+            "normalized_composition": normalized,
             "output_path": workspace.relative(output),
-            "candidate_id": f"cand_{actual['structure_hash'][:24]}",
+            "candidate_id": candidate_id,
+            "lineage": lineage.model_dump(mode="python"),
         }
     )
-    lineage = dict(payload["lineage"])
-    lineage["candidate_id"] = payload["candidate_id"]
-    payload["lineage"] = lineage
     return StructureDerivation.model_validate(payload)
+
+
+def verify_structure_derivations(
+    workspace: Workspace, records: Sequence[StructureDerivation]
+) -> list[StructureDerivation]:
+    """Verify complete manifests and rebuild an exact registration batch."""
+
+    if not records:
+        return []
+    resolved = [_resolve_derivation_output(workspace, record) for record in records]
+    groups: dict[Path, list[tuple[StructureDerivation, Path]]] = {}
+    for record, output in zip(records, resolved, strict=True):
+        groups.setdefault(output.parent, []).append((record, output))
+    rebuilt: dict[str, StructureDerivation] = {}
+    for directory, group in groups.items():
+        first = group[0][0]
+        operation = str(first.operation)
+        matcher = (
+            {"ltol": 0.2, "stol": 0.3, "angle_tol": 5}
+            if operation == "enumerate_orderings"
+            else None
+        )
+        if any(
+            str(record.operation) != operation
+            or record.input_sha256 != first.input_sha256
+            or record.parameters != first.parameters
+            for record, _ in group
+        ):
+            raise StructureArtifactError(
+                ARTIFACT_CONFLICT,
+                "registration batch fields must match one operation manifest",
+            )
+        op_id = directory.name
+        entries = verify_operation_manifest(
+            workspace,
+            directory,
+            operation_id=op_id,
+            operation=operation,
+            input_sha256=first.input_sha256,
+            parameters=first.parameters,
+            structure_matcher=matcher,
+        )
+        declared = {entry["filename"] for entry in entries}
+        supplied = [output.name for _, output in group]
+        if len(supplied) != len(set(supplied)) or set(supplied) != declared:
+            raise StructureArtifactError(
+                ARTIFACT_CONFLICT,
+                "registration batch must correspond exactly to manifest outputs",
+            )
+        for record, output in group:
+            rebuilt[record.output_path] = _rebuild_verified_derivation(
+                workspace, record, output, entries
+            )
+    return [rebuilt[record.output_path] for record in records]
+
+
+def verify_structure_derivation(
+    workspace: Workspace, record: StructureDerivation
+) -> StructureDerivation:
+    """Verify one registration whose batch must contain the complete manifest."""
+
+    return verify_structure_derivations(workspace, [record])[0]

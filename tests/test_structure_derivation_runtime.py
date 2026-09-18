@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from pymatgen.core import Lattice, Structure
 
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
@@ -72,6 +73,38 @@ def _published_record(tmp_path: Path) -> tuple[Path, StructureDerivation]:
     return workspace, records[0]
 
 
+def _published_batch(tmp_path: Path) -> tuple[Path, list[StructureDerivation]]:
+    workspace, first = _published_record(tmp_path)
+    directory = workspace / first.output_path
+    # Reuse the same request/artifact identity with two declared outputs.
+    from photomatagent.workspace import Workspace
+
+    boundary = Workspace(workspace)
+    request = OrderingRequest(
+        path="input.cif",
+        eligible_indices=[0],
+        from_element="Na",
+        to_element="Ag",
+        replacement_count=1,
+        expected_formula="AgNa",
+        hypothesis_id="hyp-ordering",
+        task_slug="task-batch",
+    )
+    structure = Structure(
+        Lattice.cubic(4), ["Na", "Ag"], [[0, 0, 0], [0.5, 0.5, 0.5]]
+    )
+    from photomatagent.scientific.capabilities.structure.artifacts import publish_structures
+
+    records = publish_structures(
+        boundary,
+        request,
+        "a" * 64,
+        [structure, structure],
+        structure_matcher={"ltol": 0.2, "stol": 0.3, "angle_tol": 5},
+    )
+    return workspace, records
+
+
 def _with_hash(record: StructureDerivation, digest: str) -> StructureDerivation:
     payload = record.model_dump(mode="python")
     payload["structure_hash"] = digest
@@ -84,10 +117,22 @@ def test_structure_state_is_idempotent_and_keeps_same_hash_from_two_sources() ->
     state = ScientificState()
     first = _record()
     second = first.model_copy(update={"id": "der_" + "e" * 20, "origin": {"tool_name": "other"}})
-    assert state.add_structure_derivation(first) is first
-    assert state.add_structure_derivation(first) is first
-    assert state.add_structure_derivation(second) is second
+    assert state.add_structure_derivation(first) == first
+    assert state.add_structure_derivation(first) == first
+    assert state.add_structure_derivation(second) == second
     assert len(state.structure_derivations) == 2
+
+
+def test_structure_state_revalidates_model_constructed_identity() -> None:
+    state = ScientificState()
+    record = _record()
+    payload = record.model_dump(mode="python")
+    payload["lineage"] = record.lineage
+    forged = StructureDerivation.model_construct(**payload)
+    object.__setattr__(forged, "candidate_id", "cand_attacker")
+    with pytest.raises(ValidationError):
+        state.add_structure_derivation(forged)
+    assert state.structure_derivations == []
 
 
 def test_structure_derived_event_is_discriminated_and_serializable() -> None:
@@ -189,6 +234,56 @@ async def test_runtime_rejects_forged_structure_batch_without_partial_state(tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["missing", "sibling", "extra", "duplicate"])
+async def test_runtime_rejects_incomplete_or_contaminated_manifest_batch(tmp_path, tamper: str) -> None:
+    workspace, records = _published_batch(tmp_path)
+    artifact = workspace / records[0].output_path
+    directory = artifact.parent
+    if tamper == "missing":
+        (directory / "structure_0001.cif").unlink()
+    elif tamper == "sibling":
+        (directory / "structure_0001.cif").write_text("not a CIF", encoding="utf-8")
+    elif tamper == "extra":
+        (directory / "unlisted.cif").write_bytes((directory / "structure_0000.cif").read_bytes())
+    else:
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["outputs"].append(dict(manifest["outputs"][0]))
+        manifest_path.write_text(json.dumps(manifest))
+    runtime = make_runtime(
+        FakeModelProvider([
+            scripted_tool_call("structure.enumerate_orderings", {}, tool_call_id=f"bad-{tamper}"),
+            FakeResponse(text="done"),
+        ]),
+        workspace=workspace,
+    )
+    runtime._tools._tools["structure.enumerate_orderings"] = RegistrationTool([
+        StructureRegistration(derivation=records[0])
+    ])
+    events = await collect(runtime, f"reject manifest {tamper}")
+    assert runtime.scientific_state.structure_derivations == []
+    assert any(event.kind == "tool_failed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_runtime_accepts_exact_complete_manifest_batch(tmp_path) -> None:
+    workspace, records = _published_batch(tmp_path)
+    runtime = make_runtime(
+        FakeModelProvider([
+            scripted_tool_call("structure.enumerate_orderings", {}, tool_call_id="complete-batch"),
+            FakeResponse(text="done"),
+        ]),
+        workspace=workspace,
+    )
+    runtime._tools._tools["structure.enumerate_orderings"] = RegistrationTool([
+        StructureRegistration(derivation=record) for record in records
+    ])
+    events = await collect(runtime, "accept complete batch")
+    assert len(runtime.scientific_state.structure_derivations) == 2
+    assert len([event for event in events if isinstance(event, StructureDerived)]) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tamper", ["missing", "cif", "operation", "hash", "parameters", "symlink", "fake_hash"])
 async def test_runtime_rejects_forged_artifact_or_manifest_atomically(tmp_path, tamper: str) -> None:
     workspace, record = _published_record(tmp_path)
@@ -245,3 +340,37 @@ async def test_runtime_rejects_structure_registration_from_non_authority_tool(tm
     events = await collect(runtime, "reject non-authority source")
     assert runtime.scientific_state.structure_derivations == []
     assert any(event.kind == "tool_failed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_runtime_rebuilds_structure_lineage_and_parent_from_manifest(tmp_path) -> None:
+    workspace, record = _published_record(tmp_path)
+    payload = record.model_dump(mode="python")
+    payload["parent_candidate_id"] = "cand_attacker"
+    payload["lineage"].update(
+        {
+            "candidate_id": record.candidate_id,
+            "parent_candidate_id": "cand_attacker",
+            "generated_by": "forged",
+            "transformation": "fake",
+            "validation_status": "PASS",
+        }
+    )
+    forged = StructureDerivation.model_validate(payload)
+    runtime = make_runtime(
+        FakeModelProvider([
+            scripted_tool_call("structure.enumerate_orderings", {}, tool_call_id="lineage"),
+            FakeResponse(text="done"),
+        ]),
+        workspace=workspace,
+    )
+    runtime._tools._tools["structure.enumerate_orderings"] = RegistrationTool([
+        StructureRegistration(derivation=forged)
+    ])
+    await collect(runtime, "rebuild lineage")
+    saved = runtime.scientific_state.structure_derivations[0]
+    assert saved.parent_candidate_id is None
+    assert saved.lineage.parent_candidate_id is None
+    assert saved.lineage.generated_by == "structure_construction"
+    assert saved.lineage.transformation == "enumerate_orderings"
+    assert saved.lineage.validation_status == "UNVALIDATED_GENERATED_STRUCTURE"

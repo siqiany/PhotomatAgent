@@ -71,6 +71,27 @@ def test_derivation_rejects_inconsistent_lineage():
     with pytest.raises(ValidationError):
         StructureDerivation(id="d", candidate_id="c", input_sha256="a"*64, structure_hash="b"*64, output_path="user_output/x/structures/op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/structure_0000.cif", operation="make_supercell", normalized_composition=(("Si", 1),), lineage={"candidate_id": "other"})
 
+
+def test_derivation_model_copy_revalidates_identity_and_freezes_updates():
+    record = StructureDerivation(
+        id="d",
+        candidate_id="c",
+        input_sha256="a" * 64,
+        structure_hash="b" * 64,
+        output_path="user_output/x/structures/op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/structure_0000.cif",
+        operation="make_supercell",
+        normalized_composition=(("Si", 1),),
+        lineage={"candidate_id": "c"},
+    )
+    with pytest.raises(ValidationError):
+        record.model_copy(update={"candidate_id": "attacker"})
+    caller_origin = {"source": "caller"}
+    copied = record.model_copy(update={"origin": caller_origin})
+    caller_origin["late"] = "mutation"
+    assert copied.origin == {"source": "caller"}
+    with pytest.raises(TypeError):
+        copied.origin["x"] = "blocked"
+
 @pytest.mark.parametrize("path", [
     "", "../x", "/tmp/x", "C:\\tmp\\x", "user_output//x", "user_output/./x",
     "tmp/foo.cif",

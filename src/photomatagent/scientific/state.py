@@ -231,15 +231,20 @@ class ScientificState(BaseModel):
         downstream projection time.
         """
 
+        # Treat every caller-supplied model as untrusted, including models
+        # produced through Pydantic's low-level copy APIs.
+        validated = StructureDerivation.model_validate(
+            record.model_dump(mode="python")
+        )
         existing = next(
-            (item for item in self.structure_derivations if item.id == record.id),
+            (item for item in self.structure_derivations if item.id == validated.id),
             None,
         )
         if existing is None:
-            self.structure_derivations.append(record)
-            return record
+            self.structure_derivations.append(validated)
+            return validated
         existing_payload = existing.model_dump(mode="json", exclude={"origin"})
-        record_payload = record.model_dump(mode="json", exclude={"origin"})
+        record_payload = validated.model_dump(mode="json", exclude={"origin"})
         if existing_payload != record_payload:
             raise ValueError(
                 f"structure derivation {record.id!r} conflicts with an existing record"

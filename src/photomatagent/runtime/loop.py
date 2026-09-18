@@ -94,6 +94,7 @@ from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.capabilities.structure.artifacts import (
     verify_structure_derivation,
+    verify_structure_derivations,
 )
 from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 from photomatagent.scientific.discovery.models import (
@@ -1286,6 +1287,23 @@ class AgentRuntime:
         shadow = self._scientific.model_copy(deep=True)
         self._evidence_authority.bind(shadow, replace=True)
         self._evidence_authority.copy_ledger(self._scientific, shadow)
+        structure_updates = [
+            update for update in updates if isinstance(update, StructureRegistration)
+        ]
+        trusted_structures: list[StructureDerivation] = []
+        if structure_updates:
+            if tool_name not in _STRUCTURE_REGISTRATION_TOOLS:
+                raise ToolError(
+                    "structure registration is only accepted from authoritative structure tools"
+                )
+            try:
+                trusted_structures = verify_structure_derivations(
+                    self._workspace,
+                    [update.derivation for update in structure_updates],
+                )
+            except Exception as exc:
+                raise ToolError(f"structure artifact verification failed: {exc}") from exc
+        structure_cursor = 0
         prepared: list[Any] = []
         for update in updates:
             if isinstance(update, HypothesisRegistration):
@@ -1308,15 +1326,13 @@ class AgentRuntime:
                 if len(shadow.material_hypotheses) > hypothesis_count:
                     prepared.append(record)
             elif isinstance(update, StructureRegistration):
-                if tool_name not in _STRUCTURE_REGISTRATION_TOOLS:
-                    raise ToolError(
-                        "structure registration is only accepted from authoritative structure tools"
-                    )
                 structure_record: StructureDerivation = self._prepare_structure_derivation(
                     update.derivation,
                     tool_name=tool_name,
                     tool_call_id=tool_call_id,
+                    trusted=trusted_structures[structure_cursor],
                 )
+                structure_cursor += 1
                 existing_count = len(shadow.structure_derivations)
                 shadow.add_structure_derivation(structure_record)
                 if len(shadow.structure_derivations) > existing_count:
@@ -1361,10 +1377,11 @@ class AgentRuntime:
         *,
         tool_name: str,
         tool_call_id: str,
+        trusted: StructureDerivation | None = None,
     ) -> StructureDerivation:
         """Revalidate tool data and replace its untrusted origin at runtime."""
 
-        trusted = verify_structure_derivation(self._workspace, record)
+        trusted = trusted or verify_structure_derivation(self._workspace, record)
         expected_candidate_id = f"cand_{trusted.structure_hash[:24]}"
         if trusted.candidate_id != expected_candidate_id:
             raise ToolError(

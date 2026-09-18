@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from functools import reduce
 from math import gcd
 import re
+from collections.abc import Mapping
 from typing import Any, Literal, Never
 
 from pydantic import (
@@ -93,6 +94,21 @@ class StructureDerivation(BaseModel):
     lineage: CandidateLineage
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     origin: dict[str, Any] = Field(default_factory=dict)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> "StructureDerivation":
+        """Copy only through the full identity and immutability validators."""
+
+        payload = self.model_dump(mode="python")
+        if deep:
+            payload = copy.deepcopy(payload)
+        if update:
+            payload.update(dict(update))
+        return type(self).model_validate(payload)
 
     @field_validator("id", "candidate_id")
     @classmethod

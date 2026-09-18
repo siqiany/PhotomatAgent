@@ -193,6 +193,7 @@ class MakeSupercellTool(Tool):
                 request,
                 file_sha256(path),
                 [result],
+                max_outputs=self._limits.max_outputs,
             )
             return _success("make_supercell", derivations)
         except ValidationError as exc:
@@ -285,6 +286,7 @@ class SubstituteSitesTool(Tool):
                 request,
                 file_sha256(path),
                 [result],
+                max_outputs=self._limits.max_outputs,
             )
             return _success("substitute_sites", derivations)
         except ValidationError as exc:
@@ -363,6 +365,7 @@ class EnumerateOrderingsTool(Tool):
                 file_sha256(path),
                 result,
                 structure_matcher=result.matcher,
+                max_outputs=self._limits.max_outputs,
             )
             return _success(
                 "enumerate_orderings",

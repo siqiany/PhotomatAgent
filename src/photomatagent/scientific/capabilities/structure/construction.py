@@ -213,6 +213,12 @@ def enumerate_orderings(
     deduplication; a capped result is explicitly marked non-exhaustive.
     """
 
+    # ``model_copy(update=...)`` can bypass Pydantic validators.  Rebuild at
+    # this operation boundary before reading limits or touching the structure.
+    try:
+        limits = ConstructionLimits.model_validate(limits.model_dump(mode="python"))
+    except Exception as exc:
+        raise StructureConstructionError("INVALID_LIMITS", str(exc)) from exc
     _validate_ordered_structure(structure)
     if not isinstance(request, OrderingRequest):
         try:
@@ -292,6 +298,8 @@ def enumerate_orderings(
         except StructureConstructionError:
             discarded += 1
             continue
+        if len(outputs) >= limits.max_outputs:
+            break
         outputs.append(candidate)
         hashes.add(candidate_hash)
         if len(outputs) >= limits.max_outputs and scanned < total:

@@ -53,6 +53,39 @@ def test_publish_is_atomic_and_reuses_complete_operation(tmp_path):
         publish_structures(workspace, request, "a" * 64, [structure])
     assert exc.value.code == "ARTIFACT_INCOMPLETE"
 
+
+@pytest.mark.parametrize("tamper", ["missing", "sibling", "extra", "duplicate"])
+def test_reuse_requires_a_complete_unique_manifest_batch(tmp_path, tamper):
+    workspace = Workspace(tmp_path)
+    request = SupercellRequest(path="input.cif", scaling=(1, 1, 1), task_slug="batch")
+    records = publish_structures(workspace, request, "a" * 64, [_structure(), _structure()])
+    directory = (workspace.root / records[0].output_path).parent
+    if tamper == "missing":
+        (directory / "structure_0001.cif").unlink()
+    elif tamper == "sibling":
+        (directory / "structure_0001.cif").write_text("not a CIF")
+    elif tamper == "extra":
+        (directory / "unlisted.cif").write_bytes((directory / "structure_0000.cif").read_bytes())
+    else:
+        manifest_path = directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["outputs"].append(dict(manifest["outputs"][0]))
+        manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(StructureArtifactError) as exc:
+        publish_structures(workspace, request, "a" * 64, [_structure(), _structure()])
+    assert exc.value.code in {"ARTIFACT_INCOMPLETE", "ARTIFACT_CONFLICT"}
+
+
+def test_reuse_enforces_current_output_cap(tmp_path):
+    workspace = Workspace(tmp_path)
+    request = SupercellRequest(path="input.cif", scaling=(1, 1, 1), task_slug="cap")
+    publish_structures(workspace, request, "a" * 64, [_structure()] * 4)
+    with pytest.raises(StructureArtifactError) as exc:
+        publish_structures(
+            workspace, request, "a" * 64, [_structure()], max_outputs=1
+        )
+    assert exc.value.code == "OUTPUT_LIMIT_EXCEEDED"
+
 def _structure():
     return Structure(Lattice.cubic(4), ["Si"], [[0, 0, 0]])
 

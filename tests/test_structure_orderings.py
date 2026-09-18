@@ -78,6 +78,23 @@ def test_ordering_count_limit_fails_before_copying_or_materializing() -> None:
     assert parent.composition.num_atoms == 4
 
 
+def test_ordering_revalidates_limits_before_materialization() -> None:
+    malformed = ConstructionLimits(max_outputs=2).model_copy(update={"max_outputs": 0})
+    with pytest.raises(StructureConstructionError) as exc_info:
+        enumerate_orderings(_parent(), _request(replacement_count=1), malformed)
+    assert exc_info.value.code == "INVALID_LIMITS"
+
+
+def test_ordering_never_appends_beyond_current_output_cap() -> None:
+    result = enumerate_orderings(
+        _parent(),
+        _request(replacement_count=1, expected_formula="Na3Ag1"),
+        ConstructionLimits(max_outputs=1),
+    )
+    assert len(result) == 1
+    assert result.truncated is True
+
+
 def test_ordering_request_validates_indices_and_host_elements() -> None:
     request = _request(from_element="Ag", to_element="Cu")
     with pytest.raises(StructureConstructionError) as exc_info:
