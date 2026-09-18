@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from photomatagent.experiments.discovery import DiscoveryMetrics, get_evidence_fixture
 from photomatagent.observability.analyzer import SessionSummary
 from photomatagent.scientific.loop.target import TargetSpec
 
@@ -53,6 +54,16 @@ class ExperimentTask(BaseModel):
     id: str = Field(min_length=1)
     prompt: str = Field(min_length=1)
     expect: Expectations | None = None
+    evidence_fixture: str = ""
+    controls: dict[str, object] = Field(default_factory=dict)
+    repeats: int = Field(default=1, ge=1)
+
+    @field_validator("evidence_fixture")
+    @classmethod
+    def validate_evidence_fixture(cls, value: str) -> str:
+        if value:
+            get_evidence_fixture(value)
+        return value
 
 
 class ExperimentVariant(BaseModel):
@@ -64,6 +75,8 @@ class ExperimentVariant(BaseModel):
     approval: Literal["auto", "deny"] = "auto"
     label: str | None = None
     tool_surface: Literal["progressive", "eager"] = "progressive"
+    workflow: str = "baseline"
+    evidence_snapshot: str = ""
 
 
 class ExperimentConfig(BaseModel):
@@ -76,6 +89,8 @@ class ExperimentConfig(BaseModel):
 
 
 class ConfigurationSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     provider: str
     model: str
     system_prompt: dict[str, object]
@@ -85,6 +100,9 @@ class ConfigurationSnapshot(BaseModel):
     tool_surface: dict[str, object] = Field(default_factory=dict)
     task_set_sha256: str = ""
     skill_index_sha256: str = ""
+    budget: dict[str, object] = Field(default_factory=dict)
+    evidence_snapshot: str = ""
+    workflow: str = "baseline"
 
 
 class ExpectationCheck(BaseModel):
@@ -104,12 +122,16 @@ class TaskEvaluation(BaseModel):
 
 class ExperimentTaskRun(BaseModel):
     task_id: str
+    repeat_index: int = Field(default=1, ge=1)
+    evidence_fixture: str = ""
+    evidence_fixture_sha256: str = ""
     session_id: str
     runtime_status: RuntimeStatus
     evaluation: TaskEvaluation
     answer: str = ""
     error: str | None = None
     summary: SessionSummary
+    discovery_metrics: DiscoveryMetrics | None = None
 
 
 class ExperimentSummary(BaseModel):
@@ -141,6 +163,7 @@ class ExperimentSummary(BaseModel):
     pruned_tool_results: int = 0
     compaction_count: int = 0
     compaction_failures: int = 0
+    discovery_metrics: DiscoveryMetrics | None = None
 
 
 class ExperimentResult(BaseModel):

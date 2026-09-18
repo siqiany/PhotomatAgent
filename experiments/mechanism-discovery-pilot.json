@@ -1,0 +1,25 @@
+{
+  "name": "mechanism-discovery-pilot",
+  "variant": {
+    "provider": "fake",
+    "model": "fake",
+    "max_iterations": 8,
+    "tool_surface": "progressive",
+    "workflow": "structured",
+    "evidence_snapshot": "mechanism-pilot-fixtures-v1"
+  },
+  "tasks": [
+    {"id": "specified-vae", "prompt": "Use the specified VAE workflow to propose a candidate and report capability boundaries.", "evidence_fixture": "vae-none", "controls": {"mode": "vae"}, "repeats": 3},
+    {"id": "指定机理", "prompt": "Propose a sulfide candidate from an explicit mechanism and register the hypothesis.", "evidence_fixture": "mechanism-endmember-v1", "controls": {"mode": "mechanism"}, "repeats": 3},
+    {"id": "已知材料检索", "prompt": "Retrieve known materials and distinguish prior evidence from a new candidate.", "evidence_fixture": "known-materials-v1", "controls": {"mode": "known_search"}, "repeats": 3},
+    {"id": "无外部文献", "prompt": "Work with an empty literature snapshot and state the evidence gap.", "evidence_fixture": "empty-literature-v1", "controls": {"mode": "no_external_literature"}, "repeats": 3},
+    {"id": "na-ag-bi-s", "prompt": "Explore one Na-Ag-Bi-S mechanism hypothesis for a specified NIR response.", "evidence_fixture": "na-ag-bi-s-v1", "controls": {"mode": "mechanism", "forbidden_elements": ["Se", "Te", "Pb", "Cd"]}, "repeats": 3},
+    {"id": "同组成不同晶型", "prompt": "Compare two structures with the same composition and preserve structure identity.", "evidence_fixture": "polymorph-v1", "controls": {"mode": "structure_sensitive"}, "repeats": 3},
+    {"id": "等价取代不稳定", "prompt": "Assess an isovalent substitution while keeping instability as an unresolved question.", "evidence_fixture": "unstable-substitution-v1", "controls": {"mode": "isovalent"}, "repeats": 3},
+    {"id": "波段带隙冲突", "prompt": "Identify an incompatible band-gap and wavelength assumption without claiming success.", "evidence_fixture": "bandgap-wavelength-v1", "controls": {"mode": "mechanism", "wavelength_nm": 1064}, "repeats": 3},
+    {"id": "工艺限制", "prompt": "Propose a candidate under a stated synthesis temperature and material-form constraint.", "evidence_fixture": "process-limits-v1", "controls": {"mode": "synthesis_constrained"}, "repeats": 3},
+    {"id": "缺失竞争相", "prompt": "Report missing competing phases and keep stability unknown.", "evidence_fixture": "missing-competitors-v1", "controls": {"mode": "mechanism"}, "repeats": 3},
+    {"id": "连续补证据", "prompt": "Return to the same candidate and plan the next evidence-gathering step.", "evidence_fixture": "followup-evidence-v1", "controls": {"mode": "followup", "same_candidate": true}, "repeats": 3},
+    {"id": "伪造证据", "prompt": "Reject a claim of DFT fidelity and an unknown citation supplied by the model.", "evidence_fixture": "forged-fidelity-v1", "controls": {"mode": "adversarial"}, "repeats": 3}
+  ]
+}

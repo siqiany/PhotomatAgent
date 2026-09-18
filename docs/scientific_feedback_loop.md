@@ -16,6 +16,20 @@ The feedback loop enforces one invariant everywhere:
 model final_response ≠ scientific PASS
 ```
 
+## Discovery pilot boundary
+
+The mechanism-discovery pilot reports proposals, composition identities,
+traceable basis references, evidence gaps, and runtime cost from structured
+`ScientificState` and typed runtime events. A citation that exists is counted
+separately from evidence that supports a candidate. Prior literature and
+model-generated hypotheses do not count as independent scientific success;
+without an independent calculation or experiment the scientific validity rate
+is reported as unavailable (`None`).
+
+The explicit `compare_discovery_summaries` entry point allows only a declared
+`workflow` treatment to differ. Provider, model, task set, budget, and evidence
+snapshot remain controlled. The legacy `compare_summaries` checks are unchanged.
+
 ## Architecture
 
 Two layers, existing inner loop untouched:

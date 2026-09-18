@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from photomatagent.scientific.capabilities.config import ScientificConfig
 from photomatagent.tools.base import Tool
@@ -48,9 +48,13 @@ def build_scientific_tools(
     from photomatagent.scientific.capabilities.generation.tools import (
         generation_pack,
     )
-    from photomatagent.scientific.capabilities.chemistry.tools import (
-        chemistry_pack,
-    )
+    chemistry_pack: Callable[[], Any] | None
+    try:
+        from photomatagent.scientific.capabilities.chemistry.tools import (
+            chemistry_pack,
+        )
+    except ImportError:  # optional RDKit capability must fail soft
+        chemistry_pack = None
     from photomatagent.scientific.capabilities.chgnet import chgnet_pack
 
     effective_config = config or ScientificConfig.from_environment(
@@ -80,9 +84,10 @@ def build_scientific_tools(
             effective_workspace,
             scientific_state=scientific_state,
         ),
-        chemistry_pack(),
         chgnet_pack(effective_config, effective_workspace),
     ]
+    if chemistry_pack is not None:
+        packs.append(chemistry_pack())
     tools: list[Tool] = []
     for pack in packs:
         try:

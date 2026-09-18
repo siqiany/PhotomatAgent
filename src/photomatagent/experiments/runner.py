@@ -8,6 +8,13 @@ from typing import Literal
 import json
 
 from photomatagent.experiments.evaluator import evaluate_expectations
+from photomatagent.experiments.discovery import (
+    composition_identities,
+    compute_discovery_metrics,
+    fixture_snapshot_sha256,
+    inject_evidence_fixture,
+    DiscoveryMetrics,
+)
 from photomatagent.experiments.models import (
     ConfigurationSnapshot,
     ExperimentConfig,
@@ -57,10 +64,19 @@ async def run_experiment(
         max_iterations=config.variant.max_iterations,
         tool_surface=config.variant.tool_surface,
         tasks=config.tasks,
+        workflow=config.variant.workflow,
+        evidence_snapshot=config.variant.evidence_snapshot,
     )
     runs: list[ExperimentTaskRun] = []
-    for task in config.tasks:
+    repeat_tasks = [
+        (task, repeat_index)
+        for task in config.tasks
+        for repeat_index in range(1, task.repeats + 1)
+    ]
+    composition_keys: set[tuple[tuple[str, int], ...]] = set()
+    for task, repeat_index in repeat_tasks:
         scientific = ScientificState()
+        fixture = inject_evidence_fixture(scientific, task.evidence_fixture)
         logger = EventLogger(base_sessions)
         surface_config = ToolSurfaceConfig(mode=config.variant.tool_surface)
         registry = create_default_registry(
@@ -100,12 +116,21 @@ async def run_experiment(
             answer = _final_answer(runtime)
         trace = load_trace(logger.session_dir)
         session_summary = analyze_trace(trace)
+        discovery_metrics = compute_discovery_metrics(
+            scientific,
+            events=trace.events,
+            session_summary=session_summary,
+        )
+        composition_keys.update(composition_identities(scientific))
         evaluation = evaluate_expectations(
             task.expect, answer=answer, summary=session_summary
         )
         runs.append(
             ExperimentTaskRun(
                 task_id=task.id,
+                repeat_index=repeat_index,
+                evidence_fixture=fixture.fixture_id,
+                evidence_fixture_sha256=fixture.content_sha256,
                 session_id=logger.session_id,
                 runtime_status=(
                     "COMPLETED" if session_summary.runtime_completed else "FAILED"
@@ -114,11 +139,12 @@ async def run_experiment(
                 answer=answer,
                 error=runtime_error,
                 summary=session_summary,
+                discovery_metrics=discovery_metrics,
             )
         )
     experiment_id = new_experiment_id(config.name)
     experiment_summary = summarize_experiment(
-        experiment_id, config, snapshot, runs
+        experiment_id, config, snapshot, runs, composition_keys
     )
     return ExperimentResult(
         experiment_id=experiment_id,
@@ -135,6 +161,8 @@ def configuration_snapshot(
     max_iterations: int,
     tool_surface: Literal["progressive", "eager"] = "progressive",
     tasks: list[ExperimentTask] | None = None,
+    workflow: str = "baseline",
+    evidence_snapshot: str = "",
 ) -> ConfigurationSnapshot:
     serialized_tasks = json.dumps(
         [task.model_dump(mode="json") for task in tasks or []],
@@ -143,6 +171,12 @@ def configuration_snapshot(
         separators=(",", ":"),
     )
     skill_index = format_skill_index(SkillLoader())
+    fixture_ids = [task.evidence_fixture for task in tasks or []]
+    fixture_snapshot = (
+        fixture_snapshot_sha256(fixture_ids)
+        if any(fixture_ids)
+        else evidence_snapshot
+    )
     return ConfigurationSnapshot(
         provider=provider,
         model=model,
@@ -166,6 +200,9 @@ def configuration_snapshot(
             "identifier": f"{ToolSurfacePlanner.__module__}.{ToolSurfacePlanner.__qualname__}",
             "config": ToolSurfaceConfig(mode=tool_surface).model_dump(),
         },
+        budget={"max_iterations": max_iterations},
+        evidence_snapshot=fixture_snapshot,
+        workflow=workflow,
         task_set_sha256=hashlib.sha256(serialized_tasks.encode("utf-8")).hexdigest(),
         skill_index_sha256=hashlib.sha256(skill_index.encode("utf-8")).hexdigest(),
     )
@@ -176,6 +213,7 @@ def summarize_experiment(
     config: ExperimentConfig,
     snapshot: ConfigurationSnapshot,
     runs: list[ExperimentTaskRun],
+    composition_keys: set[tuple[tuple[str, int], ...]] | None = None,
 ) -> ExperimentSummary:
     count = len(runs)
     passed = sum(run.evaluation.status == "PASS" for run in runs)
@@ -183,6 +221,9 @@ def summarize_experiment(
     unevaluated = sum(run.evaluation.status == "UNEVALUATED" for run in runs)
     evaluated = passed + failed
     summaries = [run.summary for run in runs]
+    discovery = _sum_discovery_metrics(
+        [run.discovery_metrics for run in runs], composition_keys=composition_keys
+    )
     total_tool_calls = sum(summary.tool_calls for summary in summaries)
     total_tool_failures = sum(summary.tool_failures for summary in summaries)
     repeated = sum(summary.repeated_tool_calls for summary in summaries)
@@ -242,7 +283,42 @@ def summarize_experiment(
         pruned_tool_results=sum(summary.pruned_tool_results for summary in summaries),
         compaction_count=sum(summary.compaction_count for summary in summaries),
         compaction_failures=sum(summary.compaction_failures for summary in summaries),
+        discovery_metrics=discovery,
     )
+
+
+def _sum_discovery_metrics(
+    values: list[DiscoveryMetrics | None],
+    *,
+    composition_keys: set[tuple[tuple[str, int], ...]] | None = None,
+) -> DiscoveryMetrics | None:
+    known = [value for value in values if value is not None]
+    if not known:
+        return None
+    input_values = [value.input_tokens for value in known]
+    output_values = [value.output_tokens for value in known]
+    return DiscoveryMetrics(
+        proposal_count=sum(value.proposal_count for value in known),
+        unique_composition_count=(
+            len(composition_keys)
+            if composition_keys is not None
+            else sum(value.unique_composition_count for value in known)
+        ),
+        traceable_basis_count=sum(value.traceable_basis_count for value in known),
+        basis_count=sum(value.basis_count for value in known),
+        unknown_property_count=sum(value.unknown_property_count for value in known),
+        unsupported_validation_count=sum(value.unsupported_validation_count for value in known),
+        tool_calls=sum(value.tool_calls for value in known),
+        input_tokens=_sum_discovery_optional(input_values),
+        output_tokens=_sum_discovery_optional(output_values),
+        scientific_validity_rate=None,
+    )
+
+
+def _sum_discovery_optional(values: list[int | None]) -> int | None:
+    if any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
 
 
 async def _run_loop_task(
