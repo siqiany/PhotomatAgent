@@ -141,6 +141,9 @@ class ScientificConfig:
     chgnet_max_structures: int = 32
     chgnet_relax_fmax: float = 0.1
     chgnet_relax_steps: int = 200
+    structure_max_atoms: int = 128
+    structure_max_raw_configurations: int = 4096
+    structure_max_outputs: int = 32
     # MatterGen is deliberately an isolated executable integration.  Keep its
     # settings separate from the main Python environment and pass only the
     # configured executable/cache through the narrow runner boundary.
@@ -303,6 +306,16 @@ class ScientificConfig:
                 200,
                 minimum=1,
                 maximum=200,
+            ),
+            structure_max_atoms=_bounded_int_env(
+                "PHOTOMATAGENT_STRUCTURE_MAX_ATOMS", 128, minimum=1, maximum=512
+            ),
+            structure_max_raw_configurations=_bounded_int_env(
+                "PHOTOMATAGENT_STRUCTURE_MAX_RAW_CONFIGURATIONS", 4096,
+                minimum=1, maximum=4096,
+            ),
+            structure_max_outputs=_bounded_int_env(
+                "PHOTOMATAGENT_STRUCTURE_MAX_OUTPUTS", 32, minimum=1, maximum=32
             ),
             mattergen_executable=_text_env(
                 "PHOTOMATAGENT_MATTERGEN_EXECUTABLE",

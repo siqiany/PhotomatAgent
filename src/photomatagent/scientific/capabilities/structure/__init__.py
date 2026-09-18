@@ -23,6 +23,7 @@ from photomatagent.scientific.capabilities.contracts import (
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
+from photomatagent.scientific.capabilities.structure.artifacts import load_structure_input
 
 
 class StructureProbe(CapabilityPack):
@@ -57,16 +58,7 @@ class StructureProbe(CapabilityPack):
 
 
 def _load_structure(path_value: str, workspace: Workspace) -> Any:
-    from pymatgen.core import Structure
-
-    path = Path(path_value).expanduser()
-    if not path.is_absolute():
-        candidate = workspace.root / path
-        if candidate.is_file():
-            path = candidate
-    if not path.is_file():
-        raise ValueError(f"structure file not found: {path_value}")
-    return Structure.from_file(str(path)), path
+    return load_structure_input(workspace, path_value)
 
 
 def _evidence_for_structure(
@@ -412,4 +404,3 @@ class StructureConvertTool(Tool):
 
 def structure_pack(config: ScientificConfig, workspace: Workspace) -> CapabilityPack:
     return StructureProbe(config, workspace)
-

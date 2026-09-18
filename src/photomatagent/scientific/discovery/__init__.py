@@ -14,6 +14,7 @@ from photomatagent.scientific.discovery.models import (
     HypothesisRegistration,
     ScientificHypothesis,
 )
+from photomatagent.scientific.discovery.structures import StructureDerivation, StructureRegistration
 
 __all__ = [
     "BasisReference",
@@ -26,4 +27,6 @@ __all__ = [
     "ScientificHypothesis",
     "composition_key",
     "normalize_composition",
+    "StructureDerivation",
+    "StructureRegistration",
 ]
