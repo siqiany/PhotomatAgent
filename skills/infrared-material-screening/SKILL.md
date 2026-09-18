@@ -38,12 +38,15 @@ the source and fidelity of every result:
    checkpoints are not joint-condition models. All outputs are
    `UNVALIDATED_GENERATED_STRUCTURE`.
 4. Run `chgnet.screen` on small batches and rank energies only within the same
-   reduced composition. Label this evidence
+   reduced composition. The tool recomputes the input file SHA-256 and
+   canonical structure hash. Label this evidence
    `source_type=ml_interatomic_potential`, `fidelity=ml_potential`; it is not
    DFT formation energy, energy above hull, stability, or detector evidence.
-5. Run `chgnet.relax` only on finalists. Send a much smaller, explicitly
-   approved set through gated VASP validation; scheduler completion alone is
-   not scientific success.
+5. Run `chgnet.relax` only on finalists. A changed geometry receives a new
+   structure candidate ID and must be rechecked by scope before downstream
+   evidence is attached. Send a much smaller, explicitly approved set through
+   the existing VASP prepare/validate/`SubmitOnceSession` gates; scheduler
+   completion or command success alone is not scientific success.
 6. For each candidate, list known versus missing transport, defects, optical
    absorption, thermal behavior, and device results. Rank by evidence
    completeness and decision relevance, not gap match alone.
@@ -57,3 +60,10 @@ the source and fidelity of every result:
 - Report which missing evidence is most decision-relevant.
 - Report unsupported or out-of-domain structures; never silently promote a
   generated or ML-potential result to a validated material or detector claim.
+- Structure evidence must carry both `candidate_id` and `structure_hash` from
+  the bytes actually read. Reject model-supplied identity claims that disagree
+  with those hashes. File renames preserve identity, while different ordered
+  structures of one composition remain separately checkable.
+- A fixture, fake CHGNet result, x=0.25 ratio check, or local VASP simulation
+  validates software boundaries only. It does not predict performance or
+  establish DFT, experimental, stability, or synthesizability conclusions.

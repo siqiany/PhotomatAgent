@@ -8,6 +8,7 @@ access; it only sees these narrow VASP tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,7 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
 )
+from photomatagent.scientific.capabilities.structure.artifacts import structure_hash
 from photomatagent.scientific.remote.models import (
     HPCJobState,
     RemoteJobRef,
@@ -33,6 +35,7 @@ from photomatagent.scientific.remote.models import (
 )
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
+from photomatagent.workspace import Workspace
 
 if TYPE_CHECKING:
     from photomatagent.scientific.applications.vasp.unified.factory import (
@@ -41,14 +44,19 @@ if TYPE_CHECKING:
 
 
 def _evidence_from_collect(
-    report: dict[str, Any], *, tool: str
+    report: dict[str, Any], *, tool: str, workspace: Workspace | Path | None = None
 ) -> list[ScientificEvidence]:
     evidence: list[ScientificEvidence] = []
+    if report.get("scientifically_valid") is not True:
+        return evidence
     parsed = report.get("parsed", {})
+    scope = _actual_structure_scope(report, workspace=workspace)
+    if not scope:
+        return evidence
     if "final_energy_eV" in parsed:
         evidence.append(
             ScientificEvidence(
-                subject=f"vasp_job_{report.get('job_id', '?')}",
+                subject=scope.get("formula", ""),
                 property="total_energy",
                 value=parsed["final_energy_eV"],
                 unit="eV",
@@ -56,6 +64,8 @@ def _evidence_from_collect(
                 source_type="dft_calculation",
                 method="VASP (profile=" + report.get("profile", "?") + ")",
                 fidelity="dft",
+                candidate_id=scope.get("candidate_id", ""),
+                structure_hash=scope.get("structure_hash", ""),
                 summary=(
                     f"VASP total energy {parsed['final_energy_eV']:.4f} eV "
                     f"(job {report.get('job_id', '?')})"
@@ -66,10 +76,81 @@ def _evidence_from_collect(
                     "job_id": report.get("job_id"),
                     "profile": report.get("profile"),
                     "scheduler_state": report.get("scheduler_state"),
+                    **scope,
                 },
             )
         )
     return evidence
+
+
+def _actual_structure_scope(
+    report: dict[str, Any], *, workspace: Workspace | Path | None
+) -> dict[str, str]:
+    """Derive structure scope from a readable local structure artifact.
+
+    Values supplied as metadata are intentionally ignored.  A VASP result can
+    only be associated with a structure when the boundary can re-read the
+    corresponding input file and hash its bytes and geometry.
+    """
+
+    if workspace is None:
+        return {}
+    root = workspace.root if isinstance(workspace, Workspace) else Path(workspace).expanduser().resolve()
+    raw_path = (
+        report.get("structure_path")
+        or report.get("input_structure_path")
+        or report.get("input_path")
+    )
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return {}
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_symlink():
+        return {}
+    path = (candidate if candidate.is_absolute() else root / candidate).resolve(strict=False)
+    if root not in path.parents and path != root:
+        return {}
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return {}
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            return {}
+    if not path.is_file() or path.is_symlink():
+        return {}
+    try:
+        from pymatgen.core import Structure
+
+        parsed = Structure.from_file(str(path))
+        digest = structure_hash(parsed)
+        return {
+            "candidate_id": f"cand_{digest[:24]}",
+            "structure_hash": digest,
+            "formula": parsed.composition.reduced_formula,
+            "input_sha256": _sha256_file(path),
+            "input_structure_path": str(path),
+        }
+    except Exception:
+        return {}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _result_structure_path(result_dir: str | Path) -> Path | None:
+    directory = Path(result_dir).expanduser()
+    for name in ("CONTCAR", "POSCAR"):
+        path = directory / name
+        if path.is_file() and not path.is_symlink():
+            return path
+    return None
 
 
 class VaspCapabilitiesTool(Tool):
@@ -361,8 +442,15 @@ class VaspCollectTool(Tool):
         "required": ["job_id", "remote_directory", "profile"],
     }
 
-    def __init__(self, application: VaspApplication | None = None) -> None:
+    def __init__(
+        self,
+        application: VaspApplication | None = None,
+        workspace: Workspace | Path | None = None,
+    ) -> None:
         self.application = application
+        self.workspace = workspace or (
+            getattr(application, "workspace", None) if application is not None else None
+        )
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         application = self.application or default_vasp_application()
@@ -387,7 +475,9 @@ class VaspCollectTool(Tool):
                 is_error=True,
                 data={"error_type": type(exc).__name__, "message": str(exc)},
             )
-        evidence = _evidence_from_collect(report, tool=self.name)
+        evidence = _evidence_from_collect(
+            report, tool=self.name, workspace=self.workspace
+        )
         return ScientificToolResult(
             output=json.dumps(report, ensure_ascii=False, indent=2),
             data=report,
@@ -418,8 +508,15 @@ class VaspInspectResultTool(Tool):
         "required": ["result_dir", "profile"],
     }
 
-    def __init__(self, application: VaspApplication | None = None) -> None:
+    def __init__(
+        self,
+        application: VaspApplication | None = None,
+        workspace: Workspace | Path | None = None,
+    ) -> None:
         self.application = application
+        self.workspace = workspace or (
+            getattr(application, "workspace", None) if application is not None else None
+        )
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         application = self.application or default_vasp_application()
@@ -435,6 +532,11 @@ class VaspInspectResultTool(Tool):
             "validation_problems": problems,
             "scientifically_valid": not problems,
             "parsed": parsed,
+            "structure_path": (
+                str(structure_path)
+                if (structure_path := _result_structure_path(directory)) is not None
+                else ""
+            ),
             "note": (
                 "local inspection only; no scheduler state involved"
             ),
@@ -449,8 +551,10 @@ class VaspInspectResultTool(Tool):
                     "scheduler_state": "LOCAL",
                     "validation_problems": problems,
                     "parsed": parsed,
+                    "structure_path": payload["structure_path"],
                 },
                 tool=self.name,
+                workspace=self.workspace,
             ),
         )
 

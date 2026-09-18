@@ -25,6 +25,7 @@ from photomatagent.scientific.discovery.composition import (
     composition_key,
     normalize_composition,
 )
+from photomatagent.scientific.discovery.structures import StructureDerivation
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.state import ScientificState
 
@@ -261,6 +262,22 @@ def _candidate_from_evidence(
 ) -> CandidateState:
     provenance = getattr(evidence, "provenance", {}) or {}
     method = generation_method or str(provenance.get("tool", ""))
+    structure_hash = str(getattr(evidence, "structure_hash", "") or "")
+    structure_representation: dict[str, Any] = {}
+    if structure_hash:
+        structure_representation = {
+            "structure_identifier": structure_hash,
+            "structure_hash": structure_hash,
+            "path": str(
+                provenance.get("path")
+                or provenance.get("input_structure_path")
+                or provenance.get("input_path")
+                or ""
+            ),
+            "hypothesis_ids": list(provenance.get("hypothesis_ids", []))
+            if isinstance(provenance.get("hypothesis_ids", []), list)
+            else [],
+        }
     lineage = CandidateLineage(
         generated_by=method or "unknown",
         generation_parameters=provenance,
@@ -274,11 +291,18 @@ def _candidate_from_evidence(
         extra_representation={
             "evidence_ids": [evidence.id],
             "evidence_type": str(getattr(evidence, "source_type", "")),
+            **structure_representation,
         },
         created_iteration=iteration,
         lineage=lineage,
     )
-    candidate.candidate_id = f"cand_{composition_key(formula)[:24]}"
+    candidate.candidate_id = (
+        f"cand_{structure_hash[:24]}"
+        if structure_hash
+        else f"cand_{composition_key(formula)[:24]}"
+    )
+    if structure_hash:
+        candidate.candidate_type = "structure"
     candidate.evidence_ids = [evidence.id]
     return candidate
 
@@ -333,16 +357,90 @@ def _attach_legacy_provenance(
     return candidate
 
 
+def _formula_from_normalized_composition(
+    composition: tuple[tuple[str, int], ...],
+) -> str:
+    return "".join(
+        symbol if amount == 1 else f"{symbol}{amount}"
+        for symbol, amount in composition
+    )
+
+
+def _structure_candidate(
+    derivation: StructureDerivation,
+    *,
+    iteration: int,
+) -> CandidateState:
+    """Project one trusted derivation without using its filename as identity."""
+
+    formula = _formula_from_normalized_composition(
+        tuple(derivation.normalized_composition)
+    )
+    candidate = candidate_from_formula(
+        formula,
+        parent_candidate_id=derivation.parent_candidate_id,
+        candidate_type="structure",
+        generation_method=derivation.operation,
+        generation_parameters={
+            "operation": derivation.operation,
+            "parameters": dict(derivation.parameters),
+            "derivation_ids": [derivation.id],
+            "sources": [
+                {
+                    "derivation_id": derivation.id,
+                    "path": derivation.output_path,
+                    "origin": dict(derivation.origin),
+                }
+            ],
+        },
+        extra_representation={
+            "structure_identifier": derivation.structure_hash,
+            "structure_hash": derivation.structure_hash,
+            "path": derivation.output_path,
+            "hypothesis_ids": (
+                [derivation.hypothesis_id] if derivation.hypothesis_id else []
+            ),
+        },
+        created_iteration=iteration,
+        lineage=derivation.lineage,
+    )
+    candidate.candidate_id = derivation.candidate_id
+    return candidate
+
+
+def _merge_structure_derivation(
+    candidate: CandidateState,
+    derivation: StructureDerivation,
+) -> None:
+    """Retain all source records while keeping one hash-derived candidate."""
+
+    representation = candidate.representation
+    hypothesis_ids = representation.setdefault("hypothesis_ids", [])
+    if derivation.hypothesis_id and derivation.hypothesis_id not in hypothesis_ids:
+        hypothesis_ids.append(derivation.hypothesis_id)
+    derivation_ids = candidate.generation_parameters.setdefault("derivation_ids", [])
+    if derivation.id not in derivation_ids:
+        derivation_ids.append(derivation.id)
+    sources = candidate.generation_parameters.setdefault("sources", [])
+    source = {
+        "derivation_id": derivation.id,
+        "path": derivation.output_path,
+        "origin": dict(derivation.origin),
+    }
+    if source not in sources:
+        sources.append(source)
+
+
 def project_candidates_from_state(
     scientific: ScientificState,
     iteration: int = 0,
 ) -> CandidateProjectionResult:
     """Project all registered hypotheses and legacy evidence into candidates.
 
-    Candidate identity is the normalized composition identity. Multiple
-    hypotheses for the same composition remain traceable through their IDs but
-    consume one candidate slot. Legacy structured evidence is retained and may
-    coexist with mechanism candidates.
+    Composition hypotheses retain composition identity; structure derivations
+    use their trusted geometry hash as identity. Multiple sources for one
+    structure merge while distinct geometries remain separate. Legacy
+    structured evidence is retained and may coexist with mechanism candidates.
     """
 
     candidates: list[CandidateState] = []
@@ -373,6 +471,17 @@ def project_candidates_from_state(
             if hypothesis.id not in hypothesis_ids:
                 hypothesis_ids.append(hypothesis.id)
 
+    for derivation in scientific.structure_derivations:
+        identity = derivation.candidate_id
+        existing = by_id.get(identity)
+        if existing is None:
+            candidate = _structure_candidate(derivation, iteration=iteration)
+            index_by_id[identity] = len(candidates)
+            candidates.append(candidate)
+            by_id[identity] = candidate
+        elif existing.candidate_type == "structure":
+            _merge_structure_derivation(existing, derivation)
+
     for evidence in scientific.evidence:
         formula = _evidence_formula(evidence)
         if not formula:
@@ -397,8 +506,37 @@ def project_candidates_from_state(
                 )
             )
             continue
+        evidence_structure_hash = str(
+            getattr(evidence, "structure_hash", "") or ""
+        )
+        if evidence_structure_hash:
+            identity = f"cand_{evidence_structure_hash[:24]}"
+            evidence_identity = str(getattr(evidence, "candidate_id", "") or "")
+            expected_identity = identity
+            if evidence_identity and evidence_identity != expected_identity:
+                diagnostics.append(
+                    CandidateProjectionDiagnostic(
+                        code="INVALID_LEGACY_CANDIDATE",
+                        evidence_id=evidence.id,
+                        message=(
+                            "ignored mismatched evidence candidate_id; derived "
+                            f"trusted identity {expected_identity} from structure_hash"
+                        ),
+                    )
+                )
         existing = by_id.get(identity)
         source = _legacy_source(evidence)
+        if existing is not None and existing.candidate_type == "structure":
+            existing.evidence_ids.append(evidence.id)
+            _attach_legacy_provenance(
+                existing,
+                sources=[
+                    *list(existing.generation_parameters.get("legacy_sources", [])),
+                    source,
+                ],
+                evidence_ids=list(existing.evidence_ids),
+            )
+            continue
         if existing is not None and existing.generation_method == "mechanism_reasoning":
             prior_sources = list(
                 existing.generation_parameters.get("legacy_sources", [])

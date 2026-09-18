@@ -171,6 +171,54 @@ class GenerationCapabilitiesTool(Tool):
                 "guidance_factor": config.mattergen_guidance_factor,
                 "seed": config.mattergen_seed,
             },
+            "structure_construction": {
+                "status": (
+                    "AVAILABLE"
+                    if importlib.util.find_spec("pymatgen") is not None
+                    else "MISSING_DEPENDENCY"
+                ),
+                "tools": [
+                    "structure.make_supercell",
+                    "structure.substitute_sites",
+                    "structure.enumerate_orderings",
+                ],
+                "scope": (
+                    "workspace-contained bounded structure derivations; exact "
+                    "composition and artifact hashes are checked by runtime"
+                ),
+                "limitations": (
+                    "does not establish stability, band gap, E_hull, "
+                    "synthesizability, or detector performance"
+                ),
+            },
+            "validation_funnel": {
+                "chgnet": {
+                    "status": (
+                        "AVAILABLE"
+                        if importlib.util.find_spec("chgnet") is not None
+                        else "MISSING_DEPENDENCY"
+                    ),
+                    "tools": ["chgnet.screen", "chgnet.relax"],
+                    "scope": "same-composition ML-potential screening and pre-relaxation",
+                    "not_claims": [
+                        "E_hull",
+                        "formation_energy",
+                        "thermodynamic_stability",
+                        "detector_performance",
+                    ],
+                },
+                "vasp": {
+                    "status": "GATED",
+                    "scope": (
+                        "reuse existing prepare, validate, approval, and "
+                        "SubmitOnceSession lifecycle"
+                    ),
+                    "completion_rule": (
+                        "Slurm COMPLETED or command success is not scientific "
+                        "success; collected artifacts must validate"
+                    ),
+                },
+            },
             "cost_class": {
                 "mechanism_reasoning": "CHEAP",
                 "vae_formula": "CHEAP",

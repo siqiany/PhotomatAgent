@@ -70,6 +70,22 @@ device measurements. Keep unknowns as unknowns and report the next capability;
 do not turn a guessed threshold, analogy, mock result, or generated structure
 into evidence.
 
+When a registered hypothesis has a trusted structure derivation, carry the
+structure hash and workspace artifact path into the next tool call. A structure
+candidate is identified by its canonical geometry hash, so renaming a CIF does
+not create a new candidate; two geometries with the same composition remain
+separate. A derived parent may be claimed only when the runtime finds the
+input-file hash in a previously registered structure artifact. An external
+mother structure can support the composition hypothesis, but it is not a
+structure parent unless its artifact is registered.
+
+The CHGNet funnel is a same-composition ML-potential screen or pre-relaxation.
+Its energy is never an `E_hull`, formation-energy, stability, or synthesizability
+claim. CHGNet relaxation output with changed geometry is a new structure
+identity. VASP evidence must come from the existing prepare, validation, and
+`SubmitOnceSession` gates; a successful command or Slurm `COMPLETED` state alone
+does not establish a scientific observation.
+
 ## Case boundary
 
 For a sulfide request that allows isovalent alloying and forbids selected
@@ -79,3 +95,8 @@ stability. Recognize incompatible simple band-to-band assumptions (for example
 conflicting wavelength and gap claims) and list alternative mechanisms as
 hypotheses needing evidence. No real HPC job or successful material may be
 reported without independent artifacts and validation.
+
+The x=0.25 example is only a fixed-ratio composition test. Test fixtures and
+fake backends demonstrate provenance and boundary behavior; they are not
+predictions, DFT results, or experimental evidence. A whole composition family
+may be rejected when the parent-structure or evidence assumptions fail.

@@ -516,6 +516,7 @@ class VaspApplication:
         )
         problems = validate_output(local, profile_name=profile_name)
         parsed = parse_result(local)
+        final_structure_path = _trusted_result_structure_path(local)
         return {
             "job_id": job_ref.job_id,
             "profile": profile_name,
@@ -525,6 +526,11 @@ class VaspApplication:
             "scientifically_valid": not problems,
             "parsed": parsed,
             "artifacts": [str(path) for path in downloaded],
+            "structure_path": (
+                str(final_structure_path)
+                if not problems and final_structure_path is not None
+                else ""
+            ),
             "note": (
                 "Slurm COMPLETED is scheduler state; scientific validity "
                 "requires an empty validation_problems list"
@@ -536,6 +542,14 @@ class VaspApplication:
 
     def parse_result(self, result_dir: str | Path) -> dict[str, Any]:
         return parse_result(result_dir)
+
+
+def _trusted_result_structure_path(result_dir: Path) -> Path | None:
+    for name in ("CONTCAR", "POSCAR"):
+        path = result_dir / name
+        if path.is_file() and not path.is_symlink():
+            return path
+    return None
 
 
 def default_vasp_application() -> VaspApplication | None:

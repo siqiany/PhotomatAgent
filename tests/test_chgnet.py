@@ -138,9 +138,21 @@ def test_screen_schema_and_registry_use_only_canonical_paths(tmp_path):
     registry = ToolRegistry()
     registry.register(screen)
 
-    assert set(screen.input_schema["properties"]) == {"paths", "rank"}
-    assert registry.validate_arguments(screen.name, {"paths": ["candidate.cif"]}) == {
-        "paths": ["candidate.cif"]
+    assert set(screen.input_schema["properties"]) == {
+        "paths", "rank", "candidate_ids", "structure_hashes"
+    }
+    assert screen.input_schema["additionalProperties"] is False
+    assert registry.validate_arguments(
+        screen.name,
+        {
+            "paths": ["candidate.cif"],
+            "candidate_ids": ["cand_abc"],
+            "structure_hashes": ["a" * 64],
+        },
+    ) == {
+        "paths": ["candidate.cif"],
+        "candidate_ids": ["cand_abc"],
+        "structure_hashes": ["a" * 64],
     }
     with pytest.raises(ToolValidationError, match="missing required argument 'paths'"):
         registry.validate_arguments(

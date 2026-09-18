@@ -220,6 +220,26 @@ def test_structure_scope_requires_matching_explicit_structure_hash() -> None:
     assert (matching, matching_reason) == (True, "applicable")
 
 
+def test_structure_a_evidence_cannot_validate_structure_b() -> None:
+    structure_a = candidate_from_formula(
+        "Na3AgBi4S8", extra_representation={"structure_hash": "sha256:a"}
+    )
+    structure_b = candidate_from_formula(
+        "Na3AgBi4S8", extra_representation={"structure_hash": "sha256:b"}
+    )
+    evidence_a = _evidence(structure_hash="sha256:a")
+
+    valid_a, reason_a = _applicable(
+        evidence_a, structure_a, EvidenceRequirements(scope="structure")
+    )
+    valid_b, reason_b = _applicable(
+        evidence_a, structure_b, EvidenceRequirements(scope="structure")
+    )
+
+    assert (valid_a, reason_a) == (True, "applicable")
+    assert (valid_b, reason_b) == (False, "STRUCTURE_MISMATCH")
+
+
 def test_device_scope_requires_structure_and_all_declared_conditions() -> None:
     candidate = candidate_from_formula(
         "Na3AgBi4S8", extra_representation={"structure_hash": "sha256:device"}

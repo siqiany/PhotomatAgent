@@ -31,6 +31,10 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
 )
+from photomatagent.scientific.capabilities.structure.artifacts import (
+    file_sha256,
+    structure_hash as canonical_structure_hash,
+)
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
@@ -52,6 +56,10 @@ Row = TypeVar("Row", bound=Mapping[str, Any])
 
 class CHGNetPredictionError(ValueError):
     """Raised when a prediction cannot support a trustworthy force summary."""
+
+
+class CHGNetScopeMismatchError(ValueError):
+    """Raised when caller-supplied identity disagrees with file-derived identity."""
 
 
 class CHGNetCapabilityPack(CapabilityPack):
@@ -218,6 +226,7 @@ class CHGNetScreenTool(_CHGNetTool):
     cost_class = "CHEAP"
     input_schema = {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "paths": {
                 "type": "array",
@@ -233,6 +242,16 @@ class CHGNetScreenTool(_CHGNetTool):
                     "Whether to add deterministic same-composition energy "
                     "ranks (default true)."
                 ),
+            },
+            "candidate_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional trusted candidate IDs, one per path; validated against parsed files.",
+            },
+            "structure_hashes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional trusted structure hashes, one per path; validated against parsed files.",
             },
         },
         "required": ["paths"],
@@ -270,7 +289,28 @@ class CHGNetScreenTool(_CHGNetTool):
             if not isinstance(rank, bool):
                 raise ValueError("rank must be a boolean")
             structures = [_load_structure(path) for path in resolved]
+            candidate_ids = _optional_scope_list(arguments.get("candidate_ids"), "candidate_ids")
+            structure_hashes = _optional_scope_list(
+                arguments.get("structure_hashes"), "structure_hashes"
+            )
+            if candidate_ids is not None and len(candidate_ids) != len(paths):
+                raise ValueError("candidate_ids must have one item per path")
+            if structure_hashes is not None and len(structure_hashes) != len(paths):
+                raise ValueError("structure_hashes must have one item per path")
+            for index, (path, structure) in enumerate(zip(resolved, structures, strict=True)):
+                _validate_scope_claim(
+                    structure,
+                    candidate_id=(candidate_ids[index] if candidate_ids is not None else None),
+                    structure_hash=(
+                        structure_hashes[index] if structure_hashes is not None else None
+                    ),
+                )
         except Exception as exc:
+            if isinstance(exc, CHGNetScopeMismatchError):
+                return self._error(
+                    f"chgnet.screen scope mismatch: {exc}",
+                    error_type="scope_mismatch",
+                )
             return self._error(
                 f"chgnet.screen invalid input: {exc}",
                 error_type="invalid_input",
@@ -287,6 +327,7 @@ class CHGNetScreenTool(_CHGNetTool):
                     structure,
                     self._workspace.relative(path),
                 )
+                _add_file_scope(row, path, structure)
                 rows.append(row)
                 evidence.append(
                     _screen_evidence(
@@ -297,6 +338,11 @@ class CHGNetScreenTool(_CHGNetTool):
                 )
             _apply_same_composition_ranks(rows, enabled=rank)
         except Exception as exc:
+            if isinstance(exc, CHGNetScopeMismatchError):
+                return self._error(
+                    f"chgnet.screen scope mismatch: {exc}",
+                    error_type="scope_mismatch",
+                )
             if isinstance(exc, CHGNetPredictionError):
                 return self._error(
                     f"chgnet.screen invalid prediction: {exc}",
@@ -375,6 +421,7 @@ class CHGNetRelaxTool(_CHGNetTool):
     cost_class = "MODERATE"
     input_schema = {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "path": {
                 "type": "string",
@@ -399,6 +446,14 @@ class CHGNetRelaxTool(_CHGNetTool):
             "output_name": {
                 "type": "string",
                 "description": "Optional safe filename below user_output/chgnet/.",
+            },
+            "candidate_id": {
+                "type": "string",
+                "description": "Optional trusted input candidate ID; validated against parsed file.",
+            },
+            "structure_hash": {
+                "type": "string",
+                "description": "Optional trusted input structure hash; validated against parsed file.",
             },
         },
         "required": ["path"],
@@ -442,7 +497,28 @@ class CHGNetRelaxTool(_CHGNetTool):
             if output_path.parent != self._workspace.root / "user_output" / "chgnet":
                 raise ValueError("output path must stay below user_output/chgnet")
             structure = _load_structure(path)
+            _validate_scope_claim(
+                structure,
+                candidate_id=(
+                    arguments.get("candidate_id")
+                    if arguments.get("candidate_id") is not None
+                    else None
+                ),
+                structure_hash=(
+                    arguments.get("structure_hash")
+                    if arguments.get("structure_hash") is not None
+                    else None
+                ),
+            )
+            input_sha256 = file_sha256(path)
+            input_structure_hash = canonical_structure_hash(structure)
         except Exception as exc:
+            if isinstance(exc, CHGNetScopeMismatchError):
+                return self._error(
+                    f"chgnet.relax scope mismatch: {exc}",
+                    error_type="scope_mismatch",
+                    details={"error": "STRUCTURE_SCOPE_MISMATCH"},
+                )
             if isinstance(exc, ImportError):
                 return self._error(
                     "chgnet.relax missing dependency: install photomatagent[chgnet]",
@@ -461,6 +537,7 @@ class CHGNetRelaxTool(_CHGNetTool):
             before = _prediction_summary(
                 before_prediction, structure, self._workspace.relative(path)
             )
+            _add_file_scope(before, path, structure)
             optimizer = self._optimizer
             if optimizer is None:
                 optimizer = _invoke_optimizer_factory(
@@ -481,6 +558,7 @@ class CHGNetRelaxTool(_CHGNetTool):
             )
             cif = _structure_to_cif(final_structure)
             _atomic_write_text(output_path, cif)
+            _add_file_scope(after, output_path, final_structure)
         except Exception as exc:
             if isinstance(exc, CHGNetPredictionError):
                 return self._error(
@@ -537,6 +615,10 @@ class CHGNetRelaxTool(_CHGNetTool):
                 relax_cell=relax_cell,
                 joint_convergence=joint_convergence,
                 converged=None,
+                structure_hash=str(before["structure_hash"]),
+                candidate_id=str(before["candidate_id"]),
+                input_sha256=input_sha256,
+                output_sha256=None,
             ),
             _relax_evidence(
                 after,
@@ -550,6 +632,10 @@ class CHGNetRelaxTool(_CHGNetTool):
                 relax_cell=relax_cell,
                 joint_convergence=joint_convergence,
                 converged=converged,
+                structure_hash=str(after["structure_hash"]),
+                candidate_id=str(after["candidate_id"]),
+                input_sha256=input_sha256,
+                output_sha256=file_sha256(output_path),
             ),
         ]
         return ScientificToolResult(
@@ -604,6 +690,41 @@ def _screen_input_paths(arguments: Mapping[str, Any]) -> list[str]:
             raise ValueError("every structure path must be a non-empty string")
         paths.append(item)
     return paths
+
+
+def _optional_scope_list(value: Any, name: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"{name} must be a list of non-empty strings")
+    return list(value)
+
+
+def _validate_scope_claim(
+    structure: Any,
+    *,
+    candidate_id: Any = None,
+    structure_hash: Any = None,
+) -> None:
+    actual_hash = canonical_structure_hash(structure)
+    actual_candidate = f"cand_{actual_hash[:24]}"
+    if candidate_id is not None and candidate_id != actual_candidate:
+        raise CHGNetScopeMismatchError(
+            f"candidate_id {candidate_id!r} does not match parsed structure"
+        )
+    if structure_hash is not None and structure_hash != actual_hash:
+        raise CHGNetScopeMismatchError(
+            f"structure_hash {structure_hash!r} does not match parsed structure"
+        )
+
+
+def _add_file_scope(row: dict[str, Any], path: Path, structure: Any) -> None:
+    digest = canonical_structure_hash(structure)
+    row["structure_hash"] = digest
+    row["candidate_id"] = f"cand_{digest[:24]}"
+    row["input_sha256"] = file_sha256(path)
 
 
 def _resolve_input_file(path_value: Any, workspace: Workspace) -> Path:
@@ -939,6 +1060,8 @@ def _screen_evidence(
         source_type="ml_interatomic_potential",
         method=f"CHGNet {model_name} single-point prediction",
         fidelity="ml_potential",
+        candidate_id=str(row.get("candidate_id", "")),
+        structure_hash=str(row.get("structure_hash", "")),
         summary=(
             f"CHGNet screened {row.get('formula', 'structure')}: "
             f"energy={row.get('energy_eV_per_atom')} eV/atom, "
@@ -954,6 +1077,9 @@ def _screen_evidence(
             "tool": tool_name,
             "model": model_name,
             "path": row.get("path", ""),
+            "input_sha256": row.get("input_sha256", ""),
+            "candidate_id": row.get("candidate_id", ""),
+            "structure_hash": row.get("structure_hash", ""),
         },
     )
 
@@ -971,10 +1097,15 @@ def _relax_evidence(
     relax_cell: bool,
     joint_convergence: bool | None,
     converged: bool | None,
+    structure_hash: str,
+    candidate_id: str,
+    input_sha256: str,
+    output_sha256: str | None,
 ) -> ScientificEvidence:
     limitations = (
         "ML-potential pre-relaxation only; the CIF requires downstream "
-        "DFT validation and is not a stability or detector-performance claim."
+        "DFT validation and is not an E_hull, stability, or "
+        "detector-performance claim."
     )
     if relax_cell and joint_convergence is None:
         limitations += (
@@ -993,6 +1124,8 @@ def _relax_evidence(
         source_type="ml_interatomic_potential",
         method=f"CHGNet {model_name} {phase} relaxation summary",
         fidelity="ml_potential",
+        candidate_id=candidate_id,
+        structure_hash=structure_hash,
         summary=(
             f"CHGNet {phase} relaxation summary for "
             f"{row.get('formula', 'structure')}"
@@ -1009,6 +1142,10 @@ def _relax_evidence(
             "steps": steps,
             "relax_cell": relax_cell,
             "converged": converged,
+            "input_sha256": input_sha256,
+            "output_sha256": output_sha256,
+            "candidate_id": candidate_id,
+            "structure_hash": structure_hash,
         },
     )
 

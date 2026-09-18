@@ -93,6 +93,9 @@ from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.capabilities.structure.artifacts import (
+    file_sha256,
+    load_structure_input,
+    structure_hash as canonical_structure_hash,
     verify_structure_derivation,
     verify_structure_derivations,
 )
@@ -1387,7 +1390,12 @@ class AgentRuntime:
             raise ToolError(
                 "structure candidate_id must be derived from structure_hash"
             )
+        parent_candidate_id = self._trusted_structure_parent(trusted)
         payload = trusted.model_dump(mode="python")
+        payload["parent_candidate_id"] = parent_candidate_id
+        lineage = dict(payload.get("lineage", {}))
+        lineage["parent_candidate_id"] = parent_candidate_id
+        payload["lineage"] = lineage
         payload["origin"] = {
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
@@ -1397,6 +1405,35 @@ class AgentRuntime:
             "model": self._model.model,
         }
         return StructureDerivation.model_validate(payload)
+
+    def _trusted_structure_parent(
+        self, record: StructureDerivation
+    ) -> str | None:
+        """Resolve parentage only from bytes of a live registered artifact."""
+
+        matches: set[str] = set()
+        for previous in self._scientific.structure_derivations:
+            if previous.output_path == record.output_path:
+                continue
+            try:
+                path = self._workspace.resolve(previous.output_path, must_exist=True)
+                if not path.is_file() or path.is_symlink():
+                    continue
+                if file_sha256(path) == record.input_sha256:
+                    parsed, _ = load_structure_input(
+                        self._workspace, previous.output_path
+                    )
+                    if canonical_structure_hash(parsed) != previous.structure_hash:
+                        continue
+                    matches.add(previous.candidate_id)
+            except (OSError, ToolError, ValueError):
+                continue
+        matches.discard(record.candidate_id)
+        if len(matches) > 1:
+            raise ToolError(
+                "structure parent is ambiguous across registered artifacts"
+            )
+        return next(iter(matches), None)
 
     async def _emit_budget(self, iteration: int) -> RuntimeEvent:
         return await self._emit(

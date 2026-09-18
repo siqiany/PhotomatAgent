@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+import hashlib
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,6 +26,7 @@ from photomatagent.scientific.applications.vasp.unified.models import (
 )
 from photomatagent.scientific.applications.vasp.unified.fingerprints import execution_fingerprint
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
+from photomatagent.scientific.capabilities.structure.artifacts import structure_hash
 from photomatagent.scientific.applications.vasp.unified.repository import (
     ensure_managed_vasp_directory,
     managed_vasp_path,
@@ -446,15 +448,57 @@ class PeriodicVaspExecutor:
                     f"{stage.name}: " + "; ".join(report.get("validation_problems", []))
                 )
                 continue
+            try:
+                structure_path = _trusted_result_structure(local_dir)
+                structure = _load_trusted_structure(structure_path)
+            except Exception as exc:
+                evidence_gaps.append(
+                    f"{stage.name}: trusted structure scope unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            parsed = report.get("parsed", {})
+            energy = parsed.get("final_energy_eV") if isinstance(parsed, dict) else None
+            if not isinstance(energy, (int, float)) or isinstance(energy, bool):
+                evidence_gaps.append(
+                    f"{stage.name}: validated result has no parsed total energy"
+                )
+                continue
+            digest = structure_hash(structure)
+            input_sha256 = _sha256_file(structure_path)
+            spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
+            evidence.append(
+                ScientificEvidence(
+                    subject=structure.composition.reduced_formula,
+                    property="total_energy",
+                    value=float(energy),
+                    unit="eV",
+                    source="SCNet VASP calculation",
+                    source_type="dft_calculation",
+                    method=f"VASP (profile={spec.profile})",
+                    fidelity="dft",
+                    candidate_id=f"cand_{digest[:24]}",
+                    structure_hash=digest,
+                    summary=(
+                        f"VASP total energy {float(energy):.4f} eV "
+                        f"(workflow {manifest.workflow_id}, stage {stage.name})"
+                    ),
+                    limitations="; ".join(report.get("validation_problems", [])),
+                    provenance={
+                        "tool": "vasp.collect",
+                        "workflow_id": manifest.workflow_id,
+                        "stage": stage.name,
+                        "job_id": record.job_id,
+                        "profile": spec.profile,
+                        "scheduler_state": report.get("scheduler_state"),
+                        "input_structure_path": str(structure_path),
+                        "input_sha256": input_sha256,
+                        "structure_hash": digest,
+                    },
+                )
+            )
             self.session.mark_result_state(
                 rid, collected=True, validated=True, evidence=len(evidence)
-            )
-            evidence.extend(
-                [
-                    # Existing periodic tools create evidence from parsed energy.
-                    # The unified service may map this via the tool pack; here
-                    # we keep validator-owned outputs in data.
-                ]
             )
         return CollectionResult(
             ok=not evidence_gaps,
@@ -462,8 +506,32 @@ class PeriodicVaspExecutor:
             evidence=evidence,
             evidence_gaps=evidence_gaps,
         )
-
     async def report(
         self, manifest: UnifiedVaspManifest, request: ReportRequest
     ) -> ReportResult:
         return ReportResult(ok=True, report_kind=request.kind)
+
+
+def _load_trusted_structure(path: Path) -> Any:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("structure artifact is missing or symlinked")
+    from pymatgen.core import Structure
+
+    return Structure.from_file(str(path))
+
+
+def _trusted_result_structure(local_dir: Path) -> Path:
+    """Select a validated final geometry from the contained result directory."""
+    for name in ("CONTCAR", "POSCAR"):
+        path = local_dir / name
+        if path.is_file() and not path.is_symlink():
+            return path
+    raise ValueError("validated VASP result has no CONTCAR/POSCAR structure")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()

@@ -6,6 +6,8 @@ from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.discovery import composition as composition_module
 from photomatagent.scientific.discovery.models import HypothesisOrigin, HypothesisProposal
 from photomatagent.scientific.discovery.registration import build_hypothesis
+from photomatagent.scientific.discovery.structures import StructureDerivation
+from photomatagent.scientific.capabilities.generation.lineage import CandidateLineage
 from photomatagent.scientific.loop.candidate import (
     candidate_from_formula,
     extract_candidate_from_state,
@@ -253,3 +255,114 @@ def test_registered_hypothesis_survives_missing_optional_composition_parser(
     }
     assert len(result.diagnostics) == 1
     assert result.diagnostics[0].code == "COMPOSITION_CAPABILITY_UNAVAILABLE"
+
+
+def _structure_derivation(
+    *,
+    structure_hash: str,
+    output_path: str,
+    derivation_id: str,
+    hypothesis_id: str | None = None,
+    parent_candidate_id: str | None = None,
+) -> StructureDerivation:
+    candidate_id = f"cand_{structure_hash[:24]}"
+    return StructureDerivation(
+        id=derivation_id,
+        candidate_id=candidate_id,
+        parent_candidate_id=parent_candidate_id,
+        hypothesis_id=hypothesis_id,
+        input_sha256="a" * 64,
+        structure_hash=structure_hash,
+        output_path=output_path,
+        operation="substitute_sites",
+        parameters={"hypothesis_id": hypothesis_id},
+        normalized_composition=(("Ag", 1), ("Bi", 4), ("Na", 3), ("S", 8)),
+        lineage=CandidateLineage(
+            candidate_id=candidate_id,
+            parent_candidate_id=parent_candidate_id,
+            generated_by="structure_construction",
+            transformation="substitute_sites",
+        ).model_dump(mode="python"),
+        origin={"tool_name": "structure.substitute_sites"},
+    )
+
+
+def test_projects_structure_derivations_as_distinct_structure_candidates() -> None:
+    first = _structure_derivation(
+        structure_hash="b" * 64,
+        derivation_id="der_first",
+        output_path="user_output/task/structures/op_" + "1" * 32 + "/structure_0000.cif",
+        hypothesis_id="hyp_a",
+    )
+    second = _structure_derivation(
+        structure_hash="c" * 64,
+        derivation_id="der_second",
+        output_path="user_output/task/structures/op_" + "2" * 32 + "/structure_0000.cif",
+        hypothesis_id="hyp_a",
+    )
+
+    candidates = extract_candidates_from_state(
+        ScientificState(structure_derivations=[first, second])
+    )
+
+    assert [candidate.candidate_id for candidate in candidates] == [
+        first.candidate_id,
+        second.candidate_id,
+    ]
+    assert all(candidate.candidate_type == "structure" for candidate in candidates)
+    assert candidates[0].representation == {
+        "formula": "AgBi4Na3S8",
+        "structure_identifier": first.structure_hash,
+        "structure_hash": first.structure_hash,
+        "path": first.output_path,
+        "hypothesis_ids": ["hyp_a"],
+    }
+
+
+def test_structure_evidence_ignores_forged_candidate_id() -> None:
+    evidence = ScientificEvidence(
+        subject="Na3AgBi4S8",
+        property="candidate_formula",
+        value="Na3AgBi4S8",
+        unit="eV",
+        source="DFT",
+        source_type="dft_calculation",
+        structure_hash="e" * 64,
+        candidate_id="cand_forged",
+        provenance={"tool": "vasp.collect"},
+    )
+
+    candidates = extract_candidates_from_state(ScientificState(evidence=[evidence]))
+
+    assert len(candidates) == 1
+    assert candidates[0].candidate_id == "cand_" + "e" * 24
+    assert candidates[0].representation["structure_hash"] == "e" * 64
+    assert "cif_hash" not in candidates[0].representation
+
+
+def test_same_structure_hash_merges_sources_and_renaming_does_not_change_identity() -> None:
+    first = _structure_derivation(
+        structure_hash="d" * 64,
+        derivation_id="der_original",
+        output_path="user_output/task/structures/op_" + "3" * 32 + "/structure_0000.cif",
+        hypothesis_id="hyp_a",
+    )
+    second = _structure_derivation(
+        structure_hash="d" * 64,
+        derivation_id="der_renamed",
+        output_path="user_output/task/structures/op_" + "4" * 32 + "/structure_0000.cif",
+        hypothesis_id="hyp_b",
+    )
+
+    candidates = extract_candidates_from_state(
+        ScientificState(structure_derivations=[first, second])
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].candidate_id == first.candidate_id
+    assert candidates[0].representation["path"] == first.output_path
+    assert candidates[0].representation["hypothesis_ids"] == ["hyp_a", "hyp_b"]
+    assert candidates[0].generation_parameters["derivation_ids"] == [
+        "der_original",
+        "der_renamed",
+    ]

@@ -374,3 +374,32 @@ async def test_runtime_rebuilds_structure_lineage_and_parent_from_manifest(tmp_p
     assert saved.lineage.generated_by == "structure_construction"
     assert saved.lineage.transformation == "enumerate_orderings"
     assert saved.lineage.validation_status == "UNVALIDATED_GENERATED_STRUCTURE"
+
+
+def test_runtime_parent_requires_current_geometry_to_match_registered_hash(
+    tmp_path: Path,
+) -> None:
+    workspace, record = _published_record(tmp_path)
+    artifact = workspace / record.output_path
+    actual_sha = __import__("hashlib").sha256(artifact.read_bytes()).hexdigest()
+    forged_payload = record.model_dump(mode="python")
+    forged_payload.update(
+        {
+            "input_sha256": actual_sha,
+            "structure_hash": "f" * 64,
+            "candidate_id": "cand_" + "f" * 24,
+        }
+    )
+    forged_payload["lineage"]["candidate_id"] = "cand_" + "f" * 24
+    forged = StructureDerivation.model_validate(forged_payload)
+    runtime = make_runtime(FakeModelProvider([]), workspace=workspace)
+    runtime.scientific_state.add_structure_derivation(forged)
+
+    child_payload = record.model_dump(mode="python")
+    child_payload["input_sha256"] = actual_sha
+    child_payload["output_path"] = (
+        "user_output/task/structures/op_" + "b" * 32 + "/structure_0000.cif"
+    )
+    child = StructureDerivation.model_validate(child_payload)
+
+    assert runtime._trusted_structure_parent(child) is None

@@ -27,6 +27,34 @@ task, budget, and evidence snapshot; these values must remain equal. Additional
 workflow-related entries such as system prompt, skill index, context, or tool
 surface explicitly authorize that treatment difference to vary.
 
+## P1 structure and validation boundary
+
+Structure derivations are projected as first-class structure candidates. Their
+candidate ID is derived from the canonical structure hash, not from a CIF
+filename or path. Records that point to the same geometry merge into one
+candidate while retaining derivation IDs, hypotheses, origins, and source
+paths. Distinct geometries with the same normalized composition remain separate
+candidates and can be checked independently. A parent structure is assigned
+only when the runtime matches the operation input SHA-256 to a previously
+registered structure artifact; an external mother structure may be linked to a
+composition hypothesis without being represented as a structure parent.
+
+CHGNet evidence is scoped from the actual workspace file and includes both the
+input SHA-256 and canonical `structure_hash`/`candidate_id`. CHGNet energies and
+forces are ML-potential observations for same-composition screening or
+pre-relaxation. They cannot be relabeled as `E_hull`, formation energy,
+stability, or detector performance. If relaxation changes geometry, the output
+gets a new structure identity and downstream evidence must use that identity.
+
+VASP continues through the existing preparation, input validation, resource and
+approval gates, and `SubmitOnceSession`. Slurm `COMPLETED` and command success
+are scheduler/execution observations; scientific evidence requires collected,
+validated artifacts. The pilot uses only fake/local calculation backends: its
+fixtures are algorithmic boundary tests, x=0.25 is a stoichiometric test
+point, and no real DFT, experiment, or material discovery is claimed. A whole
+composition family may be rejected if its parent-structure or evidence scope
+cannot be established.
+
 ## P0 validation record
 
 The offline acceptance command is:
