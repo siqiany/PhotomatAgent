@@ -161,6 +161,92 @@ def test_confirmed_target_store_persists_empty_proposal_target_metadata(tmp_path
     assert restored is not None
     assert restored.target.constraints == []
     assert restored.target.metadata["task_kind"] == "proposal"
+    assert restored.target.metadata["discovery"] == DiscoveryConstraints().model_dump(
+        mode="json"
+    )
+
+
+def test_confirmed_target_store_default_load_misses_nonempty_discovery(tmp_path: Path) -> None:
+    store = ConfirmedTargetStore(Workspace(tmp_path))
+    state = ScientificState(goal="proposal")
+    discovery = DiscoveryConstraints(required_elements=["S"])
+    store.save(
+        session_id="nonempty-discovery",
+        goal="proposal",
+        scientific_state=state,
+        target=TargetSpec(goal="proposal", constraints=[]),
+        provider="fake",
+        model="fake",
+        task_kind="proposal",
+        discovery_constraints=discovery,
+    )
+
+    assert store.load(
+        "nonempty-discovery",
+        goal="proposal",
+        scientific_state=state,
+        task_kind="proposal",
+    ) is None
+    assert store.load(
+        "nonempty-discovery",
+        goal="proposal",
+        scientific_state=state,
+        task_kind="proposal",
+        discovery_constraints=discovery,
+    ) is not None
+
+
+def test_confirmed_target_store_default_discovery_round_trips(tmp_path: Path) -> None:
+    store = ConfirmedTargetStore(Workspace(tmp_path))
+    state = ScientificState(goal="proposal")
+    record = store.save(
+        session_id="empty-discovery",
+        goal="proposal",
+        scientific_state=state,
+        target=TargetSpec(
+            goal="proposal",
+            constraints=[],
+            metadata={"task_kind": "proposal", "discovery": {"required_elements": ["Pb"]}},
+        ),
+        provider="fake",
+        model="fake",
+        task_kind="proposal",
+    )
+
+    assert record.target.metadata["discovery"] == DiscoveryConstraints().model_dump(
+        mode="json"
+    )
+    assert store.load(
+        "empty-discovery",
+        goal="proposal",
+        scientific_state=state,
+        task_kind="proposal",
+    ) == record
+
+
+def test_confirmed_target_store_legacy_missing_discovery_is_safe_miss(tmp_path: Path) -> None:
+    store = ConfirmedTargetStore(Workspace(tmp_path))
+    state = ScientificState(goal="proposal")
+    store.save(
+        session_id="legacy-discovery",
+        goal="proposal",
+        scientific_state=state,
+        target=TargetSpec(goal="proposal", constraints=[]),
+        provider="fake",
+        model="fake",
+        task_kind="proposal",
+    )
+    cache_file = next((tmp_path / ".photomatagent" / "evolution-targets").glob("*.json"))
+    payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    payload["target"]["metadata"].pop("discovery")
+    cache_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert store.load(
+        "legacy-discovery",
+        goal="proposal",
+        scientific_state=state,
+        task_kind="proposal",
+    ) is None
 
 
 def test_confirmed_target_store_cache_is_bound_to_expected_task_kind(tmp_path: Path) -> None:
