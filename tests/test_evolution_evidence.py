@@ -193,20 +193,24 @@ async def test_fresh_approval_runtime_ignores_workspace_always_setting(
     assert (await next_runtime.permission_policy.check("bash", {})).decision is (
         PermissionDecision.DENY
     )
-    assert assembly == [
-        {
-            "vasp_approval_root": (
-                tmp_path
-                / ".photomatagent/evolution-approvals/evo_test/v002_ep_test"
-            ).resolve()
-        },
-        {
-            "vasp_approval_root": (
-                tmp_path
-                / ".photomatagent/evolution-approvals/evo_test/v003_ep_next"
-            ).resolve()
-        },
+    assert len(assembly) == 2
+    assert [kwargs["vasp_approval_root"] for kwargs in assembly] == [
+        (
+            tmp_path
+            / ".photomatagent/evolution-approvals/evo_test/v002_ep_test"
+        ).resolve(),
+        (
+            tmp_path
+            / ".photomatagent/evolution-approvals/evo_test/v003_ep_next"
+        ).resolve(),
     ]
+    assert all(
+        isinstance(kwargs["scientific_state"], ScientificState)
+        for kwargs in assembly
+    )
+    assert assembly[0]["scientific_state"] is runtime.scientific_state
+    assert assembly[1]["scientific_state"] is next_runtime.scientific_state
+    assert assembly[0]["scientific_state"] is not assembly[1]["scientific_state"]
 
 
 def test_build_runtime_rejects_approval_root_escape(
