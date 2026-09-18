@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import copy
 from datetime import UTC, datetime
+from functools import reduce
+from math import gcd
 import re
 from typing import Any, Literal, Never
-from functools import reduce
 
 from pydantic import (
     BaseModel,
@@ -17,11 +18,17 @@ from pydantic import (
 )
 
 from photomatagent.scientific.capabilities.generation.lineage import CandidateLineage
+from photomatagent.scientific.discovery.composition import normalize_composition
 
 
 Operation = Literal["make_supercell", "substitute_sites", "enumerate_orderings"]
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_OUTPUT = re.compile(
+    r"^user_output/[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/structures/"
+    r"op_[0-9a-f]{32}/structure_[0-9]{4}\.cif$"
+)
+
 
 class _FrozenDict(dict[str, Any]):
     def _deny(self, *args: object, **kwargs: object) -> Never:
@@ -100,13 +107,7 @@ class StructureDerivation(BaseModel):
     @classmethod
     def safe_output_path(cls, value: str) -> str:
         path = value.replace("\\", "/")
-        unsafe = (
-            path.startswith(("/", "\\"))
-            or ":" in path[:3]
-            or "\\" in value
-            or any(part in {"", ".", ".."} for part in path.split("/"))
-        )
-        if unsafe:
+        if not _OUTPUT.fullmatch(path) or path != value:
             raise ValueError("output_path must be workspace-relative")
         return path
 
@@ -126,10 +127,10 @@ class StructureDerivation(BaseModel):
         if invalid:
             raise ValueError("normalized_composition entries must be strict symbol/integer pairs")
         result = tuple((symbol, amount) for symbol, amount in value)
-        from math import gcd
 
         valid = (
             result
+            and len(result) <= 16
             and tuple(sorted(result)) == result
             and len({symbol for symbol, _ in result}) == len(result)
             and all(
@@ -140,6 +141,9 @@ class StructureDerivation(BaseModel):
         )
         if not valid:
             raise ValueError("normalized_composition must be sorted, reduced, and positive")
+        formula = "".join(f"{symbol}{amount}" for symbol, amount in result)
+        if normalize_composition(formula) != result:
+            raise ValueError("normalized_composition is not a canonical composition")
         return result
 
     @model_validator(mode="before")
@@ -159,9 +163,17 @@ class StructureDerivation(BaseModel):
         object.__setattr__(self, "origin", _freeze(self.origin))
         return self
 
+    @model_validator(mode="after")
+    def lineage_matches_identity(self) -> "StructureDerivation":
+        if self.lineage.candidate_id != self.candidate_id:
+            raise ValueError("lineage candidate_id must match candidate_id")
+        if self.lineage.parent_candidate_id != self.parent_candidate_id:
+            raise ValueError("lineage parent_candidate_id must match parent_candidate_id")
+        return self
+
 
 class StructureRegistration(BaseModel):
-    """Untrusted command; runtime must inject trusted operation/hash/origin."""
+    """Untrusted update; runtime rebuilds trusted fields before applying it."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     derivation: StructureDerivation

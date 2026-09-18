@@ -12,6 +12,7 @@ from photomatagent.scientific.capabilities.structure.artifacts import (
     structure_hash,
 )
 from photomatagent.scientific.capabilities.structure.construction_models import (
+    OrderingRequest,
     SiteReplacement,
     SubstitutionRequest,
     SupercellRequest,
@@ -92,9 +93,31 @@ def test_manifest_tamper_and_cif_tamper_are_conflicts(tmp_path):
     assert exc.value.code == "ARTIFACT_CONFLICT"
     manifest.write_text(json.dumps({**payload, "input_sha256": "a" * 64}))
     (directory / "structure_0000.cif").write_text("garbage")
-    with pytest.raises(StructureArtifactError) as exc: publish_structures(workspace, request, "a"*64, [_structure()])
+    with pytest.raises(StructureArtifactError) as exc:
+        publish_structures(workspace, request, "a" * 64, [_structure()])
     assert exc.value.code == "ARTIFACT_CONFLICT"
 
+def test_manifest_and_output_symlinks_are_not_reused(tmp_path):
+    workspace = Workspace(tmp_path)
+    request = SupercellRequest(path="i.cif", scaling=(1, 1, 1), task_slug="symlinks")
+    record = publish_structures(workspace, request, "a" * 64, [_structure()])[0]
+    directory = (tmp_path / record.output_path).parent
+    outside_manifest = tmp_path.parent / "outside-manifest.json"
+    outside_manifest.write_text((directory / "manifest.json").read_text())
+    (directory / "manifest.json").unlink()
+    (directory / "manifest.json").symlink_to(outside_manifest)
+    with pytest.raises(StructureArtifactError) as exc:
+        publish_structures(workspace, request, "a" * 64, [_structure()])
+    assert exc.value.code == "ARTIFACT_CONFLICT"
+    (directory / "manifest.json").unlink()
+    (directory / "manifest.json").write_text(outside_manifest.read_text())
+    outside_cif = tmp_path.parent / "outside-structure.cif"
+    outside_cif.write_bytes((directory / "structure_0000.cif").read_bytes())
+    (directory / "structure_0000.cif").unlink()
+    (directory / "structure_0000.cif").symlink_to(outside_cif)
+    with pytest.raises(StructureArtifactError) as exc:
+        publish_structures(workspace, request, "a" * 64, [_structure()])
+    assert exc.value.code == "ARTIFACT_CONFLICT"
 def test_preexisting_directories_and_lock_are_untouched(tmp_path):
     workspace = Workspace(tmp_path)
     request = SupercellRequest(path="i.cif", scaling=(1, 1, 1), task_slug="t")
@@ -163,6 +186,18 @@ def test_rename_noreplace_preserves_existing_destination(tmp_path):
 def test_different_parameters_have_different_operation_ids(tmp_path):
     from photomatagent.scientific.capabilities.structure.artifacts import operation_id
     assert operation_id(SupercellRequest(path="i.cif", scaling=(1,1,1), task_slug="t"), "a"*64) != operation_id(SupercellRequest(path="i.cif", scaling=(2,1,1), task_slug="t"), "a"*64)
+
+def test_reordered_parameters_share_operation_id(tmp_path):
+    from photomatagent.scientific.capabilities.structure.artifacts import operation_id
+    first = SubstitutionRequest(path="i.cif", replacements=[SiteReplacement(index=2, from_element="Si", to_element="Ge"), SiteReplacement(index=1, from_element="Si", to_element="Ge")], expected_formula="Ge2Si", hypothesis_id="h", task_slug="t")
+    second = SubstitutionRequest(path="i.cif", replacements=list(reversed(first.replacements)), expected_formula="Ge2Si", hypothesis_id="h", task_slug="t")
+    assert operation_id(first, "a" * 64) == operation_id(second, "a" * 64)
+
+def test_reordered_ordering_indices_share_operation_id(tmp_path):
+    from photomatagent.scientific.capabilities.structure.artifacts import operation_id
+    first = OrderingRequest(path="i.cif", eligible_indices=[3, 1, 2], from_element="Si", to_element="Ge", replacement_count=1, expected_formula="GeSi2", hypothesis_id="h", task_slug="t")
+    second = OrderingRequest(path="i.cif", eligible_indices=[1, 2, 3], from_element="Si", to_element="Ge", replacement_count=1, expected_formula="GeSi2", hypothesis_id="h", task_slug="t")
+    assert operation_id(first, "a" * 64) == operation_id(second, "a" * 64)
 
 def test_output_parent_symlink_escape_does_not_write_outside(tmp_path):
     workspace = Workspace(tmp_path)

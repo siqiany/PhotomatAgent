@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence, cast
 
 from photomatagent.scientific.capabilities.generation.lineage import CandidateLineage
-from photomatagent.scientific.capabilities.structure.construction_models import OrderingRequest, SubstitutionRequest, SupercellRequest
+from photomatagent.scientific.capabilities.structure.construction_models import (
+    OrderingRequest,
+    SubstitutionRequest,
+    SupercellRequest,
+)
 from photomatagent.scientific.discovery.composition import normalize_composition
 from photomatagent.scientific.discovery.structures import Operation, StructureDerivation
 from photomatagent.workspace import Workspace
@@ -93,14 +97,34 @@ def structure_hash(structure: Any) -> str:
 def _request_parameters(request: Any) -> dict[str, Any]:
     values = request.model_dump(mode="json")
     values.pop("path", None)
+    if "replacements" in values:
+        values["replacements"] = sorted(
+            values["replacements"], key=lambda item: item["index"]
+        )
+    if "eligible_indices" in values:
+        values["eligible_indices"] = sorted(values["eligible_indices"])
     return values
 
 def operation_id(request: Any, input_sha256: str) -> str:
     payload = {"input_sha256": input_sha256, "operation": type(request).__name__, "parameters": _request_parameters(request), "algorithm_version": HASH_VERSION}
     return "op_" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
 
-def _manifest_state(directory: Path, request: Any, input_sha256: str, op_id: str) -> tuple[str, list[dict[str, Any]]]:
+def _manifest_state(
+    workspace: Workspace,
+    directory: Path,
+    request: Any,
+    input_sha256: str,
+    op_id: str,
+) -> tuple[str, list[dict[str, Any]]]:
     manifest_path = directory / "manifest.json"
+    if manifest_path.is_symlink():
+        return ARTIFACT_CONFLICT, []
+    try:
+        resolved_manifest = manifest_path.resolve(strict=True)
+    except OSError:
+        return ARTIFACT_CONFLICT, []
+    if resolved_manifest != manifest_path or not workspace.contains(resolved_manifest):
+        return ARTIFACT_CONFLICT, []
     if not manifest_path.is_file():
         return ARTIFACT_INCOMPLETE, []
     try:
@@ -140,6 +164,16 @@ def _manifest_state(directory: Path, request: Any, input_sha256: str, op_id: str
         assert isinstance(filename, str)
         seen.add(filename)
         path = directory / filename
+        if not path.exists() and not path.is_symlink():
+            return ARTIFACT_INCOMPLETE, []
+        if path.is_symlink():
+            return ARTIFACT_CONFLICT, []
+        try:
+            resolved_output = path.resolve(strict=True)
+        except OSError:
+            return ARTIFACT_CONFLICT, []
+        if resolved_output != path or not workspace.contains(resolved_output):
+            return ARTIFACT_CONFLICT, []
         if not path.is_file():
             return ARTIFACT_INCOMPLETE, []
         try:
@@ -199,7 +233,9 @@ def publish_structures(
     if not workspace.contains(destination):
         raise ValueError("structure output path escapes workspace")
     if destination.exists():
-        state, entries = _manifest_state(destination, request, input_sha256, op_id)
+        state, entries = _manifest_state(
+            workspace, destination, request, input_sha256, op_id
+        )
         if state == "valid":
             return _derivations_from_manifest(entries, destination, request, input_sha256, op_id)
         raise StructureArtifactError(state, "existing operation artifacts are incomplete or conflict with the requested operation")
