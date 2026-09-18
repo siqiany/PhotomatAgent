@@ -640,12 +640,14 @@ class CHGNetRelaxTool(_CHGNetTool):
                 output_sha256=file_sha256(output_path),
                 parent_candidate_id=(
                     f"cand_{input_structure_hash[:24]}"
-                    if str(after["structure_hash"]) != input_structure_hash
+                    if str(after["candidate_id"])
+                    != f"cand_{input_structure_hash[:24]}"
                     else None
                 ),
                 parent_structure_hash=(
                     input_structure_hash
-                    if str(after["structure_hash"]) != input_structure_hash
+                    if str(after["candidate_id"])
+                    != f"cand_{input_structure_hash[:24]}"
                     else None
                 ),
             ),

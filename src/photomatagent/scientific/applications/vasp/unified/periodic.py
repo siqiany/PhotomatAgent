@@ -472,7 +472,9 @@ class PeriodicVaspExecutor:
             digest = structure_hash(structure)
             input_sha256 = _sha256_file(structure_path)
             parent_candidate_id = (
-                f"cand_{parent_digest[:24]}" if digest != parent_digest else None
+                f"cand_{parent_digest[:24]}"
+                if f"cand_{parent_digest[:24]}" != f"cand_{digest[:24]}"
+                else None
             )
             parent_structure_hash = parent_digest if parent_candidate_id else None
             evidence.append(

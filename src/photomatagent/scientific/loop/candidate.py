@@ -289,7 +289,12 @@ def _candidate_from_evidence(
     expected_parent_id = (
         f"cand_{parent_structure_hash[:24]}" if parent_structure_hash else ""
     )
-    if parent_candidate_id != expected_parent_id or parent_structure_hash == structure_hash:
+    current_candidate_id = f"cand_{structure_hash[:24]}" if structure_hash else ""
+    if (
+        parent_candidate_id != expected_parent_id
+        or parent_structure_hash == structure_hash
+        or parent_candidate_id == current_candidate_id
+    ):
         parent_candidate_id = ""
     output_sha = _trusted_file_hash(
         provenance.get("output_sha256") or provenance.get("input_sha256")

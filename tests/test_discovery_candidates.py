@@ -391,6 +391,35 @@ def test_structure_evidence_parent_creates_lineage_node() -> None:
     assert candidate.representation["cif_hash"] == "e" * 64
 
 
+def test_parent_prefix_collision_is_never_a_self_parent() -> None:
+    prefix = "a" * 24
+    parent_hash = prefix + "b" * 40
+    child_hash = prefix + "c" * 40
+    evidence = ScientificEvidence(
+        subject="Na3AgBi4S8",
+        property="total_energy",
+        value=-3.0,
+        unit="eV",
+        source="VASP",
+        source_type="dft_calculation",
+        structure_hash=child_hash,
+        candidate_id="cand_" + prefix,
+        provenance={
+            "tool": "vasp.collect",
+            "parent_candidate_id": "cand_" + prefix,
+            "parent_structure_hash": parent_hash,
+            "output_sha256": "d" * 64,
+        },
+    )
+
+    candidate = extract_candidates_from_state(ScientificState(evidence=[evidence]))[0]
+
+    assert candidate.candidate_id == "cand_" + prefix
+    assert candidate.parent_candidate_id is None
+    assert candidate.lineage is not None
+    assert candidate.lineage.parent_candidate_id is None
+
+
 def test_validation_evidence_merges_without_replacing_construction_lineage() -> None:
     derivation = _structure_derivation(
         structure_hash="f" * 64,
