@@ -83,6 +83,41 @@ def _bind_hypothesis(
         )
 
 
+def _bind_supercell_hypothesis(
+    state: ScientificState | None,
+    hypothesis_id: str | None,
+    structure: Any,
+) -> None:
+    """Validate an optional supercell lineage reference without mutating state."""
+
+    if hypothesis_id is None:
+        return
+    if state is None:
+        raise StructureConstructionError(
+            "STATE_UNAVAILABLE",
+            "hypothesis-bound supercell construction requires a live ScientificState",
+        )
+    hypothesis = next(
+        (item for item in state.material_hypotheses if item.id == hypothesis_id),
+        None,
+    )
+    if hypothesis is None:
+        raise StructureConstructionError(
+            "HYPOTHESIS_NOT_FOUND", f"unknown hypothesis_id {hypothesis_id!r}"
+        )
+    try:
+        actual = normalize_composition(structure.composition.formula)
+    except (TypeError, ValueError) as exc:
+        raise StructureConstructionError(
+            "INVALID_INPUT_COMPOSITION", str(exc)
+        ) from exc
+    if actual != hypothesis.normalized_composition:
+        raise StructureConstructionError(
+            "HYPOTHESIS_COMPOSITION_MISMATCH",
+            "input structure composition does not match the bound hypothesis",
+        )
+
+
 class MakeSupercellTool(Tool):
     name = "structure.make_supercell"
     description = (
@@ -116,21 +151,31 @@ class MakeSupercellTool(Tool):
             },
             "hypothesis_id": {
                 "type": ["string", "null"],
-                "description": "Optional hypothesis reference; no state update is performed in Task 2.",
+                "description": "Optional hypothesis reference; if provided, it must exist in ScientificState and match the input structure composition.",
             },
         },
         "required": ["path", "scaling", "task_slug"],
     }
 
-    def __init__(self, workspace: Workspace, *, limits: ConstructionLimits | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        *,
+        scientific_state: ScientificState | None = None,
+        limits: ConstructionLimits | None = None,
+    ) -> None:
         self._workspace = workspace
         self._limits = limits or ConstructionLimits()
+        self._scientific_state = scientific_state
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         try:
             request = SupercellRequest.model_validate(arguments)
             structure, path = load_structure_input(
                 self._workspace, request.path, max_atoms=self._limits.max_atoms
+            )
+            _bind_supercell_hypothesis(
+                self._scientific_state, request.hypothesis_id, structure
             )
             result = make_supercell(structure, request.scaling, self._limits)
             derivations = publish_structures(
@@ -147,6 +192,8 @@ class MakeSupercellTool(Tool):
             return _error(code, str(exc))
         except (StructureConstructionError, ValueError, OSError) as exc:
             return _error(getattr(exc, "code", type(exc).__name__), str(exc))
+        except OverflowError as exc:
+            return _error("SCALING_LIMIT_EXCEEDED", str(exc))
         except ImportError as exc:
             return _error("MISSING_DEPENDENCY", str(exc))
 
@@ -237,5 +284,7 @@ class SubstituteSitesTool(Tool):
             return _error(code, str(exc))
         except (StructureConstructionError, ValueError, OSError) as exc:
             return _error(getattr(exc, "code", type(exc).__name__), str(exc))
+        except OverflowError as exc:
+            return _error("SCALING_LIMIT_EXCEEDED", str(exc))
         except ImportError as exc:
             return _error("MISSING_DEPENDENCY", str(exc))

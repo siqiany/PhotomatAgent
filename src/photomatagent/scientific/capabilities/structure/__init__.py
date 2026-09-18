@@ -63,7 +63,11 @@ class StructureProbe(CapabilityPack):
             StructureDensityTool(self._workspace),
             StructureNeighborsTool(self._workspace),
             StructureConvertTool(self._config, self._workspace),
-            MakeSupercellTool(self._workspace, limits=limits),
+            MakeSupercellTool(
+                self._workspace,
+                scientific_state=self._scientific_state,
+                limits=limits,
+            ),
             SubstituteSitesTool(
                 self._workspace,
                 scientific_state=self._scientific_state,

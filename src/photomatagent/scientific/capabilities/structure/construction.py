@@ -25,6 +25,10 @@ class StructureConstructionError(ValueError):
 
 
 def _validate_ordered_structure(structure: Any) -> None:
+    if len(structure) == 0:
+        raise StructureConstructionError(
+            "EMPTY_STRUCTURE", "construction requires at least one input site"
+        )
     if not getattr(structure, "is_ordered", True):
         raise StructureConstructionError(
             "PARTIAL_OCCUPANCY_UNSUPPORTED",
@@ -60,7 +64,13 @@ def make_supercell(
     # pymatgen's make_supercell mutates its receiver. Copy only after all
     # validation succeeds so failed operations cannot alter caller state.
     result = structure.copy()
-    result.make_supercell(factors)
+    try:
+        result.make_supercell(factors)
+    except OverflowError as exc:
+        raise StructureConstructionError(
+            "SCALING_LIMIT_EXCEEDED",
+            "supercell scaling exceeds the supported integer bound",
+        ) from exc
     if len(result) > limits.max_atoms:
         raise StructureConstructionError(
             "ATOM_LIMIT_EXCEEDED",
@@ -120,13 +130,18 @@ def substitute_sites(
         ) from exc
 
     result = structure.copy()
-    for replacement in replacements:
-        result.replace(replacement.index, replacement.to_element)
+    try:
+        for replacement in replacements:
+            result.replace(replacement.index, replacement.to_element)
+    except (TypeError, ValueError, IndexError, KeyError) as exc:
+        raise StructureConstructionError(
+            "INVALID_REPLACEMENT", f"replacement could not be applied: {exc}"
+        ) from exc
     try:
         actual = composition_key(result.composition.formula)
     except (TypeError, ValueError) as exc:
         raise StructureConstructionError(
-            "INVALID_EXPECTED_FORMULA", str(exc)
+            "INVALID_CONSTRUCTED_COMPOSITION", str(exc)
         ) from exc
     if actual != expected:
         raise StructureConstructionError(
