@@ -7,10 +7,14 @@ structure, and never write files or alter scientific state.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from itertools import combinations
+from math import comb
 from typing import Any, Iterable
 
 from photomatagent.scientific.capabilities.structure.construction_models import (
     ConstructionLimits,
+    OrderingRequest,
     SiteReplacement,
 )
 from photomatagent.scientific.discovery.composition import composition_key
@@ -22,6 +26,36 @@ class StructureConstructionError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass
+class OrderingEnumeration(list[Any]):
+    """List-compatible bounded enumeration result with audit counters."""
+
+    total: int = 0
+    scanned: int = 0
+    discarded: int = 0
+    truncated: bool = False
+    matcher: dict[str, float] = field(
+        default_factory=lambda: {"ltol": 0.2, "stol": 0.3, "angle_tol": 5}
+    )
+
+    def __init__(
+        self,
+        values: Iterable[Any] = (),
+        *,
+        total: int = 0,
+        scanned: int = 0,
+        discarded: int = 0,
+        truncated: bool = False,
+        matcher: dict[str, float] | None = None,
+    ) -> None:
+        list.__init__(self, values)
+        self.total = total
+        self.scanned = scanned
+        self.discarded = discarded
+        self.truncated = truncated
+        self.matcher = matcher or {"ltol": 0.2, "stol": 0.3, "angle_tol": 5}
 
 
 def _validate_ordered_structure(structure: Any) -> None:
@@ -149,3 +183,125 @@ def substitute_sites(
             f"constructed composition {result.composition.reduced_formula} does not match expected_formula {expected_formula}",
         )
     return result
+
+
+def ordering_count(site_count: int, replacement_count: int) -> int:
+    """Return the number of fixed-size site combinations after validation."""
+
+    if (
+        isinstance(site_count, bool)
+        or isinstance(replacement_count, bool)
+        or not isinstance(site_count, int)
+        or not isinstance(replacement_count, int)
+        or site_count < 1
+        or replacement_count < 1
+        or replacement_count > site_count
+    ):
+        raise ValueError("replacement_count must be between 1 and site_count")
+    return comb(site_count, replacement_count)
+
+
+def enumerate_orderings(
+    structure: Any,
+    request: OrderingRequest,
+    limits: ConstructionLimits,
+) -> OrderingEnumeration:
+    """Enumerate bounded fixed-count substitutions in deterministic index order.
+
+    The complete combination count is computed before any structure copy.  The
+    output cap is applied after exact hash and fixed-tolerance structure-match
+    deduplication; a capped result is explicitly marked non-exhaustive.
+    """
+
+    _validate_ordered_structure(structure)
+    if not isinstance(request, OrderingRequest):
+        try:
+            request = OrderingRequest.model_validate(request)
+        except Exception as exc:
+            raise StructureConstructionError("INVALID_ORDERING", str(exc)) from exc
+    eligible = tuple(sorted(request.eligible_indices))
+    if len(eligible) != len(set(eligible)) or any(
+        index < 0 or index >= len(structure) for index in eligible
+    ):
+        raise StructureConstructionError(
+            "INVALID_ORDERING", "eligible_indices must be unique input-structure indices"
+        )
+    for index in eligible:
+        if structure[index].specie.symbol != request.from_element:
+            raise StructureConstructionError(
+                "HOST_ELEMENT_MISMATCH",
+                f"input site {index} is {structure[index].specie.symbol}, expected {request.from_element}",
+            )
+    try:
+        from pymatgen.core import Composition, Element
+
+        Element(request.from_element)
+        Element(request.to_element)
+        expected_composition = composition_key(request.expected_formula)
+        amounts = structure.composition.get_el_amt_dict()
+        amounts[request.from_element] = amounts.get(request.from_element, 0.0) - request.replacement_count
+        amounts[request.to_element] = amounts.get(request.to_element, 0.0) + request.replacement_count
+        constructed_composition = composition_key(Composition(amounts).formula)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise StructureConstructionError("INVALID_ORDERING", str(exc)) from exc
+    if constructed_composition != expected_composition:
+        raise StructureConstructionError(
+            "COMPOSITION_MISMATCH",
+            "expected_formula does not match the fixed replacement count",
+        )
+    total = ordering_count(len(eligible), request.replacement_count)
+    if total > limits.max_raw_configurations:
+        raise StructureConstructionError(
+            "ENUMERATION_LIMIT_EXCEEDED",
+            f"ordering request has {total} raw configurations; limit is {limits.max_raw_configurations}",
+        )
+
+    # Imports remain lazy so a missing optional pymatgen installation keeps the
+    # base runtime and capability discovery available.
+    try:
+        from photomatagent.scientific.capabilities.structure.artifacts import structure_hash
+        from pymatgen.analysis.structure_matcher import StructureMatcher
+    except ImportError as exc:
+        raise StructureConstructionError(
+            "MISSING_DEPENDENCY", "pymatgen is required for ordering enumeration"
+        ) from exc
+    matcher_parameters = {"ltol": 0.2, "stol": 0.3, "angle_tol": 5}
+    matcher = StructureMatcher(ltol=0.2, stol=0.3, angle_tol=5)
+    outputs: list[Any] = []
+    hashes: set[str] = set()
+    scanned = 0
+    discarded = 0
+    for selected in combinations(eligible, request.replacement_count):
+        scanned += 1
+        replacements = [
+            SiteReplacement(
+                index=index,
+                from_element=request.from_element,
+                to_element=request.to_element,
+            )
+            for index in selected
+        ]
+        try:
+            candidate = substitute_sites(structure, replacements, request.expected_formula)
+            candidate_hash = structure_hash(candidate)
+            if candidate_hash in hashes or any(
+                matcher.fit(candidate, existing) for existing in outputs
+            ):
+                discarded += 1
+                continue
+        except StructureConstructionError:
+            discarded += 1
+            continue
+        outputs.append(candidate)
+        hashes.add(candidate_hash)
+        if len(outputs) >= limits.max_outputs and scanned < total:
+            break
+    truncated = scanned < total
+    return OrderingEnumeration(
+        outputs,
+        total=total,
+        scanned=scanned,
+        discarded=discarded,
+        truncated=truncated,
+        matcher=matcher_parameters,
+    )

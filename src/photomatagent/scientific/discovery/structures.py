@@ -31,6 +31,12 @@ _OUTPUT = re.compile(
 
 
 class _FrozenDict(dict[str, Any]):
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_FrozenDict":
+        copied = dict.__new__(_FrozenDict)
+        memo[id(self)] = copied
+        dict.update(copied, {copy.deepcopy(key, memo): copy.deepcopy(value, memo) for key, value in self.items()})
+        return copied
+
     def _deny(self, *args: object, **kwargs: object) -> Never:
         raise TypeError("immutable structure record")
 
@@ -38,6 +44,12 @@ class _FrozenDict(dict[str, Any]):
     __ior__ = _deny
 
 class _FrozenList(list[Any]):
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_FrozenList":
+        copied = list.__new__(_FrozenList)
+        memo[id(self)] = copied
+        list.extend(copied, [copy.deepcopy(value, memo) for value in self])
+        return copied
+
     def _deny(self, *args: object, **kwargs: object) -> Never:
         raise TypeError("immutable structure record")
 

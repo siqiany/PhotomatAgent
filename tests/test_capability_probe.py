@@ -228,6 +228,7 @@ def test_structure_pack_tools_are_deferred(tmp_path):
         "structure.convert",
         "structure.make_supercell",
         "structure.substitute_sites",
+        "structure.enumerate_orderings",
     }
     assert all(tool.exposure is ToolExposure.DEFERRED for tool in structure_tools)
 

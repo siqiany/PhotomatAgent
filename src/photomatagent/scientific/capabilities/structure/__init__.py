@@ -26,6 +26,7 @@ from photomatagent.workspace import Workspace
 from photomatagent.scientific.capabilities.structure.artifacts import load_structure_input
 from photomatagent.scientific.capabilities.structure.construction_models import ConstructionLimits
 from photomatagent.scientific.capabilities.structure.construction_tools import (
+    EnumerateOrderingsTool,
     MakeSupercellTool,
     SubstituteSitesTool,
 )
@@ -69,6 +70,11 @@ class StructureProbe(CapabilityPack):
                 limits=limits,
             ),
             SubstituteSitesTool(
+                self._workspace,
+                scientific_state=self._scientific_state,
+                limits=limits,
+            ),
+            EnumerateOrderingsTool(
                 self._workspace,
                 scientific_state=self._scientific_state,
                 limits=limits,

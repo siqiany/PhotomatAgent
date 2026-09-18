@@ -53,6 +53,7 @@ from photomatagent.runtime.events import (
     HypothesisRegistered,
     HypothesisRegistrationReasonCode,
     HypothesisRegistrationRejected,
+    StructureDerived,
     LoopCompleted,
     LoopFailed,
     LoopIterationStarted,
@@ -91,11 +92,18 @@ from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
+from photomatagent.scientific.capabilities.structure.artifacts import (
+    verify_structure_derivation,
+)
 from photomatagent.scientific.state import EvidenceAttestation, ScientificState
 from photomatagent.scientific.discovery.models import (
     HypothesisOrigin,
     HypothesisRegistration,
     ScientificHypothesis,
+)
+from photomatagent.scientific.discovery.structures import (
+    StructureDerivation,
+    StructureRegistration,
 )
 from photomatagent.scientific.discovery.registration import (
     build_hypothesis,
@@ -116,6 +124,13 @@ from photomatagent.workspace import Workspace
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _HYPOTHESIS_REGISTRATION_TOOL = "generation.register_hypothesis"
+_STRUCTURE_REGISTRATION_TOOLS = frozenset(
+    {
+        "structure.make_supercell",
+        "structure.substitute_sites",
+        "structure.enumerate_orderings",
+    }
+)
 _UNCONFIRMED_ARGUMENTS_PLACEHOLDER = (
     "[tool arguments withheld: completion unavailable]"
 )
@@ -1033,6 +1048,15 @@ class AgentRuntime:
                         request_id=update.proposal.request_id,
                     )
                 )
+            elif isinstance(update, StructureDerivation):
+                yield await self._emit(
+                    StructureDerived(
+                        derivation_id=update.id,
+                        candidate_id=update.candidate_id,
+                        parent_candidate_id=update.parent_candidate_id,
+                        structure_hash=update.structure_hash,
+                    )
+                )
         if prepared_updates:
             state_summary = format_scientific_state(self._scientific)
             registered_updates = [
@@ -1052,6 +1076,25 @@ class AgentRuntime:
                                 "candidate_id": update.candidate_id,
                             }
                             for update in registered_updates
+                        ],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            elif any(isinstance(update, StructureDerivation) for update in prepared_updates):
+                state_summary = json.dumps(
+                    {
+                        "structure_derivation_count": len(
+                            self._scientific.structure_derivations
+                        ),
+                        "derived": [
+                            {
+                                "derivation_id": update.id,
+                                "candidate_id": update.candidate_id,
+                                "structure_hash": update.structure_hash,
+                            }
+                            for update in prepared_updates
+                            if isinstance(update, StructureDerivation)
                         ],
                     },
                     ensure_ascii=False,
@@ -1224,6 +1267,8 @@ class AgentRuntime:
             self._scientific.add_task(update)
         elif isinstance(update, ScientificHypothesis):
             self._scientific.add_material_hypothesis(update)
+        elif isinstance(update, StructureDerivation):
+            self._scientific.add_structure_derivation(update)
         elif isinstance(update, EvidenceAttestation):
             self._evidence_authority.attest(self._scientific, update)
         else:
@@ -1262,6 +1307,20 @@ class AgentRuntime:
                 shadow.add_material_hypothesis(record)
                 if len(shadow.material_hypotheses) > hypothesis_count:
                     prepared.append(record)
+            elif isinstance(update, StructureRegistration):
+                if tool_name not in _STRUCTURE_REGISTRATION_TOOLS:
+                    raise ToolError(
+                        "structure registration is only accepted from authoritative structure tools"
+                    )
+                structure_record: StructureDerivation = self._prepare_structure_derivation(
+                    update.derivation,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                )
+                existing_count = len(shadow.structure_derivations)
+                shadow.add_structure_derivation(structure_record)
+                if len(shadow.structure_derivations) > existing_count:
+                    prepared.append(structure_record)
             elif isinstance(
                 update,
                 (Evidence, ScientificEvidence, ScientificClaim, CalculationRecord, ScientificTask),
@@ -1291,8 +1350,36 @@ class AgentRuntime:
             state.add_calculation(update)
         elif isinstance(update, ScientificTask):
             state.add_task(update)
+        elif isinstance(update, StructureDerivation):
+            state.add_structure_derivation(update)
         elif isinstance(update, EvidenceAttestation):
             self._evidence_authority.attest(state, update)
+
+    def _prepare_structure_derivation(
+        self,
+        record: StructureDerivation,
+        *,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> StructureDerivation:
+        """Revalidate tool data and replace its untrusted origin at runtime."""
+
+        trusted = verify_structure_derivation(self._workspace, record)
+        expected_candidate_id = f"cand_{trusted.structure_hash[:24]}"
+        if trusted.candidate_id != expected_candidate_id:
+            raise ToolError(
+                "structure candidate_id must be derived from structure_hash"
+            )
+        payload = trusted.model_dump(mode="python")
+        payload["origin"] = {
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "session_id": self._session_id,
+            "run_id": self._run_id,
+            "provider": self._model.provider,
+            "model": self._model.model,
+        }
+        return StructureDerivation.model_validate(payload)
 
     async def _emit_budget(self, iteration: int) -> RuntimeEvent:
         return await self._emit(

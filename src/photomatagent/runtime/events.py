@@ -280,6 +280,16 @@ class HypothesisRegistered(RuntimeEvent):
     request_id: str
 
 
+class StructureDerived(RuntimeEvent):
+    """A trusted structure artifact was appended to scientific state."""
+
+    kind: Literal["structure_derived"] = "structure_derived"
+    derivation_id: str
+    candidate_id: str
+    parent_candidate_id: str | None = None
+    structure_hash: str
+
+
 HypothesisRegistrationReasonCode = Literal[
     "DEFERRED_TOOL_REQUIRES_BRIDGE",
     "PERMISSION_DENIED",
@@ -559,6 +569,7 @@ AnyRuntimeEvent = Annotated[
         ToolFailed,
         ScientificStateUpdated,
         HypothesisRegistered,
+        StructureDerived,
         HypothesisRegistrationRejected,
         ScientificTraceMeta,
         BudgetUpdated,

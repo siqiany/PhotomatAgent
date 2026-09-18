@@ -356,7 +356,7 @@ async def test_hypothesis_inspection_is_paginated_and_omits_basis_body():
         {"section": "hypotheses", "limit": 1.5},
         {"section": "hypotheses", "limit": 0},
         {"section": "hypotheses", "limit": 51},
-        {"section": "structures"},
+        {"section": "unknown"},
         {"section": 1},
     ],
 )
@@ -381,7 +381,7 @@ def test_hypothesis_inspection_bounds_offset_limit_and_excludes_structures():
     assert "hypotheses" in ScientificStateInspectTool.input_schema["properties"][
         "section"
     ]["enum"]
-    assert "structures" not in ScientificStateInspectTool.input_schema["properties"][
+    assert "structures" in ScientificStateInspectTool.input_schema["properties"][
         "section"
     ]["enum"]
     registry.validate_arguments(
@@ -392,7 +392,7 @@ def test_hypothesis_inspection_bounds_offset_limit_and_excludes_structures():
         {"section": "hypotheses", "offset": -1},
         {"section": "hypotheses", "limit": 0},
         {"section": "hypotheses", "limit": 51},
-        {"section": "structures"},
+        {"section": "unknown"},
     ):
         with pytest.raises(ToolError):
             registry.validate_arguments("scientific_state_inspect", invalid)

@@ -363,7 +363,8 @@ async def test_substitution_validates_hypothesis_before_publishing(tmp_path) -> 
         }
     )
     assert not result.is_error
-    assert result.state_updates == []
+    assert len(result.state_updates) == 1
+    assert result.state_updates[0].__class__.__name__ == "StructureRegistration"
 
 
 @pytest.mark.asyncio
@@ -390,7 +391,11 @@ async def test_denied_runtime_call_does_not_publish(tmp_path) -> None:
 
 def test_surface_registers_construction_tools_as_deferred(tmp_path) -> None:
     registry = create_default_registry(ScientificState(), Workspace(tmp_path))
-    for name in ("structure.make_supercell", "structure.substitute_sites"):
+    for name in (
+        "structure.make_supercell",
+        "structure.substitute_sites",
+        "structure.enumerate_orderings",
+    ):
         tool = registry.get(name)
         assert tool.exposure is ToolExposure.DEFERRED
         assert name not in {entry.name for entry in registry.definitions(ToolExposure.DIRECT)}

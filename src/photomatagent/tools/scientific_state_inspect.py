@@ -14,7 +14,7 @@ class ScientificStateInspectTool(Tool):
     name = "scientific_state_inspect"
     description = (
         "Inspect the current scientific state (goal, hypotheses, claims, evidence, "
-        "calculations)."
+        "calculations, and bounded structure derivation records)."
     )
     namespace = "scientific"
     tags = ("scientific", "state", "evidence", "claims")
@@ -23,7 +23,7 @@ class ScientificStateInspectTool(Tool):
         "properties": {
             "section": {
                 "type": "string",
-                "enum": ["all", "hypotheses", "evidence", "claims", "calculations"],
+                "enum": ["all", "hypotheses", "structures", "evidence", "claims", "calculations"],
             },
             "offset": {"type": "integer", "minimum": 0, "default": 0},
             "limit": {
@@ -51,7 +51,7 @@ class ScientificStateInspectTool(Tool):
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         section = arguments.get("section", "all")
-        valid_sections = {"all", "hypotheses", "evidence", "claims", "calculations"}
+        valid_sections = {"all", "hypotheses", "structures", "evidence", "claims", "calculations"}
         if not isinstance(section, str) or section not in valid_sections:
             return self._invalid_arguments("unknown section")
         offset = arguments.get("offset", 0)
@@ -97,6 +97,38 @@ class ScientificStateInspectTool(Tool):
                 "limit": limit,
                 "total": len(self._state.material_hypotheses),
                 "items": items,
+            }
+            return ToolResult(
+                output=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                data=data,
+            )
+        elif section == "structures":
+            structure_records = self._state.structure_derivations[offset : offset + limit]
+            structure_items: list[dict[str, Any]] = [
+                {
+                    "derivation_id": record.id,
+                    "candidate_id": record.candidate_id,
+                    "parent_candidate_id": record.parent_candidate_id,
+                    "hypothesis_id": record.hypothesis_id,
+                    "operation": record.operation,
+                    "structure_hash": record.structure_hash,
+                    "normalized_composition": [list(item) for item in record.normalized_composition],
+                    "output_path": record.output_path,
+                    "lineage": {
+                        "candidate_id": record.lineage.candidate_id,
+                        "parent_candidate_id": record.lineage.parent_candidate_id,
+                        "generated_by": record.lineage.generated_by,
+                        "validation_status": record.lineage.validation_status,
+                    },
+                }
+                for record in structure_records
+            ]
+            data = {
+                "section": section,
+                "offset": offset,
+                "limit": limit,
+                "total": len(self._state.structure_derivations),
+                "items": structure_items,
             }
             return ToolResult(
                 output=json.dumps(data, ensure_ascii=False, separators=(",", ":")),

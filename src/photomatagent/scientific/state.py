@@ -12,6 +12,7 @@ from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.discovery.models import ScientificHypothesis
+from photomatagent.scientific.discovery.structures import StructureDerivation
 from photomatagent.scientific.tasks import ScientificTask
 
 DEFAULT_TRUSTED_EVIDENCE_TOOLS = frozenset(
@@ -61,6 +62,7 @@ class ScientificState(BaseModel):
     goal: str = ""
     hypotheses: list[str] = Field(default_factory=list)
     material_hypotheses: list[ScientificHypothesis] = Field(default_factory=list)
+    structure_derivations: list[StructureDerivation] = Field(default_factory=list)
     claims: list[ScientificClaim] = Field(default_factory=list)
     evidence: list[Evidence | ScientificEvidence] = Field(default_factory=list)
     evidence_attestations: dict[str, EvidenceAttestation] = Field(default_factory=dict)
@@ -215,5 +217,31 @@ class ScientificState(BaseModel):
         if existing.request_payload_sha256 != record.request_payload_sha256:
             raise ValueError(
                 f"request_id {record.proposal.request_id!r} conflicts with an existing payload"
+            )
+        return existing
+
+    def add_structure_derivation(
+        self, record: StructureDerivation
+    ) -> StructureDerivation:
+        """Append one trusted derivation idempotently by its stable identity.
+
+        A repeated delivery of the exact record returns the existing object.
+        The same structure hash may intentionally occur under another
+        derivation id/source, preserving provenance while sharing identity at
+        downstream projection time.
+        """
+
+        existing = next(
+            (item for item in self.structure_derivations if item.id == record.id),
+            None,
+        )
+        if existing is None:
+            self.structure_derivations.append(record)
+            return record
+        existing_payload = existing.model_dump(mode="json", exclude={"origin"})
+        record_payload = record.model_dump(mode="json", exclude={"origin"})
+        if existing_payload != record_payload:
+            raise ValueError(
+                f"structure derivation {record.id!r} conflicts with an existing record"
             )
         return existing

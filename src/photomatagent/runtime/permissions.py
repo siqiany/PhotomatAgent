@@ -91,6 +91,7 @@ def default_permission_policy() -> PermissionPolicy:
             "generation.register_hypothesis": PermissionDecision.ASK,
             "structure.make_supercell": PermissionDecision.ASK,
             "structure.substitute_sites": PermissionDecision.ASK,
+            "structure.enumerate_orderings": PermissionDecision.ASK,
         },
         # New tools must be classified deliberately.  Falling back to ASK
         # keeps newly installed scientific/MCP tools from silently gaining

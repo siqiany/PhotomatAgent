@@ -69,6 +69,16 @@ def format_scientific_state(state: ScientificState) -> str:
                 f"mechanism={hypothesis.proposal.design_operation}; "
                 f"primary_gap={primary_gap}"
             )
+    if state.structure_derivations:
+        lines.append("Structure derivations (latest 3):")
+        for derivation in state.structure_derivations[-3:]:
+            lines.append(
+                f"- [{derivation.id}] candidate={derivation.candidate_id}; "
+                f"parent={derivation.parent_candidate_id or '(none)'}; "
+                f"operation={derivation.operation}; "
+                f"composition={''.join(f'{symbol}{amount}' for symbol, amount in derivation.normalized_composition)}; "
+                f"structure_hash={derivation.structure_hash[:16]}"
+            )
     if state.claims:
         lines.append("Claims:")
         for claim in state.claims:

@@ -106,8 +106,36 @@ def _request_parameters(request: Any) -> dict[str, Any]:
     return values
 
 def operation_id(request: Any, input_sha256: str) -> str:
-    payload = {"input_sha256": input_sha256, "operation": type(request).__name__, "parameters": _request_parameters(request), "algorithm_version": HASH_VERSION}
+    payload = {
+        "input_sha256": input_sha256,
+        "operation": type(request).__name__,
+        "parameters": _request_parameters(request),
+        "algorithm_version": HASH_VERSION,
+    }
     return "op_" + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
+
+
+def _operation_id_from_manifest_fields(
+    operation: str, input_sha256: str, parameters: dict[str, Any]
+) -> str:
+    """Recompute the Task 1 operation identity from trusted manifest fields."""
+
+    request_type = next(
+        (name for name, value in _OPERATION_NAMES.items() if value == operation),
+        None,
+    )
+    if request_type is None:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "unknown structure operation")
+    payload = {
+        "input_sha256": input_sha256,
+        "operation": request_type,
+        "parameters": parameters,
+        "algorithm_version": HASH_VERSION,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return "op_" + digest[:32]
 
 def _manifest_state(
     workspace: Workspace,
@@ -115,6 +143,7 @@ def _manifest_state(
     request: Any,
     input_sha256: str,
     op_id: str,
+    structure_matcher: dict[str, float] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     manifest_path = directory / "manifest.json"
     if manifest_path.is_symlink():
@@ -142,7 +171,7 @@ def _manifest_state(
     valid_manifest = (
         manifest["hash_version"] == HASH_VERSION
         and manifest["hash_precision"] == HASH_PRECISION
-        and manifest["structure_matcher"] is None
+        and manifest["structure_matcher"] == structure_matcher
         and isinstance(entries, list)
         and 1 <= len(entries) <= MAX_OUTPUTS
     )
@@ -209,6 +238,8 @@ def publish_structures(
     request: SupercellRequest | SubstitutionRequest | OrderingRequest,
     input_sha256: str,
     structures: Sequence["Structure"],
+    *,
+    structure_matcher: dict[str, float] | None = None,
 ) -> list[StructureDerivation]:
     if not _SHA.fullmatch(input_sha256):
         raise ValueError("input_sha256 must be a lowercase SHA-256 digest")
@@ -234,7 +265,7 @@ def publish_structures(
         raise ValueError("structure output path escapes workspace")
     if destination.exists():
         state, entries = _manifest_state(
-            workspace, destination, request, input_sha256, op_id
+            workspace, destination, request, input_sha256, op_id, structure_matcher
         )
         if state == "valid":
             return _derivations_from_manifest(entries, destination, request, input_sha256, op_id)
@@ -287,7 +318,7 @@ def publish_structures(
             "algorithm_version": HASH_VERSION,
             "hash_version": HASH_VERSION,
             "hash_precision": HASH_PRECISION,
-            "structure_matcher": None,
+            "structure_matcher": structure_matcher,
             "outputs": outputs,
         }
         (stage / "manifest.json").write_text(
@@ -318,3 +349,109 @@ def _derivations_from_manifest(entries: list[dict[str, Any]], destination: Path,
         lineage = CandidateLineage(candidate_id=candidate, generated_by="structure_construction", transformation=operation)
         result.append(StructureDerivation(id=f"der_{op_id[3:]}_{entry['structure_hash'][:16]}_{ordinal:04d}", candidate_id=candidate, parent_candidate_id=None, hypothesis_id=getattr(request, "hypothesis_id", None), input_sha256=input_sha256, structure_hash=entry["structure_hash"], output_path=output_path, operation=cast(Operation, operation), parameters=_request_parameters(request), normalized_composition=normalized, lineage=cast(Any, lineage.model_dump(mode="python"))))
     return result
+
+
+def verify_structure_derivation(
+    workspace: Workspace, record: StructureDerivation
+) -> StructureDerivation:
+    """Rebuild a derivation only after verifying its published artifact.
+
+    Tool state updates are untrusted.  This verifier follows the record's
+    workspace-relative output path without accepting symlinks, then checks the
+    complete manifest header and the reparsed CIF against the record.  It is
+    intentionally kept in the artifact layer so runtime state never trusts a
+    tool-reported hash or composition on its own.
+    """
+
+    raw_path = Path(record.output_path)
+    if raw_path.is_absolute() or ".." in raw_path.parts:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure output path is not workspace-relative")
+    try:
+        output = workspace.resolve(record.output_path, must_exist=True)
+    except Exception as exc:
+        raise StructureArtifactError(ARTIFACT_INCOMPLETE, "structure output is missing or outside workspace") from exc
+    if output.is_symlink() or not output.is_file() or not workspace.contains(output):
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure output must be a regular workspace file")
+    if workspace.relative(output) != record.output_path:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure output path resolves differently")
+
+    manifest_path = output.parent / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise StructureArtifactError(ARTIFACT_INCOMPLETE, "structure manifest is missing")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest is invalid") from exc
+    required = {
+        "status", "operation_id", "operation", "input_sha256", "parameters",
+        "algorithm_version", "hash_version", "hash_precision", "structure_matcher", "outputs",
+    }
+    if not required <= manifest.keys() or manifest.get("status") != "complete":
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest is incomplete")
+    operation = str(record.operation)
+    expected_matcher = {"ltol": 0.2, "stol": 0.3, "angle_tol": 5} if operation == "enumerate_orderings" else None
+    expected_operation_id = _operation_id_from_manifest_fields(
+        operation, record.input_sha256, record.parameters
+    )
+    if (
+        manifest.get("operation_id") != expected_operation_id
+        or output.parent.name != expected_operation_id
+        or not output.parent.name.startswith("op_")
+        or manifest.get("operation") != operation
+        or manifest.get("input_sha256") != record.input_sha256
+        or manifest.get("parameters") != record.parameters
+        or manifest.get("algorithm_version") != HASH_VERSION
+        or manifest.get("hash_version") != HASH_VERSION
+        or manifest.get("hash_precision") != HASH_PRECISION
+        or manifest.get("structure_matcher") != expected_matcher
+    ):
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest does not match derivation")
+    entries = manifest.get("outputs")
+    if not isinstance(entries, list):
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "structure manifest outputs are invalid")
+    filename = output.name
+    matches = [
+        (ordinal, item)
+        for ordinal, item in enumerate(entries)
+        if isinstance(item, dict) and item.get("filename") == filename
+    ]
+    if len(matches) != 1:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "derivation output is not uniquely listed in manifest")
+    ordinal, entry = matches[0]
+    try:
+        reparsed, _ = _parse_structure_file(output)
+        normalized = [list(item) for item in normalize_composition(reparsed.composition.formula)]
+        actual = {
+            "sha256": _sha256_file(output),
+            "structure_hash": structure_hash(reparsed),
+            "formula": reparsed.composition.reduced_formula,
+            "normalized_composition": normalized,
+            "n_atoms": len(reparsed),
+        }
+    except Exception as exc:
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "published structure cannot be reparsed") from exc
+    if any(entry.get(key) != value for key, value in actual.items()):
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "published structure does not match manifest")
+    if (
+        record.structure_hash != actual["structure_hash"]
+        or [list(item) for item in record.normalized_composition] != normalized
+        or record.id != f"der_{output.parent.name[3:]}_{actual['structure_hash'][:16]}_{ordinal:04d}"
+        or record.candidate_id != f"cand_{actual['structure_hash'][:24]}"
+    ):
+        raise StructureArtifactError(ARTIFACT_CONFLICT, "derivation identity does not match published structure")
+    payload = record.model_dump(mode="python")
+    payload.update(
+        {
+            "operation": operation,
+            "input_sha256": manifest["input_sha256"],
+            "parameters": manifest["parameters"],
+            "structure_hash": actual["structure_hash"],
+            "normalized_composition": tuple(tuple(item) for item in normalized),
+            "output_path": workspace.relative(output),
+            "candidate_id": f"cand_{actual['structure_hash'][:24]}",
+        }
+    )
+    lineage = dict(payload["lineage"])
+    lineage["candidate_id"] = payload["candidate_id"]
+    payload["lineage"] = lineage
+    return StructureDerivation.model_validate(payload)

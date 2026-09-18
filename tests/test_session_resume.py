@@ -11,6 +11,7 @@ from photomatagent.models.types import (
     ToolResultMessage,
     UserMessage,
 )
+from photomatagent.runtime.state import ConversationState
 from photomatagent.runtime.context_engine import (
     CompactionState,
     ContextEngine,
@@ -19,6 +20,8 @@ from photomatagent.runtime.context_engine import (
 from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
 from photomatagent.scientific.state import EvidenceAttestation, ScientificState
+from photomatagent.scientific.capabilities.generation.lineage import CandidateLineage
+from photomatagent.scientific.discovery.structures import StructureDerivation
 from photomatagent.sessions.store import (
     SESSION_STATE_FILENAME,
     SESSION_STATE_SCHEMA_VERSION,
@@ -38,6 +41,33 @@ def _hypothesis_arguments() -> dict[str, object]:
         "design_operation": "isovalent_substitution",
         "validation_questions": ["Does the ordered phase remain stable?"],
     }
+
+
+def _structure_derivation(
+    index: int, *, parent_candidate_id: str | None = None
+) -> StructureDerivation:
+    candidate_id = f"cand_structure_{index}"
+    return StructureDerivation(
+        id=f"der_structure_{index}",
+        candidate_id=candidate_id,
+        parent_candidate_id=parent_candidate_id,
+        hypothesis_id="hypothesis-1",
+        input_sha256="a" * 64,
+        structure_hash=(str(index) * 64)[:64],
+        output_path=(
+            "user_output/resume-structures/structures/"
+            f"op_{index:032x}/structure_0000.cif"
+        ),
+        operation="enumerate_orderings",
+        parameters={"matcher": {"ltol": 0.2, "stol": 0.3, "angle_tol": 5}},
+        normalized_composition=(("Ag", 1), ("Na", 1)),
+        lineage=CandidateLineage(
+            candidate_id=candidate_id,
+            parent_candidate_id=parent_candidate_id,
+            generated_by="structure_construction",
+            transformation="enumerate_orderings",
+        ).model_dump(mode="python"),
+    )
 
 
 def test_snapshot_roundtrip_preserves_all_resume_state(tmp_path):
@@ -75,6 +105,33 @@ def test_snapshot_roundtrip_preserves_all_resume_state(tmp_path):
     assert restored.engine.compaction_count == 1
     assert restored.engine.compaction_state is not None
     assert restored.engine.compaction_state.progress == ["inspected"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_roundtrip_preserves_structure_parent_child_lineage_and_inspect(tmp_path):
+    parent = _structure_derivation(1)
+    child = _structure_derivation(2, parent_candidate_id=parent.candidate_id)
+    scientific = ScientificState(structure_derivations=[parent, child])
+    path = save_session_snapshot(
+        tmp_path,
+        conversation=ConversationState(),
+        scientific=scientific,
+        engine=None,
+    )
+    restored = load_session_snapshot(tmp_path)
+    assert path.name == SESSION_STATE_FILENAME
+    assert [item.id for item in restored.scientific.structure_derivations] == [
+        parent.id,
+        child.id,
+    ]
+    assert restored.scientific.structure_derivations[1].parent_candidate_id == parent.candidate_id
+
+    runtime = make_runtime(FakeModelProvider(), workspace=tmp_path)
+    runtime.restore_session(restored)
+    inspect = runtime._tools.get("scientific_state_inspect")
+    result = await inspect.execute({"section": "structures", "limit": 10})
+    assert result.data["total"] == 2
+    assert result.data["items"][1]["parent_candidate_id"] == parent.candidate_id
 
 
 def test_schema_v1_snapshot_loads_with_typed_authority_downgrade(tmp_path) -> None:
