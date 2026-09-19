@@ -47,6 +47,25 @@ def test_tool_search_finds_inverse_composition(catalog):
     assert "generation.vae_formula" in names
 
 
+def test_tool_search_ranks_inverse_generation_first(catalog):
+    """Regression: the inverse-generation route must own the inverse queries.
+
+    The VAE formula tool is the only route that *proposes* new compositions,
+    but its catalog text carried no "inverse" term, so it scored 1.92 against
+    "inverse composition" and fell just outside the default top-N results.
+    """
+    for query in ("inverse composition", "inverse generation", "inverse design"):
+        matches = catalog.search(query, limit=8)
+        assert matches, query
+        assert matches[0].entry.name == "generation.vae_formula", query
+
+
+def test_vae_retrieve_is_not_indexed_as_inverse_generation(catalog):
+    """Retrieval searches existing records and must not answer inverse requests."""
+    matches = catalog.search("inverse composition", limit=8)
+    assert "generation.vae_retrieve" not in [match.entry.name for match in matches]
+
+
 def test_tool_search_finds_vae_for_chinese_composition_generation(catalog):
     names = _top_names(catalog, "成分生成")
     assert "generation.vae_formula" in names

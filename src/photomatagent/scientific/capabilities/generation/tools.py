@@ -255,6 +255,14 @@ class VAEFormulaTool(Tool):
         "vae",
         "formula",
         "composition",
+        # Inverse-generation vocabulary: the skill and docs call this route
+        # "inverse generation", but without these terms the catalog text never
+        # matched a search for "inverse composition" and the tool fell just
+        # outside the default top-N results.
+        "inverse",
+        "inverse design",
+        "inverse generation",
+        "inverse composition",
         "成分生成",
         "组分生成",
         "化学式生成",
