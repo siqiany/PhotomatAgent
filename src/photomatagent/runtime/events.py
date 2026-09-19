@@ -97,6 +97,10 @@ class ContextCompactionStarted(RuntimeEvent):
     chars_before: int
     messages_before: int
     protected_turns: int
+    trigger: Literal["auto", "manual"] = "auto"
+    reason: str | None = None
+    threshold_tokens: int | None = None
+    target_tokens: int | None = None
 
 
 class ContextCompactionCompleted(RuntimeEvent):
@@ -110,6 +114,11 @@ class ContextCompactionCompleted(RuntimeEvent):
     protected_turns: int
     duration_ms: float = 0.0
     usage: dict[str, int | None] = Field(default_factory=dict)
+    trigger: Literal["auto", "manual"] = "auto"
+    reason: str | None = None
+    threshold_tokens: int | None = None
+    target_tokens: int | None = None
+    model_calls: int = 0
 
 
 class ContextCompactionFailed(RuntimeEvent):
@@ -120,6 +129,21 @@ class ContextCompactionFailed(RuntimeEvent):
     protected_turns: int
     error: str
     duration_ms: float = 0.0
+    trigger: Literal["auto", "manual"] = "auto"
+    reason: str | None = None
+    threshold_tokens: int | None = None
+    target_tokens: int | None = None
+    model_calls: int = 0
+    usage: dict[str, int | None] = Field(default_factory=dict)
+
+
+class ContextCompactionSkipped(RuntimeEvent):
+    kind: Literal["context_compaction_skipped"] = "context_compaction_skipped"
+    reason: str
+    trigger: Literal["auto", "manual"] = "auto"
+    tokens_before: int = 0
+    threshold_tokens: int | None = None
+    target_tokens: int | None = None
 
 
 class ModelStreamStarted(RuntimeEvent):
@@ -553,6 +577,7 @@ AnyRuntimeEvent = Annotated[
         ContextCompactionStarted,
         ContextCompactionCompleted,
         ContextCompactionFailed,
+        ContextCompactionSkipped,
         ModelStreamStarted,
         TextDelta,
         ToolCallStarted,

@@ -437,3 +437,33 @@ async def test_run_chat_resume_displays_bounded_migration_diagnostic(tmp_path, c
     output = capsys.readouterr().out
     assert "EVIDENCE_AUTHORITY_DOWNGRADED" in output
     assert "SECRET_RAW_CHAT_TOKEN" not in output
+
+
+def test_atomic_save_failure_keeps_previous_snapshot_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    import os
+
+    conversation = ConversationState(messages=[UserMessage(content="first")])
+    path = save_session_snapshot(
+        tmp_path,
+        conversation=conversation,
+        scientific=ScientificState(goal="first"),
+        engine=None,
+    )
+    before = path.read_text(encoding="utf-8")
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError):
+        save_session_snapshot(
+            tmp_path,
+            conversation=ConversationState(messages=[UserMessage(content="second")]),
+            scientific=ScientificState(goal="second"),
+            engine=None,
+        )
+
+    assert path.read_text(encoding="utf-8") == before
+    assert list(tmp_path.glob(".session-state-*.tmp")) == []

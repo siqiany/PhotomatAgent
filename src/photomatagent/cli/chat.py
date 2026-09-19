@@ -13,6 +13,8 @@ from photomatagent.cli.render import ChatRenderer
 from photomatagent.logging.event_logger import EventLogger, default_sessions_dir
 from photomatagent.models.factory import create_provider
 from photomatagent.runtime.budget import BudgetState
+from photomatagent.runtime.context_config import resolve_context_config
+from photomatagent.runtime.context_engine import ContextEngineConfig
 from photomatagent.runtime.loop import AgentRuntime, EventSink
 from photomatagent.runtime.permissions import (
     ApprovalSettings,
@@ -45,6 +47,9 @@ def build_runtime(
     fresh_approval: bool = False,
     application_approval_root: Path | str | None = None,
     evaluation_isolation: bool = False,
+    context_engine_config: ContextEngineConfig | None = None,
+    context_limit_tokens: int | None = None,
+    compact_trigger_tokens: int | None = None,
 ) -> tuple[AgentRuntime, EventLogger | None]:
     workspace = Workspace(workspace_root or Path.cwd())
     scientific = (
@@ -63,6 +68,15 @@ def build_runtime(
     )
     model_provider = create_provider(provider, model)
     budget = BudgetState(max_iterations=max_iterations)
+    if evaluation_isolation:
+        effective_context_config = ContextEngineConfig()
+    elif context_engine_config is not None:
+        effective_context_config = context_engine_config
+    else:
+        effective_context_config = resolve_context_config(
+            context_limit_tokens=context_limit_tokens,
+            compact_trigger_tokens=compact_trigger_tokens,
+        )
 
     policy: PermissionPolicy
     approval_handler = None
@@ -103,6 +117,7 @@ def build_runtime(
         session_id=logger.session_id if logger else None,
         fresh_approval=fresh_approval,
         application_approval_root=resolved_approval_root,
+        context_engine_config=effective_context_config,
     )
     return runtime, logger
 
@@ -228,6 +243,9 @@ async def run_chat(
     goal: str | None = None,
     resume: str | None = None,
     sessions_dir: Path | str | None = None,
+    context_limit_tokens: int | None = None,
+    compact_trigger_tokens: int | None = None,
+    context_engine_config: ContextEngineConfig | None = None,
 ) -> None:
     console = Console()
     workspace = Workspace(workspace_root or Path.cwd())
@@ -253,6 +271,9 @@ async def run_chat(
         session_dir=sessions_base or configured_sessions_dir,
         session_id=resumed_session_id,
         log_events=log_events,
+        context_engine_config=context_engine_config,
+        context_limit_tokens=context_limit_tokens,
+        compact_trigger_tokens=compact_trigger_tokens,
     )
     if resume is not None:
         assert resume_session_dir is not None

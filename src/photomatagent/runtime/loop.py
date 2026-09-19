@@ -43,11 +43,18 @@ from photomatagent.redaction import redact_text
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context import ContextBuilder, format_scientific_state
 from photomatagent.runtime.context_engine import (
+    ContextBuildCancelled,
+    ContextBuildResult,
     ContextEngine,
     ContextEngineConfig,
+    ContextLimitExceeded,
     ProviderContextSummarizer,
 )
 from photomatagent.runtime.context_budget import account_context
+from photomatagent.runtime.context_segments import (
+    UnsafeContextHistory,
+    split_atomic_spans,
+)
 from photomatagent.runtime.events import (
     BudgetUpdated,
     HypothesisRegistered,
@@ -263,15 +270,26 @@ class AgentRuntime:
             tools, tool_surface_config
         )
         self._observation = observation_policy or ObservationPolicy()
-        engine_config = context_engine_config or ContextEngineConfig()
+        if context_engine is not None:
+            engine_config = context_engine.config
+        else:
+            engine_config = context_engine_config or ContextEngineConfig()
         if model_context_limit is not None:
-            engine_config = engine_config.model_copy(
-                update={"context_limit_tokens": model_context_limit}
+            config_data = engine_config.model_dump()
+            config_data["context_limit_tokens"] = model_context_limit
+            engine_config = ContextEngineConfig.model_validate(config_data)
+        if context_engine is None:
+            self._context_engine = ContextEngine(
+                config=engine_config,
+                summarizer=ProviderContextSummarizer(model, engine_config),
             )
-        self._context_engine = context_engine or ContextEngine(
-            config=engine_config,
-            summarizer=ProviderContextSummarizer(model),
-        )
+        else:
+            self._context_engine = context_engine
+            if model_context_limit is not None:
+                self._context_engine.config = engine_config
+                summarizer = self._context_engine.summarizer
+                if isinstance(summarizer, ProviderContextSummarizer):
+                    summarizer.config = engine_config
         self._model_context_limit = self._context_engine.config.context_limit_tokens
         self._sensitive_paths = sensitive_path_policy or SensitivePathPolicy()
         self._permission = permission_policy or default_permission_policy()
@@ -328,15 +346,70 @@ class AgentRuntime:
 
         Mutates the existing live scientific state object in place so tool
         registries that hold a reference to it keep observing state updates.
-        The conversation and ContextEngine compaction cursor are replaced.
+        The conversation and ContextEngine compaction cursor are replaced only
+        after the prospective snapshot validates, so a bad cursor cannot
+        partially corrupt the currently running session.
         """
+        engine_payload = self._validate_engine_snapshot(
+            snapshot.conversation.messages, snapshot.engine
+        )
         restored_scientific = snapshot.scientific
         self._scientific.__dict__.clear()
         self._scientific.__dict__.update(restored_scientific.__dict__)
         self._evidence_authority.bind(self._scientific, replace=True)
         self._conversation = snapshot.conversation
-        if snapshot.engine is not None:
-            self._context_engine.restore(**snapshot.engine.model_dump(mode="json"))
+        if engine_payload is None:
+            self._context_engine.restore(
+                compaction_state=None,
+                compacted_message_count=0,
+                compaction_count=0,
+            )
+        else:
+            self._context_engine.restore(**engine_payload)
+
+    @staticmethod
+    def _validate_engine_snapshot(
+        messages: list[ModelMessage], engine: object | None
+    ) -> dict[str, object] | None:
+        if engine is None:
+            return None
+        if not hasattr(engine, "model_dump"):
+            raise ValueError("session snapshot has no valid ContextEngine cursor")
+        payload = engine.model_dump(mode="json")  # type: ignore[attr-defined]
+        raw_state = payload.get("compaction_state")
+        try:
+            cursor = int(payload.get("compacted_message_count") or 0)
+            count = int(payload.get("compaction_count") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "session snapshot ContextEngine cursor is not an integer"
+            ) from exc
+        if cursor < 0 or cursor > len(messages):
+            raise ValueError(
+                "session snapshot compaction cursor is outside the conversation"
+            )
+        if count < 0:
+            raise ValueError("session snapshot compaction count is negative")
+        if cursor > 0 and raw_state is None:
+            raise ValueError(
+                "session snapshot compaction cursor is non-zero without a summary"
+            )
+        if cursor == 0 and raw_state:
+            raise ValueError(
+                "session snapshot has a summary but a zero compaction cursor"
+            )
+        if cursor not in (0, len(messages)):
+            try:
+                spans = split_atomic_spans(messages)
+            except UnsafeContextHistory as exc:
+                raise ValueError(
+                    "session snapshot conversation has unsafe tool pairing"
+                ) from exc
+            if cursor not in {span.start for span in spans}:
+                raise ValueError(
+                    "session snapshot compaction cursor splits a tool transaction"
+                )
+        return payload
 
     async def run(self, goal: str) -> AsyncIterator[RuntimeEvent]:
         """Run one user turn while preserving conversation and scientific state."""
@@ -369,25 +442,39 @@ class AgentRuntime:
                 yield await self._emit(LoopIterationStarted(iteration=iteration))
 
                 surface = self._tool_surface.plan()
-                context = await self._context_engine.build(
-                    conversation=self._conversation,
-                    scientific=self._scientific,
-                    context_builder=self._context_builder,
-                    capability_manifest=surface.manifest.text,
-                    surface=surface.stats,
-                    session_id=self._session_id,
-                )
-                for context_event in context.events:
-                    yield await self._emit(context_event)
-                if context.compaction_usage is not None:
-                    self._budget.record_model_call(context.compaction_usage)
+                try:
+                    context = await self._context_engine.build(
+                        conversation=self._conversation,
+                        scientific=self._scientific,
+                        context_builder=self._context_builder,
+                        capability_manifest=surface.manifest.text,
+                        surface=surface.stats,
+                        session_id=self._session_id,
+                    )
+                except ContextBuildCancelled as exc:
+                    for context_event in await self._consume_context_result(
+                        exc.result
+                    ):
+                        yield context_event
+                    raise
+                context_events = await self._consume_context_result(context)
+                for context_event in context_events:
+                    yield context_event
+                if not context.request_allowed:
+                    raise self._context_limit_error(context, context_events)
                 messages = context.messages
                 context_budget = account_context(
                     messages,
                     surface.stats,
                     model_context_limit=self._model_context_limit,
                 )
-                request = ModelRequest(messages=messages, tools=surface.definitions)
+                request = ModelRequest(
+                    messages=messages,
+                    tools=surface.definitions,
+                    max_output_tokens=(
+                        self._context_engine.config.response_reserve_tokens
+                    ),
+                )
                 yield await self._emit(
                     ModelRequestStarted(
                         iteration=iteration,
@@ -677,22 +764,55 @@ class AgentRuntime:
             )
             raise
 
-    async def compact_working_context(self) -> list[RuntimeEvent]:
-        """Developer hook used by the interactive ``/compact`` command."""
-        surface = self._tool_surface.plan()
-        result = await self._context_engine.build(
-            conversation=self._conversation,
-            scientific=self._scientific,
-            context_builder=self._context_builder,
-            capability_manifest=surface.manifest.text,
-            surface=surface.stats,
-            session_id=self._session_id,
-            force_compaction=True,
-        )
+    async def _consume_context_result(
+        self, result: ContextBuildResult
+    ) -> list[RuntimeEvent]:
+        """Emit context events and account every summary model call exactly once."""
         emitted: list[RuntimeEvent] = []
         for event in result.events:
             emitted.append(await self._emit(event))
+        usages = list(result.compaction_usages)
+        calls = max(result.compaction_model_calls, len(usages))
+        for index in range(calls):
+            self._budget.record_model_call(
+                usages[index] if index < len(usages) else None
+            )
         return emitted
+
+    async def compact_working_context(self) -> list[RuntimeEvent]:
+        """Developer hook used by the interactive ``/compact`` command."""
+        surface = self._tool_surface.plan()
+        try:
+            result = await self._context_engine.build(
+                conversation=self._conversation,
+                scientific=self._scientific,
+                context_builder=self._context_builder,
+                capability_manifest=surface.manifest.text,
+                surface=surface.stats,
+                session_id=self._session_id,
+                force_compaction=True,
+            )
+            emitted = await self._consume_context_result(result)
+        except ContextBuildCancelled as exc:
+            await self._consume_context_result(exc.result)
+            raise
+        if not result.request_allowed:
+            raise self._context_limit_error(result, emitted)
+        return emitted
+
+    @staticmethod
+    def _context_limit_error(
+        result: ContextBuildResult, events: list[RuntimeEvent]
+    ) -> ContextLimitExceeded:
+        error = ContextLimitExceeded(
+            result.limit_error
+            or "working context exceeds the reserved model input budget"
+        )
+        # Interactive callers may render the events that were already emitted
+        # before the runtime refused to send an oversized model request.
+        error.result = result  # type: ignore[attr-defined]
+        error.events = events  # type: ignore[attr-defined]
+        return error
 
     def _close_pending_tool_calls(self) -> None:
         """Append factual terminal results for abandoned calls; never rewrite history."""

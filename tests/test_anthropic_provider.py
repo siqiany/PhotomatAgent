@@ -94,3 +94,54 @@ def test_anthropic_mapper_provider_error():
         AnthropicStreamMapper("claude-test").feed(
             {"type": "error", "error": {"message": "overloaded"}}
         )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_maps_max_output_tokens():
+    from photomatagent.models.anthropic import AnthropicProvider
+    from photomatagent.models.types import ModelRequest
+
+    class StreamContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def __aiter__(self):
+            return self._iterate()
+
+        async def _iterate(self):
+            if False:
+                yield None
+
+    class Messages:
+        def __init__(self):
+            self.calls = []
+
+        def stream(self, **kwargs):
+            self.calls.append(kwargs)
+            return StreamContext()
+
+    class Client:
+        def __init__(self):
+            self.messages = Messages()
+
+    client = Client()
+    provider = AnthropicProvider("claude-test", max_tokens=4096, client=client)
+    _ = [
+        event
+        async for event in provider.stream(
+            ModelRequest(messages=[UserMessage(content="one")])
+        )
+    ]
+    _ = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                messages=[UserMessage(content="one")], max_output_tokens=222
+            )
+        )
+    ]
+    assert client.messages.calls[0]["max_tokens"] == 4096
+    assert client.messages.calls[1]["max_tokens"] == 222

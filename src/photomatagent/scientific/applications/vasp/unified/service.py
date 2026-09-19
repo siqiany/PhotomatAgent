@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from photomatagent.errors import ToolExecutionError
@@ -34,6 +35,7 @@ from photomatagent.scientific.applications.vasp.unified.models import (
     UnifiedVaspManifest,
     UnifiedVaspRequest,
     VaspWorkflowKind,
+    WorkflowEvent,
     WorkflowState,
 )
 from photomatagent.scientific.applications.vasp.unified.repository import (
@@ -73,6 +75,11 @@ _ALLOWED_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
     },
     WorkflowState.SUBMITTED: {
         WorkflowState.RUNNING,
+        # A short job can finish between the submit and the first status query,
+        # so a scheduler-confirmed completion is reachable without an observed
+        # RUNNING transition. Without this edge a finished job would be
+        # reported as FAILED (or, before this fix, as RUNNING forever).
+        WorkflowState.SCHEDULER_COMPLETED,
         WorkflowState.RECONCILING,
         WorkflowState.FAILED,
         WorkflowState.AWAITING_RESOURCE_CONFIRMATION,
@@ -126,6 +133,26 @@ _TERMINAL_FAILED_STATES = {
     "CANCELLED",
 }
 
+# Lifecycle states that prove a stage's scheduler work finished successfully.
+# ``COLLECTED``/``VALIDATED`` also imply a completed scheduler run, but they
+# are handled by ``collect`` (scientific validation), never by ``status``.
+_SCHEDULER_SUCCESS_STATES = {
+    "COMPLETED",
+    "COLLECTED",
+    "VALIDATED",
+}
+
+# Lifecycle states that carry no scheduler decision at all: the stage was
+# never submitted, or reconciliation could not find its job. They must not be
+# treated as either failure or success.
+_UNDECIDED_STATES = {
+    "NOT_FOUND",
+    "UNKNOWN",
+    "UNKNOWN_RECONCILIATION_REQUIRED",
+    "SUBMITTING",
+    "",
+}
+
 
 def _confirmed_terminal_failure(stage_states: dict[str, str]) -> bool:
     """True when every submitted stage ended in a scheduler-confirmed failure.
@@ -140,6 +167,118 @@ def _confirmed_terminal_failure(stage_states: dict[str, str]) -> bool:
     if not submitted:
         return False
     return all(state in _TERMINAL_FAILED_STATES for state in submitted)
+
+
+_COLLECT_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
+    # Collection can be reached while a stage is still active (the scheduler
+    # finished but no status query ran first), so the validation outcomes are
+    # allowed from the whole active range, not only from SCHEDULER_COMPLETED.
+    WorkflowState.PLANNED: {WorkflowState.VALIDATION_FAILED},
+    WorkflowState.PREPARED: {WorkflowState.VALIDATION_FAILED},
+    WorkflowState.PREFLIGHTED: {
+        WorkflowState.VALIDATED,
+        WorkflowState.VALIDATION_FAILED,
+        WorkflowState.PREFLIGHTED,
+        WorkflowState.RUNNING,
+    },
+    WorkflowState.SUBMITTED: {
+        WorkflowState.VALIDATED,
+        WorkflowState.SCHEDULER_COMPLETED,
+        WorkflowState.VALIDATION_FAILED,
+        WorkflowState.RUNNING,
+        # A study parent whose child stage progressed returns to PREFLIGHTED so
+        # the next declared stage can be authorized (see ``collect``).
+        WorkflowState.PREFLIGHTED,
+    },
+    WorkflowState.RUNNING: {
+        WorkflowState.VALIDATED,
+        WorkflowState.SCHEDULER_COMPLETED,
+        WorkflowState.VALIDATION_FAILED,
+    },
+    WorkflowState.RECONCILING: {
+        WorkflowState.VALIDATED,
+        WorkflowState.SCHEDULER_COMPLETED,
+        WorkflowState.VALIDATION_FAILED,
+        WorkflowState.RUNNING,
+    },
+    WorkflowState.SCHEDULER_COMPLETED: {
+        WorkflowState.VALIDATED,
+        WorkflowState.VALIDATION_FAILED,
+        WorkflowState.SCHEDULER_COMPLETED,
+    },
+    WorkflowState.VALIDATED: {
+        WorkflowState.VALIDATED,
+        WorkflowState.SCHEDULER_COMPLETED,
+        WorkflowState.VALIDATION_FAILED,
+        WorkflowState.PREFLIGHTED,
+    },
+    WorkflowState.VALIDATION_FAILED: {
+        WorkflowState.VALIDATED,
+        WorkflowState.VALIDATION_FAILED,
+        WorkflowState.SCHEDULER_COMPLETED,
+    },
+    WorkflowState.FAILED: {WorkflowState.VALIDATION_FAILED},
+}
+
+
+def _collect_transition_allowed(
+    current: WorkflowState, target: WorkflowState
+) -> bool:
+    return target in _COLLECT_TRANSITIONS.get(current, set())
+
+
+def _next_workflow_state(
+    manifest: UnifiedVaspManifest,
+    stage_states: dict[str, str],
+) -> WorkflowState | None:
+    """Translate observed stage states into the next workflow state.
+
+    ``status`` and ``collect`` share one translation so a scheduler-confirmed
+    completion can never be reported as ``RUNNING`` (which would make
+    ``vasp.wait`` poll until the heat death of the cluster). Only stages that
+    have an observation contribute; stages that were never submitted stay
+    ``PLANNED``/``NOT_FOUND`` and cannot veto a completion.
+
+    Returns ``None`` when nothing observable changed.
+    """
+    if not stage_states:
+        return None
+    states = [
+        state for state in stage_states.values() if state not in _UNDECIDED_STATES
+    ]
+    if not states:
+        return None
+    if any(state in _TERMINAL_FAILED_STATES for state in states):
+        return WorkflowState.FAILED
+    if all(state in _SCHEDULER_SUCCESS_STATES for state in states):
+        if manifest.state is not WorkflowState.VALIDATED:
+            return WorkflowState.SCHEDULER_COMPLETED
+        return None
+    # Something is still active (SUBMITTED/PENDING/RUNNING) and nothing failed.
+    return WorkflowState.RUNNING
+
+
+def _dependency_satisfied(
+    manifest: UnifiedVaspManifest, stage: UnifiedStage
+) -> bool:
+    for dependency in stage.depends_on:
+        candidate = next(
+            (item for item in manifest.stages if item.name == dependency), None
+        )
+        if candidate is None or candidate.state not in {
+            WorkflowState.SCHEDULER_COMPLETED,
+            WorkflowState.VALIDATED,
+        }:
+            return False
+    return True
+
+
+def _has_progressable_stage(manifest: UnifiedVaspManifest) -> bool:
+    """True when a not-yet-run stage has all of its dependencies satisfied."""
+    return any(
+        stage.state is WorkflowState.PLANNED and _dependency_satisfied(manifest, stage)
+        for stage in manifest.stages
+    )
 
 
 class UnifiedVaspService:
@@ -283,13 +422,7 @@ class UnifiedVaspService:
         for item in manifest.stages:
             if item.state is not WorkflowState.PLANNED:
                 continue
-            if all(
-                next((candidate for candidate in manifest.stages if candidate.name == dependency), None)
-                is not None
-                and next(candidate for candidate in manifest.stages if candidate.name == dependency).state
-                in {WorkflowState.SCHEDULER_COMPLETED, WorkflowState.VALIDATED}
-                for dependency in item.depends_on
-            ):
+            if _dependency_satisfied(manifest, item):
                 item.state = WorkflowState.PREFLIGHTED
                 break
         return self._save_and_result(manifest, result)
@@ -302,13 +435,7 @@ class UnifiedVaspService:
         progression = (
             manifest.state is WorkflowState.VALIDATED
             and target.state in {WorkflowState.PLANNED, WorkflowState.PREFLIGHTED}
-            and all(
-                next((candidate for candidate in manifest.stages if candidate.name == dependency), None)
-                is not None
-                and next(candidate for candidate in manifest.stages if candidate.name == dependency).state
-                in {WorkflowState.SCHEDULER_COMPLETED, WorkflowState.VALIDATED}
-                for dependency in target.depends_on
-            )
+            and _dependency_satisfied(manifest, target)
         )
         if progression:
             manifest.state = WorkflowState.PREFLIGHTED
@@ -416,11 +543,57 @@ class UnifiedVaspService:
                 ),
             )
         if not result.query_failed:
-            if _confirmed_terminal_failure(result.stage_states):
-                manifest.state = WorkflowState.FAILED
-            else:
-                manifest.state = WorkflowState.RUNNING
+            for name, state in result.stage_states.items():
+                for item in manifest.stages:
+                    if item.name == name:
+                        try:
+                            item.state = WorkflowState(state)
+                        except ValueError:
+                            item.state = WorkflowState.SCHEDULER_COMPLETED
+            next_state = _next_workflow_state(manifest, result.stage_states)
+            if next_state is not None and next_state is not manifest.state:
+                self._apply_observed_state(manifest, next_state, result.stage_states)
         return self._save_and_result(manifest, result)
+
+    def _apply_observed_state(
+        self,
+        manifest: UnifiedVaspManifest,
+        target: WorkflowState,
+        stage_states: dict[str, str],
+    ) -> None:
+        """Apply an observed state when the transition is legal.
+
+        A status query can also observe an already-terminal workflow (e.g. the
+        job finished before validation, or a repeat query after failure). An
+        illegal transition must never be raised from ``status``: the workflow
+        already holds scheduler evidence, so only an explicit contradiction
+        escalates to ``FAILED``.
+        """
+        if target in _ALLOWED_TRANSITIONS.get(manifest.state, set()):
+            manifest.state = target
+            return
+        if target is WorkflowState.RUNNING and manifest.state in _TERMINAL_FAILED_STATES:
+            return
+        if manifest.state in {
+            WorkflowState.SCHEDULER_COMPLETED,
+            WorkflowState.VALIDATED,
+            WorkflowState.VALIDATION_FAILED,
+            WorkflowState.FAILED,
+        }:
+            return
+        previous = manifest.state
+        manifest.state = WorkflowState.FAILED
+        manifest.events.append(
+            WorkflowEvent(
+                event_type="illegal_state_observation",
+                timestamp=datetime.now(timezone.utc),
+                details={
+                    "observed": dict(stage_states),
+                    "implied_state": target.value,
+                    "previous_state": previous.value,
+                },
+            )
+        )
 
     async def resume(self, workflow_id: str) -> ServiceResult:
         manifest = self._load(workflow_id)
@@ -576,38 +749,57 @@ class UnifiedVaspService:
                         item.state = WorkflowState(state)
                     except ValueError:
                         item.state = WorkflowState.SCHEDULER_COMPLETED
-        if result.ok and result.validated:
-            manifest.state = WorkflowState.VALIDATED
-        elif (
-            manifest.workflow_kind is not VaspWorkflowKind.STUDY
-            and result.ok
-            and not result.errors
-            and any(
-            state == WorkflowState.VALIDATED.value
-            for state in getattr(result, "stage_states", {}).values()
-            )
-        ):
+        observed = getattr(result, "stage_states", {}) or {}
+        # Only a hard stage failure short-circuits the decision. A
+        # ``VALIDATION_FAILED`` observation still flows through the branches
+        # below (including study progression), exactly as before.
+        has_failed = any(
+            state == WorkflowState.FAILED.value for state in observed.values()
+        )
+        has_progressed = any(
+            state in {WorkflowState.VALIDATED.value, WorkflowState.SCHEDULER_COMPLETED.value}
+            for state in observed.values()
+        )
+        next_state: WorkflowState
+        if has_failed:
+            next_state = WorkflowState.VALIDATION_FAILED
+        elif result.ok and result.validated:
+            next_state = WorkflowState.VALIDATED
+        elif result.ok and has_progressed and _has_progressable_stage(manifest):
             # A dependency stage may be collected while later WorkflowSpec
             # stages are still pending.  Keep the child at the progression
             # sentinel so preflight can authorize the next stage; the result
             # remains non-validated and carries explicit evidence gaps.
-            manifest.state = WorkflowState.VALIDATED
+            next_state = WorkflowState.VALIDATED
         elif (
             manifest.workflow_kind is VaspWorkflowKind.STUDY
             and not result.errors
-            and not any(
-                state in {WorkflowState.FAILED.value, WorkflowState.VALIDATION_FAILED.value}
-                for state in getattr(result, "stage_states", {}).values()
-            )
+            and not has_failed
         ):
-            # A study child may have validated one dependency stage while its
-            # remaining declared stages still need to run.  This is a
+            # A study child may have collected or validated one dependent stage
+            # while its remaining declared tasks still need to run.  This is a
             # progression state only, never a parent scientific validation.
-            manifest.state = WorkflowState.PREFLIGHTED
+            next_state = WorkflowState.PREFLIGHTED
+        elif result.ok and has_progressed:
+            next_state = WorkflowState.SCHEDULER_COMPLETED
         elif result.ok:
-            manifest.state = WorkflowState.SCHEDULER_COMPLETED
+            next_state = WorkflowState.RUNNING
         else:
-            manifest.state = WorkflowState.VALIDATION_FAILED
+            next_state = WorkflowState.VALIDATION_FAILED
+        if next_state is not manifest.state:
+            if _collect_transition_allowed(manifest.state, next_state):
+                manifest.state = next_state
+            else:
+                previous = manifest.state
+                manifest.state = WorkflowState.FAILED
+                errors = list(getattr(result, "errors", []) or [])
+                errors.append(
+                    "illegal VASP state transition after collect: "
+                    f"{previous.value} -> {next_state.value}"
+                )
+                result = result.model_copy(
+                    update={"ok": False, "errors": errors}
+                )
         return self._save_and_result(manifest, result)
 
     async def report(

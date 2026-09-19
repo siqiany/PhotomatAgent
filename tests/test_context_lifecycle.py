@@ -57,7 +57,10 @@ def _surface() -> ToolSurfaceStats:
 def _engine(*, summarizer=None, protect_recent_turns: int = 1) -> ContextEngine:
     return ContextEngine(
         config=ContextEngineConfig(
-            context_limit_tokens=4_000,
+            context_limit_tokens=6_000,
+            response_reserve_tokens=1_024,
+            safety_margin_tokens=64,
+            compact_trigger_tokens=None,
             prune_trigger_ratio=0.50,
             compact_trigger_ratio=0.90,
             target_ratio=0.40,
@@ -136,6 +139,9 @@ async def test_recent_tool_result_is_protected_from_pruning():
     engine = ContextEngine(
         config=ContextEngineConfig(
             context_limit_tokens=6_000,
+            response_reserve_tokens=64,
+            safety_margin_tokens=64,
+            compact_trigger_tokens=None,
             prune_trigger_ratio=0.5,
             compact_trigger_ratio=0.95,
             target_ratio=0.45,
@@ -171,6 +177,9 @@ async def test_explicitly_protected_tool_result_is_not_pruned():
     engine = ContextEngine(
         config=ContextEngineConfig(
             context_limit_tokens=20_000,
+            response_reserve_tokens=64,
+            safety_margin_tokens=64,
+            compact_trigger_tokens=None,
             prune_trigger_ratio=0.10,
             compact_trigger_ratio=0.95,
             target_ratio=0.05,
@@ -223,6 +232,9 @@ async def test_inflight_transaction_blocks_semantic_compaction():
     engine = ContextEngine(
         config=ContextEngineConfig(
             context_limit_tokens=100_000,
+            response_reserve_tokens=64,
+            safety_margin_tokens=64,
+            compact_trigger_tokens=None,
             prune_trigger_ratio=0.7,
             compact_trigger_ratio=0.9,
             target_ratio=0.6,
@@ -233,7 +245,11 @@ async def test_inflight_transaction_blocks_semantic_compaction():
     result = await _build(engine, conversation, force=True)
     assert summarizer.calls == 0
     assert result.inflight_tool_transaction is True
-    assert not any(event.kind.startswith("context_compaction") for event in result.events)
+    assert any(
+        event.kind == "context_compaction_skipped"
+        and getattr(event, "reason", None) == "inflight_tool_transaction"
+        for event in result.events
+    )
 
 
 @pytest.mark.asyncio
@@ -242,7 +258,7 @@ async def test_structured_compaction_replaces_only_old_prefix():
     conversation = ConversationState(
         messages=[
             UserMessage(content="old goal"),
-            AssistantMessage(text="old answer"),
+            AssistantMessage(text="old answer " * 800),
             UserMessage(content="current goal"),
             AssistantMessage(text="current evidence"),
         ]

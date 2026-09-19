@@ -219,34 +219,58 @@ class OpenAIStreamMapper:
             mapped.append(ModelToolCallCompleted(tool_call=call, index=done_builder.index))
         elif event_type == "response.completed":
             response = as_dict(event.get("response", {}))
-            self.response_id = str(response.get("id") or self.response_id or "") or None
-            self._recover_final_calls(response, mapped)
-            self.usage = self._usage(response.get("usage"))
-            mapped.append(ModelUsageUpdated(usage=self.usage))
-            calls = sorted(
-                self.completed_calls.values(),
-                key=lambda call: next(
-                    (b.index for b in self.calls_by_item.values() if b.call_id == call.id), 0
-                ),
-            )
-            finish: FinishReason = "tool_calls" if calls else "stop"
-            if response.get("status") == "incomplete":
-                finish = "max_tokens"
-            mapped.append(
-                ModelCompleted(
-                    response=ModelResponse(
-                        text="".join(self.text_parts),
-                        tool_calls=calls,
-                        finish_reason=finish,
-                        usage=self.usage,
-                        response_id=self.response_id,
-                    )
-                )
+            self._finish_response(response, mapped, incomplete_reason=None)
+        elif event_type == "response.incomplete":
+            # A truncated response is still a completed provider call. Ignoring
+            # this terminal event makes the stream look like it produced no
+            # response at all ("got 0"), which hides actionable truncation.
+            response = as_dict(event.get("response", {}))
+            details = as_dict(response.get("incomplete_details") or {})
+            self._finish_response(
+                response,
+                mapped,
+                incomplete_reason=str(details.get("reason") or "incomplete"),
             )
         elif event_type in {"response.failed", "error"}:
             error = event.get("error") or event.get("response") or "stream failed"
             raise ProviderError("openai", str(error))
         return mapped
+
+    def _finish_response(
+        self,
+        response: dict[str, Any],
+        mapped: list[ModelStreamEvent],
+        *,
+        incomplete_reason: str | None,
+    ) -> None:
+        self.response_id = str(response.get("id") or self.response_id or "") or None
+        self._recover_final_calls(response, mapped)
+        self.usage = self._usage(response.get("usage"))
+        mapped.append(ModelUsageUpdated(usage=self.usage))
+        calls = sorted(
+            self.completed_calls.values(),
+            key=lambda call: next(
+                (b.index for b in self.calls_by_item.values() if b.call_id == call.id), 0
+            ),
+        )
+        truncated = incomplete_reason is not None or response.get("status") == "incomplete"
+        if truncated:
+            # Truncation outranks every other finish reason: neither "stop" nor
+            # "tool_calls" is trustworthy when the response was cut short.
+            finish: FinishReason = "max_tokens"
+        else:
+            finish = "tool_calls" if calls else "stop"
+        mapped.append(
+            ModelCompleted(
+                response=ModelResponse(
+                    text="".join(self.text_parts),
+                    tool_calls=calls,
+                    finish_reason=finish,
+                    usage=self.usage,
+                    response_id=self.response_id,
+                )
+            )
+        )
 
     def _recover_final_calls(
         self, response: dict[str, Any], mapped: list[ModelStreamEvent]
@@ -334,6 +358,8 @@ class OpenAIProvider:
         }
         if system_messages:
             kwargs["instructions"] = "\n\n".join(system_messages)
+        if request.max_output_tokens is not None:
+            kwargs["max_output_tokens"] = request.max_output_tokens
         try:
             stream = await self._client.responses.create(**kwargs)
             async for sdk_event in stream:

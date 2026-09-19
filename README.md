@@ -247,6 +247,82 @@ Deferred execution still follows the same sensitive-path checks, permission poli
 
 `ScientificState` is maintained independently and can receive claims, evidence, calculation records, and tasks through tool result `state_updates`.
 
+### Context compaction and output budget
+
+The context policy uses an **estimated** token count equal to
+`ceil(serialized_chars / 4)`.  It is intentionally not described as a vendor
+ tokenizer and may undercount Chinese text, code, or other non-ASCII content.
+
+The configured context window `C` is a policy value, not proof of model
+capacity.  For a window `C`, the engine derives the same values for pruning,
+automatic compaction, display, and the final hard guard:
+
+- `H = C - response_reserve_tokens - safety_margin_tokens` is the hard estimated
+  input limit for a normal model request.
+- `A = min(compact_trigger_tokens, floor(0.9 * H))` is the automatic compaction
+  trigger.  Absolute mode starts pruning at `A` too.
+- `T = min(compact_target_tokens, floor(0.6 * A))` is the compaction target.
+
+When the model window is unknown, the schema default is the conservative
+`C=128000` policy, which resolves to `H=111616`, `A=100454`, and `T=60272`
+(estimated tokens).  A configured window of `256000` resolves to
+`H=239616`, `A=215654`, and `T=128000`; `512000` is only an example and
+resolves to `H=495616`, `A=256000`, and `T=128000`.  `256k` means exactly
+`256000`, not `262144`.
+
+Automatic compaction is checked before every normal model request, including
+between tool calls inside one user turn.  A single user goal with many completed
+tool transactions is grouped atomically so an assistant tool call and all of its
+results are never split.  The most recent transactions and the latest real user
+goal message are retained.  Existing `/compact` remains the manual entry point:
+it ignores the automatic trigger, validates the same budgets and tool pairing,
+and, when event logging is enabled, saves the compaction cursor immediately.
+
+Compaction changes only the model-visible working copy and compaction cursor.
+The durable conversation, scientific state, evidence, and historical snapshots
+are not rewritten.  A failed, cancelled, or non-reducing compaction does not
+commit a cursor or summary.  Summaries are necessarily lossy; they preserve
+structured scientific fields and explicit uncertainty, but they are not a
+replacement for `ScientificState` or durable evidence.
+
+A single atomic message/transaction that is too large for the bounded summary
+input is reported as an explicit compaction failure rather than split or
+silently dropped.  The first version also cannot guarantee that an estimated
+prompt below `H` will never be rejected by a provider tokenizer.
+
+The runtime sets the normal model request output cap from
+`response_reserve_tokens` (default `8192`).  Anthropic adapters previously used
+`4096` by their own default; routed runtime requests now use the configured
+reserve unless explicitly changed.  Summary requests are always `tools=[]` and
+are capped by `min(summary_max_tokens, response_reserve_tokens)`.
+
+Configure the public numeric policy without editing `.env`:
+
+```bash
+# Use C values verified for your own service.  Replace these examples.
+export PHOTOMATAGENT_CONTEXT_LIMIT_TOKENS=512000
+export PHOTOMATAGENT_COMPACT_TRIGGER_TOKENS=256000
+export PHOTOMATAGENT_COMPACT_TARGET_TOKENS=128000
+export PHOTOMATAGENT_RESPONSE_RESERVE_TOKENS=8192
+uv run photomatagent chat
+
+# Equivalent explicit CLI form:
+uv run photomatagent chat --context-limit-tokens 512000 --compact-trigger-tokens 256000
+```
+
+For a smaller verified window, lower the trigger and target together.  The
+explicit CLI flags currently expose the window and trigger; set the target via
+its public environment variable when the schema default would be too large:
+
+```bash
+PHOTOMATAGENT_COMPACT_TARGET_TOKENS=60000 \
+  uv run photomatagent chat --context-limit-tokens 128000 \
+  --compact-trigger-tokens 100000
+```
+
+Do not simply raise the window value to claim support for a larger model
+context.
+
 The prompt layout is cache-friendly: the system message stays static for the whole
 session (base instructions, skill index, capability manifest). The live scientific
 state and the derived investigation ledger are appended as a single trailing

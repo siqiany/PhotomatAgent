@@ -1518,7 +1518,7 @@ class QdrantLiteratureStore:
             revision_conditions.append(
                 models.FieldCondition(
                     key="document_revision",
-                    match=models.MatchExcept(except_=[revision_except]),
+                    match=models.MatchExcept(**{"except": [revision_except]}),
                 )
             )
         return self._filter(
@@ -2069,7 +2069,7 @@ class QdrantLiteratureStore:
             extra = (
                 models.FieldCondition(
                     key="document_revision",
-                    match=models.MatchExcept(except_=[keep_revision]),
+                    match=models.MatchExcept(**{"except": [keep_revision]}),
                 ),
             )
         query_filter = self._passage_filter(

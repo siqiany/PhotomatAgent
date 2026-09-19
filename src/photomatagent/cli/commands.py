@@ -98,7 +98,7 @@ COMMANDS = (
         "启动内部专家评审向导；默认 validation，模式由命令参数明确选择",
     ),
     CommandSpec("/configure [options]", "配置工作区 LLM（可能交互询问）"),
-    CommandSpec("/compact", "压缩较早的工作上下文"),
+    CommandSpec("/compact", "立即压缩工作上下文，保留完整历史"),
     CommandSpec("/resume <id|目录|latest>", "回溯加载历史 session，并在其基础上继续追问"),
     CommandSpec("/exit 或 /quit", "退出当前聊天"),
 )
@@ -160,7 +160,7 @@ class ChatCommandRouter:
         elif command == "/approve":
             self._approve(args)
         elif command == "/compact":
-            await self._compact()
+            await self._compact(args)
         elif command == "/resume":
             await self._resume(args)
         elif command == "/doctor":
@@ -320,13 +320,76 @@ class ChatCommandRouter:
             }[scope]
             self.console.print(f"当前权限状态：{label}。用法：/approve -o | -a | -b")
 
-    async def _compact(self) -> None:
-        events = await self.runtime.compact_working_context()
+    async def _compact(self, args: list[str]) -> None:
+        if args in (["--help"], ["-h"]):
+            self.console.print(
+                "用法：/compact（立即压缩工作上下文；不接受定制摘要指令）"
+            )
+            return
+        if args:
+            self.console.print("用法：/compact")
+            return
+        if not self.runtime.conversation_state.messages:
+            self.console.print("[dim]没有可压缩的旧上下文[/]")
+            return
+        from photomatagent.runtime.context_engine import (
+            ContextCompactionCompleted,
+            ContextLimitExceeded,
+        )
+
+        self.console.print("[dim]正在压缩上下文…[/]")
         renderer = ChatRenderer(self.console)
+        try:
+            events = await self.runtime.compact_working_context()
+        except ContextLimitExceeded as exc:
+            for event in getattr(exc, "events", []):
+                renderer.handle(event)
+            self.console.print(
+                f"[red]上下文压缩未完成：{redact_text(str(exc))}[/]",
+                markup=False,
+            )
+            return
+        except Exception as exc:
+            self.console.print(
+                f"[red]上下文压缩失败：{redact_text(str(exc))}[/]",
+                markup=False,
+            )
+            return
+
         for event in events:
             renderer.handle(event)
-        if not events:
-            self.console.print("[dim]No eligible old turns to compact.[/]")
+        completed = any(
+            isinstance(event, ContextCompactionCompleted) for event in events
+        )
+        if not completed:
+            if not events:
+                self.console.print("[dim]没有可压缩的旧上下文[/]")
+            return
+
+        if self.logger is None:
+            self.console.print(
+                "[yellow]压缩仅当前进程生效，未持久保存。[/]"
+            )
+            return
+        try:
+            from photomatagent.sessions.store import save_session_snapshot
+
+            save_session_snapshot(
+                self.logger.session_dir,
+                conversation=self.runtime.conversation_state,
+                scientific=self.runtime.scientific_state,
+                engine=self.runtime.context_engine.snapshot(),
+            )
+        except OSError as exc:
+            self.console.print(
+                "[yellow]压缩已在内存生效，但保存失败；重启后可能恢复旧状态。[/]",
+                markup=False,
+            )
+            self.console.print(
+                f"[dim]{redact_text(str(exc))}[/]", markup=False
+            )
+            return
+        self.console.print("[green]压缩状态已保存[/]")
 
     async def _resume(self, args: list[str]) -> None:
         """Load a historical session into the running chat and continue on it."""
@@ -361,7 +424,14 @@ class ChatCommandRouter:
                 engine=self.runtime.context_engine.snapshot(),
             )
         snapshot = load_session_snapshot(session_dir)
-        self.runtime.restore_session(snapshot)
+        try:
+            self.runtime.restore_session(snapshot)
+        except ValueError as exc:
+            self.console.print(
+                f"[red]无法恢复 session：{redact_text(str(exc))}[/]",
+                markup=False,
+            )
+            return
         diagnostic_codes = migration_diagnostic_codes(snapshot)
         diagnostic_text = (
             f" 迁移诊断：{','.join(diagnostic_codes)}。"

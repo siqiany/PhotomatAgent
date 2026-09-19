@@ -451,3 +451,168 @@ async def test_unsubstantiated_executor_auto_resume_stays_reconciling(tmp_path):
     result = await service.resume(manifest.workflow_id)
 
     assert result.state is WorkflowState.RECONCILING
+
+
+class StatusScriptedExecutor(FakeVaspExecutor):
+    """Executor whose status/collect observations are driven by the test."""
+
+    def __init__(self, statuses=None, collections=None):
+        self.statuses = list(statuses or [])
+        self.collections = list(collections or [])
+        self.status_calls = 0
+
+    async def status(self, manifest):
+        if not self.statuses:
+            return StatusResult(ok=True, stage_states={})
+        index = min(self.status_calls, len(self.statuses) - 1)
+        self.status_calls += 1
+        return StatusResult(ok=True, stage_states=dict(self.statuses[index]))
+
+    async def collect(self, manifest):
+        if not self.collections:
+            return CollectionResult(ok=True, validated=True, stage_states={"relax": "VALIDATED"})
+        return self.collections.pop(0)
+
+
+async def _drive_to_running(service, workspace, executor):
+    """Plan -> prepare -> preflight -> submit -> status(RUNNING)."""
+    manifest = service.plan(periodic_request(workspace))
+    await service.prepare(manifest.workflow_id)
+    await service.preflight(manifest.workflow_id)
+    await service.submit(manifest.workflow_id)
+    executor.statuses = [
+        {"relax": "RUNNING", "static": "NOT_FOUND", "band": "NOT_FOUND", "dos": "NOT_FOUND"}
+    ]
+    executor.status_calls = 0
+    running = await service.status(manifest.workflow_id)
+    assert running.state is WorkflowState.RUNNING
+    return manifest.workflow_id
+
+
+def _reset_status(executor, states):
+    executor.statuses = [states]
+    executor.status_calls = 0
+
+
+@pytest.mark.asyncio
+async def test_status_settles_when_scheduler_reports_completion(tmp_path):
+    """Regression: a COMPLETED job must never keep reporting RUNNING.
+
+    The original status() mapped every non-failure observation to RUNNING, so
+    ``vasp.wait`` polled its full timeout forever even after Slurm finished the
+    relax stage.
+    """
+    executor = StatusScriptedExecutor()
+    service, workspace = make_service(tmp_path, executor)
+    workflow_id = await _drive_to_running(service, workspace, executor)
+
+    _reset_status(executor, {"relax": "COMPLETED", "static": "NOT_FOUND", "band": "NOT_FOUND", "dos": "NOT_FOUND"})
+    settled = await service.status(workflow_id)
+
+    assert settled.state is WorkflowState.SCHEDULER_COMPLETED
+    assert settled.ok
+    persisted = service.load_manifest(workflow_id)
+    assert persisted.state is WorkflowState.SCHEDULER_COMPLETED
+    assert persisted.stages[0].state is WorkflowState.SCHEDULER_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_status_reports_running_while_any_stage_is_active(tmp_path):
+    executor = StatusScriptedExecutor()
+    service, workspace = make_service(tmp_path, executor)
+    workflow_id = await _drive_to_running(service, workspace, executor)
+
+    _reset_status(executor, {"relax": "COMPLETED", "static": "RUNNING", "band": "NOT_FOUND", "dos": "NOT_FOUND"})
+    result = await service.status(workflow_id)
+
+    assert result.state is WorkflowState.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_status_reports_failed_for_scheduler_confirmed_failure(tmp_path):
+    executor = StatusScriptedExecutor()
+    service, workspace = make_service(tmp_path, executor)
+    workflow_id = await _drive_to_running(service, workspace, executor)
+
+    _reset_status(executor, {"relax": "FAILED", "static": "NOT_FOUND", "band": "NOT_FOUND", "dos": "NOT_FOUND"})
+    result = await service.status(workflow_id)
+
+    assert result.state is WorkflowState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_status_after_settle_is_idempotent(tmp_path):
+    executor = StatusScriptedExecutor()
+    service, workspace = make_service(tmp_path, executor)
+    workflow_id = await _drive_to_running(service, workspace, executor)
+    _reset_status(executor, {"relax": "COMPLETED", "static": "NOT_FOUND", "band": "NOT_FOUND", "dos": "NOT_FOUND"})
+
+    first = await service.status(workflow_id)
+    second = await service.status(workflow_id)
+
+    assert first.state is WorkflowState.SCHEDULER_COMPLETED
+    assert second.state is WorkflowState.SCHEDULER_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_collect_from_settled_state_does_not_hit_illegal_transition(tmp_path):
+    """Regression: collection right after a scheduler completion used to raise
+    "illegal VASP state transition: SCHEDULER_COMPLETED -> VALIDATED"."""
+    executor = StatusScriptedExecutor()
+    service, workspace = make_service(tmp_path, executor)
+    workflow_id = await _drive_to_running(service, workspace, executor)
+    _reset_status(executor, {"relax": "COMPLETED", "static": "NOT_FOUND", "band": "NOT_FOUND", "dos": "NOT_FOUND"})
+    await service.status(workflow_id)
+
+    result = await service.collect(workflow_id)
+
+    assert result.ok
+    assert result.state is WorkflowState.VALIDATED
+    assert not any("illegal" in error for error in result.errors)
+
+
+@pytest.mark.asyncio
+async def test_collect_from_running_marks_validation_failure_without_raising(tmp_path):
+    executor = StatusScriptedExecutor()
+    service, workspace = make_service(tmp_path, executor)
+    workflow_id = await _drive_to_running(service, workspace, executor)
+    executor.collections = [
+        CollectionResult(
+            ok=False,
+            validated=False,
+            stage_states={"relax": "VALIDATION_FAILED"},
+            errors=["relax: result has no parsed total energy"],
+        )
+    ]
+
+    result = await service.collect(workflow_id)
+
+    assert result.state is WorkflowState.VALIDATION_FAILED
+    assert result.errors
+
+
+@pytest.mark.asyncio
+async def test_collect_progresses_to_next_stage_after_dependency_validated(tmp_path):
+    executor = StageAwareExecutor()
+    service, workspace = make_service(tmp_path, executor)
+    service.router.register(VaspWorkflowKind.MOLECULAR, executor)
+    structure = workspace.root / "molecule.xyz"
+    structure.write_text("1\nX\nX 0 0 0\n", encoding="utf-8")
+    workflow = WorkflowSpec(
+        molecule=MoleculeSpec(name="X", structure_path="molecule.xyz", structure_kind="xyz", total_charge=0),
+        stages=[StageSpec(name=StageName.RELAX), StageSpec(name=StageName.STATIC, depends_on=StageName.RELAX)],
+        scientific_method="PBE-D3(BJ)",
+    )
+    request = UnifiedVaspRequest(
+        workflow_kind=VaspWorkflowKind.MOLECULAR,
+        scientific_spec=MolecularScientificSpec(workflow=workflow),
+    )
+    manifest = service.plan(request)
+    await service.prepare(manifest.workflow_id)
+    await service.preflight(manifest.workflow_id)
+    await service.submit(manifest.workflow_id, stage="relax")
+
+    collected = await service.collect(manifest.workflow_id)
+
+    assert collected.state is WorkflowState.VALIDATED
+    assert not any("illegal" in error for error in collected.errors)

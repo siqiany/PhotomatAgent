@@ -266,7 +266,7 @@ class AnthropicProvider:
         mapper = AnthropicStreamMapper(self.model)
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": request.max_output_tokens or self.max_tokens,
             "messages": messages,
             "tools": anthropic_tools(request.tools),
         }

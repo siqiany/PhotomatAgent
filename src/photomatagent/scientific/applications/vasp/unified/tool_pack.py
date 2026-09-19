@@ -370,13 +370,14 @@ class VaspWaitTool(_UnifiedVaspTool):
         }
         import time
 
-        deadline = time.monotonic() + timeout_seconds
-        waited = 0.0
+        started = time.monotonic()
+        deadline = started + timeout_seconds
         last: dict[str, Any] = {}
         try:
-            while time.monotonic() < deadline:
+            while True:
                 result = await self.service.status(workflow_id)
                 last = result.model_dump(mode="json")
+                waited = time.monotonic() - started
                 if result.state.value in terminal_states:
                     payload = dict(last)
                     payload["wait"] = {
@@ -389,14 +390,15 @@ class VaspWaitTool(_UnifiedVaspTool):
                         ),
                     }
                     return ScientificToolResult(output=_json(payload), data=payload)
+                if time.monotonic() >= deadline:
+                    break
                 await asyncio.sleep(poll_interval)
-                waited += poll_interval
         except Exception as exc:
             return _error(exc)
         payload = dict(last)
         payload["wait"] = {
             "settled": False,
-            "waited_seconds": round(waited, 1),
+            "waited_seconds": round(time.monotonic() - started, 1),
             "timeout_seconds": timeout_seconds,
             "note": (
                 "still SUBMITTED/RUNNING after timeout; call vasp.status "

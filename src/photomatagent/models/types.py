@@ -82,6 +82,7 @@ class ModelUsage(BaseModel):
 class ModelRequest(BaseModel):
     messages: list[ModelMessage]
     tools: list[ToolDefinition] = Field(default_factory=list)
+    max_output_tokens: int | None = Field(default=None, ge=1)
 
 
 class ModelResponse(BaseModel):

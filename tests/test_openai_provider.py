@@ -159,6 +159,56 @@ def test_openai_mapper_provider_error():
         )
 
 
+def test_openai_mapper_maps_truncated_response_as_completed_max_tokens():
+    """``response.incomplete`` is a terminal event, not silence.
+
+    Regression: the OpenAI-compatible endpoint emits ``response.incomplete``
+    (no ``response.completed``) whenever ``max_output_tokens`` is reached. The
+    mapper ignored it, so callers saw zero ``ModelCompleted`` events and
+    reported "expected exactly one completed summary response, got 0" instead
+    of an actionable truncation.
+    """
+    mapper = OpenAIStreamMapper("gpt-test")
+    mapped = _feed(
+        mapper,
+        [
+            {"type": "response.created", "response": {"id": "resp_9"}},
+            {"type": "response.output_text.delta", "delta": '{"goal":"partial'},
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_9",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [],
+                    "usage": {"input_tokens": 31, "output_tokens": 16, "total_tokens": 47},
+                },
+            },
+        ],
+    )
+
+    completed = next(event for event in mapped if isinstance(event, ModelCompleted))
+    assert completed.response.finish_reason == "max_tokens"
+    assert completed.response.text == '{"goal":"partial'
+    assert completed.response.usage.output_tokens == 16
+    assert completed.response.response_id == "resp_9"
+
+
+def test_openai_mapper_maps_incomplete_status_without_reason():
+    mapper = OpenAIStreamMapper("gpt-test")
+    mapped = _feed(
+        mapper,
+        [
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_10", "status": "incomplete", "output": []},
+            }
+        ],
+    )
+    completed = next(event for event in mapped if isinstance(event, ModelCompleted))
+    assert completed.response.finish_reason == "max_tokens"
+
+
 def test_openai_provider_passes_base_url_to_official_sdk(monkeypatch):
     captured = {}
 
@@ -343,3 +393,38 @@ def test_default_registry_tool_names_are_openai_safe(tmp_path):
         assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", definition["name"])
     for definition in registry.definitions():
         assert codec.decode(codec.encode(definition.name)) == definition.name
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_sets_max_output_tokens_only_when_requested():
+    class AsyncEvents:
+        def __aiter__(self):
+            return self._iterate()
+
+        async def _iterate(self):
+            if False:
+                yield None
+
+    class Responses:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return AsyncEvents()
+
+    class Client:
+        def __init__(self):
+            self.responses = Responses()
+
+    client = Client()
+    provider = OpenAIProvider("gpt-test", client=client)
+    request_without_limit = ModelRequest(messages=[UserMessage(content="one")])
+    _ = [event async for event in provider.stream(request_without_limit)]
+    request_with_limit = ModelRequest(
+        messages=[UserMessage(content="one")], max_output_tokens=321
+    )
+    _ = [event async for event in provider.stream(request_with_limit)]
+
+    assert "max_output_tokens" not in client.responses.calls[0]
+    assert client.responses.calls[1]["max_output_tokens"] == 321

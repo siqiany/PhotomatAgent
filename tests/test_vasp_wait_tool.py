@@ -84,6 +84,31 @@ async def test_wait_settles_with_one_tool_and_bounded_polls():
 
 
 @pytest.mark.asyncio
+async def test_wait_settles_immediately_on_scheduler_completion():
+    """Regression: a finished job must settle the wait, not poll to timeout.
+
+    The user-visible symptom of the VASP status bug: the job was COMPLETED in
+    the registry but ``status`` kept answering RUNNING, so this tool polled
+    for its whole 1800 s timeout and reported "still SUBMITTED/RUNNING".
+    """
+    service = _WaitTestService([WorkflowState.SCHEDULER_COMPLETED])
+    tool = _make_tool(service)
+
+    result = await tool.execute(
+        {
+            "workflow_id": "vasp_0123456789abcdef",
+            "timeout_seconds": 30,
+            "poll_interval_seconds": 5,
+        }
+    )
+
+    assert not result.is_error
+    assert result.data["state"] == "SCHEDULER_COMPLETED"
+    assert result.data["wait"]["settled"] is True
+    assert service.status_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_wait_timeout_returns_unsettled_without_error():
     service = _WaitTestService([WorkflowState.SUBMITTED, WorkflowState.RUNNING])
     tool = _make_tool(service)

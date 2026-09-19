@@ -199,10 +199,6 @@ def analyze_trace(
     provider = starts[0].provider if starts else "unknown"
     model = starts[0].model if starts else "unknown"
     iterations = sum(isinstance(event, LoopIterationStarted) for event in trace.events)
-    model_calls = sum(
-        isinstance(event, (ModelRequestStarted, ContextCompactionStarted))
-        for event in trace.events
-    )
     model_requests = [
         event for event in trace.events if isinstance(event, ModelRequestStarted)
     ]
@@ -234,9 +230,19 @@ def analyze_trace(
     compactions = [
         event for event in trace.events if isinstance(event, ContextCompactionCompleted)
     ]
-    compaction_failures = sum(
-        isinstance(event, ContextCompactionFailed) for event in trace.events
+    compaction_failed_events = [
+        event for event in trace.events if isinstance(event, ContextCompactionFailed)
+    ]
+    compaction_failures = len(compaction_failed_events)
+    compaction_started_count = sum(
+        isinstance(event, ContextCompactionStarted) for event in trace.events
     )
+    compaction_call_count = max(
+        compaction_started_count,
+        sum(getattr(event, "model_calls", 0) for event in compactions),
+        sum(getattr(event, "model_calls", 0) for event in compaction_failed_events),
+    )
+    model_calls = len(model_requests) + compaction_call_count
     working_tokens = [
         event.estimated_current_prompt_tokens
         for event in model_requests
@@ -275,7 +281,13 @@ def analyze_trace(
             else "loop_failed"
         )
 
-    compaction_usage = [event.usage for event in compactions if event.usage]
+    compaction_usage: list[dict[str, int | None]] = []
+    for completed_event in compactions:
+        if completed_event.usage:
+            compaction_usage.append(completed_event.usage)
+    for failed_event in compaction_failed_events:
+        if failed_event.usage:
+            compaction_usage.append(failed_event.usage)
     usage_known = any(
         (event.usage.get("total_tokens") is not None)
         or bool(event.usage.get("input_tokens"))

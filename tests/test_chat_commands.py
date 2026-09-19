@@ -221,3 +221,45 @@ def test_cli_capture_is_printed_without_ansi_escapes():
     assert "10 skill(s) from sources: photomat" in output
     assert "carrier-transport-analysis — assess transport" in output
     assert "SKILL.md" in output
+
+
+@pytest.mark.asyncio
+async def test_compact_command_saves_cursor_without_new_user_message(tmp_path):
+    from photomatagent.models.types import AssistantMessage
+    from photomatagent.runtime.context_engine import CompactionState
+
+    router, _, stream = _router(tmp_path)
+
+    class ShortSummary:
+        async def summarize(self, messages, previous):
+            return CompactionState(
+                goal="research", progress=["old work preserved"]
+            )
+
+    router.runtime.context_engine.summarizer = ShortSummary()
+    history = router.runtime.conversation_state
+    for label in ("first", "second", "third", "fourth"):
+        history.add(UserMessage(content=label))
+        history.add(AssistantMessage(text="old work " * 1000))
+    before = history.model_dump_json()
+    router.logger = EventLogger(tmp_path, session_id="compact-test")
+
+    await router.execute("/compact")
+
+    assert history.model_dump_json() == before
+    restored = load_session_snapshot(router.logger.session_dir)
+    assert restored.engine is not None
+    assert restored.engine.compaction_count == 1
+    assert restored.engine.compacted_message_count > 0
+    assert restored.conversation.model_dump_json() == before
+    assert "压缩状态已保存" in stream.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_compact_command_rejects_bad_arguments_without_provider_call(tmp_path):
+    router, _, stream = _router(tmp_path)
+    provider = router.runtime.model_provider
+    await router.execute("/compact --help")
+    await router.execute("/compact abc")
+    assert "用法：/compact" in stream.getvalue()
+    assert provider.requests == []

@@ -11,6 +11,7 @@ from rich.text import Text
 from photomatagent.runtime.events import (
     ContextCompactionCompleted,
     ContextCompactionFailed,
+    ContextCompactionSkipped,
     ContextPruneCompleted,
     LoopCompleted,
     LoopFailed,
@@ -76,13 +77,20 @@ class ChatRenderer:
             )
         elif isinstance(event, ContextCompactionCompleted):
             self._console.print(
-                f"[dim]context compacted: ~{event.tokens_before} → "
-                f"~{event.tokens_after} tokens[/]"
+                f"[green]工作上下文已压缩：约 {event.tokens_before} → "
+                f"{event.tokens_after} tokens；完整历史已保留[/]"
             )
+        elif isinstance(event, ContextCompactionSkipped):
+            reason = _compaction_skip_reason(event.reason)
+            self._console.print(f"[dim]未压缩工作上下文：{reason}[/]")
         elif isinstance(event, ContextCompactionFailed):
+            reason = _compaction_skip_reason(
+                event.reason or "provider_error"
+            )
             self._console.print(
-                f"[yellow]context compaction failed; working history retained: "
-                f"{event.error}[/]"
+                f"[yellow]工作上下文压缩失败；完整历史保持不变："
+                f"{reason}。{event.error}[/]",
+                markup=False,
             )
         elif isinstance(event, ToolCompleted):
             self._console.print(
@@ -118,6 +126,30 @@ class ChatRenderer:
 
     def flush_agent_text(self) -> None:
         self._finish_text()
+
+
+_COMPACTION_SKIP_REASONS = {
+    "no_eligible_history": "没有可压缩的旧上下文",
+    "inflight_tool_transaction": "工具调用尚未结束，暂不能压缩",
+    "no_summarizer": "当前运行时未配置摘要器",
+    "no_reduction": "压缩不会减少工作上下文，已保留原历史",
+    "retry_cooldown": "自动压缩失败后的冷却期内未重试；可手动 /compact",
+    "protected_history": "受保护的历史无法安全压缩",
+    "target_unreachable": "在保留近期上下文的前提下无法压到目标大小",
+    "unsafe_history": "工具调用历史配对不安全，无法压缩",
+    "summary_unit_too_large": "存在不可拆分的超大历史事务",
+    "summary_call_limit": "摘要调用次数达到上限",
+    "summary_timeout": "摘要请求超时",
+    "invalid_summary": "摘要格式无效",
+    "summary_too_large": "摘要超过输出预算",
+    "empty_summary": "摘要为空",
+    "provider_error": "摘要 provider 调用失败",
+    "cancelled": "压缩被取消",
+}
+
+
+def _compaction_skip_reason(reason: str) -> str:
+    return _COMPACTION_SKIP_REASONS.get(reason, reason)
 
 
 def print_skill_list(console: Console, skills: list) -> None:

@@ -44,6 +44,8 @@ from photomatagent.sessions.store import session_is_resumable
 from photomatagent.models.factory import api_key_status
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
 from photomatagent.runtime.budget import BudgetState
+from photomatagent.runtime.context_budget import resolve_thresholds
+from photomatagent.runtime.context_config import resolve_context_config
 from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import AllowAllPolicy
 from photomatagent.observability.replay import build_replay
@@ -76,6 +78,8 @@ def default_command(ctx: typer.Context) -> None:
             approval="ask",
             max_iterations=10000,
             log_events=True,
+            context_limit_tokens=None,
+            compact_trigger_tokens=None,
         )
 
 
@@ -97,6 +101,18 @@ def chat(
         "--resume",
         help="Resume a historical session: a session id, directory, or 'latest'.",
     ),
+    context_limit_tokens: int | None = typer.Option(
+        None,
+        "--context-limit-tokens",
+        min=1,
+        help="Configured model window in estimated tokens; not a capacity claim.",
+    ),
+    compact_trigger_tokens: int | None = typer.Option(
+        None,
+        "--compact-trigger-tokens",
+        min=1,
+        help="Absolute estimated input-token trigger for automatic compaction.",
+    ),
 ) -> None:
     """Start an interactive or one-goal scientific agent session (optionally resuming a historical session)."""
     _launch_chat(
@@ -108,6 +124,8 @@ def chat(
         max_iterations=max_iterations,
         log_events=log_events,
         resume=resume,
+        context_limit_tokens=context_limit_tokens,
+        compact_trigger_tokens=compact_trigger_tokens,
     )
 
 
@@ -121,6 +139,8 @@ def _launch_chat(
     max_iterations: int,
     log_events: bool,
     resume: str | None = None,
+    context_limit_tokens: int | None = None,
+    compact_trigger_tokens: int | None = None,
 ) -> None:
     if approval not in {"ask", "auto", "deny"}:
         raise typer.BadParameter("--approval must be ask | auto | deny")
@@ -138,17 +158,38 @@ def _launch_chat(
         if config.base_url:
             summary += f" / {config.base_url}"
         console.print(f"[dim]LLM 配置：{summary}（API Key 已隐藏）[/]")
+        context_config = resolve_context_config(
+            context_limit_tokens=context_limit_tokens,
+            compact_trigger_tokens=compact_trigger_tokens,
+        )
+        thresholds = resolve_thresholds(context_config)
+        console.print(
+            "[dim]上下文策略（估算 chars/4）："
+            f"配置窗口 C={context_config.context_limit_tokens}，"
+            f"输入硬限 H={thresholds.hard_input_limit}，"
+            f"自动压缩 A={thresholds.compact_trigger}，"
+            f"目标 T={thresholds.target}。[/]"
+        )
+        if context_config.context_limit_tokens <= 128_000:
+            console.print(
+                "[yellow]配置窗口为 "
+                f"{context_config.context_limit_tokens}，安全阈值提前到约 "
+                f"{thresholds.compact_trigger}（不是 256k）。[/]"
+            )
         asyncio.run(
             run_chat(
                 provider=config.provider,
                 model=config.model,
                 workspace_root=workspace,
                 approval=approval,  # type: ignore[arg-type]
-            max_iterations=max_iterations,
-            log_events=log_events,
-            goal=goal,
-            resume=resume,
-        )
+                max_iterations=max_iterations,
+                log_events=log_events,
+                goal=goal,
+                resume=resume,
+                context_limit_tokens=context_limit_tokens,
+                compact_trigger_tokens=compact_trigger_tokens,
+                context_engine_config=context_config,
+            )
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

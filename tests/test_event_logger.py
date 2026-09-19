@@ -128,3 +128,35 @@ async def test_session_stats_from_fixture_log(tmp_path):
     assert stats.input_tokens == 10
     assert stats.output_tokens == 4
     assert stats.duration_seconds == 0.25
+
+
+def test_new_skipped_event_parses_and_legacy_compaction_payload_defaults() -> None:
+    from photomatagent.runtime.events import (
+        ContextCompactionSkipped,
+        ContextCompactionStarted,
+        parse_event,
+    )
+
+    skipped = parse_event(
+        {
+            "kind": "context_compaction_skipped",
+            "reason": "no_eligible_history",
+            "trigger": "auto",
+            "tokens_before": 123,
+            "threshold_tokens": 456,
+            "target_tokens": 789,
+        }
+    )
+    assert isinstance(skipped, ContextCompactionSkipped)
+    legacy = parse_event(
+        {
+            "kind": "context_compaction_started",
+            "tokens_before": 10,
+            "chars_before": 40,
+            "messages_before": 2,
+            "protected_turns": 1,
+        }
+    )
+    assert isinstance(legacy, ContextCompactionStarted)
+    assert legacy.trigger == "auto"
+    assert legacy.threshold_tokens is None
