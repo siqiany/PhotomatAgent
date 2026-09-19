@@ -3258,6 +3258,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "coverage" },
+    { name = "fastmcp" },
     { name = "mcp" },
     { name = "mp-api" },
     { name = "numpy" },
@@ -3347,6 +3348,7 @@ requires-dist = [
     { name = "docling", marker = "extra == 'literature'", specifier = ">=2.0" },
     { name = "doped", marker = "extra == 'defects'", specifier = ">=2.0" },
     { name = "effmass", marker = "extra == 'electronic'", specifier = ">=1.3" },
+    { name = "fastmcp", specifier = ">=3.4.7" },
     { name = "mcp", specifier = ">=1.24,<2" },
     { name = "mp-api", specifier = ">=0.46.4" },
     { name = "mp-api", extras = ["mcp"], marker = "extra == 'materials'", specifier = ">=0.44" },
