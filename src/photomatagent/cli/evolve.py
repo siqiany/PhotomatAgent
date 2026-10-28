@@ -19,6 +19,7 @@ from rich.table import Table
 from rich.text import Text
 
 from photomatagent.cli.prompt import make_prompt_session
+from photomatagent.cli.qd import qd_app
 from photomatagent.config import LLMConfig
 from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger, default_sessions_dir
@@ -107,6 +108,7 @@ class FeedbackEntryCancelled(Exception):
 evolve_app = typer.Typer(
     help="Run persistent expert-feedback evolution tasks.",
 )
+evolve_app.add_typer(qd_app, name="qd")
 console = Console()
 
 
@@ -162,12 +164,21 @@ def evolve_start(
         "--require-judge",
         help="Block SUCCESS while the judge is unavailable or below quality.",
     ),
+    judge_mode: str | None = typer.Option(None, "--judge-mode", help="off | on_demand | every_round; omitted preserves legacy behavior."),
+    judge_max_calls: int | None = typer.Option(None, "--judge-max-calls", min=0),
+    judge_requested: bool = typer.Option(False, "--judge-requested"),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
 ) -> None:
     """Create, reserve, and execute the first persistent evolution episode."""
 
     if approval not in {"ask", "auto", "deny"}:
         console.print("[red]--approval must be ask | auto | deny[/]")
+        raise typer.Exit(code=2)
+    if judge_mode not in (None, "off", "on_demand", "every_round"):
+        console.print("[red]--judge-mode must be off | on_demand | every_round[/]")
+        raise typer.Exit(code=2)
+    if require_judge and judge_mode == "off":
+        console.print("[red]REQUIRED_JUDGE_DISABLED[/]")
         raise typer.Exit(code=2)
     if resume is not None and any(
         value is not None and value is not False
@@ -271,6 +282,9 @@ def evolve_start(
                     min_confidence=min_confidence,
                     judge_min_quality=judge_min_quality,
                     require_judge=require_judge,
+                    judge_mode=judge_mode,  # type: ignore[arg-type]
+                    judge_max_calls=judge_max_calls,
+                    judge_requested=judge_requested,
                 ),
                 judge=judge,
                 prior_mutations=prior_mutations,
@@ -699,12 +713,21 @@ def evolve_iterate(
         0.6, "--judge-min-quality", min=0.0, max=1.0
     ),
     require_judge: bool = typer.Option(False, "--require-judge"),
+    judge_mode: str | None = typer.Option(None, "--judge-mode", help="off | on_demand | every_round; omitted preserves legacy behavior."),
+    judge_max_calls: int | None = typer.Option(None, "--judge-max-calls", min=0),
+    judge_requested: bool = typer.Option(False, "--judge-requested"),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
 ) -> None:
     """Run the next episode from an exact confirmed revision checkpoint."""
 
     if approval not in {"ask", "auto", "deny"}:
         console.print("[red]--approval must be ask | auto | deny[/]")
+        raise typer.Exit(code=2)
+    if judge_mode not in (None, "off", "on_demand", "every_round"):
+        console.print("[red]--judge-mode must be off | on_demand | every_round[/]")
+        raise typer.Exit(code=2)
+    if require_judge and judge_mode == "off":
+        console.print("[red]REQUIRED_JUDGE_DISABLED[/]")
         raise typer.Exit(code=2)
     try:
         boundary = Workspace(workspace)
@@ -769,6 +792,9 @@ def evolve_iterate(
                     min_confidence=min_confidence,
                     judge_min_quality=judge_min_quality,
                     require_judge=require_judge,
+                    judge_mode=judge_mode,  # type: ignore[arg-type]
+                    judge_max_calls=judge_max_calls,
+                    judge_requested=judge_requested,
                 ),
                 judge=judge,
                 prior_mutations=(reserved,),
@@ -862,6 +888,9 @@ def evolve_evaluate(
         0.6, "--judge-min-quality", min=0.0, max=1.0
     ),
     require_judge: bool = typer.Option(False, "--require-judge"),
+    judge_mode: str | None = typer.Option(None, "--judge-mode", help="off | on_demand | every_round; omitted preserves legacy behavior."),
+    judge_max_calls: int | None = typer.Option(None, "--judge-max-calls", min=0),
+    judge_requested: bool = typer.Option(False, "--judge-requested"),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
 ) -> None:
     """Run an explicitly isolated evaluation against a frozen strategy."""
@@ -871,6 +900,12 @@ def evolve_evaluate(
         raise typer.Exit(code=2)
     if approval not in {"ask", "auto", "deny"}:
         console.print("[red]--approval must be ask | auto | deny[/]")
+        raise typer.Exit(code=2)
+    if judge_mode not in (None, "off", "on_demand", "every_round"):
+        console.print("[red]--judge-mode must be off | on_demand | every_round[/]")
+        raise typer.Exit(code=2)
+    if require_judge and judge_mode == "off":
+        console.print("[red]REQUIRED_JUDGE_DISABLED[/]")
         raise typer.Exit(code=2)
     try:
         boundary = Workspace(workspace)
@@ -923,6 +958,9 @@ def evolve_evaluate(
                     min_confidence=min_confidence,
                     judge_min_quality=judge_min_quality,
                     require_judge=require_judge,
+                    judge_mode=judge_mode,  # type: ignore[arg-type]
+                    judge_max_calls=judge_max_calls,
+                    judge_requested=judge_requested,
                 ),
                 judge=judge,
                 on_event=lambda event: _render_event(

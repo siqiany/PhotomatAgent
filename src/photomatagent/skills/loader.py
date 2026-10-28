@@ -62,11 +62,31 @@ class SkillLoader:
         *,
         sources: Iterable[SkillSourceConfig] | None = None,
         config_path: Path | str | None = None,
+        published_root: Path | str | None = None,
+        include_published: bool | None = None,
+        local_trial_workspace: Path | str | None = None,
+        local_task_id: str | None = None,
+        local_run_id: str | None = None,
     ) -> None:
         self.skills_dir = Path(skills_dir) if skills_dir is not None else default_skills_dir()
+        if local_trial_workspace is not None:
+            from photomatagent.skills.trial_source import LocalTrialSkillSource
+            self.local_trial_source = LocalTrialSkillSource(local_trial_workspace)
+            from photomatagent.skills.procedure_source import LocalProcedureSkillSource
+            self.local_procedure_source = LocalProcedureSkillSource(
+                local_trial_workspace, task_id=local_task_id, run_id=local_run_id,
+            )
         self._explicit_skills_dir = skills_dir is not None
         self.diagnostics: list[SkillDiagnostic] = []
         self._sources = self._resolve_sources(sources, config_path)
+        if include_published is None:
+            include_published = not self._explicit_skills_dir
+        if include_published:
+            from photomatagent.skills.published import PublishedSkillSource
+
+            self.published_source = PublishedSkillSource(
+                published_root or (Path.cwd() / ".photomatagent" / "qd" / "published-skills")
+            )
 
     @property
     def sources(self) -> list[SkillSourceConfig]:
@@ -133,10 +153,18 @@ class SkillLoader:
 
     def load_all(self) -> list[Skill]:
         """Compatibility API: explicitly load every primary SKILL.md."""
-        return sorted(
-            [entry.to_skill() for entry in self.load_index()],
-            key=lambda skill: skill.name,
-        )
+        skills: list[Skill] = []
+        for entry in self.load_index():
+            if entry.source in {"qd-published", "local-trial", "local-procedure"}:
+                content, _ = self.view(entry.name)
+                skills.append(Skill(
+                    name=entry.name, description=entry.description, path=entry.path,
+                    content=content, source=entry.source, license=entry.license,
+                    category=entry.category, tags=entry.tags, priority=entry.priority,
+                ))
+            else:
+                skills.append(entry.to_skill())
+        return sorted(skills, key=lambda skill: skill.name)
 
     def get(self, name: str) -> Skill | None:
         return next((s for s in self.load_all() if s.name == name), None)
@@ -189,6 +217,29 @@ class SkillLoader:
                         priority=source.priority,
                     )
                 )
+        published_source = getattr(self, "published_source", None)
+        if published_source is not None:
+            try:
+                entries.extend(published_source.load_index())
+            except (OSError, ValueError) as exc:
+                self.diagnostics.append(SkillDiagnostic(
+                    code="PUBLISHED_SOURCE_UNAVAILABLE",
+                    message=f"published skills are unavailable: {type(exc).__name__}",
+                    source="qd-published",
+                ))
+        local_source = getattr(self, "local_trial_source", None)
+        if local_source is not None:
+            entries.extend(local_source.load_index())
+        procedure_source = getattr(self, "local_procedure_source", None)
+        if procedure_source is not None:
+            try:
+                entries.extend(procedure_source.load_index())
+            except (OSError, ValueError) as exc:
+                self.diagnostics.append(SkillDiagnostic(
+                    code="PROCEDURE_SOURCE_UNAVAILABLE",
+                    message=f"procedural skills are unavailable: {type(exc).__name__}",
+                    source="local-procedure",
+                ))
         return self._merge(entries)
 
     def _merge(self, entries: list[SkillIndexEntry]) -> list[SkillIndexEntry]:
@@ -204,6 +255,16 @@ class SkillLoader:
         entry = next((item for item in self.load_index() if item.name == name), None)
         if entry is None:
             raise KeyError(f"unknown skill: {name}")
+        local_source = getattr(self, "local_trial_source", None)
+        if entry.source == "local-trial" and local_source is not None:
+            return local_source.view(name, path)
+        procedure_source = getattr(self, "local_procedure_source", None)
+        if entry.source == "local-procedure" and procedure_source is not None:
+            return procedure_source.view(name, path)
+        published_source = getattr(self, "published_source", None)
+        if entry.source == "qd-published" and published_source is not None:
+            content, relative, _ = published_source.view(name, path)
+            return content, relative
         root = entry.path.parent.resolve()
         target = entry.path if path is None else root / path
         resolved = target.resolve()

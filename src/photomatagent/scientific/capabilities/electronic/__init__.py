@@ -102,11 +102,98 @@ def _load_vasprun(path_value: str, workspace: Workspace) -> tuple[Any, Path]:
     return Vasprun(str(path), parse_potcar_file=False), path
 
 
+def _sampling_mode(vasprun: Any) -> str:
+    """Report the k-point sampling mode the parse actually came from.
+
+    A regular Monkhorst-Pack grid can support a *grid* gap estimate, but it is
+    not a band path; the tool must never let a stage name imply that a
+    path-resolved gap was computed.
+    """
+    try:
+        kpoints = getattr(vasprun, "kpoints", None)
+        comment = str(getattr(kpoints, "comment", "") or "")
+    except Exception:
+        comment = ""
+    lowered = comment.lower()
+    if "line" in lowered or "band" in lowered:
+        return "line_mode_band_path"
+    if "automatic" in lowered or "monkhorst" in lowered or "gamma" in lowered:
+        return "automatic_monkhorst_pack_grid"
+    return "unknown_sampling"
+
+
+def _exploratory_gap_assessment(
+    *,
+    formula: str,
+    gap: float,
+    direct: bool | None,
+    source: str,
+    sampling_mode: str,
+) -> dict[str, Any]:
+    """Explicit exploratory/verification boundary for one parsed gap.
+
+    The parser can *read* a number; that does not make it an acceptable
+    project result.  The returned contract states what was parsed, from which
+    sampling, and every blocker that prevents promotion to the original
+    candidate's verified room-temperature band gap.
+    """
+    blockers = [
+        "no_project_validated_SOC_or_noncollinear_reference_sample",
+        "no_convergence_or_occupation_audit_for_this_parse",
+        "sampling_is_a_regular_grid_not_a_band_path",
+        "no_300K_material_conclusion_can_be_inferred_from_a_single_parse",
+    ]
+    return {
+        "property": "band_gap",
+        "status": "EXPLORATORY",
+        "assessment_role": "observation",
+        "value_eV": round(float(gap), 4),
+        "unit": "eV",
+        "direct_gap": direct,
+        "subject": formula,
+        "source_file": source,
+        "method": "pymatgen Vasprun.eigenvalue_band_properties",
+        "sampling_mode": sampling_mode,
+        "acceptable_as_target_evidence": False,
+        "verification_blockers": blockers,
+        "limitations": (
+            "EXPLORATORY parsed gap from a "
+            f"{sampling_mode} vasprun.xml; not a project-verified band gap. "
+            "It is not bound to a candidate/structure/workflow/job and no "
+            "convergence, occupation, spin/SOC representation, electron "
+            "count or k-sampling audit has been performed. A regular grid is "
+            "not a band path. Do not promote this to a 300 K material "
+            "conclusion or to the original candidate's verified band gap."
+        ),
+    }
+
+
 def _gap_evidence(
-    formula: str, gap: float | None, direct: bool | None, source: str, method: str
+    formula: str,
+    gap: float | None,
+    direct: bool | None,
+    source: str,
+    method: str,
+    *,
+    sampling_mode: str = "unknown_sampling",
 ) -> list[ScientificEvidence]:
+    """Band-gap evidence that is explicitly marked exploratory.
+
+    ``electronic.band_summary`` parses an arbitrary vasprun.xml; it cannot by
+    itself satisfy the project's verification contract.  The evidence is
+    therefore emitted with the full exploratory limitation set and provenance
+    that names the sampling mode, so a checker can refuse to promote it while
+    the numeric observation stays available.
+    """
     if gap is None:
         return []
+    assessment = _exploratory_gap_assessment(
+        formula=formula,
+        gap=gap,
+        direct=direct,
+        source=source,
+        sampling_mode=sampling_mode,
+    )
     return [
         ScientificEvidence(
             subject=formula,
@@ -116,10 +203,26 @@ def _gap_evidence(
             source=source,
             source_type="calculation",
             method=method,
-            summary=f"Computed band gap for {formula} is {gap:.3f} eV"
-            + (f" ({'direct' if direct else 'indirect'})" if direct is not None else ""),
-            limitations="DFT band gap; expect systematic underestimation",
-            provenance={"tool": method, "source_file": source},
+            summary=(
+                f"EXPLORATORY parsed band gap for {formula} is {gap:.3f} eV"
+                + (
+                    f" ({'direct' if direct else 'indirect'})"
+                    if direct is not None
+                    else ""
+                )
+                + f"; sampling={sampling_mode}; not project-verified"
+            ),
+            limitations=assessment["limitations"],
+            provenance={
+                "tool": method,
+                "source_file": source,
+                "sampling_mode": sampling_mode,
+                "assessment_status": "EXPLORATORY",
+                "acceptable_as_target_evidence": False,
+                "verification_blockers": "; ".join(
+                    assessment["verification_blockers"]
+                ),
+            },
         )
     ]
 
@@ -181,8 +284,26 @@ class ElectronicBandSummaryTool(Tool):
             "direct_gap": is_direct,
             "is_metal": is_metal,
         }
+        sampling_mode = _sampling_mode(vasprun)
+        assessment = _exploratory_gap_assessment(
+            formula=formula,
+            gap=gap,
+            direct=is_direct,
+            source=str(path),
+            sampling_mode=sampling_mode,
+        )
+        card["assessment_status"] = assessment["status"]
+        card["sampling_mode"] = sampling_mode
+        card["acceptable_as_target_evidence"] = False
+        card["verification_blockers"] = assessment["verification_blockers"]
+        card["limitations"] = assessment["limitations"]
         evidence = _gap_evidence(
-            formula, None if is_metal else gap, is_direct, str(path), "pymatgen Vasprun"
+            formula,
+            None if is_metal else gap,
+            is_direct,
+            str(path),
+            "pymatgen Vasprun",
+            sampling_mode=sampling_mode,
         )
         return ScientificToolResult(
             output=json.dumps(card, ensure_ascii=False),
@@ -255,8 +376,21 @@ class ElectronicDosSummaryTool(Tool):
             "dos_max_density": round(valence_peak[1], 4),
             "window_eV": window,
         }
+        dos_sampling = _sampling_mode(vasprun)
+        card["assessment_status"] = "EXPLORATORY"
+        card["sampling_mode"] = dos_sampling
+        card["acceptable_as_target_evidence"] = False
+        card["limitations"] = (
+            "EXPLORATORY DOS-derived gap from a "
+            f"{dos_sampling} vasprun.xml; no project verification binding."
+        )
         evidence = _gap_evidence(
-            formula, None if gap is None or gap <= 1e-4 else gap, None, str(path), "pymatgen CompleteDos"
+            formula,
+            None if gap is None or gap <= 1e-4 else gap,
+            None,
+            str(path),
+            "pymatgen CompleteDos",
+            sampling_mode=dos_sampling,
         )
         return ScientificToolResult(
             output=json.dumps(card, ensure_ascii=False),

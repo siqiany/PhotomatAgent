@@ -12,6 +12,10 @@ __pycache__/
 .mypy_cache/
 dist/
 build/
+webui/node_modules/
+webui/dist/
+webui/test-results/
+webui/playwright-report/
 *.egg-info/
 output/
 tmp/
@@ -27,3 +31,6 @@ user_input/
 .coverage
 .worktrees/
 .superpowers/
+docs/
+experiments/
+tests/

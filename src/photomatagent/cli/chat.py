@@ -8,25 +8,23 @@ from typing import Literal
 from prompt_toolkit.shortcuts import PromptSession
 from rich.console import Console
 
+from photomatagent.application.runtime_factory import (
+    InteractionStrategy,
+    RuntimeFactory,
+)
 from photomatagent.cli.prompt import make_approval_handler, make_prompt_session
 from photomatagent.cli.render import ChatRenderer
-from photomatagent.logging.event_logger import EventLogger, default_sessions_dir
-from photomatagent.models.factory import create_provider
-from photomatagent.runtime.budget import BudgetState
-from photomatagent.runtime.context_config import resolve_context_config
+from photomatagent.logging.event_logger import EventLogger
 from photomatagent.runtime.context_engine import ContextEngineConfig
-from photomatagent.runtime.loop import AgentRuntime, EventSink
+from photomatagent.runtime.loop import AgentRuntime
 from photomatagent.runtime.permissions import (
-    ApprovalSettings,
     AllowAllPolicy,
     DenyAllPolicy,
     PermissionPolicy,
-    SwitchablePermissionPolicy,
     default_permission_policy,
 )
 from photomatagent.scientific.state import ScientificState
 from photomatagent.sessions.store import SessionSnapshot
-from photomatagent.tools.factory import create_default_registry
 from photomatagent.workspace import Workspace
 
 ApprovalMode = Literal["ask", "auto", "deny"]
@@ -51,33 +49,6 @@ def build_runtime(
     context_limit_tokens: int | None = None,
     compact_trigger_tokens: int | None = None,
 ) -> tuple[AgentRuntime, EventLogger | None]:
-    workspace = Workspace(workspace_root or Path.cwd())
-    scientific = (
-        scientific_state if scientific_state is not None else ScientificState()
-    )
-    resolved_approval_root = (
-        workspace.resolve(str(application_approval_root), must_exist=False)
-        if application_approval_root is not None
-        else None
-    )
-    registry = create_default_registry(
-        scientific,
-        workspace,
-        application_approval_root=resolved_approval_root,
-        evaluation_isolation=evaluation_isolation,
-    )
-    model_provider = create_provider(provider, model)
-    budget = BudgetState(max_iterations=max_iterations)
-    if evaluation_isolation:
-        effective_context_config = ContextEngineConfig()
-    elif context_engine_config is not None:
-        effective_context_config = context_engine_config
-    else:
-        effective_context_config = resolve_context_config(
-            context_limit_tokens=context_limit_tokens,
-            compact_trigger_tokens=compact_trigger_tokens,
-        )
-
     policy: PermissionPolicy
     approval_handler = None
     if approval == "ask":
@@ -87,39 +58,27 @@ def build_runtime(
         policy = AllowAllPolicy()
     else:
         policy = DenyAllPolicy()
-
-    sinks: list[EventSink] = []
-    session_base = (
-        Path(session_dir) if session_dir is not None and Path(session_dir).is_absolute()
-        else workspace.resolve(str(session_dir or ".photomatagent/sessions"), must_exist=False)
+    return RuntimeFactory.build(
+        provider=provider,
+        model=model,
+        workspace=workspace_root,
+        session_dir=session_dir,
+        session_id=session_id,
+        budget=None,
+        max_iterations=max_iterations,
+        interaction=InteractionStrategy(
+            permission_policy=policy,
+            approval_handler=approval_handler,
+            fresh_approval=fresh_approval,
+            application_approval_root=application_approval_root,
+        ),
+        scientific_state=scientific_state,
+        log_events=log_events,
+        evaluation_isolation=evaluation_isolation,
+        context_engine_config=context_engine_config,
+        context_limit_tokens=context_limit_tokens,
+        compact_trigger_tokens=compact_trigger_tokens,
     )
-    logger = (
-        EventLogger(session_base, session_id=session_id)
-        if log_events
-        else None
-    )
-    if logger is not None:
-        sinks.append(logger.log)
-
-    policy = SwitchablePermissionPolicy(
-        policy,
-        settings=None if fresh_approval else ApprovalSettings(workspace.root),
-    )
-    runtime = AgentRuntime(
-        model=model_provider,
-        tools=registry,
-        workspace=workspace,
-        scientific_state=scientific,
-        permission_policy=policy,
-        budget=budget,
-        approval_handler=approval_handler,
-        event_sinks=sinks,
-        session_id=logger.session_id if logger else None,
-        fresh_approval=fresh_approval,
-        application_approval_root=resolved_approval_root,
-        context_engine_config=effective_context_config,
-    )
-    return runtime, logger
 
 
 async def run_goal(
@@ -129,7 +88,9 @@ async def run_goal(
     *,
     session_dir: Path | str | None = None,
 ) -> None:
-    renderer = ChatRenderer(console)
+    renderer = ChatRenderer(
+        console, pause_summary_provider=runtime.pause_summary
+    )
     try:
         async for event in runtime.run(goal):
             renderer.handle(event)

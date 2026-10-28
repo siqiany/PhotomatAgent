@@ -398,6 +398,19 @@ class TargetSnapshot(TargetSpec):
         return TargetSpec.model_validate(self.model_dump(mode="python"))
 
 
+class QDBindingSnapshot(StrictModel):
+    """Trusted host-provided QD identity retained with a reviewed Episode."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    qd_task_id: ManagedId
+    trial_id: ManagedId
+    genome_id: ManagedId
+    genome_sha256: Sha256
+    environment_sha256: Sha256
+    script_bundle_sha256: Sha256
+
+
 class RubricScores(StrictModel):
     scientific_correctness: RubricScore
     evidence_sufficiency: RubricScore
@@ -605,6 +618,7 @@ class EpisodeRecord(StrictModel):
         default_factory=FrozenJsonDict,
         frozen=True,
     )
+    qd_binding: QDBindingSnapshot | None = Field(default=None, frozen=True)
     started_at: UtcDatetime | None = None
     completed_at: UtcDatetime | None = None
     summary: ScientificLoopSummary | None = None

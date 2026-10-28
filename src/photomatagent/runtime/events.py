@@ -68,6 +68,9 @@ class ModelRequestStarted(RuntimeEvent):
     durable_context_chars: int | None = None
     pruned_tool_results: int = 0
     compaction_count: int = 0
+    admission_input_tokens: int | None = None
+    delivery_only: bool = False
+    max_output_tokens: int | None = None
 
 
 class ContextPruneStarted(RuntimeEvent):
@@ -144,6 +147,8 @@ class ContextCompactionSkipped(RuntimeEvent):
     tokens_before: int = 0
     threshold_tokens: int | None = None
     target_tokens: int | None = None
+    model_calls: int = 0
+    usage: dict[str, int | None] = Field(default_factory=dict)
 
 
 class ModelStreamStarted(RuntimeEvent):
@@ -195,6 +200,17 @@ class ModelResponseCompleted(RuntimeEvent):
     tool_call_count: int
     usage: dict[str, int | None] = Field(default_factory=dict)
     duration_ms: float = 0.0
+    max_output_tokens: int | None = None
+    response_text_chars: int = 0
+
+
+class OutputRecoveryStarted(RuntimeEvent):
+    kind: Literal["output_recovery_started"] = "output_recovery_started"
+    iteration: int
+    attempt: int
+    previous_output_cap: int
+    next_output_cap: int
+    reason: str = "output_truncated"
 
 
 class ProviderFailed(RuntimeEvent):
@@ -567,6 +583,39 @@ class EvolutionTaskReopened(EvolutionRuntimeEvent):
     task_revision: int | None = None
 
 
+QDIdentifier = Annotated[str, Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")]
+QDSummary = Annotated[str, Field(max_length=240)]
+
+
+class QDTrialEvent(RuntimeEvent):
+    """Bounded host-owned event for a fixed QD trial; it has no qualification."""
+
+    event_id: QDIdentifier
+    trial_id: QDIdentifier
+    genome_id: QDIdentifier
+
+
+class QDTrialStarted(QDTrialEvent):
+    kind: Literal["qd_trial_started"] = "qd_trial_started"
+
+
+class QDTrialCollected(QDTrialEvent):
+    kind: Literal["qd_trial_collected"] = "qd_trial_collected"
+    output_count: int = Field(ge=0, le=1000)
+
+
+class QDTrialFailed(QDTrialEvent):
+    kind: Literal["qd_trial_failed"] = "qd_trial_failed"
+    reason_code: QDIdentifier
+    summary: QDSummary = ""
+
+
+class QDGenomeMismatch(QDTrialEvent):
+    kind: Literal["qd_genome_mismatch"] = "qd_genome_mismatch"
+    reason_code: Literal["GENOME_MISMATCH"] = "GENOME_MISMATCH"
+    summary: QDSummary = ""
+
+
 AnyRuntimeEvent = Annotated[
     Union[
         LoopStarted,
@@ -584,6 +633,7 @@ AnyRuntimeEvent = Annotated[
         ToolCallArgumentsDelta,
         ToolCallCompleted,
         ModelResponseCompleted,
+        OutputRecoveryStarted,
         ProviderFailed,
         ToolRequested,
         ToolApprovalRequired,
@@ -621,6 +671,10 @@ AnyRuntimeEvent = Annotated[
         EvolutionTaskAccepted,
         EvolutionTaskStopped,
         EvolutionTaskReopened,
+        QDTrialStarted,
+        QDTrialCollected,
+        QDTrialFailed,
+        QDGenomeMismatch,
     ],
     Field(discriminator="kind"),
 ]

@@ -92,6 +92,9 @@ If you have no concerns, return an empty "issues" list with a high
 scientific_quality and a short rationale.
 """
 
+JUDGE_PROMPT_VERSION = "scientific-judge-v1"
+JUDGE_SCHEMA_VERSION = "judge-report-v1"
+
 
 class JudgeIssue(BaseModel):
     """One advisory scientific concern raised by the LLM Judge."""
@@ -175,12 +178,12 @@ class ScientificJudge:
         """
         provider = getattr(self.model, "provider", "unknown")
         model_name = getattr(self.model, "model", "unknown")
-        snapshot = self._snapshot(
+        snapshot = build_judge_snapshot(
             target=target,
             candidate=candidate,
             scientific=scientific,
             evaluation=evaluation,
-            round_number=round_number,
+            evidence_limit=self.evidence_limit,
         )
         request = ModelRequest(
             messages=[
@@ -230,30 +233,33 @@ class ScientificJudge:
             report.candidate_id = candidate.candidate_id
         return report
 
-    def _snapshot(
-        self,
-        *,
-        target: TargetSpec,
-        candidate: CandidateState,
-        scientific: ScientificState,
-        evaluation: EvaluationReport,
-        round_number: int,
-    ) -> dict[str, Any]:
-        """Immutable, JSON-safe view of everything the judge may read."""
-        evidence = [
-            item.model_dump(mode="json") for item in scientific.evidence
-        ][-self.evidence_limit :]
-        return {
-            "round": round_number,
-            "target": target.model_dump(mode="json"),
-            "candidate": candidate.model_dump(mode="json"),
-            "evaluation": evaluation.model_dump(mode="json"),
-            "evidence": evidence,
-            "note": (
-                "The deterministic evaluation above is authoritative for "
-                "constraint satisfaction. Raise concerns only."
-            ),
-        }
+
+
+def build_judge_snapshot(
+    *,
+    target: TargetSpec,
+    candidate: CandidateState,
+    scientific: ScientificState,
+    evaluation: EvaluationReport,
+    evidence_limit: int = 24,
+) -> dict[str, Any]:
+    """Build the exact stable, JSON-safe input supplied to the judge.
+
+    The loop uses this same payload to derive its cache key. Invocation round
+    is intentionally excluded because it does not change the scientific
+    material being assessed.
+    """
+    evidence = [item.model_dump(mode="json") for item in scientific.evidence]
+    return {
+        "target": target.model_dump(mode="json"),
+        "candidate": candidate.model_dump(mode="json"),
+        "evaluation": evaluation.model_dump(mode="json"),
+        "evidence": evidence[-max(1, evidence_limit) :],
+        "note": (
+            "The deterministic evaluation above is authoritative for "
+            "constraint satisfaction. Raise concerns only."
+        ),
+    }
 
 
 def _extract_json_object(text: str) -> str:

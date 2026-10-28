@@ -154,6 +154,9 @@ class ScientificConfig:
     mattergen_timeout_seconds: float = 3600.0
     mattergen_guidance_factor: float = 2.0
     mattergen_seed: int = 42
+    capability_search_endpoint: str = ""
+    capability_search_token_env: str = "PHOTOMATAGENT_CAPABILITY_SEARCH_TOKEN"
+    capability_image_digest: str = ""
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
 
     @classmethod
@@ -352,6 +355,16 @@ class ScientificConfig:
                 minimum=0,
                 maximum=2**31 - 1,
             ),
+            capability_search_endpoint=_optional_text_env(
+                "PHOTOMATAGENT_CAPABILITY_SEARCH_ENDPOINT"
+            ) or "",
+            capability_search_token_env=_text_env(
+                "PHOTOMATAGENT_CAPABILITY_SEARCH_TOKEN_ENV",
+                "PHOTOMATAGENT_CAPABILITY_SEARCH_TOKEN",
+            ),
+            capability_image_digest=_optional_text_env(
+                "PHOTOMATAGENT_CAPABILITY_IMAGE_DIGEST"
+            ) or "",
             mcp_servers=servers,
         )
 

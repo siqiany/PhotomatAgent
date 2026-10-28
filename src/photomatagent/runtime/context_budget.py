@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Sequence
+from typing import Any
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -63,6 +66,90 @@ def measure_prompt(
         tokens=estimate_tokens(chars),
         messages=len(messages),
     )
+
+
+def prompt_token_upper_bound(messages: Sequence[ModelMessage], tools: Sequence[Any]) -> int:
+    """Return a conservative bound for model input tokens without a provider tokenizer.
+
+    UTF-8 bytes bound byte-fallback tokenizers, while explicit framing headroom
+    covers message and tool separators added by provider adapters. This is
+    intentionally more conservative than the UI's chars/4 estimate.
+    """
+    serialized_messages = [message.model_dump(mode="json") for message in messages]
+    serialized_tools = [
+        item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+        for item in tools
+    ]
+    payload = json.dumps(
+        {"messages": serialized_messages, "tools": serialized_tools},
+        ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+    return len(payload) + 256 + 16 * (len(messages) + len(tools))
+
+
+class PromptTokenEstimator:
+    """Reuse measured input cost; charge changed content at its byte bound.
+
+    This is an admission estimate, not a tokenizer or a guaranteed spend cap.
+    Measurements stay local to this provider runtime. Unknown usage keeps the
+    original byte bound. No durable message is shortened or rewritten here.
+    """
+
+    def __init__(self) -> None:
+        self._parts: list[bytes] = []
+        self._input_tokens = 0
+
+    @property
+    def calibrated(self) -> bool:
+        return self._input_tokens > 0
+
+    @staticmethod
+    def _serialize(messages: Sequence[ModelMessage], tools: Sequence[Any]) -> list[bytes]:
+        return [json.dumps(
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else item,
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8") for item in [*messages, *tools]]
+
+    def observe(self, messages: Sequence[ModelMessage], tools: Sequence[Any], *, input_tokens: int) -> None:
+        if input_tokens > 0:
+            self._parts = self._serialize(messages, tools)
+            self._input_tokens = input_tokens
+
+    def estimate(self, messages: Sequence[ModelMessage], tools: Sequence[Any]) -> int:
+        bound = prompt_token_upper_bound(messages, tools)
+        if self._input_tokens == 0:
+            return bound
+        # Stable message bodies dominate long research prompts. Retain the full
+        # previous measured input even when content was removed, and account for
+        # every added byte (including changes in tool schemas).
+        previous = self._parts.copy()
+        added = 0
+        for part in self._serialize(messages, tools):
+            if part in previous:
+                previous.remove(part)
+                continue
+            # Scientific state system messages change each iteration. Count the
+            # replacement bytes between their common prefix/suffix rather than
+            # charging the unchanged evidence body as new content every time.
+            best: tuple[int, bytes] | None = None
+            for old in previous:
+                prefix = 0
+                limit = min(len(old), len(part))
+                while prefix < limit and old[prefix] == part[prefix]:
+                    prefix += 1
+                suffix = 0
+                while suffix < limit - prefix and old[-suffix - 1] == part[-suffix - 1]:
+                    suffix += 1
+                matched = prefix + suffix
+                if matched > 64 and (best is None or matched > best[0]):
+                    best = (matched, old)
+            if best is None:
+                added += len(part)
+            else:
+                added += len(part) - best[0] + 32  # retokenization/framing allowance
+                previous.remove(best[1])
+        calibrated = math.ceil(self._input_tokens * 1.25) + added + 512
+        return min(bound, calibrated)
 
 
 def resolve_thresholds(config: "ContextEngineConfig") -> ContextThresholds:

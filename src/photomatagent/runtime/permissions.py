@@ -87,6 +87,7 @@ def default_permission_policy() -> PermissionPolicy:
             "write": PermissionDecision.ASK,
             "edit": PermissionDecision.ASK,
             "bash": PermissionDecision.ASK,
+            "skill_run": PermissionDecision.ASK,
             "mock.run_calculation": PermissionDecision.ASK,
             "generation.register_hypothesis": PermissionDecision.ASK,
             "structure.make_supercell": PermissionDecision.ASK,

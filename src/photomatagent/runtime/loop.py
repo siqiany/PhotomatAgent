@@ -7,8 +7,10 @@ context -> provider stream -> tool calls -> permission -> execution -> results
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
+import re
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -50,7 +52,7 @@ from photomatagent.runtime.context_engine import (
     ContextLimitExceeded,
     ProviderContextSummarizer,
 )
-from photomatagent.runtime.context_budget import account_context
+from photomatagent.runtime.context_budget import account_context, PromptTokenEstimator, prompt_token_upper_bound
 from photomatagent.runtime.context_segments import (
     UnsafeContextHistory,
     split_atomic_spans,
@@ -67,6 +69,7 @@ from photomatagent.runtime.events import (
     LoopStarted,
     ModelRequestStarted,
     ModelResponseCompleted,
+    OutputRecoveryStarted,
     ModelStreamStarted,
     ProviderFailed,
     RuntimeEvent,
@@ -106,7 +109,11 @@ from photomatagent.scientific.capabilities.structure.artifacts import (
     verify_structure_derivation,
     verify_structure_derivations,
 )
-from photomatagent.scientific.state import EvidenceAttestation, ScientificState
+from photomatagent.scientific.state import (
+    EvidenceAttestation,
+    ScientificReferenceUpdate,
+    ScientificState,
+)
 from photomatagent.scientific.discovery.models import (
     HypothesisOrigin,
     HypothesisRegistration,
@@ -135,6 +142,92 @@ from photomatagent.workspace import Workspace
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
 _HYPOTHESIS_REGISTRATION_TOOL = "generation.register_hypothesis"
+# Scheduler states that mean a real calculation is still progressing.  A
+# controlled wait is only trustworthy while its workflow is in one of these.
+_ACTIVE_WAIT_STATES = frozenset(
+    {"SUBMITTED", "PENDING", "RUNNING", "RECONCILING"}
+)
+# Tools that may grant a controlled-wait exemption.
+_WAIT_GRANT_TOOLS = frozenset({"vasp.wait", "vasp.status"})
+# Tools that report a workflow's current scheduler/lifecycle state and may
+# therefore revoke an earlier exemption once that workflow has ended.
+_WAIT_STATE_TOOLS = frozenset(
+    {"vasp.wait", "vasp.status", "vasp.collect", "vasp.report", "vasp.resume"}
+)
+_EXPLICIT_TASK_SWITCH_MARKERS = (
+    "新任务",
+    "换个任务",
+    "换一个任务",
+    "另一个任务",
+    "重新开始",
+    "new task",
+    "switch task",
+    "different task",
+)
+_TASK_SWITCH_NEGATION = re.compile(
+    r"(不要|不用|别|不是|没有|无需|不必|do not|don't|not|without)"
+)
+_TASK_SWITCH_REFERENCE = re.compile(
+    r"(之前|刚才|曾经|说过|引用|旧指令|historical|previously|earlier)"
+)
+_TASK_SWITCH_CLAUSE_BOUNDARY = re.compile(r"[，,。.;；!！?？\n]")
+
+
+def _pause_next_action(stop_reason: str, summary: dict[str, Any]) -> str:
+    """Deterministic next-step line for a paused run (no model involved)."""
+    if stop_reason == "output_truncated":
+        if summary.get("observed_evidence"):
+            return (
+                "CONTINUE_FROM_SUMMARY: the model output was truncated; resume "
+                "from the observed results above (see each item's "
+                "classification) and re-request only the missing step"
+            )
+        return (
+            "RETRY_WITH_SMALLER_STEP: the model output was truncated before any "
+            "persisted result; split the task into a smaller step"
+        )
+    if stop_reason == "diagnostic_budget_exhausted":
+        return (
+            "REPORT_BLOCKER: the bounded diagnostic exploration budget is "
+            "exhausted; report the blocker and the missing diagnostics instead "
+            "of continuing to explore"
+        )
+    if stop_reason == "no_progress":
+        return (
+            "REPORT_BLOCKER: no new task progress was observed; explain what is "
+            "missing or ask the user for the required input"
+        )
+    if stop_reason == "max_iterations":
+        return "CONTINUE: raise the iteration budget only after inspecting why it ran out"
+    if stop_reason == "output_truncated_scientific":
+        return "REPORT_STATUS: report the persisted stage/evidence facts"
+    return "REVIEW: inspect the persisted facts before the next action"
+
+
+def _is_explicit_task_switch(goal: str) -> bool:
+    """Return True only for a non-negated, non-quoted task-switch intent.
+
+    Substring matching is not enough: ``不要开始新任务，继续原任务`` must keep
+    the original goal, and references to an earlier instruction must not be
+    treated as a fresh switch.
+    """
+    normalized = goal.strip().casefold()
+    for marker in _EXPLICIT_TASK_SWITCH_MARKERS:
+        start = 0
+        while True:
+            index = normalized.find(marker, start)
+            if index < 0:
+                break
+            prefix = normalized[:index]
+            last_clause = _TASK_SWITCH_CLAUSE_BOUNDARY.split(prefix)[-1]
+            if not _TASK_SWITCH_NEGATION.search(last_clause) and not (
+                _TASK_SWITCH_REFERENCE.search(last_clause)
+            ):
+                return True
+            start = index + len(marker)
+        # If a marker appears only in negated/quoted clauses, it is not a
+        # switch; continue checking the remaining explicit markers.
+    return False
 _STRUCTURE_REGISTRATION_TOOLS = frozenset(
     {
         "structure.make_supercell",
@@ -244,6 +337,9 @@ class AgentRuntime:
         fresh_approval: bool = False,
         application_approval_root: Path | None = None,
         evidence_attestation_policy: EvidenceAttestationPolicy | None = None,
+        max_no_progress_iterations: int = 3,
+        diagnostic_observation_budget: int = 12,
+        diagnostic_warning_at: int = 8,
     ) -> None:
         self._model = model
         self._tools = tools
@@ -265,7 +361,9 @@ class AgentRuntime:
             )
             fresh_skills_dir.mkdir(parents=True, exist_ok=True)
             context_builder = ContextBuilder(SkillLoader(fresh_skills_dir))
-        self._context_builder = context_builder or ContextBuilder()
+        self._context_builder = context_builder or ContextBuilder(
+            SkillLoader(published_root=self._workspace.root / ".photomatagent" / "qd" / "published-skills")
+        )
         self._tool_surface = tool_surface_planner or ToolSurfacePlanner(
             tools, tool_surface_config
         )
@@ -295,14 +393,34 @@ class AgentRuntime:
         self._permission = permission_policy or default_permission_policy()
         self._stop_policy = stop_policy or StopPolicy()
         self._budget = budget or BudgetState()
+        self._prompt_token_estimator = PromptTokenEstimator()
+        if isinstance(self._context_engine.summarizer, ProviderContextSummarizer):
+            self._context_engine.summarizer.budget_state = self._budget
         self._approval_handler = approval_handler
         self._event_sinks = list(event_sinks or [])
         self._conversation = conversation_state or ConversationState()
         self._session_id = session_id or uuid4().hex
         self._run_id: str | None = None
         self._run_meta: dict[str, Any] = {}
+        self._active_wait_workflows: set[str] = set()
         self._fresh_approval = fresh_approval
         self._application_approval_root = application_approval_root
+        self._max_no_progress_iterations = max(
+            1, int(max_no_progress_iterations)
+        )
+        # Bounded, configurable diagnostic exploration for a *blocked
+        # scientific workflow*.  Distinct observations still grow knowledge,
+        # but they must not reset the budget forever; only a trusted task
+        # advance, new task-relevant evidence, a verified recovery action, or
+        # a controlled scheduler wait ends the blocked period.
+        self._diagnostic_budget = max(1, int(diagnostic_observation_budget))
+        self._diagnostic_warning_at = max(
+            1, min(int(diagnostic_warning_at), self._diagnostic_budget)
+        )
+        # Set when the current iteration produced real task progress (new
+        # evidence or a trusted stage advance).  It ends the blocked
+        # diagnostic period for that iteration.
+        self._iteration_had_task_progress = False
 
     @property
     def scientific_state(self) -> ScientificState:
@@ -340,6 +458,186 @@ class AgentRuntime:
         """Stable read-only identity used to attribute one runtime session."""
 
         return self._session_id
+
+    @property
+    def last_run_meta(self) -> dict[str, Any]:
+        """Read-only copy of bounded metadata from the most recent run.
+
+        ``controlled_wait_active`` is the still-valid exemption: it is true
+        only while at least one workflow's latest trusted state is an active
+        scheduler wait.  ``controlled_wait_seen`` is the historical fact that
+        a wait happened at some point in the run and is never revoked.
+        """
+        meta = dict(self._run_meta)
+        if meta.get("termination_reason") not in {
+            "no_progress",
+            "diagnostic_budget_exhausted",
+        }:
+            meta["controlled_wait_active"] = bool(self._active_wait_workflows)
+        return meta
+
+    def _blocked_diagnostic_period(self) -> bool:
+        """True while a scientific workflow is blocked on a known blocker.
+
+        Only a real scientific workflow with an explicit blocker counts: an
+        ordinary conversation or source-reading task keeps its existing
+        behaviour and is never given a diagnostic budget.  The period also
+        ends as soon as the workflow makes real progress (new evidence), so a
+        successful collect or a completed stage restores the budget instead of
+        being charged against it.
+        """
+        if not self._scientific.workflow_id:
+            return False
+        if self._iteration_had_task_progress:
+            return False
+        if self._scientific.next_stage:
+            return True
+        return bool(self._scientific.evidence_gaps)
+
+    def _record_diagnostic_observation(self, *, count: int = 1) -> None:
+        """Charge ``count`` new diagnostic observations to the blocked budget.
+
+        Charged per tool observation, never per model iteration, so batched
+        probes each pay.  Trusted scheduler waits and repeated identical
+        probes contribute ``count == 0`` and are therefore free.  The budget is
+        restored when the workflow stops being blocked (a trusted stage
+        advance, new task-relevant evidence, or a verified recovery action
+        clears the blocker).
+        """
+        if not self._blocked_diagnostic_period():
+            self._run_meta["blocked"] = False
+            self._run_meta["diagnostic_observations"] = 0
+            self._run_meta["diagnostic_warning_issued"] = False
+            self._run_meta["diagnostic_budget_remaining"] = self._diagnostic_budget
+            return
+        if count <= 0:
+            return
+        self._run_meta["blocked"] = True
+        self._run_meta["diagnostic_observations"] = (
+            int(self._run_meta.get("diagnostic_observations", 0)) + int(count)
+        )
+        used = int(self._run_meta["diagnostic_observations"])
+        self._run_meta["diagnostic_budget_remaining"] = max(
+            0, self._diagnostic_budget - used
+        )
+
+    def pause_summary(self) -> dict[str, Any]:
+        """Deterministic wrap-up built only from already-persisted facts.
+
+        Used when a run ends without a usable final answer (truncation, budget
+        exhaustion, no-progress) or when the caller wants a visible stop
+        summary.  It never calls the model and never invents a scientific
+        conclusion: anything not observed is reported as UNKNOWN.
+        """
+        meta = self.last_run_meta
+        evidence = list(self._scientific.evidence)
+        workflow_id = self._scientific.workflow_id or ""
+        stop_reason = str(meta.get("termination_reason") or "") or "UNKNOWN"
+
+        def _provenance(item: Any) -> dict[str, Any]:
+            value = getattr(item, "provenance", None)
+            return value if isinstance(value, dict) else {}
+
+        observed: list[dict[str, Any]] = []
+        attested: list[dict[str, Any]] = []
+        exploratory: list[dict[str, Any]] = []
+        background: list[dict[str, Any]] = []
+        for item in evidence:
+            provenance = _provenance(item)
+            status = str(
+                provenance.get("assessment_status") or ""
+            ).upper()
+            acceptable = provenance.get("acceptable_as_target_evidence")
+            # Host-held ledger only.  ``provenance`` is producer payload: any
+            # tool state update can write it and a restored snapshot carries
+            # it verbatim.  ``verified_attestation`` is the non-persistent
+            # record the runtime created from the *executed registry tool*,
+            # so producer payload may downgrade an item (exploratory) but can
+            # never upgrade it.
+            attestation = self._scientific.verified_attestation(
+                str(getattr(item, "id", ""))
+            )
+            authority = (
+                attestation.authority if attestation is not None else None
+            )
+            # Presence in ScientificState is not validation, and even a
+            # trusted source is not validation of the target: the runtime
+            # reports attested *observations*.  Deciding that a target is
+            # scientifically validated belongs to the deterministic checker,
+            # so this summary never claims it.
+            if status == "EXPLORATORY" or acceptable is False:
+                bucket = exploratory
+                classification = "EXPLORATORY"
+            elif authority == "observation":
+                bucket = attested
+                classification = "ATTESTED_OBSERVATION"
+            elif authority == "synthetic":
+                bucket = background
+                classification = "SYNTHETIC"
+            else:
+                bucket = background
+                classification = "BACKGROUND"
+            record = {
+                "property": getattr(item, "property", ""),
+                "value": getattr(item, "value", None),
+                "unit": getattr(item, "unit", ""),
+                "stage": provenance.get("stage", ""),
+                "job_id": provenance.get("job_id"),
+                "assessment_status": provenance.get("assessment_status"),
+                "classification": classification,
+                # Host-held origin of the observation, not the payload's
+                # self-description.  ``None`` means no runtime attestation.
+                "attested": attestation is not None,
+                "attestation_authority": authority,
+                "attestation_origin": (
+                    attestation.origin if attestation is not None else None
+                ),
+                "attestation_tool_name": (
+                    attestation.tool_name if attestation is not None else None
+                ),
+            }
+            observed.append(record)
+            bucket.append(record)
+        summary: dict[str, Any] = {
+            "stop_reason": stop_reason,
+            "workflow_id": workflow_id or "UNKNOWN",
+            "next_stage": self._scientific.next_stage or "UNKNOWN",
+            "active_wait_workflows": sorted(self._active_wait_workflows),
+            # Neutral name: everything found in ScientificState, with an
+            # explicit per-item classification derived from the host
+            # attestation ledger.  Stored != validated.
+            "observed_evidence": observed,
+            # Kept for existing consumers, but deliberately never populated by
+            # the runtime: only the deterministic checker validates a target,
+            # and an attested observation is not validation.
+            "validated_evidence": [],
+            "validation_status": "NOT_DETERMINED_BY_RUNTIME",
+            "attested_evidence": attested,
+            "exploratory_evidence": exploratory,
+            "background_evidence": background,
+            "claims": len(self._scientific.claims),
+            "evidence_gaps": list(self._scientific.evidence_gaps),
+            "identified_gaps": list(meta.get("evidence_gaps_identified") or []),
+            "capability_escalations": list(
+                meta.get("capability_escalations") or []
+            ),
+            "diagnostic_observations": meta.get("diagnostic_observations"),
+            "active_subtask": self._scientific.active_subtask or "UNKNOWN",
+            "goal": self._scientific.goal or "UNKNOWN",
+            "note": (
+                "deterministic local stop summary; it contains only persisted "
+                "facts and makes no scientific claim. Evidence present in "
+                "ScientificState is not automatically validated: each item is "
+                "classified from the host attestation ledger, and the runtime "
+                "never asserts target validation (validation_status="
+                "NOT_DETERMINED_BY_RUNTIME)."
+            ),
+        }
+        summary["blocked_reason"] = meta.get("blocked_reason") or (
+            summary["evidence_gaps"][0] if summary["evidence_gaps"] else "UNKNOWN"
+        )
+        summary["next_action"] = _pause_next_action(stop_reason, summary)
+        return summary
 
     def restore_session(self, snapshot: SessionSnapshot) -> None:
         """Reload a saved session snapshot and continue on top of it.
@@ -415,18 +713,53 @@ class AgentRuntime:
         """Run one user turn while preserving conversation and scientific state."""
         self._close_pending_tool_calls()
         self._run_id = uuid4().hex
+        self._run_observed_keys: set[tuple[object, ...]] = set()
+        # Workflows whose latest trusted scheduler state is still active.  A
+        # wait is only an exemption while at least one workflow remains here.
+        self._active_wait_workflows = set()
         self._run_meta = {
             "skills_loaded": [],
+            "published_skill_activity": [],
             "scientific_tools_used": [],
             "evidence_created": 0,
             "evidence_sources": [],
             "evidence_gaps_identified": [],
             "capability_escalations": [],
+            "controlled_wait_seen": False,
+            "controlled_wait_this_iteration": False,
+            "controlled_wait_active": False,
+            "termination_reason": "",
+            "new_observation_seen": False,
+            "diagnostic_observations": 0,
+            "diagnostic_budget": self._diagnostic_budget,
+            "diagnostic_budget_remaining": self._diagnostic_budget,
+            "diagnostic_warning_issued": False,
+            "blocked": False,
+            "new_diagnostic_observations": 0,
+            "new_wait_observations": 0,
+            "wait_observations": 0,
         }
+        no_progress_streak = 0
+        diagnostic_notice_pending = False
         run_started = time.monotonic()
-        self._scientific.goal = goal
+        if not self._scientific.goal:
+            self._scientific.goal = goal
+            self._scientific.active_subtask = goal
+        elif _is_explicit_task_switch(goal):
+            # An explicit task switch replaces the old research objective and
+            # clears stale workflow pointers.  A plain continuation/refinement
+            # below never overwrites the durable original goal.
+            self._scientific.goal = goal
+            self._scientific.active_subtask = goal
+            self._scientific.workflow_id = ""
+            self._scientific.next_stage = ""
+            self._scientific.evidence_gaps = []
+        else:
+            self._scientific.active_subtask = goal
         self._conversation.add(UserMessage(content=goal))
         iteration = 0
+        original_context_config = self._context_engine.config
+        output_recoveries = 0
         try:
             yield await self._emit(
                 LoopStarted(
@@ -439,6 +772,35 @@ class AgentRuntime:
             while True:
                 iteration += 1
                 self._budget.record_iteration()
+                progress_before = self._progress_fingerprint()
+                evidence_before = len(self._scientific.evidence)
+                self._iteration_had_task_progress = False
+                self._run_meta["controlled_wait_this_iteration"] = False
+                self._run_meta["new_observation_seen"] = False
+                self._run_meta["new_diagnostic_observations"] = 0
+                self._run_meta["new_wait_observations"] = 0
+                if diagnostic_notice_pending:
+                    # Deterministic, factual budget notice: the model is told
+                    # its remaining diagnostic budget and that it must report
+                    # the blocker instead of continuing to explore.
+                    diagnostic_notice_pending = False
+                    remaining = int(
+                        self._run_meta.get("diagnostic_budget_remaining", 0)
+                    )
+                    self._conversation.add(
+                        UserMessage(
+                            content=(
+                                "runtime_notice: diagnostic exploration budget "
+                                f"exhausted ({self._diagnostic_budget} distinct "
+                                "observations) while a scientific workflow is "
+                                f"blocked. Remaining budget: {remaining}. Stop "
+                                "exploring source/data and report the blocker, "
+                                "the evidence already gathered, and the missing "
+                                "diagnostics instead."
+                            )
+                        )
+                    )
+                    self._run_meta["diagnostic_warning_issued"] = True
                 yield await self._emit(LoopIterationStarted(iteration=iteration))
 
                 surface = self._tool_surface.plan()
@@ -468,12 +830,46 @@ class AgentRuntime:
                     surface.stats,
                     model_context_limit=self._model_context_limit,
                 )
+                max_output_tokens = self._context_engine.config.response_reserve_tokens
+                fallback_model_tokens = 0
+                request_tools = surface.definitions
+                delivery_only = False
+                estimated_input_tokens: int | None = None
+                if self._budget.max_total_tokens is not None:
+                    remaining_tokens = self._budget.max_total_tokens - self._budget.total_tokens
+                    estimated_input_tokens = self._prompt_token_estimator.estimate(messages, surface.definitions)
+                    if (self._prompt_token_estimator.calibrated and remaining_tokens > 0
+                            and remaining_tokens < 2 * (estimated_input_tokens + max_output_tokens)):
+                        delivery_only = True
+                        request_tools = []
+                        messages = [*messages, UserMessage(content=(
+                            "runtime_budget_notice: remaining budget is reserved for final delivery. "
+                            "Do not call tools or start new searches. Deliver a complete concise answer "
+                            "from existing observations, distinguish completed work from drafts, and "
+                            "mark missing evidence UNKNOWN. Explain any blocker and the next step."
+                        ))]
+                        estimated_input_tokens = self._prompt_token_estimator.estimate(messages, request_tools)
+                    max_output_tokens = min(
+                        max_output_tokens, remaining_tokens - estimated_input_tokens,
+                    )
+                    if max_output_tokens <= 0:
+                        raise RuntimeError(
+                            "TOKEN_BUDGET_EXHAUSTED: "
+                            f"total_limit={self._budget.max_total_tokens}, "
+                            f"consumed={self._budget.total_tokens}, "
+                            f"remaining={remaining_tokens}, "
+                            f"input_upper_bound={estimated_input_tokens}"
+                        )
+                    # Missing usage never benefits from the calibrated admission
+                    # estimate. Reserve the byte bound plus requested output.
+                    # Interrupted/unsettled requests are accounted separately by
+                    # application runners at the full remaining case budget.
+                    fallback_model_tokens = min(remaining_tokens,
+                        prompt_token_upper_bound(messages, request_tools) + max_output_tokens)
                 request = ModelRequest(
                     messages=messages,
-                    tools=surface.definitions,
-                    max_output_tokens=(
-                        self._context_engine.config.response_reserve_tokens
-                    ),
+                    tools=request_tools,
+                    max_output_tokens=max_output_tokens,
                 )
                 yield await self._emit(
                     ModelRequestStarted(
@@ -513,6 +909,9 @@ class AgentRuntime:
                         durable_context_chars=context.durable_size.chars,
                         pruned_tool_results=context.pruned_tool_results,
                         compaction_count=context.compaction_count,
+                        admission_input_tokens=estimated_input_tokens,
+                        delivery_only=delivery_only,
+                        max_output_tokens=max_output_tokens,
                     )
                 )
 
@@ -705,7 +1104,13 @@ class AgentRuntime:
                     )
                     raise no_completion_error
 
-                self._budget.record_model_call(response.usage)
+                self._budget.record_model_call(
+                    response.usage, fallback_tokens=fallback_model_tokens,
+                )
+                if response.usage.resolved_total_tokens >= response.usage.input_tokens:
+                    self._prompt_token_estimator.observe(
+                        messages, request_tools, input_tokens=response.usage.input_tokens,
+                    )
                 yield await self._emit(
                     ModelResponseCompleted(
                         iteration=iteration,
@@ -716,20 +1121,62 @@ class AgentRuntime:
                         tool_call_count=len(response.tool_calls),
                         usage=response.usage.model_dump(),
                         duration_ms=(time.monotonic() - model_started) * 1000,
+                        max_output_tokens=max_output_tokens,
+                        response_text_chars=len(response.text),
                     )
                 )
                 self._conversation.add(
                     AssistantMessage(text=response.text, tool_calls=response.tool_calls)
                 )
+                if delivery_only and response.tool_calls:
+                    self._close_tool_calls(response.tool_calls, "not executed: final delivery budget reserve")
+                    raise RuntimeError("DELIVERY_TOOLS_NOT_ALLOWED: final answer required within remaining budget")
 
                 decision = self._stop_policy.should_stop(
                     iteration=iteration, response=response, budget=self._budget
                 )
+                if (decision.reason == "output_truncated"
+                        and output_recoveries < original_context_config.output_recovery_attempts
+                        and self._budget.model_calls < self._budget.max_iterations):
+                    # Never execute or splice truncated tool arguments. Preserve
+                    # the failed transaction and request a fresh, bounded response.
+                    self._close_tool_calls(response.tool_calls, "not executed: output_truncated")
+                    next_cap = min(
+                        max_output_tokens * 2, 32_768,
+                        original_context_config.context_limit_tokens
+                        - original_context_config.safety_margin_tokens - 1_025,
+                    )
+                    if next_cap > max_output_tokens:
+                        output_recoveries += 1
+                        self._context_engine.config = original_context_config.model_copy(
+                            update={"response_reserve_tokens": next_cap}
+                        )
+                        recovery_action = (
+                            "Do not call tools or start new searches. Deliver a concise final answer "
+                            "from existing observations, with blockers and unfinished work explicit. "
+                            if delivery_only else
+                            "Continue with fresh complete tool requests, save small intermediate "
+                            "artifacts early, and give a concise final answer. "
+                        )
+                        self._conversation.add(UserMessage(content=(
+                            "runtime_output_recovery: the preceding response was truncated; "
+                            "its tool fragments were not executed and its text is incomplete. "
+                            "Do not treat it as verified evidence. " + recovery_action +
+                            "Retain the original task constraints. Missing evidence is "
+                            "UNKNOWN. This recovery uses the existing call and token budgets."
+                        )))
+                        yield await self._emit(OutputRecoveryStarted(
+                            iteration=iteration, attempt=output_recoveries,
+                            previous_output_cap=max_output_tokens, next_output_cap=next_cap,
+                        ))
+                        yield await self._emit_budget(iteration)
+                        continue
                 if decision.should_stop:
                     self._close_tool_calls(
                         response.tool_calls,
                         f"not executed because loop stopped: {decision.reason}",
                     )
+                    self._run_meta["termination_reason"] = decision.reason
                     yield await self._emit_budget(iteration)
                     yield await self._emit(
                         LoopCompleted(
@@ -750,10 +1197,184 @@ class AgentRuntime:
                     )
                     return
 
+                tool_calls_seen = False
                 for tool_call in response.tool_calls:
+                    tool_calls_seen = True
                     async for event in self._handle_tool_call(tool_call, iteration):
                         yield event
                 yield await self._emit_budget(iteration)
+                scientific_progress = (
+                    self._progress_fingerprint() != progress_before
+                )
+                new_evidence = (
+                    len(self._scientific.evidence) > evidence_before
+                )
+                if new_evidence:
+                    self._iteration_had_task_progress = True
+                # A trusted task advance (new evidence) ends the blocked
+                # diagnostic period: the workflow is moving again, so the
+                # exploratory budget is restored instead of being drained by
+                # legitimate progress.
+                if new_evidence and self._run_meta.get("blocked"):
+                    self._run_meta["blocked"] = False
+                    self._run_meta["diagnostic_observations"] = 0
+                    self._run_meta["diagnostic_warning_issued"] = False
+                    self._run_meta["diagnostic_budget_remaining"] = (
+                        self._diagnostic_budget
+                    )
+                blocked_now = self._blocked_diagnostic_period()
+                if blocked_now:
+                    # Inside a blocked period, one *new* diagnostic observation
+                    # costs one budget unit and is counted per tool call, so a
+                    # batched response with several probes pays for each probe.
+                    # A trusted scheduler wait is operational and costs
+                    # nothing; a repeated identical probe yields no new
+                    # information, so it does not drain the budget either.
+                    if tool_calls_seen:
+                        self._record_diagnostic_observation(
+                            count=int(
+                                self._run_meta.get(
+                                    "new_diagnostic_observations", 0
+                                )
+                            )
+                        )
+                        if (
+                            scientific_progress
+                            or new_evidence
+                            or self._run_meta.get(
+                                "controlled_wait_this_iteration"
+                            )
+                        ):
+                            no_progress_streak = 0
+                        elif self._run_meta.get("new_observation_seen"):
+                            # New knowledge is not task progress: it only
+                            # decays the repetition stall by one step, so a
+                            # stalled workflow still stops deterministically
+                            # while distinct exploration is not killed.
+                            no_progress_streak = max(0, no_progress_streak - 1)
+                        else:
+                            # The same probe again: no new information at all.
+                            no_progress_streak += 1
+                    elif (
+                        scientific_progress
+                        or new_evidence
+                        or self._run_meta.get("controlled_wait_this_iteration")
+                    ):
+                        no_progress_streak = 0
+                    else:
+                        # No observation was attempted at all: genuine model
+                        # stagnation, not budget-bounded exploration.
+                        no_progress_streak += 1
+                    used = int(self._run_meta["diagnostic_observations"])
+                    if (
+                        not self._run_meta.get("diagnostic_warning_issued")
+                        and used >= self._diagnostic_warning_at
+                    ):
+                        diagnostic_notice_pending = True
+                    if used >= self._diagnostic_budget:
+                        reason = "diagnostic_budget_exhausted"
+                        blocker = (
+                            f"runtime_diagnostic_budget_exhausted: workflow="
+                            f"{self._scientific.workflow_id or 'unknown'}; "
+                            f"next_stage="
+                            f"{self._scientific.next_stage or 'unknown'}; "
+                            f"observations={used}; "
+                            f"evidence_created="
+                            f"{self._run_meta.get('evidence_created', 0)}"
+                        )
+                        self._run_meta.setdefault(
+                            "evidence_gaps_identified", []
+                        ).append(blocker)
+                        self._run_meta["blocked_reason"] = blocker
+                        self._run_meta["termination_reason"] = reason
+                        self._run_meta["controlled_wait_active"] = False
+                        yield await self._emit(
+                            LoopCompleted(
+                                iterations=iteration,
+                                reason=reason,
+                                duration_ms=(
+                                    time.monotonic() - run_started
+                                ) * 1000,
+                            )
+                        )
+                        yield await self._emit(
+                            ScientificTraceMeta(
+                                skills_loaded=self._run_meta["skills_loaded"],
+                                scientific_tools_used=self._run_meta[
+                                    "scientific_tools_used"
+                                ],
+                                evidence_created=self._run_meta[
+                                    "evidence_created"
+                                ],
+                                evidence_sources=self._run_meta[
+                                    "evidence_sources"
+                                ],
+                                evidence_gaps_identified=self._run_meta[
+                                    "evidence_gaps_identified"
+                                ],
+                                capability_escalations=self._run_meta[
+                                    "capability_escalations"
+                                ],
+                            )
+                        )
+                        return
+                elif (
+                    scientific_progress
+                    or self._run_meta.get("controlled_wait_this_iteration")
+                    or self._run_meta.get("new_observation_seen")
+                ):
+                    no_progress_streak = 0
+                else:
+                    no_progress_streak += 1
+                # While a blocked workflow still has diagnostic budget left,
+                # the budget (not the repetition stall) is the deterministic
+                # stop; a restored budget lets ordinary stall accounting apply
+                # again.  A stall with no tool call at all is always reported.
+                if no_progress_streak >= self._max_no_progress_iterations:
+                    blocker = (
+                        f"runtime_no_progress: workflow="
+                        f"{self._scientific.workflow_id or 'unknown'}; "
+                        f"next_stage="
+                        f"{self._scientific.next_stage or 'unknown'}; "
+                        f"streak={no_progress_streak}"
+                    )
+                    self._run_meta.setdefault(
+                        "evidence_gaps_identified", []
+                    ).append(blocker)
+                    # A runtime that stopped for lack of progress must not be
+                    # reported as a controlled wait, even if a workflow was
+                    # active earlier in the run.  The outer controller relies
+                    # on this explicit termination contract.
+                    self._run_meta["termination_reason"] = "no_progress"
+                    self._run_meta["controlled_wait_active"] = False
+                    yield await self._emit(
+                        LoopCompleted(
+                            iterations=iteration,
+                            reason="no_progress",
+                            duration_ms=(
+                                time.monotonic() - run_started
+                            ) * 1000,
+                        )
+                    )
+                    yield await self._emit(
+                        ScientificTraceMeta(
+                            skills_loaded=self._run_meta["skills_loaded"],
+                            scientific_tools_used=self._run_meta[
+                                "scientific_tools_used"
+                            ],
+                            evidence_created=self._run_meta["evidence_created"],
+                            evidence_sources=self._run_meta[
+                                "evidence_sources"
+                            ],
+                            evidence_gaps_identified=self._run_meta[
+                                "evidence_gaps_identified"
+                            ],
+                            capability_escalations=self._run_meta[
+                                "capability_escalations"
+                            ],
+                        )
+                    )
+                    return
         except Exception as exc:
             yield await self._emit(
                 LoopFailed(
@@ -763,6 +1384,8 @@ class AgentRuntime:
                 )
             )
             raise
+        finally:
+            self._context_engine.config = original_context_config
 
     async def _consume_context_result(
         self, result: ContextBuildResult
@@ -813,6 +1436,168 @@ class AgentRuntime:
         error.result = result  # type: ignore[attr-defined]
         error.events = events  # type: ignore[attr-defined]
         return error
+
+    def _progress_fingerprint(self) -> tuple[object, ...]:
+        """Stable identity of deterministic scientific progress in this run.
+
+        File reads and repeated framework-source inspection do not change any
+        of these fields and therefore do not count as progress.
+        """
+        return (
+            len(self._scientific.evidence),
+            len(self._scientific.claims),
+            len(self._scientific.calculations),
+            len(self._scientific.pending_tasks),
+            len(self._scientific.material_hypotheses),
+            len(self._scientific.structure_derivations),
+            self._scientific.workflow_id,
+            self._scientific.next_stage,
+            tuple(self._scientific.evidence_gaps),
+        )
+
+    @staticmethod
+    def _canonical_observation_value(value: object) -> str:
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+        except (TypeError, ValueError):
+            return repr(value)
+
+    @classmethod
+    def _observation_key(
+        cls,
+        name: str,
+        result: ToolResult,
+        arguments: dict[str, object],
+    ) -> tuple[object, ...]:
+        """Identity of one successful observation applied to progress.
+
+        Repeated identical observations (same workflow state or same tool
+        arguments/content) do not count as progress.  New data, changed
+        content, or a changed normalized workflow stage state does.
+        """
+        raw_data = result.data
+        data: dict[str, object] = raw_data if isinstance(raw_data, dict) else {}
+        raw_nested = data.get("data")
+        nested: dict[str, object] = raw_nested if isinstance(raw_nested, dict) else {}
+
+        def pick(key: str) -> object:
+            value = data.get(key)
+            if value not in (None, "", [], {}):
+                return value
+            return nested.get(key)
+
+        def as_str_tuple(value: object) -> tuple[str, ...]:
+            if isinstance(value, (list, tuple, set)):
+                return tuple(sorted(str(item) for item in value))
+            return ()
+
+        workflow_id = str(pick("workflow_id") or pick("job_id") or "")
+        if workflow_id:
+            stage_states = pick("stage_states")
+            if not isinstance(stage_states, dict):
+                stage_states = {}
+            normalized_stages = tuple(
+                sorted(
+                    (str(stage), str(state))
+                    for stage, state in stage_states.items()
+                )
+            )
+            pending = as_str_tuple(pick("pending_stages"))
+            validated = as_str_tuple(pick("validated_stages"))
+            wait = data.get("wait")
+            settled: object = None
+            if isinstance(wait, dict):
+                settled = wait.get("settled")
+            return (
+                "workflow",
+                workflow_id,
+                str(pick("state") or pick("scheduler_state") or ""),
+                str(pick("next_stage") or ""),
+                normalized_stages,
+                pending,
+                validated,
+                settled,
+            )
+
+        output_digest = hashlib.sha256(
+            result.output.encode("utf-8", errors="replace")
+        ).hexdigest()
+        return (
+            "observation",
+            name,
+            cls._canonical_observation_value(arguments),
+            output_digest,
+        )
+
+    @staticmethod
+    def _structured_workflow_identity(result: ToolResult) -> str:
+        """Return the workflow/job identity a structured result refers to.
+
+        Reads the public result's top-level fields first and falls back to the
+        nested ``data`` payload, matching the progress-observation contract.
+        """
+        raw_data = result.data
+        data: dict[str, object] = raw_data if isinstance(raw_data, dict) else {}
+        raw_nested = data.get("data")
+        nested: dict[str, object] = raw_nested if isinstance(raw_nested, dict) else {}
+        raw = data.get("workflow_id") or data.get("job_id")
+        if raw in (None, ""):
+            raw = nested.get("workflow_id") or nested.get("job_id")
+        return str(raw) if raw not in (None, "") else ""
+
+    @classmethod
+    def _structured_wait_signal(
+        cls, name: str, result: ToolResult
+    ) -> tuple[str, str] | None:
+        """Classify a scheduler-state result as an active or ended wait.
+
+        Returns ``(workflow_key, "active"|"inactive")`` for tools that report a
+        workflow's scheduler state, else ``None``.  A per-workflow "inactive"
+        signal is what revokes an earlier wait exemption: a workflow that has
+        reached a terminal or non-running state is no longer a controlled wait.
+        """
+        if name not in _WAIT_STATE_TOOLS:
+            return None
+        key = cls._structured_workflow_identity(result)
+        if not key:
+            return None
+        raw_data = result.data
+        data: dict[str, object] = raw_data if isinstance(raw_data, dict) else {}
+        raw_nested = data.get("data")
+        nested: dict[str, object] = raw_nested if isinstance(raw_nested, dict) else {}
+        raw_state = data.get("state") or data.get("scheduler_state")
+        if raw_state in (None, ""):
+            raw_state = nested.get("state") or nested.get("scheduler_state")
+        state = str(raw_state or "")
+        raw_wait = data.get("wait")
+        if not isinstance(raw_wait, dict):
+            raw_wait = nested.get("wait")
+        wait = raw_wait if isinstance(raw_wait, dict) else None
+        settled = wait.get("settled") if wait is not None else None
+        if state in _ACTIVE_WAIT_STATES or settled is False:
+            return key, "active"
+        if state or wait is not None:
+            return key, "inactive"
+        return None
+
+    @classmethod
+    def _is_controlled_wait_result(cls, name: str, result: ToolResult) -> bool:
+        """Detect a controlled scheduler wait from structured tool data.
+
+        This deliberately does not scan model-visible text for "RUNNING".
+        The tool must identify a workflow/job and expose an active structured
+        state or an explicit unsettled wait record.
+        """
+        if name not in _WAIT_GRANT_TOOLS:
+            return False
+        signal = cls._structured_wait_signal(name, result)
+        return signal is not None and signal[1] == "active"
 
     def _close_pending_tool_calls(self) -> None:
         """Append factual terminal results for abandoned calls; never rewrite history."""
@@ -1098,6 +1883,53 @@ class AgentRuntime:
             return
 
         duration_ms = (time.monotonic() - tool_started) * 1000
+        # Granting and revoking a wait exemption are deliberately separate.
+        # A trusted application result that names this workflow and reports an
+        # explicit inactive/terminal state revokes an earlier exemption even
+        # when the tool marks the result as an error (for example a public
+        # collect that returned VALIDATION_FAILED with no usable evidence).
+        # Errors never grant a new wait and never count as scientific progress;
+        # results without a structured workflow identity or state (a bare
+        # network/query exception) leave eligibility untouched.
+        wait_signal = self._structured_wait_signal(name, result)
+        if wait_signal is not None:
+            wait_key, wait_kind = wait_signal
+            if wait_kind == "active":
+                if not result.is_error:
+                    self._run_meta["controlled_wait_seen"] = True
+                    self._run_meta["controlled_wait_this_iteration"] = True
+                    self._active_wait_workflows.add(wait_key)
+            else:
+                self._active_wait_workflows.discard(wait_key)
+        if not result.is_error:
+            observation_key = self._observation_key(name, result, arguments)
+            if (
+                observation_key is not None
+                and observation_key not in self._run_observed_keys
+            ):
+                self._run_observed_keys.add(observation_key)
+                self._run_meta["new_observation_seen"] = True
+                # Charge the bounded diagnostic budget per *new* observation,
+                # counted per tool call (not per model iteration) so a batched
+                # response with several probes pays for each probe.  A result
+                # that also carries a trusted active wait is exempt: the wait
+                # is operational, not diagnostic exploration.
+                if wait_signal is not None and wait_signal[1] == "active":
+                    self._run_meta["new_wait_observations"] = (
+                        int(self._run_meta.get("new_wait_observations", 0)) + 1
+                    )
+                    self._run_meta["wait_observations"] = (
+                        int(self._run_meta.get("wait_observations", 0)) + 1
+                    )
+                else:
+                    self._run_meta["new_diagnostic_observations"] = (
+                        int(
+                            self._run_meta.get(
+                                "new_diagnostic_observations", 0
+                            )
+                        )
+                        + 1
+                    )
         if result.is_error:
             observation = self._observation.apply(name, result.output)
             if name == _HYPOTHESIS_REGISTRATION_TOOL:
@@ -1250,6 +2082,18 @@ class AgentRuntime:
             skill = str(result.data.get("skill", ""))
             if skill and skill not in self._run_meta["skills_loaded"]:
                 self._run_meta["skills_loaded"].append(skill)
+            if result.data.get("source") == "qd-published":
+                self._run_meta["published_skill_activity"].append({
+                    "stage": "loaded", "skill": skill,
+                    "bundle_sha256": result.data.get("bundle_sha256"),
+                })
+        if tool_name == "script_run" and result.data.get("published_skill"):
+            self._run_meta["published_skill_activity"].append({
+                "stage": "script_executed",
+                "skill": result.data.get("published_skill"),
+                "execution_id": result.data.get("execution_id"),
+                "succeeded": result.data.get("skill_execution_succeeded"),
+            })
         if namespace not in {"", "core", "skills"}:
             if tool_name and tool_name not in self._run_meta["scientific_tools_used"]:
                 self._run_meta["scientific_tools_used"].append(tool_name)
@@ -1389,6 +2233,8 @@ class AgentRuntime:
             self._scientific.add_calculation(update)
         elif isinstance(update, ScientificTask):
             self._scientific.add_task(update)
+        elif isinstance(update, ScientificReferenceUpdate):
+            self._apply_scientific_reference(self._scientific, update)
         elif isinstance(update, ScientificHypothesis):
             self._scientific.add_material_hypothesis(update)
         elif isinstance(update, StructureDerivation):
@@ -1397,6 +2243,39 @@ class AgentRuntime:
             self._evidence_authority.attest(self._scientific, update)
         else:
             raise ToolError(f"unsupported scientific state update: {type(update).__name__}")
+
+    @staticmethod
+    def _apply_scientific_reference(
+        state: ScientificState, update: ScientificReferenceUpdate
+    ) -> None:
+        """Apply resumable references without replacing authoritative ledgers.
+
+        Field contract:
+
+        * ``None`` means "not provided" and leaves the current pointer.
+        * An explicit empty string/list clears that pointer (a completed
+          workflow has no next stage and no outstanding gaps).
+        * A change of ``workflow_id`` replaces the whole reference: earlier
+          workflow A's pending stage/gaps must not survive into workflow B as
+          if they belonged to it.  Explicitly provided B fields are then
+          applied on top of the cleared reference.
+
+        These pointers never assert that a stage ran; manifests and the
+        ``JobRegistry`` remain the authoritative execution facts.
+        """
+        workflow_changed = (
+            update.workflow_id is not None
+            and update.workflow_id != state.workflow_id
+        )
+        if update.workflow_id is not None:
+            state.workflow_id = update.workflow_id
+        if workflow_changed:
+            state.next_stage = ""
+            state.evidence_gaps = []
+        if update.next_stage is not None:
+            state.next_stage = update.next_stage
+        if update.evidence_gaps is not None:
+            state.evidence_gaps = list(update.evidence_gaps)
 
     def _prepare_state_updates(
         self,
@@ -1462,7 +2341,14 @@ class AgentRuntime:
                     prepared.append(structure_record)
             elif isinstance(
                 update,
-                (Evidence, ScientificEvidence, ScientificClaim, CalculationRecord, ScientificTask),
+                (
+                    Evidence,
+                    ScientificEvidence,
+                    ScientificClaim,
+                    CalculationRecord,
+                    ScientificTask,
+                    ScientificReferenceUpdate,
+                ),
             ):
                 self._apply_state_update_to(shadow, update)
                 prepared.append(update)
@@ -1489,6 +2375,8 @@ class AgentRuntime:
             state.add_calculation(update)
         elif isinstance(update, ScientificTask):
             state.add_task(update)
+        elif isinstance(update, ScientificReferenceUpdate):
+            self._apply_scientific_reference(state, update)
         elif isinstance(update, StructureDerivation):
             state.add_structure_derivation(update)
         elif isinstance(update, EvidenceAttestation):

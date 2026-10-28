@@ -143,7 +143,12 @@ class SkillViewTool(Tool):
             content, resolved = self.loader.view(name, str(path) if path else None)
         except (KeyError, OSError, ValueError) as exc:
             return ToolResult(output=f"skill_view failed: {exc}", is_error=True)
-        return ToolResult(
-            output=content,
-            data={"skill": name, "path": resolved},
-        )
+        entry = next((item for item in self.loader.load_index() if item.name == name), None)
+        data: dict[str, Any] = {"skill": name, "path": resolved}
+        if entry is not None and entry.source == "qd-published":
+            data.update({
+                "source": entry.source,
+                "bundle_sha256": entry.bundle_sha256,
+                "usage_stage": "loaded",
+            })
+        return ToolResult(output=content, data=data)

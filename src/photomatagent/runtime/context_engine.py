@@ -24,7 +24,8 @@ from photomatagent.models.types import (
 )
 from photomatagent.redaction import redact_secrets, redact_text
 from photomatagent.runtime.context import ContextBuilder
-from photomatagent.runtime.context_budget import measure_prompt, resolve_thresholds
+from photomatagent.runtime.budget import BudgetState
+from photomatagent.runtime.context_budget import measure_prompt, prompt_token_upper_bound, resolve_thresholds
 from photomatagent.runtime.context_segments import (
     CompactionCut,
     MessageSpan,
@@ -66,6 +67,9 @@ class ContextEngineConfig(BaseModel):
     compact_trigger_tokens: int | None = Field(default=256_000, ge=1)
     compact_target_tokens: int = Field(default=128_000, ge=1)
     response_reserve_tokens: int = Field(default=8_192, ge=1)
+    # Ordinary Web tasks may recover a truncated response once. Frozen evals
+    # retain their original policy; recovery never expands the run budget.
+    output_recovery_attempts: int = Field(default=0, ge=0, le=1)
     safety_margin_tokens: int = Field(default=8_192, ge=0)
     protect_recent_turns: int = Field(default=2, ge=1)
     recent_transaction_count: int = Field(default=2, ge=1)
@@ -181,6 +185,7 @@ class ProviderContextSummarizer:
         self.last_usage: ModelUsage | None = None
         self.last_model_calls = 0
         self.last_usages: list[ModelUsage] = []
+        self.budget_state: BudgetState | None = None
 
     @property
     def summary_output_cap(self) -> int:
@@ -323,6 +328,25 @@ class ProviderContextSummarizer:
         self, messages: list[ModelMessage], previous: CompactionState | None
     ) -> CompactionState:
         request = self._make_request(messages, previous)
+        if self.budget_state is not None and self.budget_state.max_total_tokens is not None:
+            already_used = self.budget_state.total_tokens + sum(
+                usage.resolved_total_tokens for usage in self.last_usages
+            )
+            remaining = self.budget_state.max_total_tokens - already_used
+            output_limit = remaining - prompt_token_upper_bound(request.messages, request.tools)
+            if output_limit <= 0:
+                raise SummaryError("token_budget_exhausted", "context summary exceeds remaining token budget")
+            request.max_output_tokens = min(request.max_output_tokens or output_limit, output_limit)
+        usage_count_before = len(self.last_usages)
+
+        def retain_ambiguous_request_cost() -> None:
+            if (self.budget_state is not None and self.budget_state.max_total_tokens is not None
+                    and len(self.last_usages) == usage_count_before):
+                fallback = (prompt_token_upper_bound(request.messages, request.tools)
+                            + (request.max_output_tokens or 0))
+                self.last_usages.append(ModelUsage(total_tokens=fallback))
+                self.last_usage = _aggregate_usage(self.last_usages)
+
         self.last_model_calls += 1
         completed: list[ModelCompleted] = []
         try:
@@ -331,17 +355,26 @@ class ProviderContextSummarizer:
                     if isinstance(event, ModelCompleted):
                         completed.append(event)
                         usage = event.response.usage
+                        if self.budget_state is not None and self.budget_state.max_total_tokens is not None:
+                            fallback = (prompt_token_upper_bound(request.messages, request.tools)
+                                        + (request.max_output_tokens or 0))
+                            if usage.resolved_total_tokens == 0:
+                                usage = usage.model_copy(update={"total_tokens": fallback})
                         self.last_usages.append(usage.model_copy(deep=True))
                         self.last_usage = _aggregate_usage(self.last_usages)
         except TimeoutError as exc:
+            retain_ambiguous_request_cost()
             raise SummaryError(
                 "summary_timeout", "summary provider request timed out"
             ) from exc
         except asyncio.CancelledError:
+            retain_ambiguous_request_cost()
             raise
         except SummaryError:
+            retain_ambiguous_request_cost()
             raise
         except Exception as exc:
+            retain_ambiguous_request_cost()
             raise SummaryError(
                 "provider_error", f"summary provider failed: {type(exc).__name__}"
             ) from exc
@@ -812,6 +845,8 @@ class ContextEngine:
                                         trigger=trigger,
                                         tokens_before=before.tokens,
                                         thresholds=thresholds,
+                                        model_calls=compaction_calls,
+                                        usages=compaction_usages,
                                     ))
                                 else:
                                     status = "failed"
@@ -837,6 +872,15 @@ class ContextEngine:
                             compaction_calls, compaction_usages = (
                                 self._summary_observations()
                             )
+                            events.append(self._failed_event(
+                                error="context summary cancelled",
+                                trigger=trigger,
+                                tokens_before=before.tokens,
+                                thresholds=thresholds,
+                                protected_turns=protected_turns,
+                                model_calls=compaction_calls,
+                                usages=compaction_usages,
+                            ))
                             final_size = _measure(context_messages, surface)
                             result = self._result(
                                 messages=context_messages,
@@ -1055,6 +1099,8 @@ class ContextEngine:
         trigger: Literal["auto", "manual"],
         tokens_before: int,
         thresholds,
+        model_calls: int = 0,
+        usages: list[ModelUsage] | None = None,
     ) -> ContextCompactionSkipped:
         return ContextCompactionSkipped(
             reason=reason,
@@ -1062,6 +1108,8 @@ class ContextEngine:
             tokens_before=tokens_before,
             threshold_tokens=thresholds.compact_trigger,
             target_tokens=thresholds.target,
+            model_calls=model_calls,
+            usage=_usage_dict(usages or []),
         )
 
     @staticmethod

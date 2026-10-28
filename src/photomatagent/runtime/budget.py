@@ -19,17 +19,25 @@ class BudgetState(BaseModel):
     iterations: int = 0
     # Effectively unbounded agent loop; CLI flags can still cap it explicitly.
     max_iterations: int = 10000
+    max_total_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     compute_cost: float = 0.0
 
-    def record_model_call(self, usage: ModelUsage | None = None) -> None:
+    def record_model_call(self, usage: ModelUsage | None = None, *, fallback_tokens: int = 0) -> None:
         self.model_calls += 1
         if usage is not None:
             self.input_tokens += usage.input_tokens
             self.output_tokens += usage.output_tokens
-            self.total_tokens += usage.resolved_total_tokens
+            reported_tokens = usage.resolved_total_tokens
+            self.total_tokens += (
+                max(reported_tokens, fallback_tokens)
+                if self.max_total_tokens is not None and reported_tokens == 0
+                else reported_tokens
+            )
+        elif self.max_total_tokens is not None:
+            self.total_tokens += fallback_tokens
 
     def record_tool_call(self) -> None:
         self.tool_calls += 1
@@ -41,4 +49,4 @@ class BudgetState(BaseModel):
         return self.iterations >= self.max_iterations
 
     def snapshot(self) -> dict[str, int | float]:
-        return self.model_dump(exclude={"max_iterations"})
+        return self.model_dump(exclude={"max_iterations", "max_total_tokens"})

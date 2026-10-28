@@ -434,11 +434,21 @@ class VaspStudyExecutorAdapter:
             } for item in child.stages):
                 continue
             child_stage = self._next_stage(child)
-            if child_stage is None and child.workflow_id not in self._preflighted_child_ids and child.state in {
-                WorkflowState.PLANNED,
-                WorkflowState.PREPARED,
-                WorkflowState.VALIDATED,
-            }:
+            needs_progression_preflight = (
+                child_stage is None
+                and child.state is WorkflowState.SCHEDULER_COMPLETED
+            )
+            if child_stage is None and (
+                needs_progression_preflight
+                or (
+                    child.workflow_id not in self._preflighted_child_ids
+                    and child.state in {
+                        WorkflowState.PLANNED,
+                        WorkflowState.PREPARED,
+                        WorkflowState.VALIDATED,
+                    }
+                )
+            ):
                 try:
                     preflight = await self.child_service.preflight(child.workflow_id)
                     if not getattr(preflight, "ok", False):

@@ -8,6 +8,7 @@ default ``uv run pytest`` never touches SCNet.
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,11 @@ class FakeSCNetBackend:
         }
         self.fail_submit_with = fail_submit_with
         self.strict = strict
+        # Scripted digest problems for the post-upload verification probe
+        # (name -> reported remote digest) and files that vanish/are
+        # unreadable after upload.  Both model corrupt or partial transfers.
+        self.digest_upload_violations: dict[str, str] = {}
+        self.remote_file_violations: set[str] = set()
         # Models the real-world ambiguity: sbatch accepted the job on the
         # cluster but the client process died/timed out before parsing the id.
         self.submit_succeeds_but_times_out = submit_succeeds_but_times_out
@@ -320,7 +326,38 @@ class FakeSCNetBackend:
         """Determine which required inputs are missing on the remote dir."""
         validate_remote_path(remote_directory)
         files = self.remote_files.get(remote_directory, {})
-        return [name for name in names if name not in files]
+        present = set(files) - set(self.remote_file_violations)
+        return [name for name in names if name not in present]
+
+    async def verify_remote_input_digests(
+        self, remote_directory: str, digests: dict[str, str]
+    ) -> dict[str, str]:
+        """Return the authorized inputs whose remote bytes do not match.
+
+        Mirrors the real backend's bounded ``sha256sum`` probe: only the
+        caller-supplied (already allow-listed) names are inspected, and a
+        missing/unreadable file is reported as a digest mismatch so no
+        sbatch can proceed on an unverified input set.
+        """
+        validate_remote_path(remote_directory)
+        files = self.remote_files.get(remote_directory, {})
+        mismatched: dict[str, str] = {}
+        for name, expected in digests.items():
+            if name in self.remote_file_violations:
+                mismatched[name] = "remote file missing or unreadable"
+                continue
+            scripted = self.digest_upload_violations.get(name)
+            if scripted is not None:
+                mismatched[name] = scripted
+                continue
+            content = files.get(name)
+            if content is None:
+                mismatched[name] = "remote file missing or unreadable"
+                continue
+            actual = hashlib.sha256(content).hexdigest()
+            if actual != expected:
+                mismatched[name] = actual
+        return mismatched
 
     async def job_status(self, job_id: str) -> HPCJobState:
         if not job_id.isdigit():

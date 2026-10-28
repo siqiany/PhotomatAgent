@@ -19,6 +19,7 @@ from typing import Any
 from photomatagent.scientific.applications.vasp.profiles import (
     VaspProfile,
     get_profile,
+    periodic_stage_specs,
 )
 from photomatagent.scientific.applications.vasp.psp import potcar_element_name
 
@@ -283,16 +284,12 @@ class VaspInputGenerator:
         root.mkdir(parents=True, exist_ok=True)
         stages: list[dict[str, Any]] = []
         source_poscar: str | Path | None = None
-        dependencies: dict[str, dict[str, Any]] = {
-            "relax": {"depends_on": None, "required_outputs": []},
-            "static": {"depends_on": "relax", "required_outputs": ["CONTCAR"]},
-            "band": {"depends_on": "static", "required_outputs": ["CONTCAR", "CHGCAR"]},
-            "dos": {"depends_on": "static", "required_outputs": ["CONTCAR", "CHGCAR"]},
-            "optics": {"depends_on": "static", "required_outputs": ["CONTCAR", "CHGCAR"]},
-            "md": {"depends_on": None, "required_outputs": []},
-            "snapshot": {"depends_on": "md", "required_outputs": ["CONTCAR", "XDATCAR"]},
-        }
-        for index, stage in enumerate(profile.stages, start=1):
+        # The dependency DAG is owned by profiles.periodic_stage_specs so
+        # workflow.json and UnifiedVaspManifest cannot drift apart.
+        for index, stage_spec in enumerate(
+            periodic_stage_specs(profile_name), start=1
+        ):
+            stage = stage_spec.name
             stage_dir = root / f"{index:02d}_{stage}"
             generated = self.generate_stage(
                 structure_path=structure_path,
@@ -302,7 +299,16 @@ class VaspInputGenerator:
                 spec_overrides=spec_overrides,
                 source_poscar=source_poscar,
             )
-            generated.update(dependencies.get(stage, {}))
+            generated.update(
+                {
+                    "depends_on": (
+                        stage_spec.depends_on[0]
+                        if len(stage_spec.depends_on) == 1
+                        else None
+                    ),
+                    "required_outputs": list(stage_spec.required_outputs),
+                }
+            )
             stages.append(generated)
             if stage in {"relax", "md"}:
                 source_poscar = stage_dir / "POSCAR"

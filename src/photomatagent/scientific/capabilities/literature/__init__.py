@@ -765,7 +765,10 @@ class LiteratureProbe(CapabilityPack):
         )
 
     def tools(self) -> list[Tool]:
+        from photomatagent.scientific.capabilities.literature.source_fetch import LiteratureFetchSourceTool
+
         return [
+            LiteratureFetchSourceTool(),
             LiteratureSearchArxivTool(self._config),
             LiteratureSearchLocalTool(self._config, self._workspace),
             LiteratureListPapersTool(self._workspace),

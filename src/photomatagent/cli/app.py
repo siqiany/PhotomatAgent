@@ -997,6 +997,15 @@ def loop(
         "--require-judge",
         help="Block SUCCESS while the judge is unavailable or below quality.",
     ),
+    judge_mode: str | None = typer.Option(
+        None, "--judge-mode", help="Judge trigger policy: off | on_demand | every_round (default preserves legacy behavior).",
+    ),
+    judge_max_calls: int | None = typer.Option(
+        None, "--judge-max-calls", min=0, help="Maximum judge calls for this loop run.",
+    ),
+    judge_requested: bool = typer.Option(
+        False, "--judge-requested", help="Request one on-demand judge assessment when mode is on_demand.",
+    ),
     log_events: bool = typer.Option(True, "--log-events/--no-log-events"),
 ) -> None:
     """Run the Evidence-Guided Scientific Feedback Loop.
@@ -1027,6 +1036,9 @@ def loop(
         judge_model=judge_model,
         judge_min_quality=judge_min_quality,
         require_judge=require_judge,
+        judge_mode=judge_mode,
+        judge_max_calls=judge_max_calls,
+        judge_requested=judge_requested,
         log_events=log_events,
     )
     raise typer.Exit(code=exit_code)

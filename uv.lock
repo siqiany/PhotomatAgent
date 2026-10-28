@@ -1461,6 +1461,23 @@ wheels = [
 ]
 
 [[package]]
+name = "fastapi"
+version = "0.142.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "opentelemetry-api" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/56/4f/f7c30a73127e0a8bbffe788369b8359e530b01ae06e2757936fa35bc5e6d/fastapi-0.142.2.tar.gz", hash = "sha256:06366626f2e70576367714d9ab2fe8472e6c8456dba69b399f9f797ab5e92570", size = 466721, upload-time = "2026-09-30T09:51:11.277Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/b6/78aaf9141fb46742928c113f3cf6ef2259d538cb02b604b7656c1dc9883c/fastapi-0.142.2-py3-none-any.whl", hash = "sha256:bd5f4d81f1e93a88bcd77caf4dfe3c2dbffc3805407a0007e9a114c18b3a670b", size = 144409, upload-time = "2026-09-30T09:51:09.8Z" },
+]
+
+[[package]]
 name = "fastmcp"
 version = "3.4.7"
 source = { registry = "https://pypi.org/simple" }
@@ -3329,12 +3346,19 @@ science = [
 transport = [
     { name = "amset" },
 ]
+web = [
+    { name = "fastapi" },
+    { name = "python-multipart" },
+    { name = "uvicorn" },
+]
 
 [package.dev-dependencies]
 dev = [
+    { name = "fastapi" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "python-multipart" },
 ]
 
 [package.metadata]
@@ -3348,6 +3372,7 @@ requires-dist = [
     { name = "docling", marker = "extra == 'literature'", specifier = ">=2.0" },
     { name = "doped", marker = "extra == 'defects'", specifier = ">=2.0" },
     { name = "effmass", marker = "extra == 'electronic'", specifier = ">=1.3" },
+    { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.115" },
     { name = "fastmcp", specifier = ">=3.4.7" },
     { name = "mcp", specifier = ">=1.24,<2" },
     { name = "mp-api", specifier = ">=0.46.4" },
@@ -3361,6 +3386,7 @@ requires-dist = [
     { name = "pypdf", marker = "extra == 'literature'", specifier = ">=4.0" },
     { name = "pytaser", marker = "extra == 'optics'", specifier = ">=1.0" },
     { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "python-multipart", marker = "extra == 'web'", specifier = ">=0.0.20" },
     { name = "qdrant-client", marker = "extra == 'literature'", specifier = ">=1.19,<2" },
     { name = "rdkit", specifier = ">=2026.3.6" },
     { name = "rich", specifier = ">=13.7" },
@@ -3370,14 +3396,17 @@ requires-dist = [
     { name = "torch", marker = "extra == 'literature'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "extra == 'literature'", specifier = ">=0.17", index = "https://download.pytorch.org/whl/cpu" },
     { name = "typer", specifier = ">=0.12" },
+    { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.30" },
 ]
-provides-extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "chgnet", "generation", "science"]
+provides-extras = ["materials", "electronic", "literature", "defects", "transport", "device", "optics", "chgnet", "generation", "science", "web"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "fastapi", specifier = ">=0.115" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "python-multipart", specifier = ">=0.0.20" },
 ]
 
 [[package]]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import asyncio
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,7 +16,7 @@ from photomatagent.workspace import Workspace
 
 class GrepTool(Tool):
     name = "grep"
-    description = "Search text with a regular expression inside the workspace."
+    description = "Search text with a regular expression inside the workspace. Search is bounded; narrow the path/glob when truncated."
     exposure = ToolExposure.DIRECT
     tags = ("file", "search", "text")
     input_schema = {
@@ -52,7 +53,17 @@ class GrepTool(Tool):
                 self.workspace.validate_glob(str(glob_pattern))
             limit = min(int(arguments.get("limit", self.default_limit)), 1000)
             matches: list[str] = []
-            for path in self._files(base, str(glob_pattern) if glob_pattern else None):
+            scan_limit_reached = False
+            for scanned, path in enumerate(self._files(base, str(glob_pattern) if glob_pattern else None), start=1):
+                if scanned >= 10_000:
+                    scan_limit_reached = True
+                    break
+                if scanned % 128 == 0:
+                    await asyncio.sleep(0)
+                if (not path.is_file()
+                        or not self.workspace.contains(path.resolve(strict=False))
+                        or self.sensitive_paths.is_sensitive(self.workspace.relative(path))):
+                    continue
                 try:
                     lines = path.read_text(encoding="utf-8").splitlines()
                 except (UnicodeError, OSError):
@@ -66,7 +77,9 @@ class GrepTool(Tool):
                     break
             output = "\n".join(matches) or "(no matches)"
             original_chars = len(output)
-            truncated = len(matches) >= limit or len(output) > self.max_chars
+            truncated = scan_limit_reached or len(matches) >= limit or len(output) > self.max_chars
+            if scan_limit_reached:
+                output += "\n... [candidate scan limit reached; results incomplete; narrow the path/glob]"
             if len(output) > self.max_chars:
                 marker = (
                     f"\n... [grep output bounded from {original_chars} chars; "
@@ -78,6 +91,7 @@ class GrepTool(Tool):
                 data={
                     "matches": matches,
                     "truncated": truncated,
+                    "scan_limit_reached": scan_limit_reached,
                     "original_chars": original_chars,
                     "delivered_chars": len(output),
                 },
@@ -88,11 +102,4 @@ class GrepTool(Tool):
     def _files(self, base: Path, pattern: str | None) -> Iterable[Path]:
         if base.is_file():
             return [base]
-        candidates = base.glob(pattern or "**/*")
-        return sorted(
-            path
-            for path in candidates
-            if path.is_file()
-            and self.workspace.contains(path.resolve(strict=False))
-            and not self.sensitive_paths.is_sensitive(self.workspace.relative(path))
-        )
+        return base.glob(pattern or "**/*")

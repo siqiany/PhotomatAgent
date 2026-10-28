@@ -56,6 +56,15 @@ def format_scientific_state(state: ScientificState) -> str:
     """Render the scientific state as plain text for the model."""
     lines: list[str] = []
     lines.append(f"Goal: {state.goal or '(none yet)'}")
+    if state.active_subtask and state.active_subtask != state.goal:
+        lines.append(f"Current subtask: {state.active_subtask}")
+    if state.workflow_id:
+        lines.append(f"Workflow reference: {state.workflow_id}")
+    if state.next_stage:
+        lines.append(f"Next stage reference: {state.next_stage}")
+    if state.evidence_gaps:
+        lines.append("Evidence gaps:")
+        lines += [f"- {gap}" for gap in state.evidence_gaps]
     if state.hypotheses:
         lines.append("Hypotheses:")
         lines += [f"- {h}" for h in state.hypotheses]
@@ -87,16 +96,19 @@ def format_scientific_state(state: ScientificState) -> str:
                 f"evidence={claim.supporting_evidence})"
             )
     if state.evidence:
-        lines.append("Evidence:")
+        lines.append(
+            "Evidence (use the exact evidence_id below for basis[].evidence_id; "
+            "paper identifiers, property names and tool names are not evidence IDs):"
+        )
         for ev in state.evidence:
             if isinstance(ev, Evidence):
                 lines.append(
-                    f"- ({ev.type} from {ev.source}) {ev.content} "
+                    f"- [evidence_id={ev.id}] ({ev.type} from {ev.source}) {ev.content} "
                     f"(confidence={ev.confidence})"
                 )
             else:
                 lines.append(
-                    f"- ({getattr(ev, 'source_type', 'observation')} from "
+                    f"- [evidence_id={ev.id}] ({getattr(ev, 'source_type', 'observation')} from "
                     f"{getattr(ev, 'source', 'unknown')}) "
                     f"{getattr(ev, 'summary', '')} ({getattr(ev, 'property', '')} "
                     f"= {getattr(ev, 'value', '')} {getattr(ev, 'unit', '')})"

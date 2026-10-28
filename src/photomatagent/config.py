@@ -207,7 +207,6 @@ def read_preferred_config(
     environ: MutableMapping[str, str] | None = None,
 ) -> LLMConfig | None:
     """Read configuration without prompting, for diagnostics."""
-    store.ensure_exists()
     target_environ = os.environ if environ is None else environ
     values = store.values(target_environ)
     selected_value = provider or values.get(PREFERRED_PROVIDER_ENV, "")

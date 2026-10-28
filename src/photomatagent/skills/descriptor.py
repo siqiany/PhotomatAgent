@@ -23,6 +23,7 @@ class SkillDescriptor:
     tags: tuple[str, ...] = field(default_factory=tuple)
     priority: int = 100
     category: str = ""
+    bundle_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -33,4 +34,3 @@ class SkillDiagnostic:
     message: str
     source: str = ""
     path: Path | None = None
-

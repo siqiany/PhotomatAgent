@@ -120,6 +120,13 @@ DEFAULT_PROPERTY_ALIASES: dict[str, set[str]] = {
     "effective_mass": {"effective_mass", "avg_electron_mass_m0", "avg_hole_mass_m0"},
 }
 
+# Canonical target properties the deterministic evaluator can map to a
+# documented evidence identity.  ``total_energy`` is kept because it is a
+# first-class VASP evidence property, but it deliberately has no alias to
+# band_gap or device metrics.
+_KNOWN_TARGET_PROPERTIES = frozenset(DEFAULT_PROPERTY_ALIASES) | {"total_energy"}
+
+
 _UNIT_SUFFIX = {
     "_mev_per_atom": "meV/atom",
     "_ev_per_atom": "eV/atom",
@@ -366,6 +373,7 @@ class ScientificEvaluator:
         )
         verdict = _verdict(outcomes)
         rationale = _rationale(verdict, outcomes, gaps, contradictions)
+        diagnostics = self._independence_diagnostics(scientific)
         constraint_results = [
             PropertyEvaluation(
                 property=o.property,
@@ -385,6 +393,7 @@ class ScientificEvaluator:
             evidence_gaps=gaps,
             critical_evidence_gaps=critical_gaps,
             contradictions=contradictions,
+            diagnostics=diagnostics,
             hard_constraints_passed=hard_constraints_passed,
             score=score,
             confidence=confidence,
@@ -401,6 +410,56 @@ class ScientificEvaluator:
     def _aliases_for(self, property_name: str) -> set[str]:
         known = self.aliases.get(property_name, set())
         return {property_name, *known}
+
+    def _independence_diagnostics(
+        self, scientific: ScientificState
+    ) -> list[str]:
+        """Mark same-method/parameter replays as not independent support.
+
+        This is an audit diagnostic only.  It does not turn a valid single
+        observation into FAIL or UNKNOWN, and it does not add a second
+        evidence framework.
+        """
+        groups: dict[tuple[str, str, str, str, str], int] = {}
+        for evidence in scientific.evidence:
+            if not isinstance(evidence, ScientificEvidence):
+                continue
+            property_name = str(evidence.property or "").strip()
+            if (
+                property_name not in _KNOWN_TARGET_PROPERTIES
+                and property_name not in self.aliases
+            ):
+                continue
+            method = str(evidence.method or "").strip().casefold()
+            structure_hash = str(evidence.structure_hash or "").strip()
+            conditions = json.dumps(
+                _normalized_condition_value(evidence.conditions),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            parameter_source = str(
+                evidence.provenance.get("shared_parameter_source")
+                or evidence.provenance.get("parameter_source")
+                or ""
+            ).strip().casefold()
+            key = (
+                property_name,
+                method,
+                structure_hash,
+                conditions,
+                parameter_source,
+            )
+            groups[key] = groups.get(key, 0) + 1
+        diagnostics: list[str] = []
+        for key, count in sorted(groups.items()):
+            if count < 2:
+                continue
+            property_name = key[0]
+            diagnostics.append(
+                f"{property_name}:SHARED_METHOD_OR_PARAMETERS_NOT_INDEPENDENT"
+            )
+        return diagnostics
 
     def _evaluate_constraint(
         self,
@@ -419,6 +478,19 @@ class ScientificEvaluator:
                 severity=constraint.severity,
                 result="UNKNOWN",
                 reason="CONSTRAINT_TARGET_INVALID",
+            )
+        if (
+            constraint.property not in _KNOWN_TARGET_PROPERTIES
+            and constraint.property not in self.aliases
+        ):
+            return ConstraintOutcome(
+                property=constraint.property,
+                operator=constraint.operator,
+                target_value=constraint.value,
+                unit=constraint.unit,
+                severity=constraint.severity,
+                result="UNKNOWN",
+                reason="PROPERTY_UNSUPPORTED",
             )
         requirements, requirements_error = self._requirements_for(constraint.property)
         if requirements_error:

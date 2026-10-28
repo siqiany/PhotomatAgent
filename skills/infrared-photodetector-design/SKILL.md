@@ -52,7 +52,29 @@ Never escalate to expensive evidence when cheap evidence can close the gap.
 - A database match is NOT a validated detector. Band-gap matching alone never
   justifies "promising detector" conclusions.
 - Use `ir.compile_constraints` first to get deterministic physics constraints
-  (photon energies, cutoff energy, thermal limits, responsivity, BLIP).
+  (photon energies, cutoff energy, thermal limits, responsivity, BLIP). When
+  the goal specifies wavelength, EQE, active dimensions, detectivity, or speed,
+  pass those typed targets to the same tool before estimating a device design.
+  Treat its ideal responsivity, total-noise allowance, time constant, and
+  Johnson R0/R0A values as `NECESSARY_CONSTRAINT`, never measured performance.
+- Read `background_reference_conditions` before discussing BLIP: the tool's
+  current temperature input also sets its background reference temperature.
+  Do not replace a supplied 250 K with the 300 K default. Its hemispherical
+  exitance is not a measured detector field of view. The geometric-mean
+  reference wavelength is not a spectral average. Noise budgets are conditional
+  on the assumed target responsivity; recompute when the working point changes.
+- When numeric device claims are supplied, use `claimed_metrics` to compare
+  values and exact units with those bounds. `ARITHMETICALLY_COMPATIBLE` is only
+  a formula check; source identity and empirical performance remain unknown.
+- Check the target against evidence for the same device, material phase,
+  operating temperature, wavelength, bias, and physical current path. Missing
+  or mismatched evidence leaves empirical performance `UNKNOWN`; do not infer
+  a measured bound from a formula or a different device.
+- For public primary HTML or abstract evidence, use deferred
+  `literature.fetch_source` when available. Record blocked access and abstract
+  coverage explicitly; an abstract does not establish full-text details or
+  same-wavelength device performance. Use existing local PDF tools for local
+  papers, and do not use arbitrary shell or web access to bypass source limits.
 - Report missing prerequisites explicitly; never fabricate DFT/experimental
   values.
 - Record every observation as evidence with source and method.

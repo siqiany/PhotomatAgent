@@ -90,7 +90,7 @@ COMMANDS = (
     CommandSpec("/experiments run <config>", "运行确定性实验"),
     CommandSpec("/experiments compare <a> <b>", "比较两份实验结果"),
     CommandSpec(
-        "/evolve [list|status|history|start|feedback|compile|iterate]",
+        "/evolve [list|status|history|start|feedback|compile|iterate|qd]",
         "管理专家反馈驱动的持久演化任务；feedback/compile 复用当前交互会话",
     ),
     CommandSpec(

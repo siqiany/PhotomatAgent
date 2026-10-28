@@ -77,6 +77,15 @@ class StagnationDetector:
         """True when this exact candidate (fingerprint) was already proposed."""
         return candidate.fingerprint in self._fingerprints
 
+    def record_controlled_wait(self) -> None:
+        """Reset the no-progress window while a real scheduler job runs.
+
+        A controlled ``vasp.wait``/``vasp.status`` observation of
+        RUNNING/PENDING/SUBMITTED is not model reasoning failure and must not
+        count as scientific stagnation or cause cancellation.
+        """
+        self._no_progress_rounds = 0
+
     def record(
         self,
         candidate: CandidateState,

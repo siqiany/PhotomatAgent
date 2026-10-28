@@ -20,6 +20,7 @@ This module performs no SSH and no sbatch itself: it drives a backend object
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 from datetime import datetime, timezone
@@ -50,6 +51,20 @@ from photomatagent.scientific.remote.scheduler import (
 from photomatagent.scientific.remote.scnet import validate_remote_path
 
 MARKER_FILENAME = "photomatagent.request.json"
+
+
+def _authorized_digest(value: str) -> str:
+    """Normalize a caller-supplied content digest for comparison."""
+    return value.strip().lower()
+
+
+def _sha256_file(path: Path) -> str:
+    """Streaming file digest; bounded memory even for large CHGCAR files."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class SubmissionGate(BaseModel):
@@ -142,6 +157,17 @@ class JobBackend(Protocol):
         """
         ...
 
+    async def verify_remote_input_digests(
+        self, remote_directory: str, digests: dict[str, str]
+    ) -> dict[str, str]:
+        """Return ``{name: observed}`` for authorized inputs that do not match.
+
+        Optional capability: implementations that cannot hash remotely either
+        omit the method or report every requested name as a mismatch.  The
+        lifecycle never treats a missing capability as verified input.
+        """
+        ...
+
 
 class RemoteArtifactCopy(BaseModel):
     """One allow-listed artifact staged into the new job directory."""
@@ -195,8 +221,17 @@ class SubmitOnceSession:
         potcar_mode: str = "none",
         potcar_symbols: list[str] | None = None,
         remote_psp_dir: str = "",
+        required_input_sha256: dict[str, str] | None = None,
     ) -> SubmitOnceResult:
-        """Submit at most once per request_id; see module docstring."""
+        """Submit at most once per request_id; see module docstring.
+
+        ``required_input_sha256`` is the application-side authorization list:
+        every entry must exist in ``local_input_dir`` with exactly that
+        digest, must not be a symlink, and must reach the remote directory
+        with the same digest before sbatch is allowed.  ``None`` (the
+        default) preserves the legacy upload contract for callers that have
+        no upstream-authored artifacts to stage.
+        """
         input_dir = Path(local_input_dir).expanduser().resolve()
         hash_value = canonical_input_hash(input_dir)
         rid = request_id or derive_request_id(application, workflow_stage, hash_value)
@@ -272,6 +307,7 @@ class SubmitOnceSession:
             potcar_mode=potcar_mode,
             potcar_symbols=potcar_symbols or [],
             remote_psp_dir=remote_psp_dir,
+            required_input_sha256=required_input_sha256,
         )
 
     def mark_result_state(
@@ -560,6 +596,7 @@ class SubmitOnceSession:
         potcar_mode: str,
         potcar_symbols: list[str],
         remote_psp_dir: str,
+        required_input_sha256: dict[str, str] | None = None,
     ) -> SubmitOnceResult:
         request_id = record.request_id
         remote_directory = self._unique_remote_directory(
@@ -601,6 +638,26 @@ class SubmitOnceSession:
             for name in ("POSCAR", "INCAR", "KPOINTS", "POTCAR.meta")
             if (input_dir / name).is_file()
         ]
+        # Authorized upstream artifacts are uploaded only when the caller
+        # explicitly binds their digest; never by sweeping the directory.
+        extra_names, extra_error = self._resolve_required_inputs(
+            input_dir, required_input_sha256
+        )
+        if extra_error is not None:
+            self.registry.update(
+                request_id,
+                state=JobLifecycleState.FAILED,
+                last_error=extra_error,
+            )
+            current = self.registry.get(request_id)
+            assert current is not None
+            return SubmitOnceResult(
+                request_id=request_id,
+                record=current.public_dict(),
+                blocked=True,
+                error=extra_error,
+            )
+        names.extend(extra_names)
         script_rendered = False
         if script_renderer is not None:
             # The submission script is generated from the caller's single
@@ -851,6 +908,14 @@ class SubmitOnceSession:
                     ),
                 )
 
+        # -- verify the authorized artifact bytes remotely before sbatch -----
+        if required_input_sha256:
+            digest_error = await self._verify_required_input_digests(
+                request_id, remote_directory, required_input_sha256
+            )
+            if digest_error is not None:
+                return digest_error
+
         spec = RemoteJobSpec(
             application="vasp",
             job_name=record.job_name,
@@ -926,6 +991,106 @@ class SubmitOnceSession:
             request_id=request_id,
             record=current.public_dict(),
             submitted=True,
+        )
+
+    def _resolve_required_inputs(
+        self,
+        input_dir: Path,
+        required: dict[str, str] | None,
+    ) -> tuple[list[str], str | None]:
+        """Locally vet the caller's authorized input digests.
+
+        Returns the staged filenames to upload plus an error string when the
+        authorization cannot be satisfied.  Only fixed allow-listed basenames
+        are accepted: no separators, no ``..``, no absolute paths, no
+        symlinks, and the local bytes are re-hashed against the authorized
+        digest before anything is uploaded.
+        """
+        if not required:
+            return [], None
+        from photomatagent.scientific.remote.scheduler import (
+            REMOTE_INPUT_ALLOWLIST,
+        )
+
+        names: list[str] = []
+        for name, digest in required.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(digest, str)
+                or name not in REMOTE_INPUT_ALLOWLIST
+                or len(digest) != 64
+            ):
+                return [], (
+                    f"authorized input {name!r} is not an allow-listed "
+                    "artifact with a sha256 digest; upload and sbatch refused"
+                )
+            path = input_dir / name
+            if path.is_symlink():
+                return [], (
+                    f"authorized input {name!r} is a symlink; upload and "
+                    "sbatch refused"
+                )
+            if not path.is_file():
+                return [], (
+                    f"authorized input {name!r} is missing from the local "
+                    "stage directory; upload and sbatch refused"
+                )
+            if _sha256_file(path) != _authorized_digest(digest):
+                return [], (
+                    f"authorized input {name!r} does not match its approved "
+                    "digest; upload and sbatch refused"
+                )
+            if name not in names:
+                names.append(name)
+        return names, None
+
+    async def _verify_required_input_digests(
+        self,
+        request_id: str,
+        remote_directory: str,
+        required: dict[str, str],
+    ) -> SubmitOnceResult | None:
+        """Confirm the uploaded artifacts match their authorized digests.
+
+        Missing verification capability is a hard pre-sbatch failure: an
+        upload whose remote bytes were never confirmed must not be run.
+        """
+        verify = getattr(self.backend, "verify_remote_input_digests", None)
+        if verify is None:
+            mismatched: dict[str, str] = {
+                name: "backend cannot verify remote digests"
+                for name in required
+            }
+        else:
+            try:
+                mismatched = await verify(remote_directory, dict(required))
+            except Exception as exc:
+                mismatched = {
+                    name: f"{type(exc).__name__}: {exc}" for name in required
+                }
+        if not mismatched:
+            return None
+        detail = ", ".join(
+            f"{name} (expected {required[name]}, remote {observed})"
+            for name, observed in sorted(mismatched.items())
+        )
+        self.registry.update(
+            request_id,
+            state=JobLifecycleState.FAILED,
+            last_error=(
+                "authorized remote inputs failed digest verification: " + detail
+            ),
+        )
+        current = self.registry.get(request_id)
+        assert current is not None
+        return SubmitOnceResult(
+            request_id=request_id,
+            record=current.public_dict(),
+            blocked=True,
+            error=(
+                "authorized remote inputs failed digest verification before "
+                f"sbatch: {detail}"
+            ),
         )
 
     async def _query_status(

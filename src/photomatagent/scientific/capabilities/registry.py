@@ -10,6 +10,7 @@ from photomatagent.tools.base import Tool
 from photomatagent.workspace import Workspace
 
 if TYPE_CHECKING:
+    from photomatagent.capability_acquisition.sandbox import SandboxService
     from photomatagent.scientific.state import ScientificState
 
 
@@ -19,6 +20,9 @@ def build_scientific_tools(
     *,
     vasp_approval_root: Path | str | None = None,
     scientific_state: ScientificState | None = None,
+    sandbox_service: SandboxService | None = None,
+    published_skill_source: Any = None,
+    resource_owners: list[object] | None = None,
 ) -> list[Tool]:
     """Instantiate every capability pack and collect their tools.
 
@@ -99,10 +103,68 @@ def build_scientific_tools(
         except Exception:
             # A broken pack must never take down agent startup.
             continue
+    from photomatagent.capability_acquisition.discovery import (
+        CapabilityDiscoveryService,
+        DiscoveryProvider,
+        ExactPyPISearchProvider,
+        HTTPSearchProvider,
+        PyPIMetadataProvider,
+    )
+    from photomatagent.capability_acquisition.installation import UVPlanResolver
+    from photomatagent.capability_acquisition.tools import (
+        CapabilityInspectTool,
+        CapabilitySearchTool,
+    )
+
+    search_provider: DiscoveryProvider | None = None
+    if effective_config.capability_search_endpoint:
+        try:
+            import os
+
+            token = os.environ.get(effective_config.capability_search_token_env) or None
+            search_provider = HTTPSearchProvider(
+                effective_config.capability_search_endpoint, token=token
+            )
+        except ValueError:
+            # Invalid endpoint is a localized diagnostic returned as unavailable
+            # by the tools; base runtime and other packs remain available.
+            search_provider = None
+    metadata_provider = PyPIMetadataProvider()
+    from photomatagent.capability_acquisition.local_backend import LocalDevBackend, local_python_digest
+
+    is_local_dev = isinstance(getattr(sandbox_service, "backend", None), LocalDevBackend)
+    if is_local_dev and search_provider is None:
+        search_provider = ExactPyPISearchProvider()
+    digest = local_python_digest() if is_local_dev else effective_config.capability_image_digest
+    plan_resolver = (
+        UVPlanResolver(
+            image_digest=digest,
+            metadata_provider=metadata_provider,
+            execution_backend="local_dev" if is_local_dev else "podman",
+        )
+        if digest
+        else None
+    )
+    discovery = CapabilityDiscoveryService(
+        search_provider=search_provider,
+        metadata_provider=metadata_provider,
+        plan_resolver=plan_resolver,
+    )
+    tools.extend([CapabilitySearchTool(discovery), CapabilityInspectTool(discovery, local_dev=is_local_dev)])
+    if sandbox_service is not None:
+        from photomatagent.capability_acquisition.tools import (
+            CapabilityInstallTool,
+            ScriptRunTool,
+        )
+
+        tools.extend([
+            CapabilityInstallTool(discovery, sandbox_service),
+            ScriptRunTool(sandbox_service, published_skill_source),
+        ])
     builtin_names = {getattr(tool, "name", "") for tool in tools}
     tools.extend(
         _mcp_gateway_tools(
-            effective_config, effective_workspace, builtin_names
+            effective_config, effective_workspace, builtin_names, resource_owners
         )
     )
     return tools
@@ -112,6 +174,7 @@ def _mcp_gateway_tools(
     config: ScientificConfig,
     workspace: Workspace,
     builtin_tool_names: set[str] | None = None,
+    resource_owners: list[object] | None = None,
 ) -> list[Tool]:
     """Register configured MCP servers as deferred tools through the gateway.
 
@@ -123,6 +186,8 @@ def _mcp_gateway_tools(
     from photomatagent.mcp.manager import MCPServerManager
 
     manager = MCPServerManager(config.mcp_servers, workspace=workspace.root)
+    if resource_owners is not None:
+        resource_owners.append(manager)
     try:
         gateway_tools = manager.register_tools(builtin_tool_names)
         authoritative_names = builtin_tool_names or set()

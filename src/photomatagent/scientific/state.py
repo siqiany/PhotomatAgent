@@ -51,6 +51,21 @@ class EvidenceAttestation(BaseModel):
         }[self.origin]
 
 
+class ScientificReferenceUpdate(BaseModel):
+    """Runtime-validated references to authoritative workflow state.
+
+    ``None`` means "not provided"; an empty string/list is an explicit clear
+    (for example a completed workflow that no longer has a next stage).
+    These are pointers into manifests/JobRegistry, never a second execution
+    ledger, and are applied through the normal ToolResult.state_updates
+    validation path.
+    """
+
+    workflow_id: str | None = None
+    next_stage: str | None = None
+    evidence_gaps: list[str] | None = None
+
+
 class ScientificState(BaseModel):
     """Deliberately richer than a message history.
 
@@ -60,6 +75,16 @@ class ScientificState(BaseModel):
     """
 
     goal: str = ""
+    # The original full research goal is preserved when the user sends a
+    # short continuation instruction such as "continue the VASP validation".
+    # ``active_subtask`` records the latest instruction without replacing the
+    # durable goal.  Workflow references are execution pointers only; the
+    # authoritative request/job/artifact facts remain in the VASP manifests
+    # and JobRegistry.
+    active_subtask: str = ""
+    workflow_id: str = ""
+    next_stage: str = ""
+    evidence_gaps: list[str] = Field(default_factory=list)
     hypotheses: list[str] = Field(default_factory=list)
     material_hypotheses: list[ScientificHypothesis] = Field(default_factory=list)
     structure_derivations: list[StructureDerivation] = Field(default_factory=list)
@@ -130,6 +155,15 @@ class ScientificState(BaseModel):
     def add_evidence(
         self, evidence: Evidence | ScientificEvidence
     ) -> Evidence | ScientificEvidence:
+        # Evidence ids are the idempotency key used by deterministic
+        # re-collection and recovery.  Re-adding the same identity must not
+        # duplicate the ScientificState record.
+        existing = next(
+            (item for item in self.evidence if item.id == evidence.id),
+            None,
+        )
+        if existing is not None:
+            return existing
         self.evidence.append(evidence)
         return evidence
 

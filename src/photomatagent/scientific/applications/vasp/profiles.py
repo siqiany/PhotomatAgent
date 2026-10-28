@@ -53,6 +53,15 @@ class VaspProfile:
     needs_configuration: bool = False
 
 
+@dataclass(frozen=True)
+class PeriodicStageSpec:
+    """Single source of truth for periodic stage dependency metadata."""
+
+    name: str
+    depends_on: tuple[str, ...] = ()
+    required_outputs: tuple[str, ...] = ()
+
+
 _WIKI_SOC = (
     "VASP wiki: LSORBIT page (LSORBIT=.TRUE. implies LNONCOLLINEAR=.TRUE.; "
     "use vasp_ncl; GGA_COMPAT=.FALSE., LASPH=.TRUE., LREAL=.FALSE.; ISYM=-1 "
@@ -240,6 +249,90 @@ NAMD_PREPARATION = VaspProfile(
     ],
     needs_configuration=True,
 )
+
+
+_STANDARD_SEMICONDUCTOR_GRAPH = (
+    PeriodicStageSpec("relax"),
+    PeriodicStageSpec("static", ("relax",), ("CONTCAR",)),
+    PeriodicStageSpec(
+        "band", ("static",), ("CONTCAR", "CHGCAR")
+    ),
+    PeriodicStageSpec(
+        "dos", ("static",), ("CONTCAR", "CHGCAR")
+    ),
+)
+
+_PERIODIC_STAGE_GRAPHS: dict[str, tuple[PeriodicStageSpec, ...]] = {
+    "standard_semiconductor": _STANDARD_SEMICONDUCTOR_GRAPH,
+    "narrow_gap_soc": _STANDARD_SEMICONDUCTOR_GRAPH,
+    # The optics profile starts from a static ground state; it does not
+    # contain the relax stage, so a global stage-name dependency on "relax"
+    # would reference a non-existent parent.
+    "optics": (
+        PeriodicStageSpec("static"),
+        PeriodicStageSpec(
+            "optics", ("static",), ("CONTCAR", "CHGCAR")
+        ),
+    ),
+    "namd_preparation": (
+        PeriodicStageSpec("md"),
+        PeriodicStageSpec(
+            "snapshot", ("md",), ("CONTCAR", "XDATCAR")
+        ),
+    ),
+}
+
+
+def _validate_periodic_stage_graph(
+    profile_name: str, specs: tuple[PeriodicStageSpec, ...]
+) -> None:
+    names = [spec.name for spec in specs]
+    if len(names) != len(set(names)):
+        raise ValueError(f"stage graph for {profile_name!r} has duplicate stages")
+    by_name = {spec.name: spec for spec in specs}
+    for spec in specs:
+        for dependency in spec.depends_on:
+            if dependency not in by_name:
+                raise ValueError(
+                    f"stage graph for {profile_name!r} references missing "
+                    f"parent {dependency!r} from {spec.name!r}"
+                )
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            raise ValueError(
+                f"stage graph for {profile_name!r} contains a cycle at {name!r}"
+            )
+        visiting.add(name)
+        for dependency in by_name[name].depends_on:
+            visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+
+    for name in names:
+        visit(name)
+
+
+def periodic_stage_specs(profile_name: str) -> list[PeriodicStageSpec]:
+    """Return the validated stage DAG for one periodic VASP profile."""
+    profile = get_profile(profile_name)
+    specs = _PERIODIC_STAGE_GRAPHS.get(profile.name)
+    if specs is None:
+        raise ValueError(
+            f"no periodic stage dependency contract for profile {profile.name!r}"
+        )
+    if [spec.name for spec in specs] != profile.stages:
+        raise ValueError(
+            f"stage graph for {profile.name!r} does not match profile stages: "
+            f"graph={[spec.name for spec in specs]!r}, "
+            f"profile={profile.stages!r}"
+        )
+    _validate_periodic_stage_graph(profile.name, specs)
+    return list(specs)
 
 
 def profiles() -> list[VaspProfile]:

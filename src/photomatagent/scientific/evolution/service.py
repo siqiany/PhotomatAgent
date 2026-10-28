@@ -54,6 +54,7 @@ from photomatagent.scientific.evolution.models import (
     ExpertFeedbackDraft,
     ExpertFeedbackRecord,
     FeedbackCompilation,
+    QDBindingSnapshot,
     RevisionPlan,
     Sha256,
     StrategyArm,
@@ -598,6 +599,7 @@ class EvolutionService:
         capability_fingerprint: Sha256 | None = None,
         data_source_fingerprints: dict[str, Sha256] | None = None,
         owner_token: str | None = None,
+        qd_binding: QDBindingSnapshot | None = None,
     ) -> MutationResult[EpisodeRecord]:
         if mode == "IMPORTED_SESSION":
             raise InvalidEvolutionTransition("IMPORTED_SESSION requires historical import service")
@@ -613,6 +615,7 @@ class EvolutionService:
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
                 owner_token=owner_token,
+                qd_binding=qd_binding,
                 allow_imported=False,
             )
 
@@ -626,7 +629,7 @@ class EvolutionService:
                 transaction, task, mode="IMPORTED_SESSION", provider=None,
                 model=None, tool_surface_fingerprint=None,
                 capability_fingerprint=None, data_source_fingerprints={},
-                owner_token=owner_token, allow_imported=True,
+                owner_token=owner_token, qd_binding=None, allow_imported=True,
             )
 
     def claim_fresh_evaluation(
@@ -980,6 +983,7 @@ class EvolutionService:
         capability_fingerprint: Sha256 | None,
         data_source_fingerprints: dict[str, Sha256],
         owner_token: str | None,
+        qd_binding: QDBindingSnapshot | None,
         allow_imported: bool,
     ) -> MutationResult[EpisodeRecord]:
         evolution_id = task.evolution_id
@@ -1010,6 +1014,7 @@ class EvolutionService:
                 strategy_sha256,
                 strategy_cutoff_at,
                 owner_token,
+                qd_binding,
             )
             return MutationResult(existing, self._reservation_events(existing, initial))
         if task.status != required_status:
@@ -1043,6 +1048,7 @@ class EvolutionService:
             strategy_cutoff_at=strategy_cutoff_at,
             task_snapshot=task.model_dump(mode="json"),
             target_snapshot=TargetSnapshot.model_validate(task.target),
+            qd_binding=qd_binding,
             provider=provider,
             model=model,
             tool_surface_fingerprint=tool_surface_fingerprint,
@@ -1069,6 +1075,7 @@ class EvolutionService:
                 strategy_sha256,
                 strategy_cutoff_at,
                 owner_token,
+                qd_binding,
             )
             persisted = existing
         updated = task.model_copy(
@@ -1880,6 +1887,7 @@ class EvolutionService:
         tool_surface_fingerprint: Sha256 | None = None,
         capability_fingerprint: Sha256 | None = None,
         data_source_fingerprints: dict[str, Sha256] | None = None,
+        qd_binding: QDBindingSnapshot | None = None,
     ) -> IterationClaim:
         """Atomically verify the exact revision checkpoint and claim its episode."""
 
@@ -1904,6 +1912,7 @@ class EvolutionService:
                 capability_fingerprint=capability_fingerprint,
                 data_source_fingerprints=data_source_fingerprints or {},
                 owner_token=owner_token,
+                qd_binding=qd_binding,
                 allow_imported=False,
             )
             return IterationClaim(
@@ -2860,6 +2869,7 @@ class EvolutionService:
         strategy_sha256: Sha256 | None,
         strategy_cutoff_at: UtcDatetime | None,
         owner_token: str | None,
+        qd_binding: QDBindingSnapshot | None,
     ) -> None:
         expected_version = (
             task.current_version
@@ -2882,6 +2892,7 @@ class EvolutionService:
             or episode.strategy_sha256 != strategy_sha256
             or episode.strategy_cutoff_at != strategy_cutoff_at
             or episode.owner_token != owner_token
+            or episode.qd_binding != qd_binding
             or episode.parent_version != task.last_completed_version
             or episode.applied_feedback_id
             != (task.feedback_ids[-1] if task.feedback_ids else None)

@@ -91,9 +91,18 @@ def run_scientific_loop_cli(
     judge_model: str | None = None,
     judge_min_quality: float = 0.6,
     require_judge: bool = False,
+    judge_mode: str | None = None,
+    judge_max_calls: int | None = None,
+    judge_requested: bool = False,
     log_events: bool = True,
 ) -> int:
     console = Console()
+    if judge_mode not in (None, "off", "on_demand", "every_round"):
+        console.print("[red]--judge-mode must be off | on_demand | every_round[/]")
+        return 1
+    if require_judge and judge_mode == "off":
+        console.print("[red]REQUIRED_JUDGE_DISABLED: --require-judge cannot be used with --judge-mode off[/]")
+        return 1
     target = resolve_loop_target(goal=goal, target_json=target_json, demo=demo)
     config, created = _resolve_config(DotEnvConfig(workspace), provider, model)
     if created:
@@ -126,6 +135,9 @@ def run_scientific_loop_cli(
             min_confidence=min_confidence,
             judge_min_quality=judge_min_quality,
             require_judge=require_judge,
+            judge_mode=judge_mode,  # type: ignore[arg-type]
+            judge_max_calls=judge_max_calls,
+            judge_requested=judge_requested,
         ),
         judge=judge,
         event_sinks=sinks,

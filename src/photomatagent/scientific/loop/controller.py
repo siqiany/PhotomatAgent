@@ -20,6 +20,8 @@ BUDGET_EXHAUSTED (round/candidate caps).
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
 import time
 from collections.abc import AsyncIterator, Callable
 from uuid import uuid4
@@ -52,7 +54,13 @@ from photomatagent.scientific.loop.feedback import (
     build_feedback,
     format_feedback_for_model,
 )
-from photomatagent.scientific.loop.judge import JudgeReport, ScientificJudge
+from photomatagent.scientific.loop.judge import (
+    JudgeReport,
+    ScientificJudge,
+    build_judge_snapshot,
+)
+from photomatagent.scientific.loop.judge import JUDGE_PROMPT_VERSION, JUDGE_SCHEMA_VERSION
+from photomatagent.scientific.loop.judge_policy import JudgeMode, JudgePolicy
 from photomatagent.scientific.loop.policy import (
     ScientificLoopDecision,
     ScientificLoopPolicy,
@@ -75,6 +83,10 @@ class ScientificLoopConfig(BaseModel):
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     judge_min_quality: float = Field(default=0.6, ge=0.0, le=1.0)
     require_judge: bool = Field(default=False)
+    # None preserves the legacy every-round behavior for callers with old configs.
+    judge_mode: JudgeMode | None = None
+    judge_max_calls: int | None = Field(default=None, ge=0)
+    judge_requested: bool = False
 
 
 def format_loop_state_snapshot(
@@ -149,6 +161,7 @@ class ScientificLoopController:
         )
         self.candidate_extractor = candidate_extractor or extract_candidate_from_state
         self.judge = judge
+        self.judge_policy = self._new_judge_policy()
         self.event_sinks = list(event_sinks or [])
         self.session_id = session_id
         self.run_id: str | None = None
@@ -156,6 +169,16 @@ class ScientificLoopController:
         self.summary: ScientificLoopSummary | None = None
         self._projection_diagnostics: list[str] = []
         self._last_judge_report: JudgeReport | None = None
+
+    def _new_judge_policy(self) -> JudgePolicy:
+        effective_judge_mode = self.config.judge_mode or "every_round"
+        default_judge_calls = 1 if effective_judge_mode == "on_demand" else self.config.max_rounds
+        return JudgePolicy(
+            mode=effective_judge_mode,
+            require_judge=self.config.require_judge,
+            max_calls=(self.config.judge_max_calls if self.config.judge_max_calls is not None
+                       else default_judge_calls),
+        )
 
     # ------------------------------------------------------------------ #
     # public API
@@ -178,6 +201,7 @@ class ScientificLoopController:
         self.state = ScientificLoopState(target=self.target)
         self.summary = None
         self._projection_diagnostics = []
+        self.judge_policy = self._new_judge_policy()
         feedback: FeedbackSignal | None = None
         self.state.status = "RUNNING"
         dry_evidence_rounds = 0
@@ -208,6 +232,19 @@ class ScientificLoopController:
             instruction = self._round_instruction(effective_goal, feedback)
             async for event in self.runtime.run(instruction):
                 yield event
+            round_meta = self.runtime.last_run_meta
+            # Only a wait whose workflow is still active at round end exempts
+            # this round.  A wait observed earlier in the same round that has
+            # since reached a terminal state, a runtime that declared
+            # no_progress, or a runtime that exhausted its bounded diagnostic
+            # exploration does not mask later stagnation.
+            non_wait_terminations = {
+                "no_progress",
+                "diagnostic_budget_exhausted",
+            }
+            controlled_wait_observed = bool(
+                round_meta.get("controlled_wait_active")
+            ) and round_meta.get("termination_reason") not in non_wait_terminations
 
             scientific = self.runtime.scientific_state
             projected = self._extract_candidates(scientific, self.state.round)
@@ -231,13 +268,21 @@ class ScientificLoopController:
             evaluation = self.evaluator.evaluate(candidate, scientific)
             self.state.add_candidate(candidate, evaluation)
             if candidate is not None:
-                progress = progress_from_evaluation(
-                    candidate,
-                    evaluation,
-                    scientific,
-                )
-                self.stagnation.record(candidate, evaluation, progress=progress)
-                self.state.no_progress_rounds = self.stagnation.no_progress_rounds
+                if controlled_wait_observed:
+                    self.stagnation.record_controlled_wait()
+                    self.state.no_progress_rounds = 0
+                else:
+                    progress = progress_from_evaluation(
+                        candidate,
+                        evaluation,
+                        scientific,
+                    )
+                    self.stagnation.record(
+                        candidate, evaluation, progress=progress
+                    )
+                    self.state.no_progress_rounds = (
+                        self.stagnation.no_progress_rounds
+                    )
 
             yield await self._emit(
                 CandidateEvaluated(
@@ -388,10 +433,65 @@ class ScientificLoopController:
         changes a FAIL/UNKNOWN. Returns None when no judge is configured or
         there is no candidate to judge.
         """
-        if self.judge is None or candidate is None:
+        if candidate is None:
             return None
+        artifact_payload = build_judge_snapshot(
+            target=self.target,
+            candidate=candidate,
+            scientific=scientific,
+            evaluation=evaluation,
+            evidence_limit=self.judge.evidence_limit if self.judge else 24,
+        )
+        artifact_sha256 = hashlib.sha256(json.dumps(
+            artifact_payload, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        contract_sha256 = hashlib.sha256(json.dumps(
+            self.target.model_dump(mode="json"), sort_keys=True,
+            separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        provider = getattr(self.judge.model, "provider", "unknown") if self.judge else "unavailable"
+        model_name = getattr(self.judge.model, "model", "unknown") if self.judge else "unavailable"
+        deterministic_success = (
+            evaluation.verdict == "PASS"
+            and not evaluation.critical_evidence_gaps
+            and evaluation.confidence >= self.config.min_confidence
+        )
+        decision = self.judge_policy.decide(
+            artifact_sha256=artifact_sha256,
+            contract_sha256=contract_sha256,
+            provider=provider,
+            model=model_name,
+            prompt_version=JUDGE_PROMPT_VERSION,
+            schema_version=JUDGE_SCHEMA_VERSION,
+            user_requested=self.config.judge_requested,
+            non_machine_issue=self.target.metadata.get("non_machine_review") is True,
+            stagnated=self.stagnation.stalled,
+            required_success=deterministic_success,
+        )
+        if decision.cache_key is None:
+            return None
+        cached = self.judge_policy.cached(decision.cache_key)
+        if cached is not None:
+            if candidate.candidate_id:
+                cached.candidate_id = candidate.candidate_id
+            return cached
+        if not decision.call:
+            if decision.reason == "required_budget_exhausted":
+                return JudgeReport(
+                    status="UNAVAILABLE", provider=provider, model=model_name,
+                    error="judge call budget exhausted while required for SUCCESS",
+                )
+            return None
+        if self.judge is None:
+            report = JudgeReport(
+                status="UNAVAILABLE", provider=provider, model=model_name,
+                error="judge is required or triggered but no provider is configured",
+            )
+            self.judge_policy.remember(decision.cache_key, report)
+            return report
         try:
-            return await self.judge.assess(
+            report = await self.judge.assess(
                 target=self.target,
                 candidate=candidate,
                 scientific=scientific,
@@ -399,12 +499,14 @@ class ScientificLoopController:
                 round_number=self.state.round,
             )
         except Exception as exc:
-            return JudgeReport(
+            report = JudgeReport(
                 status="UNAVAILABLE",
                 provider=getattr(self.judge.model, "provider", "unknown"),
                 model=getattr(self.judge.model, "model", "unknown"),
                 error=f"judge failure must not break the loop: {type(exc).__name__}: {exc}",
             )
+        self.judge_policy.remember(decision.cache_key, report)
+        return report
 
     def _extract(self, scientific: ScientificState, round_number: int) -> CandidateState | None:
         return self.candidate_extractor(scientific, round_number)

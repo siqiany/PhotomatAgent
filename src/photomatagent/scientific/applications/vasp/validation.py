@@ -12,8 +12,10 @@ requires the vasprun.xml contract:
   appends when the SCF loop exits on convergence (conservative: when the
   marker is absent the run is reported as "cannot confirm", never as
   converged)
-* relax stages additionally require ionic convergence (early exit below
-  NSW, or the OUTCAR ``reached required accuracy`` marker)
+* relax stages additionally require an explicit trusted structural
+  convergence marker (the OUTCAR ``reached required accuracy`` text).  An
+  electronic ``EDIFF`` marker, a low ionic-step count, and ``NSW=0`` are not
+  accepted as proof that a relax run completed.
 
 ``parse_result`` extracts bounded values (final energy, dielectric
 spectrum summary) that enter ScientificEvidence.
@@ -21,6 +23,7 @@ spectrum summary) that enter ScientificEvidence.
 
 from __future__ import annotations
 
+import math
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -35,9 +38,21 @@ REQUIRED_VASP_RESULT_FILES = (
     "vasprun.xml",
     "OSZICAR",
 )
-_IONIC_STEP = re.compile(r"<i\s+name=\"ionic step\"[^>]*>")
-_NSW = re.compile(r"<i\s+name=\"NSW\"[^>]*>\s*(\d+)")
 
+_STAGE_REQUIRED_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    "md": ("XDATCAR",),
+    "snapshot": ("WAVECAR",),
+}
+
+
+def required_result_files(stage: str | None = None) -> tuple[str, ...]:
+    """Return the bounded download list for one execution stage.
+
+    Large stage-specific artifacts (WAVECAR/XDATCAR) are requested only for
+    the stage that actually validates them.
+    """
+    extra = _STAGE_REQUIRED_ARTIFACTS.get(str(stage or ""), ())
+    return tuple(dict.fromkeys((*REQUIRED_VASP_RESULT_FILES, *extra)))
 
 class VasprunCheck(BaseModel):
     """Outcome of one vasprun.xml validation pass."""
@@ -84,12 +99,7 @@ def check_vasprun(vasprun_path: str | Path) -> VasprunCheck:
     final_step = scsteps[-1]
     has_c = final_step.findall("c")
     has_v = final_step.findall("v")
-    # Ionic convergence: relaxation ends before NSW, or OUTCAR marker.
     outcar = path.parent / "OUTCAR"
-    final_text = ET.tostring(final, encoding="unicode")
-    nsw_match = _NSW.search(ET.tostring(root, encoding="unicode")[:50000])
-    ionic_steps = len(_IONIC_STEP.findall(final_text))
-    nsw: int | None = int(nsw_match.group(1)) if nsw_match else None
     outcar_marker = False
     electronic_outcar_marker = False
     if outcar.is_file():
@@ -98,9 +108,10 @@ def check_vasprun(vasprun_path: str | Path) -> VasprunCheck:
             "aborting loop because EDIFF is reached" in tail
             or "EDIFF was reached" in tail
         )
-        outcar_marker = (
-            "reached required accuracy" in tail or "EDIFF is reached" in tail
-        )
+        # Only this explicit structural convergence marker is trusted.  The
+        # electronic "EDIFF is reached" text says nothing about ionic
+        # relaxation, and neither does a low ionic-step count or NSW=0.
+        outcar_marker = "reached required accuracy" in tail
     if (has_c and has_v) or electronic_outcar_marker:
         check.electronic_converged = True
     else:
@@ -109,30 +120,124 @@ def check_vasprun(vasprun_path: str | Path) -> VasprunCheck:
             "electronic convergence marker not found in vasprun.xml or "
             "OUTCAR; SCF convergence cannot be confirmed"
         )
-    if outcar_marker:
-        check.ionic_converged = True
-    elif nsw is not None and nsw > 0 and ionic_steps < nsw:
-        check.ionic_converged = True
-    elif nsw is not None and nsw == 0:
-        check.ionic_converged = True  # static run: no ionic relaxation needed
-    else:
-        check.ionic_converged = None
+    check.ionic_converged = True if outcar_marker else None
     return check
 
 
-def validate_output(result_dir: str | Path, *, profile_name: str) -> list[str]:
-    """Return a list of validation problems (empty means acceptable)."""
+_VALIDATION_STAGES = frozenset(
+    {"relax", "static", "band", "dos", "optics", "md", "snapshot"}
+)
+
+
+def _validation_stage(profile_name: str, stage: str | None) -> str | None:
+    """Separate the scientific method profile from the execution stage.
+
+    Historical callers passed the stage name as ``profile_name`` (for example
+    ``profile_name="relax"``).  Preserve that contract only while it is
+    unambiguous.  New callers should pass ``stage`` explicitly, because
+    scientific profiles such as ``narrow_gap_soc`` do not select a stage.
+    """
+    if stage is not None and stage.strip():
+        return stage.strip()
+    if profile_name in _VALIDATION_STAGES:
+        return profile_name
+    return None
+
+
+def _nonfinite_total_energy_problem(directory: Path) -> str | None:
+    """Return an explicit problem if a parsed final total energy is not finite."""
+    try:
+        parsed = parse_result(directory)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return f"final total energy could not be parsed as a finite number: {exc}"
+    energy = parsed.get("final_energy_eV")
+    if isinstance(energy, (int, float)) and not math.isfinite(float(energy)):
+        return "final total energy is not finite"
+    return None
+
+
+def validate_output(
+    result_dir: str | Path,
+    *,
+    profile_name: str,
+    stage: str | None = None,
+) -> list[str]:
+    """Return a list of validation problems (empty means acceptable).
+
+    ``profile_name`` identifies the scientific method/parameters.  ``stage``
+    identifies the workflow stage whose requirements apply.  Passing a stage
+    explicitly is required for profiles whose names are not stage names.
+    """
     directory = Path(result_dir)
     problems: list[str] = []
     check = check_vasprun(directory / "vasprun.xml")
     problems.extend(check.reasons)
     if check.electronic_converged is False:
         problems.append("electronic SCF did not converge")
-    if profile_name == "relax" and check.ionic_converged is not True:
+    nonfinite = _nonfinite_total_energy_problem(directory)
+    if nonfinite is not None:
+        problems.append(nonfinite)
+
+    validation_stage = _validation_stage(profile_name, stage)
+    if validation_stage is None:
+        problems.append(
+            "validation stage is required when profile_name="
+            f"{profile_name!r} is not a stage name"
+        )
+        return problems
+    if validation_stage not in _VALIDATION_STAGES:
+        problems.append(f"unsupported validation stage: {validation_stage!r}")
+        return problems
+    if validation_stage == "relax" and check.ionic_converged is not True:
         problems.append("relax stage: ionic convergence cannot be confirmed")
-    if profile_name in {"band", "dos", "optics"} and not (directory / "CHGCAR").is_file():
-        problems.append(f"{profile_name} stage requires CHGCAR from the static run")
+    if validation_stage in {"band", "dos", "optics"} and not (
+        directory / "CHGCAR"
+    ).is_file():
+        problems.append(
+            f"{validation_stage} stage requires CHGCAR from the static run"
+        )
+    if validation_stage in {"md", "snapshot"}:
+        parsed = parse_result(directory)
+        if "final_energy_eV" not in parsed:
+            problems.append(
+                f"{validation_stage} stage requires a parsed final energy"
+            )
+        if validation_stage == "md" and not (directory / "XDATCAR").is_file():
+            problems.append("md stage requires XDATCAR from the MD trajectory")
+        if validation_stage == "snapshot" and not (directory / "WAVECAR").is_file():
+            problems.append("snapshot stage requires WAVECAR from the MD snapshot")
     return problems
+
+
+def parse_band_gap(
+    result_dir: str | Path,
+    *,
+    stage: str,
+    profile_name: str,
+) -> dict[str, Any]:
+    """Return a bounded band-gap evidence candidate or an explicit gap.
+
+    LIMITED (task 14): the repository has no fixed periodic SOC/noncollinear
+    band/static vasprun.xml sample against which the installed parser could be
+    validated for this project.  This function therefore never fabricates a
+    numeric gap.  It returns ``UNSUPPORTED`` with no value until such samples
+    exist; callers must keep the target property UNKNOWN.
+    """
+    return {
+        "property": "band_gap",
+        "status": "UNSUPPORTED",
+        "value_eV": None,
+        "unit": "eV",
+        "stage": stage,
+        "profile_name": profile_name,
+        "reason": "NO_APPLICABLE_FIXED_SOC_NONCOLLINEAR_BAND_SAMPLE",
+        "limitations": (
+            "No fixed periodic SOC/noncollinear band/static vasprun.xml sample "
+            "is present in the repository; pymatgen parsed an unrelated "
+            "molecular fixture only. Numeric band_gap evidence is not emitted."
+        ),
+        "result_dir": str(result_dir),
+    }
 
 
 def parse_result(result_dir: str | Path) -> dict[str, Any]:

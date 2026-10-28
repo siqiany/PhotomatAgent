@@ -211,3 +211,69 @@ def remote_copy_artifact_command(
         f"{_remote_path_expression(source_remote_directory + '/' + filename)} "
         f"{_remote_path_expression(destination_remote_directory + '/')}"
     )
+
+
+# Fixed, application-independent allow-list of staged input artifacts that may
+# be uploaded to a job directory and digest-verified there.  It intentionally
+# mirrors ``_REMOTE_COPY_ALLOWLIST``: both are closed sets of VASP artifacts,
+# never caller-supplied arbitrary paths or commands.
+REMOTE_INPUT_ALLOWLIST = frozenset(
+    {"POSCAR", "CONTCAR", "INCAR", "KPOINTS", "CHGCAR", "XDATCAR", "POTCAR"}
+)
+
+# Fixed, application-independent allow-list of diagnostic artifacts that may be
+# fetched from a *failed* job directory.  Diagnostics never become scientific
+# evidence, so this set is deliberately separate from the result contract.
+REMOTE_DIAGNOSTIC_ALLOWLIST = frozenset(
+    {
+        "OUTCAR",
+        "vasprun.xml",
+        "OSZICAR",
+        "vasp.out",
+        "vasp.err",
+        "slurm.out",
+        "slurm.err",
+    }
+)
+
+
+def remote_job_log_names(job_id: str) -> tuple[str, ...]:
+    """Return the bounded ``<job_id>.out`` / ``<job_id>.err`` names.
+
+    ``job_id`` must already be scheduler-validated (numeric) by the caller;
+    this helper re-checks it so no caller-supplied string can shape a remote
+    path or command.
+    """
+    if not job_id.isdigit():
+        raise ValueError(f"job id must be numeric, got {job_id!r}")
+    return (f"{job_id}.out", f"{job_id}.err")
+
+
+def is_remote_diagnostic_name(name: str, job_id: str) -> bool:
+    """True when ``name`` is an allow-listed diagnostic for ``job_id``."""
+    if name in REMOTE_DIAGNOSTIC_ALLOWLIST:
+        return True
+    try:
+        return name in remote_job_log_names(job_id)
+    except ValueError:
+        return False
+
+
+def remote_digest_command(
+    remote_directory: str, names: list[str]
+) -> str:
+    """Bound a ``sha256sum`` probe to an already allow-listed name set.
+
+    Only the fixed allow-listed filenames are ever interpolated, so no
+    caller-supplied string reaches the remote shell.  Unknown names are
+    dropped rather than quoted: verification of an unlisted artifact is a
+    contract error the caller must catch locally.
+    """
+    allowlisted = [name for name in names if name in REMOTE_INPUT_ALLOWLIST]
+    loop_names = " ".join(shlex.quote(name) for name in allowlisted)
+    return (
+        f"cd {_remote_path_expression(remote_directory)} 2>/dev/null && "
+        f'for f in {loop_names}; do [ -f "$f" ] && '
+        "printf '%s %s\\n' \"$f\" \"$(sha256sum \"$f\" | cut -d' ' -f1)\"; "
+        "done"
+    )

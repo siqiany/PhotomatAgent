@@ -22,6 +22,7 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
 )
+from photomatagent.scientific.state import ScientificReferenceUpdate
 from photomatagent.tools.base import Tool
 from photomatagent.tools.exposure import ToolExposure
 
@@ -54,6 +55,45 @@ class _UnifiedVaspTool(Tool):
 
     def __init__(self, service: UnifiedVaspService) -> None:
         self.service = service
+
+    def _workflow_reference_data(self, workflow_id: str) -> dict[str, Any]:
+        """Bounded stage-state reference from the authoritative manifest.
+
+        These fields make workflow observations comparable without making the
+        model-visible tool payload the execution ledger.
+        """
+        loader = getattr(self.service, "load_manifest", None)
+        if not callable(loader) or not workflow_id:
+            return {}
+        try:
+            manifest = loader(workflow_id)
+        except Exception:
+            return {}
+        stage_states = {
+            stage.name: stage.state.value for stage in manifest.stages
+        }
+        next_stage = ""
+        for stage in manifest.stages:
+            if stage_states.get(stage.name) == "VALIDATED":
+                continue
+            if all(
+                stage_states.get(dependency) == "VALIDATED"
+                for dependency in stage.depends_on
+            ):
+                next_stage = stage.name
+                break
+        return {
+            "workflow_state": manifest.state.value,
+            "stage_states": stage_states,
+            "next_stage": next_stage,
+        }
+
+    @staticmethod
+    def _merge_reference_data(
+        payload: dict[str, Any], reference: dict[str, Any]
+    ) -> None:
+        for key, value in reference.items():
+            payload.setdefault(key, value)
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -169,6 +209,9 @@ class VaspPlanTool(_UnifiedVaspTool):
             return _error(exc)
         payload = manifest.model_dump(mode="json")
         payload["ok"] = True
+        self._merge_reference_data(
+            payload, self._workflow_reference_data(manifest.workflow_id)
+        )
         return ScientificToolResult(output=_json(payload), data=payload)
 
 
@@ -215,9 +258,13 @@ class VaspPreflightTool(_UnifiedVaspTool):
             result = await self.service.preflight(workflow_id)
         except Exception as exc:
             return _error(exc)
+        payload = result.model_dump(mode="json")
+        self._merge_reference_data(
+            payload, self._workflow_reference_data(workflow_id)
+        )
         return ScientificToolResult(
-            output=_json(result.model_dump(mode="json")),
-            data=result.model_dump(mode="json"),
+            output=_json(payload),
+            data=payload,
             is_error=not result.ok,
         )
 
@@ -262,6 +309,9 @@ class VaspSubmitTool(_UnifiedVaspTool):
                 "round-trip) instead of polling vasp.status repeatedly; do "
                 "not run unrelated tools while the job runs"
             )
+        self._merge_reference_data(
+            payload, self._workflow_reference_data(parsed.workflow_id)
+        )
         return ScientificToolResult(
             output=_json(payload),
             data=payload,
@@ -287,9 +337,13 @@ class VaspStatusTool(_UnifiedVaspTool):
             result = await self.service.status(workflow_id)
         except Exception as exc:
             return _error(exc)
+        payload = result.model_dump(mode="json")
+        self._merge_reference_data(
+            payload, self._workflow_reference_data(workflow_id)
+        )
         return ScientificToolResult(
-            output=_json(result.model_dump(mode="json")),
-            data=result.model_dump(mode="json"),
+            output=_json(payload),
+            data=payload,
             is_error=not result.ok,
         )
 
@@ -433,11 +487,27 @@ class VaspCollectTool(_UnifiedVaspTool):
         payload = result.model_dump(mode="json")
         if not result.ok:
             payload["evidence_gaps"] = result.evidence_gaps or payload.get("errors", [])
+        self._merge_reference_data(
+            payload, self._workflow_reference_data(workflow_id)
+        )
+        evidence = list(result.evidence)
+        # A partial collect can be workflow-level NOT validated/failed while
+        # still carrying independently validated sub-stage evidence.  Preserve
+        # that evidence through the normal runtime validation path, but keep
+        # true failures (no validated evidence) as is_error.
+        is_error = not result.ok and not evidence
+        next_stage = str((result.data or {}).get("next_stage") or "")
+        reference = ScientificReferenceUpdate(
+            workflow_id=workflow_id,
+            next_stage=next_stage,
+            evidence_gaps=[str(gap) for gap in (result.evidence_gaps or [])],
+        )
         return ScientificToolResult(
             output=_json(payload),
             data=payload,
-            is_error=not result.ok,
-            evidence=result.evidence,
+            is_error=is_error,
+            evidence=evidence,
+            state_updates=[*evidence, reference],
         )
 
 

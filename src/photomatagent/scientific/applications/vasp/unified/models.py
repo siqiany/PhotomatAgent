@@ -68,6 +68,10 @@ class ScientificChange(BaseModel):
 class UnifiedStage(BaseModel):
     name: str
     depends_on: list[str] = Field(default_factory=list)
+    # Science/input contract metadata mirrored from
+    # profiles.periodic_stage_specs; execution wiring is performed later and
+    # never guessed from stage names.
+    required_outputs: list[str] = Field(default_factory=list)
     state: WorkflowState = WorkflowState.PLANNED
     resource_recommendation: ResourceRequest | None = None
     request_id: str | None = None

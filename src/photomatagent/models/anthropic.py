@@ -261,6 +261,13 @@ class AnthropicProvider:
             client = AsyncAnthropic(api_key=api_key)
         self._client = client
 
+    async def aclose(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         system, messages = anthropic_input(request.messages)
         mapper = AnthropicStreamMapper(self.model)

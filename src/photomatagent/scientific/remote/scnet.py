@@ -39,6 +39,7 @@ from photomatagent.scientific.remote.scheduler import (
     parse_sbatch_job_id,
     remote_cancel_command,
     remote_copy_artifact_command,
+    remote_digest_command,
     remote_jobs_by_name_command,
     remote_ls_command,
     remote_mkdir_command,
@@ -442,6 +443,35 @@ class SCNetBackend:
             else:
                 present.add(name)
         return [name for name in names if name not in present]
+
+    async def verify_remote_input_digests(
+        self, remote_directory: str, digests: dict[str, str]
+    ) -> dict[str, str]:
+        """Return the authorized inputs whose remote bytes do not match.
+
+        A single bounded, read-only ``sha256sum`` probe over the already
+        allow-listed filenames.  Anything the probe cannot confirm -- a
+        failed listing, an unreachable host, a missing file -- is reported as
+        a mismatch so the caller refuses to sbatch on unverified inputs.
+        """
+        validate_remote_path(remote_directory)
+        names = sorted(digests)
+        result = await self._run_ssh(remote_digest_command(remote_directory, names))
+        if not result.ok:
+            return {name: "remote digest probe failed" for name in names}
+        observed: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                observed[parts[0].lstrip("./")] = parts[1]
+        mismatched: dict[str, str] = {}
+        for name, expected in digests.items():
+            actual = observed.get(name)
+            if actual is None:
+                mismatched[name] = "remote file missing or unreadable"
+            elif actual != expected:
+                mismatched[name] = actual
+        return mismatched
 
     async def upload_files(
         self, local_paths: list[Path], remote_directory: str

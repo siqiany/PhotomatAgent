@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import uuid
 import hashlib
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any, cast
 
 from photomatagent.scientific.applications.vasp.application import VaspApplication
-from photomatagent.scientific.applications.vasp.profiles import get_profile
+from photomatagent.scientific.applications.vasp.profiles import (
+    get_profile,
+    periodic_stage_specs,
+)
 from photomatagent.scientific.applications.vasp.unified.executors import (
     CollectionResult,
     OperationResult,
@@ -23,6 +27,7 @@ from photomatagent.scientific.applications.vasp.unified.models import (
     ReportRequest,
     UnifiedStage,
     UnifiedVaspManifest,
+    WorkflowState,
 )
 from photomatagent.scientific.applications.vasp.unified.fingerprints import execution_fingerprint
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
@@ -47,6 +52,7 @@ from photomatagent.scientific.remote.models import (
 from photomatagent.scientific.remote.registry import (
     JobLifecycleState,
     JobRegistry,
+    canonical_input_hash,
     derive_request_id,
 )
 from photomatagent.workspace import Workspace
@@ -100,6 +106,54 @@ class PeriodicVaspExecutor:
         structure = self._workspace_path(spec.structure_path)
         output_dir = self._stage_root(manifest)
         self._revalidate_application_paths(manifest, output_dir)
+        if any(
+            isinstance((stage.attempt_inputs or {}).get("staged_input_sha256"), dict)
+            and bool((stage.attempt_inputs or {}).get("staged_input_sha256"))
+            for stage in manifest.stages
+        ):
+            # A workflow can be prepared twice during recovery/resume.  Never
+            # regenerate the whole input tree after any stage has an
+            # authorized staged-input hash; that would overwrite the exact
+            # bytes represented by the execution fingerprint.
+            stages: list[dict[str, Any]] = []
+            for stage in manifest.stages:
+                expected = (stage.attempt_inputs or {}).get(
+                    "staged_input_sha256"
+                )
+                existing = self._existing_stage_dir(manifest, stage)
+                if isinstance(expected, dict) and expected:
+                    if existing is None:
+                        raise ValueError(
+                            f"authorized stage {stage.name!r} inputs are missing; "
+                            "refusing to regenerate and overwrite the binding"
+                        )
+                    errors = self._verify_authorized_inputs(existing, stage)
+                    if errors:
+                        raise ValueError(
+                            f"authorized stage {stage.name!r} inputs changed; "
+                            "refusing to overwrite: " + "; ".join(errors)
+                        )
+                    stages.append(
+                        {"stage": stage.name, "directory": str(existing)}
+                    )
+                else:
+                    directory = self._prepare_stage_dir(manifest, stage)
+                    stages.append(
+                        {"stage": stage.name, "directory": str(directory)}
+                    )
+            self._revalidate_application_paths(manifest, output_dir)
+            profile = get_profile(spec.profile)
+            return {
+                "profile": profile.name,
+                "soc": profile.soc,
+                "executable": profile.executable,
+                "stages": stages,
+                "potcar_policy": "POTCAR resolved at submit time; never committed",
+                "notes": [
+                    "bound stage directories were preserved; only unbound "
+                    "stage directories were generated"
+                ],
+            }
         data = self.application.prepare_inputs(
             structure_path=structure,
             profile_name=spec.profile,
@@ -126,11 +180,299 @@ class PeriodicVaspExecutor:
     def _stage_dir(
         self, manifest: UnifiedVaspManifest, stage: UnifiedStage
     ) -> Path | None:
-        data = self._prepare_data(manifest)
-        for item in data.get("stages", []):
-            if item.get("stage") == stage.name:
-                return Path(item["directory"])
+        existing = self._existing_stage_dir(manifest, stage)
+        expected = (stage.attempt_inputs or {}).get("staged_input_sha256")
+        if existing is not None and isinstance(expected, dict) and expected:
+            return existing
+        try:
+            return self._prepare_stage_dir(manifest, stage)
+        except Exception:
+            return None
+
+    def _prepare_stage_dir(
+        self, manifest: UnifiedVaspManifest, stage: UnifiedStage
+    ) -> Path:
+        """Generate only the requested stage directory.
+
+        ``_prepare_data`` generates the complete input tree.  Rewriting every
+        stage there would overwrite already-bound downstream inputs (for
+        example static's POSCAR) when a later stage is prepared.  This helper
+        keeps preparation stage-local and leaves previously bound directories
+        byte-for-byte untouched.
+        """
+        spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
+        profile = get_profile(spec.profile)
+        structure = self._workspace_path(spec.structure_path)
+        problems = self.application.validate_inputs(structure, spec.profile)
+        if problems:
+            raise ValueError("; ".join(problems))
+        root = self._stage_root(manifest)
+        for index, stage_spec in enumerate(
+            periodic_stage_specs(spec.profile), start=1
+        ):
+            if stage_spec.name != stage.name:
+                continue
+            output = root / f"{index:02d}_{stage.name}"
+            self._revalidate_application_paths(manifest, output)
+            self.application.generator.generate_stage(
+                structure_path=structure,
+                profile=profile,
+                stage=stage.name,
+                output_dir=output,
+                spec_overrides=dict(spec.scientific_overrides),
+            )
+            self._revalidate_application_paths(manifest, output)
+            return output
+        raise ValueError(f"stage {stage.name!r} is not part of profile {spec.profile!r}")
+
+    def _required_upload_inputs(
+        self,
+        manifest: UnifiedVaspManifest,
+        stage: UnifiedStage,
+        stage_dir: Path,
+    ) -> tuple[dict[str, str], list[str]]:
+        """Map the stage authorization onto the files the job must receive.
+
+        Only artifacts that this stage actually depends on -- its upstream
+        ``required_outputs`` that are not ordinary VASP inputs -- are bound
+        here.  Ordinary POSCAR/INCAR/KPOINTS/POTCAR staging keeps its
+        existing separate policy so the upload set never silently grows.
+        """
+        from photomatagent.scientific.remote.scheduler import (
+            REMOTE_INPUT_ALLOWLIST,
+        )
+
+        expected = (stage.attempt_inputs or {}).get("staged_input_sha256")
+        if not isinstance(expected, dict) or not expected:
+            return {}, []
+        upstream_names = set(self._stage_required_outputs(manifest, stage))
+        if not upstream_names:
+            return {}, []
+        selected: dict[str, str] = {}
+        errors: list[str] = []
+        for name in sorted(upstream_names):
+            if name in {"POSCAR", "INCAR", "KPOINTS", "CONTCAR", "POTCAR.meta"}:
+                # CONTCAR is materialized as this stage's POSCAR (already
+                # bound under "POSCAR" above); uploading it again would ship
+                # an unrequested duplicate under a second name.
+                continue
+            if name not in REMOTE_INPUT_ALLOWLIST:
+                errors.append(
+                    f"upstream artifact {name!r} is not an uploadable VASP "
+                    "input; refusing to submit an incomplete stage"
+                )
+                continue
+            digest = expected.get(name)
+            if not isinstance(digest, str) or len(digest) != 64:
+                errors.append(
+                    f"upstream artifact {name!r} is required by stage "
+                    f"{stage.name!r} but is not bound in the authorized "
+                    "inputs; re-prepare and re-approve the stage"
+                )
+                continue
+            path = stage_dir / name
+            if path.is_symlink() or not path.is_file():
+                errors.append(
+                    f"authorized upstream artifact {name!r} is missing or "
+                    "symlinked in the stage directory"
+                )
+                continue
+            if _sha256_file(path) != digest:
+                errors.append(
+                    f"authorized upstream artifact {name!r} changed after "
+                    "approval"
+                )
+                continue
+            selected[name] = digest
+        return selected, errors
+
+    def _stage_required_outputs(
+        self, manifest: UnifiedVaspManifest, stage: UnifiedStage
+    ) -> tuple[str, ...]:
+        """Required upstream artifacts for one stage.
+
+        The manifest's explicit ``required_outputs`` wins; it is populated
+        from the same profile DAG, and this fallback keeps stages built
+        without explicit outputs upload-correct instead of silently empty.
+        """
+        if stage.required_outputs:
+            return tuple(stage.required_outputs)
+        spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
+        for stage_spec in periodic_stage_specs(spec.profile):
+            if stage_spec.name == stage.name:
+                return tuple(stage_spec.required_outputs)
+        return ()
+
+    def _existing_stage_dir(
+        self, manifest: UnifiedVaspManifest, stage: UnifiedStage
+    ) -> Path | None:
+        """Locate an already-generated stage directory without rewriting it."""
+        profile = cast(PeriodicScientificSpec, manifest.scientific_spec).profile
+        root = self._stage_root(manifest)
+        for index, stage_spec in enumerate(
+            periodic_stage_specs(profile), start=1
+        ):
+            if stage_spec.name == stage.name:
+                candidate = root / f"{index:02d}_{stage.name}"
+                return candidate if candidate.is_dir() else None
         return None
+
+    def _staged_input_hashes(self, stage_dir: Path) -> dict[str, str]:
+        hashes: dict[str, str] = {}
+        for name in ("POSCAR", "INCAR", "KPOINTS", "CHGCAR", "XDATCAR"):
+            path = stage_dir / name
+            if path.is_file() and not path.is_symlink():
+                hashes[name] = _sha256_file(path)
+        return hashes
+
+    def _verify_authorized_inputs(
+        self,
+        stage_dir: Path,
+        stage: UnifiedStage,
+    ) -> list[str]:
+        """Verify staged inputs against the execution identity already bound."""
+        expected = stage.attempt_inputs or {}
+        expected_files = expected.get("staged_input_sha256")
+        if not isinstance(expected_files, dict) or not expected_files:
+            return []
+        errors: list[str] = []
+        for name, digest in expected_files.items():
+            path = stage_dir / str(name)
+            if path.is_symlink() or not path.is_file():
+                errors.append(f"authorized input {name!r} is missing or symlinked")
+            elif _sha256_file(path) != str(digest):
+                errors.append(f"authorized input {name!r} changed after approval")
+        expected_directory = expected.get("input_directory_sha256")
+        if isinstance(expected_directory, str) and expected_directory:
+            current = canonical_input_hash(stage_dir)
+            if current != expected_directory:
+                errors.append(
+                    "execution input directory changed after approval; "
+                    "a new authorization is required"
+                )
+        return errors
+
+    async def prepare_stage_inputs(
+        self, manifest: UnifiedVaspManifest, stage: UnifiedStage
+    ) -> OperationResult:
+        """Materialize deterministic local inputs for one stage.
+
+        Upstream artifacts are copied only from already-VALIDATED stages in
+        this workflow.  The returned ``attempt_inputs`` binds every source and
+        destination hash into the execution fingerprint.
+        """
+        spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
+        stage_spec = next(
+            (
+                item
+                for item in periodic_stage_specs(spec.profile)
+                if item.name == stage.name
+            ),
+            None,
+        )
+        if stage_spec is None:
+            return OperationResult(
+                ok=False,
+                errors=[f"stage {stage.name!r} is not part of profile {spec.profile!r}"],
+            )
+
+        expected = stage.attempt_inputs or {}
+        expected_files = expected.get("staged_input_sha256")
+        stage_dir = self._existing_stage_dir(manifest, stage)
+        if isinstance(expected_files, dict) and expected_files:
+            if stage_dir is None:
+                return OperationResult(
+                    ok=False,
+                    errors=[
+                        "authorized stage inputs are missing; re-prepare the "
+                        "workflow and authorize a new execution identity"
+                    ],
+                )
+            errors = self._verify_authorized_inputs(stage_dir, stage)
+            if errors:
+                return OperationResult(ok=False, errors=errors)
+            return OperationResult(
+                ok=True,
+                data={"directory": str(stage_dir), "attempt_inputs": {}},
+            )
+
+        # First authorization pass: generate only this stage directory, then
+        # stage the upstream outputs.  Never regenerate sibling stage dirs.
+        try:
+            stage_dir = self._prepare_stage_dir(manifest, stage)
+        except Exception as exc:
+            return OperationResult(
+                ok=False,
+                errors=[f"{type(exc).__name__}: {exc}"],
+            )
+        upstream_artifacts: list[dict[str, Any]] = []
+        try:
+            workspace = Workspace(self.application.workspace)
+            for dependency in stage_spec.depends_on:
+                upstream = next(
+                    (item for item in manifest.stages if item.name == dependency),
+                    None,
+                )
+                if upstream is None:
+                    raise ValueError(f"required upstream stage {dependency!r} is missing")
+                if upstream.state is not WorkflowState.VALIDATED:
+                    raise ValueError(
+                        f"required upstream stage {dependency!r} is "
+                        f"{upstream.state.value}, not VALIDATED"
+                    )
+                upstream_dir = self._managed_workflow_path(
+                    "results", manifest.workflow_id, upstream.name
+                )
+                revalidate_managed_vasp_path(workspace, upstream_dir)
+                if upstream_dir.is_symlink() or not upstream_dir.is_dir():
+                    raise ValueError(
+                        f"validated upstream results for {dependency!r} are absent"
+                    )
+                request_id = self._request_id(manifest, upstream)
+                for artifact in stage_spec.required_outputs:
+                    source = upstream_dir / artifact
+                    if source.is_symlink() or not source.is_file():
+                        raise ValueError(
+                            f"required upstream artifact {artifact!r} from "
+                            f"{dependency!r} is missing or symlinked"
+                        )
+                    try:
+                        source.relative_to(workspace.root)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"upstream artifact {source} is outside the workspace"
+                        ) from exc
+                    destination_name = "POSCAR" if artifact == "CONTCAR" else artifact
+                    destination = stage_dir / destination_name
+                    shutil.copy2(source, destination)
+                    source_digest = _sha256_file(source)
+                    destination_digest = _sha256_file(destination)
+                    upstream_artifacts.append(
+                        {
+                            "source_stage": dependency,
+                            "source_request_id": request_id,
+                            "artifact": artifact,
+                            "destination": destination_name,
+                            "source_sha256": source_digest,
+                            "destination_sha256": destination_digest,
+                        }
+                    )
+        except Exception as exc:
+            return OperationResult(
+                ok=False,
+                errors=[f"{type(exc).__name__}: {exc}"],
+                evidence_gaps=["upstream artifact staging was blocked"],
+            )
+
+        attempt_inputs = {
+            "input_directory_sha256": canonical_input_hash(stage_dir),
+            "staged_input_sha256": self._staged_input_hashes(stage_dir),
+            "upstream_artifacts": upstream_artifacts,
+        }
+        return OperationResult(
+            ok=True,
+            data={"directory": str(stage_dir), "attempt_inputs": attempt_inputs},
+        )
 
     def _request_id(
         self, manifest: UnifiedVaspManifest, stage: UnifiedStage
@@ -211,12 +553,16 @@ class PeriodicVaspExecutor:
         if not symbols:
             return []
         try:
-            stage_dirs = self._prepare_data(manifest).get("stages", [])
+            directory = self._existing_stage_dir(manifest, manifest.stages[0])
+            if directory is None:
+                stage_dirs = self._prepare_data(manifest).get("stages", [])
+                if not stage_dirs:
+                    return [
+                        "no stage input directories prepared; run vasp.prepare first"
+                    ]
+                directory = Path(stage_dirs[0]["directory"])
         except Exception as exc:
             return [f"{type(exc).__name__}: {exc}"]
-        if not stage_dirs:
-            return ["no stage input directories prepared; run vasp.prepare first"]
-        directory = Path(stage_dirs[0]["directory"])
         if self.application.resolve_potcar(directory) is not None:
             return []
         if self.application.remote_psp_dir:
@@ -263,16 +609,31 @@ class PeriodicVaspExecutor:
                 JobLifecycleState.CANCELLED,
             }
         )
-        stage_dir = self._stage_dir(manifest, stage)
-        if stage_dir is None:
+        prepared_inputs = await self.prepare_stage_inputs(manifest, stage)
+        if not prepared_inputs.ok:
             return SubmissionResult(
                 ok=False,
                 request_id=request_id,
                 submitted=False,
-                errors=[f"stage {stage.name} was not prepared"],
+                errors=prepared_inputs.errors,
+                evidence_gaps=prepared_inputs.evidence_gaps,
             )
+        stage_dir = Path(str(prepared_inputs.data["directory"]))
         spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
         profile = get_profile(spec.profile)
+        # The exact bytes authorized for this execution identity must be the
+        # bytes that reach the cluster.  An approved list that cannot be
+        # satisfied locally is a hard stop, not a silent partial upload.
+        authorized_inputs, authorization_errors = self._required_upload_inputs(
+            manifest, stage, stage_dir
+        )
+        if authorization_errors:
+            return SubmissionResult(
+                ok=False,
+                request_id=request_id,
+                submitted=False,
+                errors=authorization_errors,
+            )
         symbols = self.application._potcar_symbols(stage_dir)
         local_potcar = self.application.resolve_potcar(stage_dir)
         potcar_mode = "local" if local_potcar is not None else (
@@ -333,6 +694,7 @@ class PeriodicVaspExecutor:
                 potcar_mode=potcar_mode,
                 potcar_symbols=symbols,
                 remote_psp_dir=self.application.remote_psp_dir,
+                required_input_sha256=authorized_inputs,
             )
         except Exception as exc:
             return SubmissionResult(
@@ -413,15 +775,129 @@ class PeriodicVaspExecutor:
             data={"reconciled": True},
         )
 
+    @staticmethod
+    def _record_scheduler_state(record: Any) -> HPCJobState:
+        """Return the observed scheduler enum, never a default SUBMITTED."""
+        scheduler_state = getattr(record, "scheduler_state", None)
+        if isinstance(scheduler_state, HPCJobState):
+            return scheduler_state
+        state = getattr(record, "state", None)
+        if state in {
+            JobLifecycleState.COMPLETED,
+            JobLifecycleState.COLLECTED,
+            JobLifecycleState.VALIDATED,
+        }:
+            return HPCJobState.COMPLETED
+        if isinstance(state, JobLifecycleState):
+            return HPCJobState(state.value)
+        try:
+            return HPCJobState(str(state))
+        except (TypeError, ValueError):
+            return HPCJobState.UNKNOWN
+
+    @staticmethod
+    def _next_stage_from_states(
+        manifest: UnifiedVaspManifest,
+        stage_states: dict[str, str],
+    ) -> str | None:
+        for stage in manifest.stages:
+            if stage_states.get(stage.name) == "VALIDATED":
+                continue
+            if all(
+                stage_states.get(dependency) == "VALIDATED"
+                for dependency in stage.depends_on
+            ):
+                return stage.name
+        return None
+
     async def collect(self, manifest: UnifiedVaspManifest) -> CollectionResult:
-        evidence_gaps: list[str] = []
+        stage_states: dict[str, str] = {}
+        pending_stages: list[str] = []
+        validated_stages: list[str] = []
         evidence: list[ScientificEvidence] = []
+        evidence_gaps: list[str] = []
+        errors: list[str] = []
+        diagnostics: list[dict[str, Any]] = []
+
         for stage in manifest.stages:
             rid = self._request_id(manifest, stage)
             record = self.session.registry.get(rid)
             if record is None or record.job_id is None:
-                evidence_gaps.append(f"{stage.name}: no job_id in registry")
+                stage_states[stage.name] = "NOT_FOUND"
+                pending_stages.append(stage.name)
+                evidence_gaps.append(
+                    f"{stage.name}: no job_id in registry; not submitted"
+                )
                 continue
+
+            # Production JobRecords always carry ``state``.  A minimal test
+            # surrogate may omit it; such a record already has a job_id, so
+            # collection proceeds through the normal application validation
+            # path instead of being classed as unsubmitted.
+            record_state = getattr(record, "state", None)
+
+            if record_state is not None and record_state in {
+                JobLifecycleState.FAILED,
+                JobLifecycleState.TIMEOUT,
+                JobLifecycleState.OUT_OF_MEMORY,
+                JobLifecycleState.CANCELLED,
+            }:
+                message = (
+                    f"{stage.name}: scheduler state {record_state.value}; "
+                    "no result evidence was produced"
+                )
+                stage_states[stage.name] = record_state.value
+                errors.append(message)
+                evidence_gaps.append(message)
+                diagnostics.append(
+                    await self._collect_stage_diagnostics(
+                        manifest, stage, record, record_state.value
+                    )
+                )
+                continue
+
+            if record_state is JobLifecycleState.UNKNOWN_RECONCILIATION_REQUIRED:
+                message = (
+                    f"{stage.name}: {record_state.value}; reconcile required "
+                    "before collection"
+                )
+                stage_states[stage.name] = record_state.value
+                pending_stages.append(stage.name)
+                evidence_gaps.append(message)
+                continue
+
+            if record_state in {
+                JobLifecycleState.PREPARED,
+                JobLifecycleState.PREFLIGHT_PASSED,
+                JobLifecycleState.SUBMITTING,
+                JobLifecycleState.SUBMITTED,
+                JobLifecycleState.PENDING,
+                JobLifecycleState.RUNNING,
+            }:
+                stage_states[stage.name] = record_state.value
+                pending_stages.append(stage.name)
+                evidence_gaps.append(
+                    f"{stage.name}: {record_state.value}; result is not ready "
+                    "to collect"
+                )
+                continue
+
+            if record_state is not None and record_state not in {
+                JobLifecycleState.COMPLETED,
+                JobLifecycleState.COLLECTED,
+                JobLifecycleState.VALIDATED,
+            }:
+                # Unknown lifecycle values are reconciliation ambiguities, not
+                # scheduler success and not missing/unsubmitted stages.
+                stage_states[stage.name] = record_state.value
+                pending_stages.append(stage.name)
+                evidence_gaps.append(
+                    f"{stage.name}: unrecognized lifecycle state "
+                    f"{record_state.value!r}; reconcile required"
+                )
+                continue
+
+            scheduler_state = self._record_scheduler_state(record)
             local_dir = self._managed_workflow_path(
                 "results", manifest.workflow_id, stage.name
             )
@@ -433,21 +909,45 @@ class PeriodicVaspExecutor:
                         application="vasp",
                         job_id=record.job_id,
                         remote_directory=record.remote_directory or "",
+                        state=scheduler_state,
                     ),
                     local_dir=local_dir,
                     profile_name=cast(
                         PeriodicScientificSpec, manifest.scientific_spec
                     ).profile,
+                    stage=stage.name,
                 )
                 self._revalidate_application_paths(manifest, local_dir)
             except Exception as exc:
-                evidence_gaps.append(f"{stage.name}: {type(exc).__name__}: {exc}")
+                message = f"{stage.name}: {type(exc).__name__}: {exc}"
+                stage_states[stage.name] = "UNKNOWN"
+                errors.append(message)
+                evidence_gaps.append(message)
                 continue
+
             if not report.get("scientifically_valid", False):
-                evidence_gaps.append(
-                    f"{stage.name}: " + "; ".join(report.get("validation_problems", []))
+                problems = [
+                    str(problem)
+                    for problem in report.get("validation_problems", [])
+                ]
+                message = f"{stage.name}: " + (
+                    "; ".join(problems) if problems else "validation failed"
+                )
+                stage_states[stage.name] = "VALIDATION_FAILED"
+                evidence_gaps.append(message)
+                self.session.mark_result_state(
+                    rid, collected=True, validated=False, error=message
+                )
+                diagnostics.append(
+                    await self._collect_stage_diagnostics(
+                        manifest,
+                        stage,
+                        record,
+                        "VALIDATION_FAILED",
+                    )
                 )
                 continue
+
             spec = cast(PeriodicScientificSpec, manifest.scientific_spec)
             try:
                 parent_path = self._workspace_path(spec.structure_path)
@@ -457,18 +957,30 @@ class PeriodicVaspExecutor:
                 structure_path = _trusted_result_structure(local_dir)
                 structure = _load_trusted_structure(structure_path)
             except Exception as exc:
-                evidence_gaps.append(
+                message = (
                     f"{stage.name}: trusted structure scope unavailable: "
                     f"{type(exc).__name__}: {exc}"
                 )
+                stage_states[stage.name] = "VALIDATION_FAILED"
+                evidence_gaps.append(message)
+                self.session.mark_result_state(
+                    rid, collected=True, validated=False, error=message
+                )
                 continue
+
             parsed = report.get("parsed", {})
             energy = parsed.get("final_energy_eV") if isinstance(parsed, dict) else None
             if not isinstance(energy, (int, float)) or isinstance(energy, bool):
-                evidence_gaps.append(
+                message = (
                     f"{stage.name}: validated result has no parsed total energy"
                 )
+                stage_states[stage.name] = "VALIDATION_FAILED"
+                evidence_gaps.append(message)
+                self.session.mark_result_state(
+                    rid, collected=True, validated=False, error=message
+                )
                 continue
+
             digest = structure_hash(structure)
             input_sha256 = _sha256_file(structure_path)
             parent_candidate_id = (
@@ -477,15 +989,34 @@ class PeriodicVaspExecutor:
                 else None
             )
             parent_structure_hash = parent_digest if parent_candidate_id else None
+            # Stable identity: a re-collection of the same request/stage/output
+            # must be idempotent, while a changed output or property creates a
+            # new evidence identity instead of hiding the change behind the old
+            # record.
+            evidence_identity = "|".join(
+                [
+                    manifest.workflow_id,
+                    stage.name,
+                    rid,
+                    "total_energy",
+                    f"{float(energy):.12g}",
+                    digest,
+                    input_sha256,
+                ]
+            )
+            evidence_id = (
+                "sev_" + hashlib.sha256(evidence_identity.encode("utf-8")).hexdigest()[:12]
+            )
             evidence.append(
                 ScientificEvidence(
+                    id=evidence_id,
                     subject=structure.composition.reduced_formula,
                     property="total_energy",
                     value=float(energy),
                     unit="eV",
                     source="SCNet VASP calculation",
                     source_type="dft_calculation",
-                    method=f"VASP (profile={spec.profile})",
+                    method=f"VASP (profile={spec.profile}, stage={stage.name})",
                     fidelity="dft",
                     candidate_id=f"cand_{digest[:24]}",
                     structure_hash=digest,
@@ -501,6 +1032,11 @@ class PeriodicVaspExecutor:
                         "job_id": record.job_id,
                         "profile": spec.profile,
                         "scheduler_state": report.get("scheduler_state"),
+                        "job_lifecycle_state": (
+                            record_state.value
+                            if isinstance(record_state, JobLifecycleState)
+                            else getattr(record, "state", None)
+                        ),
                         "input_structure_path": str(structure_path),
                         "input_sha256": input_sha256,
                         "output_sha256": input_sha256,
@@ -511,19 +1047,150 @@ class PeriodicVaspExecutor:
                     },
                 )
             )
+            stage_states[stage.name] = "VALIDATED"
+            validated_stages.append(stage.name)
             self.session.mark_result_state(
                 rid, collected=True, validated=True, evidence=len(evidence)
             )
+
+        validated = bool(manifest.stages) and not errors and all(
+            stage_states.get(stage.name) == "VALIDATED"
+            for stage in manifest.stages
+        )
+        next_stage = self._next_stage_from_states(manifest, stage_states)
+        data: dict[str, Any] = {
+            "pending_stages": pending_stages,
+            "validated_stages": validated_stages,
+        }
+        if any(stage.name in {"band", "dos"} for stage in manifest.stages):
+            data["unsupported_property_gaps"] = {
+                "band_gap": (
+                    "UNSUPPORTED: no fixed periodic SOC/noncollinear "
+                    "band/static sample is available; no numeric band_gap "
+                    "evidence is emitted (task 14 LIMITED)"
+                )
+            }
+        if next_stage is not None:
+            data["next_stage"] = next_stage
+        if errors:
+            data["blocked_reason"] = "; ".join(errors)
+        elif pending_stages:
+            data["blocked_reason"] = "pending: " + ", ".join(pending_stages)
+        if diagnostics:
+            data["diagnostics"] = diagnostics
+            data["next_action"] = _diagnostic_next_action(diagnostics)
         return CollectionResult(
-            ok=not evidence_gaps,
-            validated=not evidence_gaps,
+            ok=not errors,
+            validated=validated,
             evidence=evidence,
             evidence_gaps=evidence_gaps,
+            errors=errors,
+            stage_states=stage_states,
+            data=data,
         )
+
+    async def _collect_stage_diagnostics(
+        self,
+        manifest: UnifiedVaspManifest,
+        stage: UnifiedStage,
+        record: Any,
+        stage_state: str,
+    ) -> dict[str, Any]:
+        """Gather bounded failure diagnostics for one non-validated stage.
+
+        Diagnostics are explicitly separated from scientific evidence: they
+        never enter ``evidence``, never change the scheduler/lifecycle state,
+        never trigger a resubmit, and a missing or unreadable log is reported
+        as a typed gap instead of being inferred from error text.
+        """
+        job_id = str(getattr(record, "job_id", "") or "")
+        remote_directory = getattr(record, "remote_directory", None)
+        base: dict[str, Any] = {
+            "stage": stage.name,
+            "request_id": getattr(record, "request_id", None),
+            "job_id": job_id,
+            "stage_state": stage_state,
+            "scheduler_state": self._record_scheduler_state(record).value
+            if record is not None
+            else "UNKNOWN",
+            "remote_directory": remote_directory,
+            "diagnostic_status": "UNAVAILABLE",
+            "artifacts": [],
+            "missing_artifacts": [],
+            "diagnostic_gaps": [],
+        }
+        if not job_id or not remote_directory:
+            base["diagnostic_gaps"].append(
+                "no confirmed job id / remote directory; failure logs are "
+                "not addressable from the local registry"
+            )
+            return base
+        diagnostic_dir = self._managed_workflow_path(
+            "diagnostics", manifest.workflow_id, stage.name
+        )
+        try:
+            revalidate_managed_vasp_path(
+                Workspace(self.application.workspace), diagnostic_dir
+            )
+            report = await self.application.collect_diagnostics(
+                job_ref=RemoteJobRef(
+                    backend="scnet",
+                    application="vasp",
+                    job_id=job_id,
+                    remote_directory=remote_directory,
+                    state=self._record_scheduler_state(record),
+                ),
+                local_dir=diagnostic_dir,
+                diagnostic_dir=diagnostic_dir,
+            )
+        except Exception as exc:
+            base["diagnostic_status"] = "QUERY_FAILED"
+            base["diagnostic_gaps"].append(
+                f"diagnostic collection failed: {type(exc).__name__}: {exc}"
+            )
+            return base
+        # ``requested`` travels with the gaps so a consumer can tell an
+        # unqueried name apart from a queried-but-missing one.
+        for key in ("requested", "artifacts", "missing_artifacts", "diagnostic_gaps"):
+            value = report.get(key)
+            if isinstance(value, list):
+                base[key] = value
+        status = report.get("diagnostic_status")
+        if isinstance(status, str) and status:
+            base["diagnostic_status"] = status
+        return base
+
     async def report(
         self, manifest: UnifiedVaspManifest, request: ReportRequest
     ) -> ReportResult:
         return ReportResult(ok=True, report_kind=request.kind)
+
+
+def _diagnostic_next_action(diagnostics: list[dict[str, Any]]) -> str:
+    """Deterministic next step for a failed-stage diagnostic set.
+
+    A failed job whose logs are still absent must pause and be reported; the
+    caller must not be nudged into guessing from source code or source
+    exploration.
+    """
+    collected = [
+        item
+        for item in diagnostics
+        if item.get("diagnostic_status") == "COLLECTED" and item.get("artifacts")
+    ]
+    if collected:
+        stages = ", ".join(str(item.get("stage")) for item in collected)
+        return (
+            "READ_FAILURE_DIAGNOSTICS: inspect the collected OUTCAR/"
+            f"vasprun.xml/OSZICAR excerpts for {stages}; they are not "
+            "scientific evidence and do not authorize a resubmit"
+        )
+    return (
+        "PAUSE_FOR_MISSING_DIAGNOSTICS: no failure log is available locally; "
+        "report the stage as FAILED with UNKNOWN remote cause and wait for "
+        "log retrieval -- do not infer the error from source code and do not "
+        "resubmit without the normal preflight/approval gates"
+    )
 
 
 def _load_trusted_structure(path: Path) -> Any:

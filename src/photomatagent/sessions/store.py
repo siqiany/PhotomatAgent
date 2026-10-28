@@ -116,7 +116,12 @@ def load_session_snapshot(session_dir: Path | str) -> SessionSnapshot:
     path = snapshot_path(session_dir)
     if not path.is_file():
         raise FileNotFoundError(f"session snapshot not found: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    return parse_session_snapshot(path.read_bytes())
+
+
+def parse_session_snapshot(content: bytes | str) -> SessionSnapshot:
+    """Parse one exact snapshot payload, applying the same legacy migration as the file loader."""
+    payload = json.loads(content)
     version = payload.get("schema_version", 1)
     if version == 1:
         payload["schema_version"] = SESSION_STATE_SCHEMA_VERSION
@@ -161,6 +166,7 @@ __all__ = [
     "SessionMigrationDiagnostic",
     "SessionSnapshot",
     "load_session_snapshot",
+    "parse_session_snapshot",
     "migration_diagnostic_codes",
     "save_session_snapshot",
     "session_is_resumable",

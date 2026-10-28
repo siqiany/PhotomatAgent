@@ -1,8 +1,8 @@
 # PhotomatAgent
 
-PhotomatAgent is a Python scientific-agent runtime for materials research, with a focus on infrared optoelectronic materials and detectors. It provides an explicit model/tool loop, structured scientific state, local workspace tools, optional scientific capability packs, and integrations for MCP and SCNet-based computation.
+PhotomatAgent is a Python scientific-agent runtime for materials research, with a focus on infrared optoelectronic materials and detectors. It provides an explicit model/tool loop, structured scientific state, a local browser-based research workbench, optional scientific capability packs, and integrations for MCP and SCNet-based computation.
 
-It is designed to run as a CLI application. The runtime owns context construction, model streaming, tool authorization, tool execution, observation redaction, and event logging.
+The Web workbench is the main interface for creating research tasks, adding feedback and evidence, reusing checked methods, and comparing frozen evaluation conditions. The CLI remains available for diagnostics and advanced workflows. The runtime owns context construction, model streaming, tool authorization, tool execution, observation redaction, and event logging.
 
 ## Features
 
@@ -40,6 +40,19 @@ uv sync
 ```
 
 Install only the extras you need:
+
+```bash
+# Local browser workbench (required for the Web interface)
+uv sync --extra web --inexact
+```
+
+The Web workbench runs locally on `127.0.0.1` and serves its built UI and API
+from one origin. See the [Chinese Web workbench guide](docs/web_workbench_user_guide.md)
+for the one-time installation, first launch, feedback, checked skill reuse, and
+frozen evaluation walkthrough. Once dependencies and model configuration are
+ready, daily use starts with the platform launcher in `scripts/`.
+
+Install other scientific integrations only when your workflow needs them:
 
 ```bash
 # Materials Project
@@ -122,9 +135,34 @@ uv run photomatagent doctor
 
 `doctor` checks the Python/runtime configuration, configured provider, available skills directory, writable session directory, and a local fake-provider loop smoke test.
 
-## Quick start
+## Quick start: Web research workbench
 
-Start an interactive chat:
+From the repository folder, launch the local workbench:
+
+```bash
+# Windows (from the repository folder in File Explorer or a terminal)
+scripts\start-workbench.cmd
+
+# Linux or WSL
+bash scripts/start-workbench.sh
+```
+
+The launcher checks the local prerequisites and model configuration, then
+opens the browser after the server is ready. It does not create or rewrite
+`.env`. Follow [docs/web_workbench_user_guide.md](docs/web_workbench_user_guide.md)
+if setup is incomplete. To inspect the browser workflow without using a real
+provider, launch the explicitly labeled engineering demo with `--demo`.
+
+The main path is one persistent task: **创建任务 → 提交给智能体 → 继续改进
+→ 保存并回放技能 → 对照评测**. The original output and later revisions stay
+separate; a checker result is evidence under its stated contract, not proof of a
+materials-science claim.
+
+## CLI and advanced workflows
+
+The CLI remains useful for diagnostics, lower-level runtime work, and existing
+scientific commands. It is not needed for daily browser-workbench use. Start an
+interactive chat with:
 
 ```bash
 uv run photomatagent chat
@@ -539,6 +577,13 @@ uv run pytest -q tests/test_evolution_end_to_end.py
 重新评估启用条件。同一任务的多个 Episode 是相关样本，不能冒充独立任务。经验默认
 从 `OBSERVATION` 开始，系统不会自动把它晋升为 Skill；可复用 Skill 还需要跨任务证据
 和显式用户批准。
+
+## 质量—多样性技能进化（实验性）
+
+新的 `evolve qd` CLI 与上述旧版 `evolve` 生命周期并行，支持冻结任务、反馈、档案查看和
+显式技能发布；操作步骤见 [QD 技能进化说明](docs/qd_skill_evolution.md)。当前 `run`/`resume`
+尚缺生产 runtime adapter，会以 `QD_RUNTIME_ADAPTER_REQUIRED` 安全失败。冻结评测目前仅有
+fake runner 工程回归，不代表真实模型或科研效果验证；发布仍要求对确切 bundle 单独批准。
 
 ## Development
 

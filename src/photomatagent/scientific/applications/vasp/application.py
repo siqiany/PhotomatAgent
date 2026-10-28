@@ -10,6 +10,8 @@ prepare -> submit -> status -> collect.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import re
@@ -28,8 +30,8 @@ from photomatagent.scientific.applications.vasp.psp import (
     is_safe_potcar_symbol,
 )
 from photomatagent.scientific.applications.vasp.validation import (
-    REQUIRED_VASP_RESULT_FILES,
     parse_result,
+    required_result_files,
     validate_output,
 )
 from photomatagent.scientific.remote.models import (
@@ -503,6 +505,7 @@ class VaspApplication:
         job_ref: RemoteJobRef,
         local_dir: str | Path,
         profile_name: str,
+        stage: str | None = None,
     ) -> dict[str, Any]:
         """Download results, validate, parse; returns a structured report."""
         if self.backend is None:
@@ -511,10 +514,12 @@ class VaspApplication:
         local.mkdir(parents=True, exist_ok=True)
         downloaded = await self.backend.download_files(
             job_ref.remote_directory,
-            list(REQUIRED_VASP_RESULT_FILES),
+            list(required_result_files(stage)),
             local,
         )
-        problems = validate_output(local, profile_name=profile_name)
+        problems = validate_output(
+            local, profile_name=profile_name, stage=stage
+        )
         parsed = parse_result(local)
         final_structure_path = _trusted_result_structure_path(local)
         return {
@@ -537,11 +542,191 @@ class VaspApplication:
             ),
         }
 
-    def validate_output(self, result_dir: str | Path, profile_name: str) -> list[str]:
-        return validate_output(result_dir, profile_name=profile_name)
+    def validate_output(
+        self,
+        result_dir: str | Path,
+        profile_name: str,
+        stage: str | None = None,
+    ) -> list[str]:
+        return validate_output(result_dir, profile_name=profile_name, stage=stage)
 
     def parse_result(self, result_dir: str | Path) -> dict[str, Any]:
         return parse_result(result_dir)
+
+    # -- failure diagnostics (never scientific evidence) --------------------
+
+    def diagnostic_filenames(self, job_id: str) -> list[str]:
+        """Bounded, fixed-name diagnostic set for one failed job.
+
+        Only allow-listed names plus the scheduler-validated numeric
+        ``job_id`` logs are ever requested; an invalid job id yields no
+        ``.out``/``.err`` names instead of a caller-shaped path.
+        """
+        from photomatagent.scientific.remote.scheduler import (
+            REMOTE_DIAGNOSTIC_ALLOWLIST,
+            remote_job_log_names,
+        )
+
+        names = list(REMOTE_DIAGNOSTIC_ALLOWLIST)
+        try:
+            names.extend(remote_job_log_names(job_id))
+        except ValueError:
+            pass
+        return sorted(set(names))
+
+    def _stored_excerpt_artifact(
+        self,
+        name: str,
+        text: str,
+        limit: int,
+        remote_size: int,
+    ) -> dict[str, Any]:
+        """Describe one locally stored diagnostic excerpt (never the full file).
+
+        ``sha256`` is explicitly the hash of the **stored excerpt bytes**, not
+        of the remote artifact, so a truncated log can never masquerade as the
+        complete original file.
+        """
+        raw = text.encode("latin-1", errors="replace")
+        return {
+            "name": name,
+            "size_bytes": len(raw),
+            "remote_size_bytes": max(0, int(remote_size)),
+            "sha256": _sha256_bytes(raw),
+            "sha256_scope": "stored_excerpt_bytes",
+            "truncated": int(remote_size) > len(raw),
+            "excerpt": text[:_DIAGNOSTIC_EXCERPT_BYTES],
+        }
+
+    async def _remote_diagnostic_size(
+        self,
+        remote_directory: str,
+        name: str,
+        timeout_seconds: float,
+    ) -> int | None:
+        """Best-effort remote size probe for the pre-download size check."""
+        lister = getattr(self.backend, "list_remote_artifacts", None)
+        if lister is None:
+            return None
+        try:
+            artifacts = await asyncio.wait_for(
+                lister(remote_directory),
+                timeout=max(1.0, float(timeout_seconds)),
+            )
+        except Exception:
+            return None
+        for artifact in artifacts or []:
+            if getattr(artifact, "name", None) == name:
+                value = getattr(artifact, "size_bytes", None)
+                return int(value) if isinstance(value, int) else None
+        return None
+
+    async def collect_diagnostics(
+        self,
+        *,
+        job_ref: RemoteJobRef,
+        local_dir: str | Path,
+        diagnostic_dir: str | Path | None = None,
+        max_files: int = 8,
+        max_file_bytes: int = 200_000,
+        timeout_seconds: float = 60.0,
+    ) -> dict[str, Any]:
+        """Fetch bounded failure diagnostics from a confirmed job directory.
+
+        The returned report is explicitly *not* scientific evidence: it exists
+        so a failed stage can be explained without the caller guessing from
+        source code.  A failed/missing/oversized probe becomes a typed
+        diagnostic gap; it never changes FAILED into success, never permits a
+        resubmit, and never produces a ``ScientificEvidence`` entry.
+        """
+        if self.backend is None:
+            raise RuntimeError("VASP backend is not configured")
+        target = Path(diagnostic_dir or local_dir).expanduser().resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        names = self.diagnostic_filenames(job_ref.job_id)[: max(0, int(max_files))]
+        report: dict[str, Any] = {
+            "job_id": job_ref.job_id,
+            "scheduler_state": job_ref.state.value,
+            "remote_directory": job_ref.remote_directory,
+            "requested": names,
+            "artifacts": [],
+            "missing_artifacts": [],
+            "diagnostic_status": "UNAVAILABLE",
+            "diagnostic_gaps": [],
+            "note": (
+                "FAILED diagnostics are not scientific evidence; they never "
+                "authorize a resubmit and never change the scheduler state"
+            ),
+        }
+        if not names:
+            report["diagnostic_gaps"].append("no allow-listed diagnostic names")
+            return report
+        limit = max(1, int(max_file_bytes))
+        reader = getattr(self.backend, "read_remote_text", None)
+        if reader is None:
+            report["diagnostic_status"] = "UNSUPPORTED"
+            report["diagnostic_gaps"].append(
+                "backend cannot read diagnostics with a byte limit; no "
+                "failure log is available for this job"
+            )
+            return report
+        try:
+            for name in names:
+                # Bounded transfer: the backend reads at most ``limit`` bytes
+                # (a ``tail -c`` window remotely), so an oversized
+                # OUTCAR/vasprun.xml is never copied to local disk in full.
+                content = await asyncio.wait_for(
+                    reader(job_ref.remote_directory, name, limit),
+                    timeout=max(1.0, float(timeout_seconds)),
+                )
+                if content is None or content == "":
+                    report["missing_artifacts"].append(name)
+                    continue
+                raw = content.encode("latin-1", errors="replace")
+                # When the read filled the window, ask the backend for the
+                # remote size so the report states the real file size instead
+                # of pretending the excerpt is the whole artifact.
+                remote_size = len(raw)
+                if len(raw) >= limit:
+                    probed = await self._remote_diagnostic_size(
+                        job_ref.remote_directory, name, timeout_seconds
+                    )
+                    if probed is not None:
+                        remote_size = max(probed, len(raw))
+                report["artifacts"].append(
+                    self._stored_excerpt_artifact(
+                        name,
+                        raw.decode("latin-1", errors="replace"),
+                        limit,
+                        remote_size,
+                    )
+                )
+                if remote_size > len(raw):
+                    report["diagnostic_gaps"].append(
+                        f"diagnostic artifact {name!r} reached the "
+                        f"{limit}-byte transfer limit and was truncated"
+                    )
+        except Exception as exc:
+            report["diagnostic_status"] = "QUERY_FAILED"
+            report["diagnostic_gaps"].append(
+                f"diagnostic read failed: {type(exc).__name__}: {exc}"
+            )
+            return report
+        # Missing names must survive a partial collection: only *successfully
+        # read* artifacts count as observed.  Folding the explicit missing set
+        # back into ``observed`` made the difference set empty on every normal
+        # run, which hid stdout/stderr gaps from the diagnostic consumer.
+        collected = {str(item["name"]) for item in report["artifacts"]}
+        report["missing_artifacts"] = sorted(set(names) - collected)
+        if report["artifacts"]:
+            report["diagnostic_status"] = "COLLECTED"
+        else:
+            report["diagnostic_status"] = "MISSING"
+            report["diagnostic_gaps"].append(
+                "no diagnostic artifact was present in the remote job "
+                "directory; the remote failure cause is UNKNOWN locally"
+            )
+        return report
 
 
 def _trusted_result_structure_path(result_dir: Path) -> Path | None:
@@ -550,6 +735,21 @@ def _trusted_result_structure_path(result_dir: Path) -> Path | None:
         if path.is_file() and not path.is_symlink():
             return path
     return None
+
+
+_DIAGNOSTIC_EXCERPT_BYTES = 4000
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def default_vasp_application() -> VaspApplication | None:
