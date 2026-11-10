@@ -9,7 +9,7 @@ test("a research task runs through the backend and remains visible after refresh
   await page.getByRole("button", { name: "产物与自进化", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "中波红外材料初筛" })).toBeVisible();
-  await page.getByText("本轮预算").click();
+  await page.locator("summary").filter({ hasText: "本轮预算与自动修订" }).click();
   await page.getByLabel("模型调用上限", { exact: true }).fill("7");
   await page.getByLabel("Token 上限", { exact: true }).fill("24000");
   await page.getByLabel("运行时间上限（秒）").fill("900");
@@ -34,7 +34,7 @@ test("a research task runs through the backend and remains visible after refresh
   await expect.poll(() => submittedBudget).toEqual({ max_model_calls: 7, max_tokens: 24000, wall_seconds: 900 });
   const report = page.getByRole("region", { name: "本轮报告" });
   await expect(report).toContainText("初稿演示：吸收边和载流子输运仍需实验验证。");
-  await expect(page.locator(".run-status")).toHaveText("已完成");
+  await expect(page.locator(".run-status")).toHaveText("部分完成");
   const runId = await page.getByTestId("active-run-id").textContent();
   expect(runId).toMatch(/^run_/);
 
@@ -64,7 +64,7 @@ test("an unavailable optional capabilities endpoint does not block the task work
 
 test("task list and task detail failures can be retried in place", async ({ page }) => {
   let taskListAttempts = 0;
-  await page.route("**/api/tasks", async (route) => {
+  await page.route(/\/api\/tasks(?:\?.*)?$/, async (route) => {
     if (route.request().method() === "GET" && taskListAttempts++ === 0) {
       await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: { message: "暂时不可用" } }) });
       return;
@@ -207,13 +207,13 @@ test("conversation keeps multiple turns, opens details on demand, and exposes a 
   const composer = page.getByLabel("本轮需求");
   await composer.fill("比较材料候选，标出证据缺口。");
   await composer.press("Enter");
-  await expect(page.locator(".run-status")).toHaveText("已完成");
+  await expect(page.locator(".run-status")).toHaveText("运行结束");
   await expect(page.locator(".conversation-turn")).toHaveCount(1);
   await composer.fill("继续核对来源");
   await composer.press("Shift+Enter");
   await expect(composer).toHaveValue("继续核对来源\n");
   await composer.press("Enter");
-  await expect(page.locator(".run-status")).toHaveText("已完成");
+  await expect(page.locator(".run-status")).toHaveText("运行结束");
   await expect(page.locator(".conversation-turn")).toHaveCount(2);
   await page.reload();
   await expect(page.locator(".conversation-turn")).toHaveCount(2);

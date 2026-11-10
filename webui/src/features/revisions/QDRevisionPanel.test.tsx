@@ -27,17 +27,39 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function render() {
+async function render(onRun = vi.fn()) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
   mounted.push({ root, host });
-  await act(async () => { root.render(<QDRevisionPanel taskId={taskId} disabled={false} busy={false} events={[]} onRun={vi.fn()} />); });
+  await act(async () => { root.render(<QDRevisionPanel taskId={taskId} disabled={false} busy={false} events={[]} onRun={onRun} />); });
   await act(async () => { await Promise.resolve(); });
   return host;
 }
 
 describe("QDRevisionPanel", () => {
+  it("binds the fixed MWIR checker to a bounded software precision search", async () => {
+    vi.spyOn(api, "skillSources").mockResolvedValue({ items: [{ ...failedSource, argv: ["--precision", "15"] }] });
+    const onRun = vi.fn();
+    const host = await render(onRun);
+    const checker = host.querySelector<HTMLSelectElement>("[aria-label='独立检查器']")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(checker, "mwir_noise_budget");
+      checker.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const alternatives = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(alternatives, "--precision 12\n--precision 17");
+      alternatives.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>(".revision-plan-actions button")!.click();
+    });
+    expect(onRun).toHaveBeenCalledWith(expect.objectContaining({
+      checker: { checker_id: "mwir_noise_budget", input_key: "data", output_path: "result.json", field: "detectivity_jones", units: "Jones" },
+      argv_choices: [["--precision", "15"], ["--precision", "12"], ["--precision", "17"]],
+    }));
+  });
   it("keeps a completed baseline eligible even when its selected checker may fail", async () => {
     vi.spyOn(api, "skillSources").mockResolvedValue({ items: [failedSource] });
     const host = await render();

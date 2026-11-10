@@ -45,6 +45,9 @@ class EventLogger:
         redactor: Redactor | None = None,
         session_id: str | None = None,
     ) -> None:
+        self.repository: Any = None
+        self.storage_owner: Any = None
+        self.session_lock: Any = None
         self.session_id = session_id or _session_id()
         base = Path(sessions_dir) if sessions_dir is not None else default_sessions_dir()
         self.session_dir = base / self.session_id
@@ -54,13 +57,28 @@ class EventLogger:
         self._redactor = redactor or redact_secrets
 
     async def log(self, event: RuntimeEvent) -> None:
+        if self.repository is not None:
+            import asyncio
+            await asyncio.to_thread(self.repository.event,self.session_id,event)
+            return
+        from photomatagent.sessions.reader import database_session
+        with database_session(self.session_dir) as repository:
+            if repository is not None:
+                repository.event(self.session_id, event)
+                return
         payload = self._redactor(event.model_dump(mode="json"))
+        payload["trace_event_id"] = event.trace_event_id
         if isinstance(event, EvolutionRuntimeEvent):
             payload = _bound_evolution_summaries(payload)
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def read_events(self) -> list[RuntimeEvent]:
+        from photomatagent.sessions.reader import database_session
+        with database_session(self.session_dir) as repository:
+            if repository is not None:
+                with repository.db.lock:
+                    return [parse_event(json.loads(row[0])) for row in repository.conn.execute("SELECT payload_json FROM runtime_events WHERE session_id=? ORDER BY session_seq", (self.session_id,))]
         events: list[RuntimeEvent] = []
         if not self.events_path.exists():
             return events
@@ -69,3 +87,12 @@ class EventLogger:
                 if line.strip():
                     events.append(parse_event(json.loads(line)))
         return events
+
+    def close(self) -> None:
+        if self.session_lock is not None:
+            self.session_lock.release()
+            self.session_lock = None
+        if self.storage_owner is not None:
+            self.storage_owner.close()
+            self.storage_owner = None
+            self.repository = None

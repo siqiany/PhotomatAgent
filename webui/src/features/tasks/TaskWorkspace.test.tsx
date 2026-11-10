@@ -8,7 +8,7 @@ import { TaskWorkspace } from "./TaskWorkspace";
 
 vi.mock("../skills/SkillPanel", () => ({ SkillPanel: () => null }));
 vi.mock("../evaluations/EvaluationPanel", () => ({ EvaluationPanel: () => null }));
-vi.mock("../revisions/FeedbackForm", () => ({ FeedbackForm: () => null }));
+vi.mock("../revisions/FeedbackForm", () => ({ FeedbackForm: ({ onPrepare }: { onPrepare: (run: string, text: string, artifacts: string[]) => void }) => <button data-testid="submit-feedback" onClick={() => onPrepare("source", "核查边界条件", [])}>提交意见并自动返修</button> }));
 vi.mock("../revisions/RevisionPlan", () => ({
   RevisionPlan: ({ plan }: { plan: { plan_id: string; feedback_text: string } }) => <output data-testid="revision-plan-id">{plan.plan_id}|{plan.feedback_text}</output>,
 }));
@@ -57,8 +57,13 @@ describe("TaskWorkspace mount", () => {
     expect(logged).not.toHaveBeenCalled();
   });
 
-  it("submits bounded evolution defaults and the user's explicit delivery filenames", async () => {
-    vi.spyOn(api, "task").mockResolvedValue(detail);
+  it("submits bounded evolution defaults and the selected image and explicit delivery filenames", async () => {
+    const attachmentId = "artifact_" + "a".repeat(32);
+    vi.spyOn(api, "task").mockResolvedValue({
+      ...detail,
+      artifacts: [{ artifact_id: attachmentId, task_id: detail.task.task_id, run_id: null,
+        filename: "sample.png", media_type: "image/png", size_bytes: 120, sha256: "b".repeat(64) }],
+    });
     vi.spyOn(api, "capabilities").mockResolvedValue({ items: [] });
     vi.spyOn(api, "procedures").mockResolvedValue({ items: [] });
     vi.spyOn(api, "revisionPlans").mockResolvedValue({ items: [] });
@@ -93,10 +98,12 @@ describe("TaskWorkspace mount", () => {
     const checkbox = host.querySelector("[aria-label='启用自动修订']") as HTMLInputElement;
     await act(async () => {
       checkbox.click();
+      (host.querySelector(".image-controls input[type=checkbox]") as HTMLInputElement).click();
       host.querySelector("form.composer")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(api.startRun).toHaveBeenCalledWith(detail.task.task_id, expect.objectContaining({
+      image_attachment_ids: [attachmentId],
       evolution: {
         enabled: false, max_rounds: 5, patience: 2,
         required_artifacts: ["report.md", "data.csv"], checks: [], target: null,
@@ -220,4 +227,45 @@ describe("TaskWorkspace mount", () => {
     expect(JSON.parse(window.sessionStorage.getItem(`photomatagent:revision-context:${taskId}`) ?? "{}"))
       .toMatchObject({ planId: older.plan_id, sourceRunId: older.source_run_id });
   });
+});
+
+it("submits expert feedback and starts repair without a second launch click", async () => {
+  const taskId = detail.task.task_id;
+  const completed = { ...detail, runs: [{ run_id: "source", task_id: taskId, status: "SUCCEEDED", created_at: "now", request: { text: "研究", strategy: "standard" } } as RunRecord] };
+  const plan: RevisionPlan = {
+    plan_id: "auto-plan", task_id: taskId, feedback_id: "feedback", source_run_id: "source",
+    source_digest: "digest", source_run_status: "SUCCEEDED", source_artifacts: [],
+    feedback_text: "核查边界条件", status: "READY", issues: [], warnings: [], attempt: 1,
+    created_at: "now", run_id: "repair", run_attempts: [{ attempt: 1, run_id: "repair", status: "QUEUED" }], compiler_cost: {},
+  };
+  vi.spyOn(api, "task").mockResolvedValue(completed);
+  vi.spyOn(api, "capabilities").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "procedures").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "revisionPlans").mockResolvedValue({ items: [] });
+  vi.spyOn(api, "revisionPlan").mockResolvedValue(plan);
+  const submit = vi.spyOn(api, "submitFeedback").mockResolvedValue({ plan, status: "STARTED", run: { task_id: taskId, run_id: "repair" } });
+  const manual = vi.spyOn(api, "executeRevision");
+  vi.spyOn(apiModule, "subscribeToTask").mockReturnValue({ close: vi.fn() } as unknown as EventSource);
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  mounted.push({ root, host });
+  await act(async () => {
+    root.render(<TaskWorkspace taskId={taskId} mobilePanel="workspace" onTaskChanged={vi.fn()} />);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  await act(async () => { (host.querySelector("button.revision-entry") as HTMLButtonElement).click(); });
+  await act(async () => {
+    (host.querySelector("[data-testid='submit-feedback']") as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(submit).toHaveBeenCalledWith(taskId, expect.objectContaining({
+    source_run_id: "source", text: "核查边界条件",
+    budget: { max_model_calls: 1, max_tokens: 65536, wall_seconds: 1800 },
+    revision_budget: { max_model_calls: 20, max_tokens: 100000, wall_seconds: 1800 },
+  }), expect.any(String));
+  expect(manual).not.toHaveBeenCalled();
+  expect(host.textContent).toContain("正在自动返修");
+  expect(JSON.parse(window.sessionStorage.getItem(`photomatagent:revision-context:${taskId}`)!)).toMatchObject({ planId: "auto-plan", revisionRunId: "repair" });
+  expect(host.querySelector("[data-testid='revision-plan-id']")?.closest("details")?.open).toBe(false);
 });

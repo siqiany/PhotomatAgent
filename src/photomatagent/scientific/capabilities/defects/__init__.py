@@ -1,8 +1,8 @@
 """Defect capability pack backed by ``doped`` (namespace ``defects``).
 
-V1 exposes capabilities metadata, defect generation, and thermodynamic
-analysis wrappers. When DFT inputs or the doped dependency are missing the
-tools return a clear prerequisite report instead of hallucinating results.
+Exposes capabilities metadata, defect generation, and a prerequisite-only
+thermodynamics wrapper. Full thermodynamic analysis is not implemented;
+missing inputs or dependencies receive localized prerequisite diagnostics.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from photomatagent.workspace import Workspace
 
 class DefectsProbe(CapabilityPack):
     name = "defects"
-    description = "Defect formation energies and charge states via doped."
+    description = "Defect generation via doped; thermodynamic analysis is prerequisite-only."
 
     def probe(self) -> ProbeResult:
         try:
@@ -43,6 +43,7 @@ class DefectsProbe(CapabilityPack):
             )
         return ProbeResult(
             status=CapabilityStatus.AVAILABLE,
+            detail="doped generation dependency importable; defects.analyze is prerequisite-only.",
             version=importlib.metadata.version("doped"),
         )
 
@@ -69,8 +70,8 @@ def _doped_error() -> str:
 class DefectsCapabilitiesTool(Tool):
     name = "defects.capabilities"
     description = (
-        "Describe what the defects capability can compute (formation energies, "
-        "charge states, thermodynamic analysis) and its DFT prerequisites."
+        "Describe supported defect generation, upstream doped thermodynamics and "
+        "DFT prerequisites. The defects.analyze solver is not implemented."
     )
     short_description = "Defect workflow capabilities and prerequisites."
     exposure = ToolExposure.DEFERRED
@@ -82,10 +83,14 @@ class DefectsCapabilitiesTool(Tool):
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         payload = {
             "capabilities": [
+                "defect generation (vacancies, interstitials, substitutions, complexes)",
+                "check defect-analysis dependency and required file presence",
+            ],
+            "implementation_status": {"defects.analyze": "PREREQUISITE_ONLY"},
+            "upstream_capabilities": [
                 "defect formation energies vs Fermi level and chemical potentials",
                 "defect charge states and thermodynamic transition levels",
                 "defect concentration / Fermi-level pinning analysis",
-                "defect generation (vacancies, interstitials, substitutions, complexes)",
             ],
             "prerequisites": [
                 "DFT-relaxed bulk supercell structure (POSCAR/CIF)",
@@ -93,7 +98,11 @@ class DefectsCapabilitiesTool(Tool):
                 "chemical potential ranges for the elements",
                 "band edge alignment / VBM reference (optional but recommended)",
             ],
-            "note": "defects.generate works with a structure; defects.analyze needs DFT energies.",
+            "note": (
+                "defects.generate can generate inputs when its prerequisites are met. "
+                "defects.analyze does not yet run thermodynamics; installing doped or "
+                "providing the accepted files does not complete the solver integration."
+            ),
         }
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
@@ -180,11 +189,11 @@ class DefectsGenerateTool(Tool):
 class DefectsAnalyzeTool(Tool):
     name = "defects.analyze"
     description = (
-        "Analyze defect formation energies from doped defects.json plus DFT "
-        "energy files; returns formation energies, transition levels, and "
-        "thermodynamic limits. Reports missing inputs explicitly."
+        "Check doped and defect-analysis input prerequisites only. Full defect "
+        "thermodynamics is not implemented; no formation energies or transition "
+        "levels are computed. Use defects.capabilities for implementation limits."
     )
-    short_description = "Defect thermodynamics analysis (formation energy, transition levels)."
+    short_description = "Check defect thermodynamics prerequisites; solver not implemented."
     exposure = ToolExposure.DEFERRED
     namespace = "defects"
     source = "doped"
@@ -233,12 +242,14 @@ class DefectsAnalyzeTool(Tool):
             )
         return ScientificToolResult(
             output=(
-                "missing prerequisite: full defect thermodynamics needs per-defect "
-                "DFT energies for every charge state (doped DefectThermodynamics). "
-                "No formation energies are reported without them."
+                "defects.analyze is prerequisite-only: full doped thermodynamics "
+                "integration is not implemented. Per-defect charge-state energies, "
+                "chemical potentials and corrections cannot be supplied through this "
+                "schema. Use a supported separately executable method or report the "
+                "implementation gap; retrying this wrapper cannot produce formation energies."
             ),
             is_error=True,
-            data={"error": "MISSING_PREREQUISITE"},
+            data={"error": "NOT_IMPLEMENTED", "implementation_status": "PREREQUISITE_ONLY"},
         )
 
 

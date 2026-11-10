@@ -6,6 +6,7 @@ does not execute tools and never owns an agent loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import hashlib
 import re
@@ -21,6 +22,7 @@ from photomatagent.models.types import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    ProviderContinuation,
     ModelStreamEvent,
     ModelStreamStarted,
     ModelTextDelta,
@@ -34,10 +36,12 @@ from photomatagent.models.types import (
     ToolDefinition,
     ToolResultMessage,
     UserMessage,
+    active_image_entries,
 )
-from photomatagent.models.utils import as_dict, safe_provider_message
+from photomatagent.models.utils import as_dict, provider_failure_code, safe_provider_message
 
 _OPENAI_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DEEPSEEK_TEXT_TOOL_PREFIXES = ("<｜｜DSML｜｜", "</｜｜DSML｜｜", "<||DSML||", "</||DSML||")
 
 
 def _json_error_position(exc: json.JSONDecodeError) -> str:
@@ -90,15 +94,35 @@ class OpenAIToolNameCodec:
 
 
 def openai_input(
-    messages: Sequence[ModelMessage], tool_names: OpenAIToolNameCodec | None = None
+    messages: Sequence[ModelMessage], tool_names: OpenAIToolNameCodec | None = None,
+    *, model: str = "", endpoint_key: str = "", image_assets: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for message in messages:
+    last_user = max((i for i, msg in enumerate(messages) if isinstance(msg, UserMessage) and not msg.context_only), default=-1)
+    active_images = active_image_entries(messages)
+
+    def content_with_images(text: str, index: int) -> str | list[dict[str, str]]:
+        images = active_images.get(index, ())
+        if not images:
+            return text
+        content = [{"type": "input_text", "text": text}]
+        for image in images:
+            encoded = (image_assets or {}).get(image.sha256)
+            if not encoded:
+                raise ProviderError("openai", "Requested image asset is unavailable", code="IMAGE_ASSET_MISSING")
+            content.append({"type": "input_image", "image_url": f"data:{image.media_type};base64,{encoded}"})
+        return content
+
+    for index, message in enumerate(messages):
         if isinstance(message, SystemMessage):
             items.append({"role": "system", "content": message.content})
         elif isinstance(message, UserMessage):
-            items.append({"role": "user", "content": message.content})
+            items.append({"role": "user", "content": content_with_images(message.content, index)})
         elif isinstance(message, AssistantMessage):
+            carry = message.continuation
+            if (carry and "deepseek" in model.casefold() and carry.model == model and carry.endpoint_key == endpoint_key
+                    and message.tool_calls and index > last_user):
+                items.extend({"type": "reasoning", "content": part} for part in carry.reasoning)
             if message.text:
                 items.append({"role": "assistant", "content": message.text})
             for call in message.tool_calls:
@@ -115,7 +139,7 @@ def openai_input(
                 {
                     "type": "function_call_output",
                     "call_id": message.tool_call_id,
-                    "output": message.content,
+                    "output": content_with_images(message.content, index),
                 }
             )
     return items
@@ -174,10 +198,11 @@ class OpenAIStreamMapper:
     """Stateful pure mapper; tests feed it mocked SDK event dictionaries."""
 
     def __init__(
-        self, model: str, tool_names: OpenAIToolNameCodec | None = None
+        self, model: str, tool_names: OpenAIToolNameCodec | None = None, *, endpoint_key: str = "",
     ) -> None:
         self.model = model
         self.tool_names = tool_names
+        self.endpoint_key = endpoint_key
         self.response_id: str | None = None
         self.text_parts: list[str] = []
         self.calls_by_item: dict[str, _CallBuilder] = {}
@@ -186,6 +211,27 @@ class OpenAIStreamMapper:
         self.started = False
         self._deferred_failures: dict[str, _DeferredCallFailure] = {}
         self._streamed_fragments: set[str] = set()
+        self._text_tail = ""
+        self._invalid_text_tool = False
+
+    def _feed_text(self, delta: str, *, final: bool = False) -> str:
+        if "deepseek" not in self.model.casefold():
+            return delta
+        if self._invalid_text_tool:
+            return ""
+        joined = self._text_tail + delta
+        self._text_tail = ""
+        matches = [index for marker in _DEEPSEEK_TEXT_TOOL_PREFIXES if (index := joined.find(marker)) >= 0]
+        if matches:
+            self._invalid_text_tool = True
+            return joined[:min(matches)]
+        if not final:
+            pending = max((size for marker in _DEEPSEEK_TEXT_TOOL_PREFIXES
+                           for size in range(1, len(marker)) if joined.endswith(marker[:size])), default=0)
+            if pending:
+                self._text_tail = joined[-pending:]
+                return joined[:-pending]
+        return joined
 
     def feed(self, raw: Any) -> list[ModelStreamEvent]:
         event = as_dict(raw)
@@ -202,9 +248,9 @@ class OpenAIStreamMapper:
                 )
             )
         elif event_type == "response.output_text.delta":
-            delta = str(event.get("delta", ""))
-            self.text_parts.append(delta)
-            mapped.append(ModelTextDelta(text=delta))
+            if delta := self._feed_text(str(event.get("delta", ""))):
+                self.text_parts.append(delta)
+                mapped.append(ModelTextDelta(text=delta))
         elif event_type == "response.output_item.added":
             item = as_dict(event.get("item", {}))
             if item.get("type") == "function_call":
@@ -283,8 +329,11 @@ class OpenAIStreamMapper:
                 terminal=self._describe_terminal(response, details),
             )
         elif event_type in {"response.failed", "error"}:
-            error = event.get("error") or event.get("response") or "stream failed"
-            raise ProviderError("openai", str(error))
+            response = as_dict(event.get("response") or {})
+            error = event.get("error") or response.get("error") or {}
+            code = error.get("code") if isinstance(error, dict) else None
+            reason = "RATE_LIMITED" if code in ("rate_limit_exceeded", "rate_limited") else "UPSTREAM_FAILURE"
+            raise ProviderError("openai", "Response stream failed", code=reason)
         return mapped
 
     def _describe_terminal(
@@ -304,6 +353,9 @@ class OpenAIStreamMapper:
         terminal: str,
     ) -> None:
         self.response_id = str(response.get("id") or self.response_id or "") or None
+        if tail := self._feed_text("", final=True):
+            self.text_parts.append(tail)
+            mapped.append(ModelTextDelta(text=tail))
         # Decide truncation before touching tool arguments: a cut-off response
         # makes every argument fragment untrustworthy, so it must not be
         # validated as if it were a complete request.
@@ -320,7 +372,7 @@ class OpenAIStreamMapper:
             truncated = True
         self.usage = self._usage(response.get("usage"))
         mapped.append(ModelUsageUpdated(usage=self.usage))
-        if truncated:
+        if truncated or self._invalid_text_tool:
             # Dropping the fragments is deliberate: StopPolicy derives
             # "output_truncated" from this finish reason, and a partial
             # arguments string must never reach a tool. Rebuilding the fragment
@@ -339,8 +391,25 @@ class OpenAIStreamMapper:
             # Truncation outranks every other finish reason: neither "stop" nor
             # "tool_calls" is trustworthy when the response was cut short.
             finish: FinishReason = "max_tokens"
+        elif self._invalid_text_tool:
+            finish = "invalid_tool_markup"
         else:
             finish = "tool_calls" if calls else "stop"
+        continuation = None
+        if calls and "deepseek" in self.model.casefold():
+            reasoning = []
+            for raw_item in response.get("output") or ():
+                item = as_dict(raw_item)
+                if item.get("type") != "reasoning":
+                    continue
+                content = item.get("content")
+                if isinstance(content, list):
+                    content = "".join(str(as_dict(part).get("text", "")) for part in content
+                                      if as_dict(part).get("type") == "reasoning_text")
+                if isinstance(content, str) and content:
+                    reasoning.append(content)
+            if reasoning and len(reasoning) <= 16 and sum(map(len, reasoning)) <= 200_000:
+                continuation = ProviderContinuation(model=self.model, endpoint_key=self.endpoint_key, reasoning=tuple(reasoning))
         mapped.append(
             ModelCompleted(
                 response=ModelResponse(
@@ -349,6 +418,7 @@ class OpenAIStreamMapper:
                     finish_reason=finish,
                     usage=self.usage,
                     response_id=self.response_id,
+                    continuation=continuation,
                 )
             )
         )
@@ -400,12 +470,20 @@ class OpenAIStreamMapper:
             call_id = str(item.get("call_id") or item.get("id") or "")
             if call_id in self.completed_calls:
                 continue
-            builder = self.calls_by_item.get(call_id) or _CallBuilder(
-                item_id=call_id,
-                call_id=call_id,
-                name=self._decode_tool_name(str(item.get("name", ""))),
-                index=index,
-            )
+            if not call_id:
+                raise ProviderError("openai", "Missing function call identity", code="INVALID_TOOL_CALL")
+            item_id = str(item.get("id") or call_id)
+            builder = self.calls_by_item.get(item_id)
+            if builder is None:
+                builder = next((value for value in self.calls_by_item.values() if value.call_id == call_id), None)
+            if builder is None:
+                builder = _CallBuilder(
+                    item_id=item_id,
+                    call_id=call_id,
+                    name=self._decode_tool_name(str(item.get("name", ""))),
+                    index=index,
+                )
+                self.calls_by_item[item_id] = builder
             call = self._complete_call(
                 item,
                 builder,
@@ -469,6 +547,7 @@ class OpenAIStreamMapper:
             "invalid JSON arguments for "
             f"{failure.call_id}: tool={failure.tool_name or 'unknown'} "
             f"argument_chars={failure.argument_chars} {terminal}: {failure.reason}",
+            code="INVALID_TOOL_ARGUMENTS",
         )
 
     def _decode_tool_name(self, name: str) -> str:
@@ -519,6 +598,8 @@ class OpenAIProvider:
 
             client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._client = client
+        endpoint = str(getattr(client, "base_url", None) or base_url or "").rstrip("/")
+        self._endpoint_key = hashlib.sha256(endpoint.encode()).hexdigest() if endpoint else ""
 
     async def aclose(self) -> None:
         close = getattr(self._client, "close", None)
@@ -529,7 +610,7 @@ class OpenAIProvider:
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         tool_names = OpenAIToolNameCodec(request.tools)
-        mapper = OpenAIStreamMapper(self.model, tool_names)
+        mapper = OpenAIStreamMapper(self.model, tool_names, endpoint_key=self._endpoint_key)
         system_messages = [
             message.content for message in request.messages if isinstance(message, SystemMessage)
         ]
@@ -542,7 +623,7 @@ class OpenAIProvider:
             # function_call and function_call_output items travel together with
             # matching call_ids, which works on official Responses API and on
             # OpenAI-compatible endpoints that do not support previous_response_id.
-            "input": openai_input(conversation, tool_names),
+            "input": openai_input(conversation, tool_names, model=self.model, endpoint_key=self._endpoint_key, image_assets=request.image_assets),
             "tools": openai_tools(request.tools, tool_names),
             "stream": True,
         }
@@ -558,4 +639,4 @@ class OpenAIProvider:
         except ProviderError:
             raise
         except Exception as exc:
-            raise ProviderError(self.provider, safe_provider_message(exc)) from exc
+            raise ProviderError(self.provider, safe_provider_message(exc), code=provider_failure_code(exc)) from exc

@@ -92,7 +92,9 @@ class EvolutionKnowledge:
             return ""
         misses = 0
         for item in available:
-            if item.get("status") != "APPROVED_PROCEDURE" or item.get("task_id") == task_id:
+            if item.get("status") not in {"APPROVED_PROCEDURE", "VALIDATED_PROCEDURE"} or item.get("task_id") == task_id:
+                continue
+            if item.get("status") == "APPROVED_PROCEDURE" and item.get("run_id") in self.store.result_invalidations(item["task_id"]):
                 continue
             overlap = len(query & _terms(str(item.get("scope", "")) + " " + str(item.get("description", ""))))
             if overlap:
@@ -152,9 +154,15 @@ class EvolutionKnowledge:
         for skill_id in sorted(retrieved):
             self.store.append_event_for_run(run_id, "evolution_guidance_outcome", {
                 "skill_id": skill_id, "observation_sha256": record["record_sha256"],
-                "status": "IMPROVED" if reward > 0 else "NEGATIVE_USE", "reward": reward})
+                "status": "OBSERVED_AFTER_RETRIEVAL", "task_delivery_reward": reward,
+                "actual_use": "UNKNOWN", "causal_attribution": "UNESTABLISHED",
+                "limitations": ["Retrieval and a later delivery change do not establish use or causal benefit."]})
         if passed and closed:
-            self._capture_candidate(task_id, run_id, round_index, before, after, action_text, record)
+            if not any(e.run_id==run_id and e.type=='research_contract' for e in self.store.events_after(task_id,0)):
+                # Legacy/imported flows retain their manual draft path. New
+                # research uses executed methods + independent qualification,
+                # never a generic report template as automatic experience.
+                self._capture_candidate(task_id, run_id, round_index, before, after, action_text, record)
         return record
 
     def _capture_candidate(self, task_id: str, run_id: str, round_index: int,
@@ -221,8 +229,9 @@ class EvolutionKnowledge:
         issues = [item for item in report.get("issues", []) if isinstance(item, dict)]
         repairable = [item for item in issues if item.get("repairable") is True]
         action = "repair_delivery" if report.get("delivery_status") == "FAIL" and repairable else "gather_evidence" if report.get("delivery_status") == "UNKNOWN" else "stop"
+        invalidations = self.store.result_invalidations(task_id)
         observations = [event.payload for event in self.store.events_after(task_id, 0)
-                        if event.type == "evolution_observation"]
+                        if event.type == "evolution_observation" and event.run_id not in invalidations]
         rewards = [float(value) for item in observations
                    if isinstance((value := item.get("reward")), (int, float)) and not isinstance(value, bool)]
         reliability = {"observations": len(observations),
@@ -282,8 +291,9 @@ class EvolutionKnowledge:
             for task in tasks:
                 if task.task_id == task_id:
                     continue
+                invalidations = self.store.result_invalidations(task.task_id)
                 for event in self.store.events_after(task.task_id, 0):
-                    if event.type != "evolution_observation":
+                    if event.type != "evolution_observation" or event.run_id in invalidations:
                         continue
                     record = dict(event.payload)
                     digest = record.pop("record_sha256", None)

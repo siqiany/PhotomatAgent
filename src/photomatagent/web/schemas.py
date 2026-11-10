@@ -62,6 +62,7 @@ class TaskSummaryResponse(ResearchTask):
 
 class TaskListResponse(BaseModel):
     items: list[TaskSummaryResponse]
+    next_cursor: str | None = None
 
 
 class ArtifactMetadataResponse(BaseModel):
@@ -72,6 +73,7 @@ class ArtifactMetadataResponse(BaseModel):
     media_type: str
     size_bytes: int
     sha256: str
+    result_invalidation_ids: list[str] = Field(default_factory=list)
 
 
 class AttachmentResponse(ArtifactMetadataResponse):
@@ -79,6 +81,7 @@ class AttachmentResponse(ArtifactMetadataResponse):
 
 
 class TaskDetailResponse(BaseModel):
+    pagination: dict[str, str | None] | None = None
     task: ResearchTask
     runs: list[RunRecord]
     links: list[WorkbenchLink]

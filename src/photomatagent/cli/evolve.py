@@ -268,7 +268,7 @@ def evolve_start(
             session_dir=boundary.root / default_sessions_dir(),
             log_events=log_events,
         )
-        judge = _build_judge(judge_provider, judge_model, console)
+        judge = _build_judge(judge_provider, judge_model, console, workspace=boundary.root)
         execution = asyncio.run(
             _execute_initial_episode(
                 store=store,
@@ -777,7 +777,7 @@ def evolve_iterate(
             log_events=log_events,
             scientific_state=inherited,
         )
-        judge = _build_judge(judge_provider, judge_model, console)
+        judge = _build_judge(judge_provider, judge_model, console, workspace=boundary.root)
         execution = asyncio.run(
             _execute_revised_episode(
                 store=store,
@@ -944,7 +944,7 @@ def evolve_evaluate(
             logger_box.append(logger)
             return runtime
 
-        judge = _build_judge(judge_provider, judge_model, console)
+        judge = _build_judge(judge_provider, judge_model, console, workspace=boundary.root)
         execution = asyncio.run(
             run_fresh_evaluation(
                 service=service,
@@ -1131,8 +1131,8 @@ def evolve_compile(
     try:
         boundary = Workspace(workspace)
         service = EvolutionService(EvolutionStore(boundary))
-        config = _resolve_provider_config(boundary.root, provider, model)
-        compiler = _build_feedback_compiler(config)
+        config = _resolve_feedback_config(boundary.root, provider, model)
+        compiler = _build_feedback_compiler(config, boundary.root)
         compilation = asyncio.run(
             run_compilation_flow(
                 service=service,
@@ -1184,8 +1184,8 @@ async def run_compile_command(
 
     boundary = Workspace(workspace)
     service = EvolutionService(EvolutionStore(boundary))
-    config = _resolve_provider_config(boundary.root, provider, model)
-    compiler = _build_feedback_compiler(config)
+    config = _resolve_feedback_config(boundary.root, provider, model)
+    compiler = _build_feedback_compiler(config, boundary.root)
     compilation = await run_compilation_flow(
         service=service,
         evolution_id=evolution_id,
@@ -1298,10 +1298,16 @@ async def run_revision_confirmation_flow(
     return mutation.entity
 
 
-def _build_feedback_compiler(config: LLMConfig) -> FeedbackCompiler:
+def _resolve_feedback_config(workspace: Path, provider: str | None, model: str | None) -> LLMConfig:
+    from photomatagent.model_settings import selection, values
+    selected, name, _, base_url = selection(values(workspace), "feedback", provider, model)
+    return LLMConfig(provider=selected, model=name, base_url=base_url)
+
+
+def _build_feedback_compiler(config: LLMConfig, workspace: Path | None = None) -> FeedbackCompiler:
     from photomatagent.models.factory import create_provider
 
-    return FeedbackCompiler(create_provider(config.provider, config.model))
+    return FeedbackCompiler(create_provider(config.provider, config.model, role="feedback", workspace=workspace))
 
 
 def _render_compilation(output: Console, compilation: FeedbackCompilation) -> None:

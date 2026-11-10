@@ -11,6 +11,7 @@ from photomatagent.tools.base import Tool, ToolResult
 
 
 class ScientificStateInspectTool(Tool):
+    effect_class = "READ_ONLY"
     name = "scientific_state_inspect"
     description = (
         "Inspect the current scientific state (goal, hypotheses, claims, evidence, "
@@ -23,9 +24,10 @@ class ScientificStateInspectTool(Tool):
         "properties": {
             "section": {
                 "type": "string",
-                "enum": ["all", "hypotheses", "structures", "evidence", "claims", "calculations"],
+                "enum": ["all", "hypotheses", "structures", "evidence", "claims", "calculations", "process_plans"],
             },
             "offset": {"type": "integer", "minimum": 0, "default": 0},
+            "process_plan_id": {"type": "string", "pattern": "^proc_[0-9a-f]{32}$"},
             "limit": {
                 "type": "integer",
                 "minimum": 1,
@@ -51,7 +53,7 @@ class ScientificStateInspectTool(Tool):
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         section = arguments.get("section", "all")
-        valid_sections = {"all", "hypotheses", "structures", "evidence", "claims", "calculations"}
+        valid_sections = {"all", "hypotheses", "structures", "evidence", "claims", "calculations", "process_plans"}
         if not isinstance(section, str) or section not in valid_sections:
             return self._invalid_arguments("unknown section")
         offset = arguments.get("offset", 0)
@@ -134,6 +136,37 @@ class ScientificStateInspectTool(Tool):
                 output=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
                 data=data,
             )
+        elif section == "process_plans":
+            plans = self._state.process_plans
+            plan_id = arguments.get("process_plan_id")
+            if plan_id is not None:
+                plan = next((item for item in plans if item.id == plan_id), None)
+                if plan is None:
+                    return self._invalid_arguments("unknown process plan")
+                result = {
+                    "plan_id": plan.id, "scientific_validation": "UNKNOWN",
+                    "outcomes": [item.model_dump(mode="json", exclude_none=True) for item in plan.outcomes[offset:offset + min(limit, 5)]],
+                    "revisions": [plan.revision_impact(item) | {"revised_plan_id": item.id}
+                                  for item in plans if item.previous_plan_id == plan.id][-5:],
+                    **plan.proposal_readiness(),
+                }
+                return ToolResult(output=json.dumps(result, ensure_ascii=False), data=result)
+            active = self._state.research_delivery
+            superseded = {
+                plan_id for delivery in self._state.research_deliveries if delivery.superseded
+                for plan_id in delivery.plan_ids
+            }.difference(active.plan_ids if active else ())
+            plan_items: list[dict[str, Any]] = [
+                {"plan_id": plan.id, "question": plan.decision_question, "sample": plan.sample,
+                 "steps": len(plan.steps), "branches": len(plan.transitions), "sample_count": len(plan.samples),
+                 "previous_plan_id": plan.previous_plan_id, "status": "PROPOSED",
+                 "delivery_superseded": plan.id in superseded,
+                 "outcome_count": len(plan.outcomes),
+                 **plan.proposal_readiness()}
+                for plan in plans[offset:offset + min(limit, 10)]
+            ]
+            plan_data = {"section": section, "offset": offset, "total": len(plans), "items": plan_items}
+            return ToolResult(output=json.dumps(plan_data, ensure_ascii=False), data=plan_data)
         elif section == "evidence":
             text = "\n".join(
                 (

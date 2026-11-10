@@ -102,9 +102,11 @@ PROPERTY_RULES: tuple[PropertyRule, ...] = (
     ),
     PropertyRule(
         property="temperature",
-        keywords=("temperature", "operating temperature", "measurement temperature"),
+        keywords=("temperature", "annealed at", "heated at"),
         units=(UnitRule(r"\bK\b", "K"),),
     ),
+    PropertyRule("thickness", ("thickness", "thick"), (UnitRule(r"nm\b", "nm"),)),
+    PropertyRule("duration", ("duration", "annealed", "dried"), (UnitRule(r"\bmin\b", "min"),)),
     PropertyRule(
         property="bandgap",
         keywords=("band gap", "bandgap", "band-gap", "optical gap", "energy gap"),
@@ -137,7 +139,10 @@ _MATERIAL_RE = re.compile(
 )
 _TEMPERATURE_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*K\b")
 _WAVELENGTH_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*((?:μm|µm|um|nm))\b")
-_BIAS_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*V\b")
+_BIAS_RE = re.compile(r"([-+−]?\d+(?:[.,]\d+)?)\s*V\b")
+_SAMPLE_RE = re.compile(r"\b(?i:sample|film|device)\s+([A-Z][A-Z0-9_-]{0,30}|\d{1,6})\b")
+_MULTI_SAMPLE_RE = re.compile(r"\b(?i:samples|films|devices)\b|" + _SAMPLE_RE.pattern + r"\s*(?:(?i:and|or)|[/,])\s*[A-Z0-9]\b")
+_RANGE_RE = re.compile(r"(?<![\w.])([-+]?\d+(?:\.\d+)?)\s*(?:[–−-]|\bto\b)\s*([-+]?\d+(?:\.\d+)?)\s*$")
 
 
 def _sentences(text: str) -> list[str]:
@@ -166,7 +171,10 @@ def _nearest_number_before(sentence: str, end: int, window: int = 25) -> float |
         )
         if rank(candidate) > rank(match) and overlapping:
             match = candidate
-    return _value_for_match(match)
+    sign_index = match.start() - 1
+    negative = (sign_index >= 0 and fragment[sign_index] in "-−"
+                and (sign_index == 0 or fragment[sign_index - 1] not in "eE^"))
+    return (-1 if negative else 1) * _value_for_match(match)
 
 
 def _subject(sentence: str) -> str | None:
@@ -176,29 +184,34 @@ def _subject(sentence: str) -> str | None:
 
 def _method(sentence: str) -> str:
     lowered = sentence.casefold()
-    if "calculat" in lowered or "simulat" in lowered:
-        return "calculated value"
-    return "reported experimental value"
+    if re.search(r"\b(target|goal|threshold|required|aim|proposed)\b", lowered):
+        return "target or proposed value"
+    if "calculat" in lowered or "simulat" in lowered or "predict" in lowered:
+        return "calculated or predicted value"
+    if re.search(r"\b(measured|observed|experimentally|annealed|deposited|dried|heated)\b", lowered):
+        return "reported experimental value"
+    return "UNKNOWN"
 
 
 def _conditions(sentence: str) -> dict[str, Any]:
     provenance: dict[str, Any] = {}
-    temperature = _TEMPERATURE_RE.search(sentence)
-    if temperature:
+    temperatures = list(_TEMPERATURE_RE.finditer(sentence))
+    if len(temperatures) == 1:
+        temperature = temperatures[0]
         value = parse_number(temperature.group(1))
         if value is not None:
             provenance["temperature_K"] = value
-    wavelength = _WAVELENGTH_RE.search(sentence)
-    if wavelength:
+    wavelengths = list(_WAVELENGTH_RE.finditer(sentence))
+    if len(wavelengths) == 1:
+        wavelength = wavelengths[0]
         value = parse_number(wavelength.group(1))
         if value is not None:
             unit = wavelength.group(2)
             provenance["wavelength_um"] = value / 1000.0 if unit == "nm" else value
-    bias = _BIAS_RE.search(sentence)
-    if bias:
-        value = parse_number(bias.group(1))
-        if value is not None:
-            provenance["bias_V"] = value
+    biases = list(_BIAS_RE.finditer(sentence))
+    if len(biases) == 1:
+        bias = biases[0]
+        provenance["bias_V"] = float(bias.group(1).replace(",", ".").replace("−", "-"))
     return provenance
 
 
@@ -217,25 +230,48 @@ def extract_evidence_from_text(
             if not any(keyword in lowered for keyword in rule.keywords):
                 continue
             for unit_rule in rule.units:
-                for unit_match in re.finditer(unit_rule.pattern, sentence):
+                unit_matches = list(re.finditer(unit_rule.pattern, sentence))
+                for unit_match in unit_matches:
                     value = _nearest_number_before(sentence, unit_match.start())
                     if value is None:
                         continue
+                    # A reported interval is not a point value.
+                    prefix = sentence[:unit_match.start()]
+                    interval = _RANGE_RE.search(prefix)
+                    reported = [float(interval[1]), float(interval[2])] if interval else value
                     provenance = _conditions(sentence)
+                    labels = {match[1] for match in _SAMPLE_RE.finditer(sentence)}
+                    ambiguous = (len(labels) > 1 or len(unit_matches) != 1
+                                 or bool(re.search(r"\b(respectively|versus|while|whereas|but)\b|[±;]", sentence, re.IGNORECASE))
+                                 or bool(_MULTI_SAMPLE_RE.search(sentence))
+                                 or any(len(list(pattern.finditer(sentence))) > 1
+                                        for pattern in (_TEMPERATURE_RE, _WAVELENGTH_RE, _BIAS_RE)))
+                    conditions = dict(provenance)
+                    if rule.property == "temperature":
+                        conditions.pop("temperature_K", None)
+                    if rule.property in {"thickness", "wavelength"}:
+                        conditions.pop("wavelength_um", None)
+                    if not ambiguous and labels:
+                        conditions["sample_label"] = next(iter(labels))
+                    provenance["quantity_ambiguous"] = ambiguous
+                    provenance["sample_condition_binding"] = "EXPLICIT_SAME_SENTENCE" if "sample_label" in conditions else "UNKNOWN"
                     provenance["property_context"] = sentence[:160]
                     if page is not None:
                         provenance["page"] = page
                     if passage_id:
                         provenance["passage_id"] = passage_id
+                    method = _method(sentence)
                     evidence.append(
                         ScientificEvidence(
+                            assessment_role="proposal" if method == "target or proposed value" else "observation",
+                            conditions=conditions,
                             subject=_subject(sentence) or "detector",
                             property=rule.property,
-                            value=value,
+                            value=reported,
                             unit=unit_rule.unit,
                             source=source,
                             source_type="literature",
-                            method=_method(sentence),
+                            method=method,
                             summary=sentence[:220],
                             limitations=(
                                 "Regex extraction; verify value and conditions "
@@ -258,12 +294,29 @@ def extract_evidence_from_passages(
         text = str(passage.get("text") or "")
         if not text:
             continue
-        results.extend(
-            extract_evidence_from_text(
-                text,
-                source=str(passage.get("source") or passage.get("file_name") or ""),
-                page=passage.get("page"),
-                passage_id=str(passage.get("passage_id") or ""),
-            )
+        extracted = extract_evidence_from_text(
+            text,
+            source=str(passage.get("source") or passage.get("file_name") or ""),
+            page=passage.get("page"),
+            passage_id=str(passage.get("passage_id") or ""),
         )
+        for item in extracted:
+            if passage.get("unattested") or passage.get("document_revision"):
+                provenance = dict(item.provenance)
+                if passage.get("unattested"):
+                    provenance["source_kind"] = "UNATTESTED_TEXT"
+                else:
+                    provenance.update({
+                        name: passage[name] for name in (
+                            "source_kind", "source_record_id", "source_sha256", "document_revision",
+                            "object_id", "anchors",
+                        )
+                    })
+                    if "publication" in passage:
+                        provenance["publication"] = passage["publication"]
+                item = item.model_copy(update={
+                    "assessment_role": "proposal" if passage.get("unattested") else item.assessment_role,
+                    "provenance": provenance,
+                })
+            results.append(item)
     return results

@@ -28,6 +28,7 @@ from photomatagent.scientific.capabilities.literature.models import (
     IngestState,
     LiteratureSourceKind,
     PassagePoint,
+    StructuredPassageReference,
     validate_relative_source_path,
 )
 from photomatagent.scientific.capabilities.literature.providers.base import ModelIdentity
@@ -365,6 +366,13 @@ class QdrantLiteratureStore:
 
     def _documents_alias(self) -> str:
         return f"{self.prefix}_documents_current"
+
+    async def aclose(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            result = close()
+            if inspect.isawaitable(result):
+                await result
 
     def _passages_alias(self) -> str:
         return f"{self.prefix}_passages_current"
@@ -907,7 +915,7 @@ class QdrantLiteratureStore:
         self._staging_generation = generation
         return generation
 
-    async def _validate_generation_ready(self, generation: CollectionGeneration) -> bool:
+    async def _validate_generation_ready(self, generation: CollectionGeneration, *, allow_partial: bool = False) -> dict[str, Any]:
         """Reject a staging pair with unresolved document/run failures."""
         if not await self._collection_exists(generation.documents_physical) or not await self._collection_exists(
             generation.passages_physical
@@ -949,8 +957,12 @@ class QdrantLiteratureStore:
             ) from exc
         unresolved: list[str] = []
         has_ready_passage = False
+        ready_documents: dict[tuple[str, str], DocumentManifest] = {}
         for record in records or ():
             payload = _payload(record)
+            manifest = self._manifest_from_record(record)
+            if manifest is not None and manifest.status is DocumentStatus.READY:
+                ready_documents[(manifest.workspace_id, manifest.document_id)] = manifest
             if payload.get("record_type") in {"document", "ingestion_run"}:
                 point_fingerprint = str(
                     payload.get("model_fingerprint", payload.get("generation_fingerprint", ""))
@@ -971,7 +983,7 @@ class QdrantLiteratureStore:
                 or payload.get("retryable") is True
             ):
                 unresolved.append(str(payload.get("run_id", "ingestion_run")))
-        if unresolved:
+        if unresolved and not allow_partial:
             raise QdrantStoreError(
                 "generation_incomplete",
                 "generation has unresolved ingestion failures",
@@ -1019,22 +1031,31 @@ class QdrantLiteratureStore:
             if payload.get("ingest_state") == IngestState.STAGED.value:
                 unresolved_passages.append(str(payload.get("passage_id", "passage")))
             if payload.get("ingest_state") == IngestState.READY.value:
-                has_ready_passage = True
-        if unresolved_passages:
+                manifest = ready_documents.get((str(payload.get("workspace_id", "")), str(payload.get("document_id", ""))))
+                if (manifest is not None
+                    and manifest.content_sha256 == payload.get("document_revision")
+                    and self._fingerprint_matches(manifest.model_fingerprint, generation.fingerprint)
+                    and self._fingerprint_matches(point_fingerprint, generation.fingerprint)):
+                    has_ready_passage = True
+        if unresolved_passages and not allow_partial:
             raise QdrantStoreError(
                 "generation_incomplete",
                 "generation contains unresolved staged passages",
             )
-        return has_ready_passage
+        return {"has_ready_passage": has_ready_passage, "unresolved_records": len(unresolved),
+                "staged_passages": len(unresolved_passages), "complete": not unresolved and not unresolved_passages}
 
     async def _activation_ready(
         self,
         generation: CollectionGeneration,
         *,
         allow_empty_bootstrap: bool,
-    ) -> None:
-        has_ready_passage = await self._validate_generation_ready(generation)
-        if not has_ready_passage:
+        allow_partial: bool = False,
+    ) -> dict[str, Any]:
+        if allow_partial and allow_empty_bootstrap:
+            raise QdrantStoreError("generation_incomplete", "partial activation cannot be combined with empty bootstrap")
+        status = await self._validate_generation_ready(generation, allow_partial=allow_partial)
+        if not status["has_ready_passage"]:
             if not allow_empty_bootstrap:
                 raise QdrantStoreError(
                     "generation_incomplete",
@@ -1055,15 +1076,18 @@ class QdrantLiteratureStore:
                     "empty bootstrap is allowed only before current aliases exist",
                 )
 
+        return status
+
     async def activate_generation(
         self,
         generation: CollectionGeneration,
         *,
         allow_empty_bootstrap: bool = False,
-    ) -> None:
-        """Validate and atomically expose a completed staging generation."""
-        await self._activation_ready(
-            generation, allow_empty_bootstrap=allow_empty_bootstrap
+        allow_partial: bool = False,
+    ) -> dict[str, Any]:
+        """Validate and atomically expose a staging generation."""
+        status = await self._activation_ready(
+            generation, allow_empty_bootstrap=allow_empty_bootstrap, allow_partial=allow_partial
         )
         try:
             await self._switch_current_generation(generation)
@@ -1075,6 +1099,7 @@ class QdrantLiteratureStore:
                 ) from exc
             raise
         self._staging_generation = generation
+        return status
 
     def select_staging_generation(self, generation: CollectionGeneration) -> None:
         """Select an already-created physical pair for ingestion writes."""
@@ -2282,6 +2307,33 @@ class QdrantLiteratureStore:
         result = _record_attr(response, "result", [])
         return list(result or [])
 
+    async def _ready_document_records(
+        self, records: Sequence[Any], *, generation: CollectionGeneration,
+        workspace_id: str, source_kind: LiteratureSourceKind | str,
+    ) -> list[Any]:
+        """Fail closed when a passage lacks a committed document revision."""
+        ids = list(dict.fromkeys(
+            str(_payload(record).get("document_id", "")) for record in records
+            if _payload(record).get("document_id")
+        ))
+        manifests = await self.get_document_manifests(
+            workspace_id, ids, generation=generation, source_kind=source_kind
+        )
+        result = []
+        for record in records:
+            payload = _payload(record)
+            manifest = manifests.get(str(payload.get("document_id", "")))
+            if (manifest is not None and manifest.status is DocumentStatus.READY
+                and manifest.content_sha256 == payload.get("document_revision")
+                and self._fingerprint_matches(manifest.model_fingerprint, generation.fingerprint)
+                and self._fingerprint_matches(str(payload.get("model_fingerprint", "")), generation.fingerprint)
+                and payload.get("workspace_id") == workspace_id
+                and payload.get("record_type") == "passage"
+                and payload.get("ingest_state") == IngestState.READY.value
+                and _source_kind_value(payload.get("source_kind")) == _source_kind_value(source_kind)):
+                result.append(record)
+        return result
+
     async def dense_candidates(
         self,
         dense: Sequence[float],
@@ -2289,12 +2341,16 @@ class QdrantLiteratureStore:
         workspace_id: str,
         source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
         limit: int,
+        document_id: str | None = None,
+        document_revision: str | None = None,
     ) -> list[SearchCandidate]:
         generation = await self._current_or_error()
         cap = self._limit(limit)
         query_filter = self._passage_filter(
             workspace_id=workspace_id,
             ingest_state=IngestState.READY,
+            document_id=document_id,
+            document_revision=document_revision,
             source_kind=source_kind,
         )
         response = await self._client.query_points(
@@ -2307,7 +2363,8 @@ class QdrantLiteratureStore:
             with_vectors=False,
             **self._timeout_kwargs(),
         )
-        return [self._candidate_from_record(record) for record in self._query_points(response)[:cap]]
+        records = await self._ready_document_records(self._query_points(response)[:cap], generation=generation, workspace_id=workspace_id, source_kind=source_kind)
+        return [self._candidate_from_record(record) for record in records]
 
     async def sparse_candidates(
         self,
@@ -2316,6 +2373,8 @@ class QdrantLiteratureStore:
         workspace_id: str,
         source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
         limit: int,
+        document_id: str | None = None,
+        document_revision: str | None = None,
     ) -> list[SearchCandidate]:
         generation = await self._current_or_error()
         cap = self._limit(limit)
@@ -2323,6 +2382,8 @@ class QdrantLiteratureStore:
         query_filter = self._passage_filter(
             workspace_id=workspace_id,
             ingest_state=IngestState.READY,
+            document_id=document_id,
+            document_revision=document_revision,
             source_kind=source_kind,
         )
         response = await self._client.query_points(
@@ -2335,7 +2396,8 @@ class QdrantLiteratureStore:
             with_vectors=False,
             **self._timeout_kwargs(),
         )
-        return [self._candidate_from_record(record) for record in self._query_points(response)[:cap]]
+        records = await self._ready_document_records(self._query_points(response)[:cap], generation=generation, workspace_id=workspace_id, source_kind=source_kind)
+        return [self._candidate_from_record(record) for record in records]
 
     async def hybrid_candidates(
         self,
@@ -2345,6 +2407,8 @@ class QdrantLiteratureStore:
         workspace_id: str,
         source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
         limit: int,
+        document_id: str | None = None,
+        document_revision: str | None = None,
     ) -> list[SearchCandidate]:
         generation = await self._current_or_error()
         cap = self._limit(limit)
@@ -2352,6 +2416,8 @@ class QdrantLiteratureStore:
         query_filter = self._passage_filter(
             workspace_id=workspace_id,
             ingest_state=IngestState.READY,
+            document_id=document_id,
+            document_revision=document_revision,
             source_kind=source_kind,
         )
         prefetch = [
@@ -2378,7 +2444,8 @@ class QdrantLiteratureStore:
             with_vectors=False,
             **self._timeout_kwargs(),
         )
-        return [self._candidate_from_record(record) for record in self._query_points(response)[:cap]]
+        records = await self._ready_document_records(self._query_points(response)[:cap], generation=generation, workspace_id=workspace_id, source_kind=source_kind)
+        return [self._candidate_from_record(record) for record in records]
 
     def _passage_from_record(self, record: Any) -> PassagePoint | None:
         payload = _payload(record)
@@ -2426,6 +2493,8 @@ class QdrantLiteratureStore:
                 pmcid=str(payload.get("pmcid", "")),
                 journal=str(payload.get("journal", "")),
                 relevance_tier=str(payload.get("relevance_tier", "")),
+                structured_ref=(StructuredPassageReference.model_validate(payload["structured_ref"])
+                                if payload.get("structured_ref") is not None else None),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -2460,6 +2529,7 @@ class QdrantLiteratureStore:
             records = records_result[0]
         else:
             records = _record_attr(records_result, "points", [])
+        records = await self._ready_document_records(records, generation=generation, workspace_id=workspace_id, source_kind=source_kind)
         result: list[PassagePoint] = []
         for record in records:
             payload = _payload(record)

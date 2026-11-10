@@ -35,8 +35,10 @@ generate novel structures, and never re-implements SSH/Slurm/POTCAR handling
    lower-level lifecycle calls for the user.
 4. `total_charge` must always be explicit; it is never guessed from a
    molecule name, file name or formula.
-5. Follow the fixed chain: prepare → preflight → submit → status/wait →
-   resume → collect → validate → analyze/report.
+5. Select operations from the recorded lifecycle state. A new submission
+   requires prepare → preflight → submit; an already submitted job continues
+   with status/wait, supported resume, collect, validate and analysis/report
+   as needed. Do not repeat earlier stages or skip their required gates.
 6. A failed status query NEVER triggers a resubmission (refresh/reconcile
    only; UNKNOWN stays UNKNOWN until proven otherwise).
 7. An ambiguous sbatch result MUST be reconciled (registry + marker +
@@ -64,8 +66,9 @@ generate novel structures, and never re-implements SSH/Slurm/POTCAR handling
 17. Every recovery, threshold change and method change is written into
     provenance (attempt id, old/new values, reason, practical-convergence
     markers).
-18. Every response returns job_id, remote directory, current scientific
-    state and the next step — never just "已完成".
+18. For job-operation responses return the recorded job_id, remote directory,
+    current scientific state and next step when available — never just "已完成".
+    A capabilities or planning response must not invent job identifiers.
 19. WAIT, do not busy-poll. After `vasp.submit`, call `vasp.wait` (it polls
     internally with a timer and costs ONE model round-trip) and then react
     to the settled state. Repeatedly calling `vasp.status` (or filling the

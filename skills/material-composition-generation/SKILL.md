@@ -13,7 +13,12 @@ provenance and keep composition proposal, structure generation, and property
 validation as separate stages. For mechanism-based requests, use
 `generation.register_hypothesis` through the mechanism-guided skill.
 
-## Workflow
+## Model invocation and optional follow-up
+
+Return the requested compositions with their provenance when that completes the
+task. Structure generation, ML screening and DFT below are conditional follow-up
+options, not requirements for every composition-generation request. Existing
+data or checked methods may support later analysis without running a new model.
 
 1. Map every requested, trained material property into `target_properties`.
    Supported canonical fields are `gap_selected_eV`,
@@ -55,11 +60,13 @@ validation as separate stages. For mechanism-based requests, use
    `mattergen-generate` executable. `MATTERGEN_SKILL_SCRIPT` is retained only
    as a legacy compatibility override; never imply that a structure was
    generated when the executable, checkpoint, archive, or manifest is missing.
-7. After structures exist, run `chgnet.screen` on a small batch. Compare raw
+7. If the user needs an ML-potential structure comparison, run `chgnet.screen`
+   on a small batch of available structures. Compare raw
    CHGNet energies only within identical reduced compositions; label all
    CHGNet values `source_type=ml_interatomic_potential` and
-   `fidelity=ml_potential`. Run `chgnet.relax` only for finalists, then send a
-   much smaller set through the gated VASP workflow for DFT validation.
+   `fidelity=ml_potential`. Use `chgnet.relax` only when geometry refinement
+   answers the current question. If new DFT evidence is required, send a much
+   smaller authorized set through the gated VASP workflow for DFT validation.
 8. Treat every generated formula or structure as
    `UNVALIDATED_GENERATED_STRUCTURE`. Use database, electronic-structure,
    stability, transport, defect, optical, and device capabilities in later
@@ -75,9 +82,10 @@ validation as separate stages. For mechanism-based requests, use
   `VAE_METADATA_PATH` are optional retrained-model overrides only.
 - If novelty metadata is unavailable, only set `require_novel=false` after
   telling the user that novelty can no longer be established against the
-  training set.
+  training set, and only when novelty is not an explicit required constraint.
 - If no proposals survive, report the rejection counts. Relax at most one
-  explicit constraint at a time and label the rerun exploratory.
+  optional exploratory condition at a time and label the rerun exploratory.
+  Do not relax a required user constraint without their agreement.
 - Do not send responsivity, EQE, detectivity, dark current, response time, or
   other device-level properties to the VAE: its training pairs contain the 14
   material-level fields above, not device labels. Route device validation to

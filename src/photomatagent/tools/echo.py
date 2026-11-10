@@ -6,6 +6,7 @@ from photomatagent.tools.base import Tool, ToolResult
 
 
 class EchoTool(Tool):
+    effect_class = "READ_ONLY"
     name = "echo"
     description = "Echo the given text back. Useful for smoke tests."
     tags = ("utility", "test")

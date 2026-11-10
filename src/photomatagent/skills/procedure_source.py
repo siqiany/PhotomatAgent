@@ -24,7 +24,7 @@ class LocalProcedureSkillSource:
 
         entries = []
         for item in self.service.list_skills():
-            if item.get("status") != "APPROVED_PROCEDURE":
+            if item.get("status") not in {"APPROVED_PROCEDURE", "VALIDATED_PROCEDURE"}:
                 continue
             try:
                 record = self.service.read(item["skill_id"])
@@ -32,7 +32,7 @@ class LocalProcedureSkillSource:
                 continue
             entries.append(SkillIndexEntry(
                 name=record["index_name"],
-                description=f"Approved procedural guidance: {record['description']} (unvalidated science)",
+                description=f"{record['status']} procedural guidance: {record['description']} (unvalidated science)",
                 path=self.service.root / record["skill_id"] / "SKILL.md",
                 source=self.source_name,
                 priority=self.priority,
@@ -48,7 +48,7 @@ class LocalProcedureSkillSource:
             if entry.name == name:
                 skill_id = entry.path.parent.name
                 record = self.service.read(skill_id, task_id=self.task_id, run_id=self.run_id)
-                if record["status"] != "APPROVED_PROCEDURE":
+                if record["status"] not in {"APPROVED_PROCEDURE", "VALIDATED_PROCEDURE"}:
                     break
                 return _model_view(record), "SKILL.md"
         raise KeyError(f"unknown approved procedure: {name}")

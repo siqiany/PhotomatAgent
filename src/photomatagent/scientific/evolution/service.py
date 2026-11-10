@@ -458,7 +458,7 @@ class EvolutionService:
                     ),
                     expected_revision=task.revision,
                 )
-            if persisted_experience is not None:
+            if persisted_experience is not None and current.execution_mode != "IMPORTED_SESSION":
                 observation = create_strategy_observation(
                     task=task,
                     comparison=persisted_report,

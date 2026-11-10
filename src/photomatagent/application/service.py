@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import hashlib
 from pathlib import Path
 from typing import Any, cast
 
 from photomatagent.application.history import HistoricalWorkbenchImporter
 from photomatagent.application.errors import ServiceError
-from photomatagent.application.models import RunRef, RunRequest, TaskCreate
+from photomatagent.application.models import AutomaticFeedbackRequest, AutomaticRevisionResponse, ContextCompactRequest, EvolutionOptions, RunRef, RunRequest, TaskCreate
 from photomatagent.application.runner import RunManager
 from photomatagent.application.revisions import FeedbackPlanner, RevisionService
 from photomatagent.application.store import (
@@ -24,6 +26,10 @@ from photomatagent.sessions.store import (
     session_is_resumable,
     snapshot_path,
 )
+
+SKILL_SOURCE_RUN_STATUSES = frozenset({
+    "SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "INTERRUPTED",
+})
 
 
 class WorkbenchService:
@@ -41,12 +47,18 @@ class WorkbenchService:
         revision_compiler: FeedbackPlanner | None = None,
     ) -> None:
         self.store = store
+        from photomatagent.persistence.maintenance import StorageService
+        self.storage = StorageService(store, Path(workspace_root).resolve())
         self.manager = manager
         self.workspace_root = Path(workspace_root).resolve()
         self.sessions_dir = Path(sessions_dir).resolve()
         from photomatagent.application.skills import LocalSkillService
         self.skill_service = LocalSkillService(self.workspace_root)
         manager.register_host_operation("skill_replay", self._execute_skill_replay)
+        from photomatagent.application.capability_evolution import CapabilityEvolutionService
+        self.capability_evolution = CapabilityEvolutionService(self)
+        from photomatagent.application.capability_benchmark import CapabilityBenchmarkService
+        self.capability_benchmark = CapabilityBenchmarkService(self)
         self.importer = HistoricalWorkbenchImporter(store)
         self.artifacts = artifacts
         import shutil
@@ -78,17 +90,67 @@ class WorkbenchService:
             compiler=revision_compiler,
             qd_service=self.qd_service,
         )
+        manager.register_completion_hook(self._index_completed_run)
+
+    async def _index_completed_run(self, run_id: str) -> None:
+        import asyncio
+        await asyncio.to_thread(self.storage.index_run, run_id)
+
+    async def submit_feedback(
+        self, task_id: str, request: AutomaticFeedbackRequest, request_key: str,
+    ) -> AutomaticRevisionResponse:
+        """Compile and start one durable revision, shared by Web and CLI.
+
+        The full request (including repair budget) is bound to the prepare key.
+        Replays use a stable execution key, including after a lost HTTP response.
+        """
+        plan_id = await self.revision_service.prepare(task_id, request, request_key)
+        plan = self.revision_service.get(plan_id)
+        if plan.status != "READY":
+            return AutomaticRevisionResponse(
+                plan=plan, status="PREPARING" if plan.status == "PREPARING" else "PLAN_UNAVAILABLE",
+                diagnostic=plan.error,
+            )
+        if any(issue.category == "TASK_DEFINITION" and issue.status == "QUERY" for issue in plan.issues):
+            return AutomaticRevisionResponse(
+                plan=plan, status="NEEDS_CLARIFICATION",
+                diagnostic="需要补充任务目标或约束；反馈与计划已保留，尚未启动修订。",
+            )
+        execution_key = "auto-revision:" + hashlib.sha256(request_key.encode()).hexdigest()
+        try:
+            reference = await self.revision_service.execute(plan_id, request.revision_budget, execution_key)
+        except ServiceError as error:
+            return AutomaticRevisionResponse(
+                plan=self.revision_service.get(plan_id), status="EXECUTION_BLOCKED",
+                diagnostic=str(error), error_code=error.code,
+            )
+        return AutomaticRevisionResponse(
+            plan=self.revision_service.get(plan_id), status="STARTED", run=reference,
+        )
 
     def skill_sources(self) -> list[dict[str, Any]]:
+        return self.skill_source_catalog()[0]
+
+    def skill_source_catalog(self) -> tuple[list[dict[str, Any]], dict[str, int]]:
         import json
         from photomatagent.scientific.evolution.qd.store import QDStore, QDStoreError
         from photomatagent.capability_acquisition.models import ExecutionRecord, ExecutionRequest
         from photomatagent.errors import ToolExecutionError
         items = []
+        invalidated_by_task: dict[str, int] = {}
         for source in self.skill_service.sources():
             try:
                 run = self.store.run(str(source["run_id"]))
-                if run.task_id == source["task_id"] and run.status in {"SUCCEEDED", "PARTIAL"}:
+                # A completed, provenance-checked script execution can be a
+                # method source even if the wider research run later failed.
+                # LocalSkillService.create independently verifies execution
+                # completion, immutable inputs/plan, and the selected checker.
+                if run.task_id != source["task_id"] or run.status not in SKILL_SOURCE_RUN_STATUSES:
+                    continue
+                if run.result_invalidation_ids:
+                    if source["state"] == "COMPLETED":
+                        invalidated_by_task[run.task_id] = invalidated_by_task.get(run.task_id, 0) + 1
+                else:
                     items.append(source | {"kind": "ordinary_run"})
             except KeyError:
                 continue
@@ -113,12 +175,12 @@ class WorkbenchService:
                                           "input_keys": list(request.input_refs), "artifacts": [a.path for a in record.artifacts], "state": record.state})
                 except (QDStoreError, ValueError, OSError, ToolExecutionError):
                     continue
-        return items
+        return items, invalidated_by_task
 
     async def start_skill_replay(self, skill_id: str, payload: Any, request_key: str) -> RunRef:
         from photomatagent.application.skills import SkillReplay
         self.task_detail(payload.task_id)
-        self.skill_service.read(skill_id)
+        self._check_skill_replay_source(skill_id, payload)
         refs = payload.input_refs
         if refs is not None:
             resolved = {}
@@ -130,6 +192,8 @@ class WorkbenchService:
                         raise ServiceError("SKILL_INPUT_UNAVAILABLE", "输入文件不存在。") from exc
                     if row["task_id"] != payload.task_id:
                         raise ServiceError("SKILL_INPUT_SCOPE_VIOLATION", "输入不属于当前任务。")
+                    if self.store.artifact_result_invalidations(row["artifact_id"]):
+                        raise ServiceError("SKILL_INPUT_REVALIDATION_REQUIRED", "该产物属于已失效的历史结果。", status_code=409)
                     resolved[key] = row["path"]
                 else:
                     resolved[key] = ref
@@ -158,6 +222,7 @@ class WorkbenchService:
         payload = SkillReplay.model_validate(operation["payload"])
         if payload.task_id != run.task_id:
             raise ValueError("SKILL_HOST_TASK_MISMATCH")
+        self._check_skill_replay_source(str(operation["skill_id"]), payload)
         started = monotonic()
         result = await self.skill_service.replay(str(operation["skill_id"]), payload, run_id=run.run_id)
         for relative in result["artifacts"]:
@@ -168,19 +233,27 @@ class WorkbenchService:
         self.store.append_event_for_run(run.run_id, "skill_use", result | {"wall_seconds": monotonic() - started, "model_calls": 0})
         self.store.append_event_for_run(run.run_id, "loop_completed", {"reason": "completed" if result["code"] == "OK" and result["checker"]["status"] == "PASS" else "unresolved"})
 
+    def _check_skill_replay_source(self, skill_id: str, payload: Any) -> None:
+        source = self.skill_service.read(skill_id)["source"]
+        if (payload.input_refs is None and source["kind"] == "ordinary_run"
+                and source["run_id"] in self.store.result_invalidations(source["task_id"])):
+            raise ServiceError("SKILL_INPUT_REVALIDATION_REQUIRED", "源运行已失效，请绑定当前任务的新输入。", status_code=409)
+
     def create_task(self, request: TaskCreate) -> str:
         if request.attachment_ids:
             raise ServiceError("INVALID_ATTACHMENT", "新建任务不能引用其他任务的附件。")
         return self.store.create_task(request)
 
     def list_tasks(self) -> list[dict[str, object]]:
-        result: list[dict[str, object]] = []
-        for task in self.store.tasks():
-            runs = self.store.runs_for_task(task.task_id)
-            result.append(task.model_dump(mode="json") | {
-                "latest_run": runs[-1].model_dump(mode="json") if runs else None,
-            })
-        return result
+        # Compatibility endpoint: preserve all rows without N+1 run queries.
+        items: list[dict[str, object]] = []
+        cursor = None
+        while True:
+            page = self.store.projects.task_page(archived=True, cursor=cursor, limit=200)
+            items.extend(page["items"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                return items
 
     def task_detail(self, task_id: str) -> dict[str, object]:
         try:
@@ -192,6 +265,7 @@ class WorkbenchService:
             raise ServiceError("NOT_FOUND", "任务不存在。", status_code=404) from error
         journal = self.store.events_after(task_id, 0)
         progress = [event for event in journal if event.type == "closed_loop_completed"]
+        invalidations = {run.run_id: run.result_invalidation_ids for run in runs if run.result_invalidation_ids}
         candidates = [event.payload for event in journal if event.type == "evolution_candidate_captured"]
         frozen_versions = {
             str(item["bundle_sha256"])
@@ -205,13 +279,76 @@ class WorkbenchService:
             "links": [link.model_dump(mode="json") for link in links],
             "artifacts": [self.artifacts.metadata_row(row) for row in artifacts],
             "evolution": {
-                "latest": progress[-1].payload if progress else None,
+                "latest": self._result_projection(progress[-1].payload, invalidations.get(progress[-1].run_id, [])) if progress else None,
                 "candidates": candidates,
                 "skill_reliability": [self.evaluation_service.skill_reliability(digest, task_id=task_id) for digest in sorted(frozen_versions)],
             },
         }
 
+    def summary_detail(self, task_id: str) -> dict[str, Any]:
+        try:
+            task = self.store.task(task_id)
+        except KeyError as exc:
+            raise ServiceError("NOT_FOUND", "任务不存在。", status_code=404) from exc
+        with self.store.database.lock:
+            conn = self.store._connection
+            runs = conn.execute("SELECT run_id FROM runs WHERE task_id=? ORDER BY created_at DESC,run_id DESC LIMIT 51",(task_id,)).fetchall()
+            artifacts = conn.execute("SELECT * FROM artifacts WHERE task_id=? ORDER BY created_at DESC,artifact_id DESC LIMIT 51",(task_id,)).fetchall()
+            progress = conn.execute("SELECT payload_json,run_id FROM events WHERE task_id=? AND type='closed_loop_completed' ORDER BY seq DESC LIMIT 1",(task_id,)).fetchone()
+            candidates = conn.execute("SELECT payload_json FROM events WHERE task_id=? AND type='evolution_candidate_captured' ORDER BY seq DESC LIMIT 50",(task_id,)).fetchall()
+        import json
+        invalidations = self.store.result_invalidations(task_id)
+        latest = self._result_projection(json.loads(progress[0]), invalidations.get(progress[1], [])) if progress else None
+        return {"task":task.model_dump(mode="json"),"runs":[self.store.run(row[0]).model_dump(mode="json") for row in reversed(runs[:50])],"links":[item.model_dump(mode="json") for item in self.store.links_for_task(task_id)],"artifacts":[self.artifacts.metadata_row(row) for row in artifacts[:50]],"evolution":{"latest":latest,"candidates":[json.loads(row[0]) for row in candidates],"skill_reliability":[]},"pagination":{"runs_before":runs[49][0] if len(runs)>50 else None,"artifacts_before":artifacts[49]["artifact_id"] if len(artifacts)>50 else None}}
+
+    @staticmethod
+    def _result_projection(payload: dict[str, Any], invalidations: list[str]) -> dict[str, Any]:
+        if not invalidations:
+            return payload
+        return payload | {"status": "REVALIDATION_REQUIRED", "delivery_status": "UNKNOWN",
+                          "scientific_status": "UNKNOWN", "result_invalidation_ids": invalidations}
+
+    def _database_history(self, task_id: str) -> dict[str, Any] | None:
+        import json
+        from photomatagent.models.types import UserMessage, AssistantMessage
+        link = next((item for item in self.store.links_for_task(task_id) if item.source_type == "sqlite_session"), None)
+        if link is None:
+            return None
+        with self.store.database.lock:
+            row = self.store._connection.execute("SELECT * FROM checkpoints WHERE checkpoint_id=?", (link.source_id,)).fetchone()
+            if row is None or row["sha256"] != link.source_digest:
+                raise ServiceError("HISTORY_SOURCE_CHANGED", "历史检查点不可用或已变化。", status_code=409)
+            try:
+                snapshot = self.storage.sessions.load(row["session_id"],row["checkpoint_id"])
+            except (ValueError,OSError) as exc:
+                raise ServiceError("HISTORY_SOURCE_CHANGED", "历史检查点未通过完整性检查。", status_code=409) from exc
+            encoded = snapshot.model_dump_json().encode()
+            if hashlib.sha256(encoded).hexdigest()!=link.snapshot_digest:
+                raise ServiceError("HISTORY_SOURCE_CHANGED", "历史快照摘要已变化。", status_code=409)
+            event_bytes = self.store._connection.execute("SELECT COALESCE(SUM(length(payload_json)),0) FROM runtime_events WHERE session_id=? AND session_seq<=?", (row["session_id"],row["runtime_event_end_seq"])).fetchone()[0]
+            if len(encoded)>50*1024*1024 or event_bytes>50*1024*1024:
+                raise ServiceError("HISTORY_SOURCE_UNAVAILABLE", "历史源超过读取上限。", status_code=409)
+            events = [json.loads(item[0]) for item in self.store._connection.execute("SELECT payload_json FROM runtime_events WHERE session_id=? AND session_seq<=? ORDER BY session_seq",(row["session_id"],row["runtime_event_end_seq"]))]
+        messages: list[dict[str, str]] = []
+        truncated = False
+        for item in snapshot.conversation.messages:
+            if isinstance(item,UserMessage):
+                role,text = "user",item.content
+            elif isinstance(item,AssistantMessage):
+                role,text = "assistant",item.text
+            else:
+                continue
+            if len(messages)>=200:
+                truncated=True
+                break
+            messages.append({"role":role,"text":text[:12_000]})
+            truncated=truncated or len(text)>12_000
+        return {"source":{"session_id":row["session_id"],"checkpoint_id":row["checkpoint_id"],"source_digest":link.source_digest,"current":True,"messages_current":True},"messages":messages,"messages_truncated":truncated,"events":events,"snapshot":json.loads(encoded)}
+
     def historical_task(self, task_id: str) -> dict[str, object]:
+        database_history = self._database_history(task_id)
+        if database_history is not None:
+            return {key:database_history[key] for key in ("source","messages","messages_truncated")}
         try:
             self.store.task(task_id)
             link = next(
@@ -283,9 +420,67 @@ class WorkbenchService:
             "messages_truncated": truncated,
         }
 
+    def historical_source(self, task_id: str) -> dict[str, Any]:
+        """Full source for extraction, with immutable import digests rechecked."""
+        import json
+        database_history = self._database_history(task_id)
+        if database_history is not None:
+            return {key:database_history[key] for key in ("source","events","snapshot")}
+        history = self.historical_task(task_id)
+        source = cast(dict[str, Any], history["source"])
+        if not source["current"]:
+            raise ServiceError("HISTORY_SOURCE_CHANGED", "原历史已变化，拒绝提炼。", status_code=409)
+        link = next(item for item in self.store.links_for_task(task_id) if item.source_type == "runtime_session")
+        root = (self.sessions_dir / link.source_id).resolve()
+        payloads: dict[str, bytes] = {}
+        for name, expected in (("events.jsonl", link.source_digest), ("session_state.json", link.snapshot_digest)):
+            if expected is None:
+                continue
+            path = root / name
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 50 * 1024 * 1024:
+                raise ServiceError("HISTORY_SOURCE_UNAVAILABLE", "历史源文件不可用或过大。", status_code=409)
+            payload = path.read_bytes()
+            if hashlib.sha256(payload).hexdigest() != expected:
+                raise ServiceError("HISTORY_SOURCE_CHANGED", "历史源摘要变化，拒绝提炼。", status_code=409)
+            payloads[name] = payload
+        return {"source": source,
+                "events": [json.loads(line) for line in payloads["events.jsonl"].splitlines() if line.strip()],
+                "snapshot": json.loads(payloads["session_state.json"]) if "session_state.json" in payloads else None}
+
+    async def compact_context(self, task_id: str, request: ContextCompactRequest, request_key: str) -> RunRef:
+        """Queue compaction against the latest checkpoint under the task's run lock."""
+        try:
+            task = self.store.task(task_id)
+            if self.storage.sessions.unresolved(task.session_id):
+                raise ServiceError("RECONCILIATION_REQUIRED", "请先核对未完成的工具调用。", status_code=409)
+            operation = RunRequest(
+                text="手动压缩工作上下文（保留完整科研历史）",
+                budget=request.budget,
+                host_operation={"operation": "context_compaction"},
+                evolution=EvolutionOptions(enabled=False),
+            )
+            reference = self.store.reserve_run(task_id, operation, request_key, operation="context_compaction")
+            if self.store.run(reference.run_id).status == "QUEUED":
+                await self.manager.enqueue(reference.run_id)
+            return reference
+        except KeyError as error:
+            raise ServiceError("NOT_FOUND", "任务不存在。", status_code=404) from error
+        except IdempotencyConflict as error:
+            raise ServiceError("IDEMPOTENCY_CONFLICT", str(error), status_code=409) from error
+        except ActiveRunConflict as error:
+            raise ServiceError("ACTIVE_RUN_EXISTS", "当前任务仍在运行，请在安全结束后压缩。", status_code=409, retryable=True) from error
+
     async def start_run(self, task_id: str, request: RunRequest, request_key: str) -> RunRef:
         self._require_available_strategy(request)
+        if self.storage.sessions.unresolved(self.store.task(task_id).session_id):
+            raise ServiceError("RECONCILIATION_REQUIRED", "请先核对未完成的工具调用。", status_code=409)
         try:
+            if request.image_attachment_ids:
+                from photomatagent.application.workbench_images import bind_uploaded_images
+                from photomatagent.workspace import Workspace
+
+                await asyncio.to_thread(bind_uploaded_images, self.store, Workspace(self.workspace_root),
+                                        task_id, request.image_attachment_ids)
             reference = self.store.reserve_run(task_id, request, request_key)
             if self.store.run(reference.run_id).status == "QUEUED":
                 await self.manager.enqueue(reference.run_id)
@@ -320,7 +515,8 @@ class WorkbenchService:
             else:
                 operation_name = host_operation.get("operation")
                 supported = (
-                    previous.request.strategy in {"qd", "skill_replay"}
+                    (previous.request.strategy in {"qd", "skill_replay", "capability_evolution", "capability_benchmark"}
+                     or host_operation == {"operation": "context_compaction"})
                     and isinstance(operation_name, str)
                     and self.manager.has_host_operation(operation_name)
                 )
@@ -332,6 +528,8 @@ class WorkbenchService:
                         run_id=run_id,
                         next_action="检查后端能力状态；不可恢复时保留原运行并创建普通反馈修订。",
                     )
+            if self.storage.sessions.unresolved(self.store.task(previous.task_id).session_id):
+                raise ServiceError("RECONCILIATION_REQUIRED", "存在未完成核对的工具调用，无法安全续接。", status_code=409)
             recovery = await self.manager.recover(run_id)
             if recovery.status.value == "RECONCILIATION_REQUIRED":
                 raise ServiceError(
@@ -348,6 +546,8 @@ class WorkbenchService:
                 operation="resume_run",
                 idempotency_binding={"source_run_id": run_id},
             )
+            with self.store._transaction():
+                self.store._connection.execute("UPDATE runs SET resumes_run_id=? WHERE run_id=?", (run_id,reference.run_id))
             if reference.run_id == run_id:
                 raise ServiceError(
                     "IDEMPOTENCY_CONFLICT",
@@ -377,10 +577,10 @@ class WorkbenchService:
                 next_action="切换为普通科研运行；反馈与 QD 策略将在对应阶段开放。",
             )
 
-    def events_after(self, task_id: str, seq: int):
+    def events_after(self, task_id: str, seq: int, *, limit: int = 500):
         try:
             self.store.task(task_id)
-            return self.store.events_after(task_id, seq, limit=500)
+            return self.store.events_after(task_id, seq, limit=limit)
         except KeyError as error:
             raise ServiceError("NOT_FOUND", "任务不存在。", status_code=404) from error
 

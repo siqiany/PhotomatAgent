@@ -17,6 +17,7 @@ from photomatagent.application.service import WorkbenchService
 from photomatagent.web.artifacts import MAX_UPLOAD_BYTES
 from photomatagent.web.middleware import UploadBodyLimitMiddleware
 from photomatagent.web.routes import router
+from photomatagent.web.model_settings import router as model_settings_router
 
 
 def create_app(
@@ -48,7 +49,10 @@ def create_app(
         UploadBodyLimitMiddleware,
         max_body_bytes=MAX_UPLOAD_BYTES + 1024 * 1024,
     )
+    from photomatagent.web.information import router as information_router
+    app.include_router(information_router)
     app.include_router(router)
+    app.include_router(model_settings_router)
 
     static_directory = Path(webui_directory) if webui_directory is not None else None
     if static_directory is None:

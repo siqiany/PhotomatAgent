@@ -67,7 +67,7 @@ def build_scientific_tools(
     effective_workspace = workspace or Workspace(Path.cwd())
     packs = [
         materials_pack(effective_config),
-        literature_pack(effective_config, effective_workspace),
+        literature_pack(effective_config, effective_workspace, resource_owners=resource_owners),
         structure_pack(
             effective_config,
             effective_workspace,
@@ -131,11 +131,16 @@ def build_scientific_tools(
             search_provider = None
     metadata_provider = PyPIMetadataProvider()
     from photomatagent.capability_acquisition.local_backend import LocalDevBackend, local_python_digest
+    from photomatagent.capability_acquisition.container_backend import PodmanSandboxBackend
 
-    is_local_dev = isinstance(getattr(sandbox_service, "backend", None), LocalDevBackend)
-    if is_local_dev and search_provider is None:
+    backend = getattr(sandbox_service, "backend", None)
+    is_local_dev = isinstance(backend, LocalDevBackend)
+    is_podman = isinstance(backend, PodmanSandboxBackend)
+    if not effective_config.capability_search_endpoint:
         search_provider = ExactPyPISearchProvider()
-    digest = local_python_digest() if is_local_dev else effective_config.capability_image_digest
+    digest = (local_python_digest() if is_local_dev else
+              effective_config.capability_image_digest or
+              (backend.restored_image_digest() if isinstance(backend, PodmanSandboxBackend) else None))
     plan_resolver = (
         UVPlanResolver(
             image_digest=digest,
@@ -154,13 +159,65 @@ def build_scientific_tools(
     if sandbox_service is not None:
         from photomatagent.capability_acquisition.tools import (
             CapabilityInstallTool,
+            CapabilityPlanTool,
             ScriptRunTool,
         )
 
         tools.extend([
+            CapabilityPlanTool(discovery),
             CapabilityInstallTool(discovery, sandbox_service),
             ScriptRunTool(sandbox_service, published_skill_source),
         ])
+    import os
+
+    from photomatagent.capability_acquisition.method_discovery import (
+        MethodDiscoveryService, MethodInspectTool, MethodSearchExternalTool, MethodSearchTool,
+    )
+    from photomatagent.capability_acquisition.web_sources import PublicSourceClient, WebFetchTool, WebSearchService, WebSearchTool
+    from photomatagent.scientific.capabilities.literature.federated import FederatedLiterature
+    from photomatagent.capability_acquisition.repository_sources import (
+        FetchRepositoryArchiveTool, FetchRepositoryScriptTool, RepositorySearchService, RepositorySearchTool,
+    )
+
+    web_hosts = frozenset(
+        host.strip().lower() for host in os.environ.get("PHOTOMATAGENT_WEB_FETCH_HOSTS", "").split(",")
+        if host.strip()
+    )
+    web_search = WebSearchService(os.environ.get("PHOTOMATAGENT_WEB_SEARCH_ENDPOINT", ""),
+                                  os.environ.get("PHOTOMATAGENT_WEB_SEARCH_TOKEN", ""))
+    repositories = RepositorySearchService()
+    from photomatagent.scientific.capabilities.literature.documents import DocumentService
+
+    methods = MethodDiscoveryService(effective_workspace, web=web_search, repositories=repositories,
+                                     literature=FederatedLiterature.configured(DocumentService(effective_workspace)), packages=discovery)
+    tools.extend([
+        MethodSearchTool(methods, scientific_state), MethodInspectTool(methods), MethodSearchExternalTool(methods, scientific_state),
+        WebSearchTool("", service=web_search),
+        WebFetchTool(PublicSourceClient(web_hosts, request_quota=64)),
+    ])
+    from photomatagent.application.reproduction import (
+        ReproductionService, ReproductionTool, configured_reproduction_sandbox,
+    )
+
+    reproduction_sandbox = sandbox_service if sandbox_service is not None else configured_reproduction_sandbox(effective_workspace)
+
+    scratch = getattr(reproduction_sandbox, "dynamic_script_prefix", None)
+    tools.extend([
+        RepositorySearchTool(service=repositories),
+        FetchRepositoryScriptTool(effective_workspace, scratch),
+        FetchRepositoryArchiveTool(effective_workspace, scratch),
+    ])
+    reproduction = ReproductionService(effective_workspace, reproduction_sandbox)
+    tools.extend([
+        ReproductionTool(reproduction, "prepare"),
+        ReproductionTool(reproduction, "execute"),
+        ReproductionTool(reproduction, "inspect"),
+    ])
+    if scientific_state is not None:
+        from photomatagent.tools.process_plan import RegisterDecisionTool, RegisterProcessPlanTool
+
+        tools.extend([RegisterProcessPlanTool(scientific_state, effective_workspace, methods),
+                      RegisterDecisionTool(scientific_state, methods)])
     builtin_names = {getattr(tool, "name", "") for tool in tools}
     tools.extend(
         _mcp_gateway_tools(

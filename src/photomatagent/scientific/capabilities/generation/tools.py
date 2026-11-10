@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any, IO, Iterable, Literal, Mapping, cast
 
+from photomatagent.scientific.applicability import reject_outside_domain, with_domain_input
 from photomatagent.scientific.capabilities.base import (
     CapabilityPack,
     CapabilityStatus,
@@ -319,10 +320,14 @@ class VAEFormulaTool(Tool):
         },
     }
 
+    input_schema = with_domain_input(input_schema)
+
     def __init__(self, config: Any = None) -> None:
         self.config = config
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("structure-generation", arguments):
+            return rejected
         target_properties = arguments.get("target_properties") or {}
         if not isinstance(target_properties, dict):
             return ScientificToolResult(
@@ -572,6 +577,8 @@ class MatterGenTool(Tool):
         },
     }
 
+    input_schema = with_domain_input(input_schema)
+
     def __init__(
         self,
         config: ScientificConfig | None = None,
@@ -584,6 +591,8 @@ class MatterGenTool(Tool):
         self.runner = runner
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("structure-generation", arguments):
+            return rejected
         config = self.config
         requested_mode = arguments.get("pretrained_name")
         if requested_mode is None:

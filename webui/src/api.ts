@@ -2,13 +2,15 @@ import type { components } from "./generated/api-schema";
 
 export type TaskCreate = components["schemas"]["TaskCreate"];
 export type RunRequest = components["schemas"]["RunRequest-Input"];
-export type ResearchTask = components["schemas"]["ResearchTask"];
+type ApiResearchTask = components["schemas"]["ResearchTask"];
+export type ResearchTask = Omit<ApiResearchTask, "project_id" | "management_status" | "updated_at" | "revision" | "tags"> & Partial<Pick<ApiResearchTask, "project_id" | "management_status" | "updated_at" | "revision" | "tags">>;
 type ApiRunRecord = components["schemas"]["RunRecord"];
 export type RunRecord = Omit<ApiRunRecord, "request"> & {
   request: Pick<RunRequest, "text" | "strategy"> & {
     budget?: components["schemas"]["BudgetSpec"];
     evolution?: components["schemas"]["EvolutionOptions"];
     host_operation?: Record<string, unknown> | null;
+    image_attachment_ids?: string[];
   };
 };
 type ApiTaskSummary = components["schemas"]["TaskSummaryResponse"];
@@ -16,7 +18,7 @@ export type TaskSummary = Omit<ApiTaskSummary, "latest_run"> & {
   latest_run?: RunRecord | null;
 };
 type ApiTaskDetail = components["schemas"]["TaskDetailResponse"];
-export type TaskDetail = Omit<ApiTaskDetail, "runs"> & { runs: RunRecord[] };
+export type TaskDetail = Omit<ApiTaskDetail, "runs" | "task"> & { runs: RunRecord[]; task: ResearchTask };
 export type Artifact = components["schemas"]["ArtifactMetadataResponse"];
 export type Capability = components["schemas"]["CapabilityResponse"];
 export type HistorySession = components["schemas"]["HistorySessionResponse"];
@@ -40,7 +42,7 @@ export type RevisionRunRequest = {
 
 export type SkillStatus = "CANDIDATE" | "TRIALABLE" | "REUSED" | "DISABLED" | "REVALIDATION_REQUIRED";
 export type SkillCheckerSpec = {
-  checker_id: "json_numeric_sum" | "json_numeric_bounds";
+  checker_id: "json_numeric_sum" | "json_numeric_bounds" | "mwir_noise_budget" | "rc_network" | "report_tables" | "fresnel_film";
   input_key?: string;
   output_path: string;
   field: string;
@@ -53,6 +55,7 @@ export type SkillSourceRef =
   | { kind: "ordinary_run"; task_id: string; run_id: string; execution_id: string }
   | { kind: "qd_trial"; task_id: string; trial_id: string; execution_id: string };
 export type SkillCreate = {
+  parent_skill_id?: string;
   name: string;
   description: string;
   scope: string;
@@ -81,12 +84,19 @@ export interface SkillUse {
   artifacts: string[];
 }
 export interface LocalSkill {
+  interface?: { input_schema: Record<string, unknown>; output_schema: Record<string, unknown>; argv_choices: string[][]; units: Record<string, string>; assumptions: string[]; limitations: string[] } | null;
   skill_id: string;
+  version?: string;
+  plugin_id?: string;
+  logical_name?: string;
+  parent_skill_id?: string | null;
+  contract_sha256?: string;
   name?: string;
   description?: string;
   scope?: string;
   source?: SkillSourceRef;
   request?: { input_refs?: Record<string, string> };
+  input_keys?: string[];
   status: SkillStatus;
   source_evidence?: SkillCheckerResult;
   uses: SkillUse[];
@@ -112,7 +122,7 @@ export interface Procedure {
   scope: string;
   task_id: string;
   run_id: string;
-  status: "CANDIDATE" | "APPROVED_PROCEDURE" | "DISABLED";
+  status: "CANDIDATE" | "APPROVED_PROCEDURE" | "VALIDATED_PROCEDURE" | "DISABLED";
   validation_status: "UNKNOWN";
   instructions?: string;
   retrieval_count?: number;
@@ -263,9 +273,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body;
 }
 
+export type ModelRole = "main" | "judge" | "feedback";
+export type ModelSetting = { provider: string; model: string; base_url: string; key_configured: boolean; configured: boolean };
+export type ModelSettings = Record<ModelRole, ModelSetting>;
+
 export const api = {
-  tasks: () => request<{ items: TaskSummary[] }>("/api/tasks"),
-  task: (taskId: string) => request<TaskDetail>(`/api/tasks/${encodeURIComponent(taskId)}`),
+  modelSettings: () => request<ModelSettings>("/api/settings/models"),
+  saveModelSettings: (role: string, body: { provider: string; model: string; base_url: string; api_key?: string }) =>
+    request<ModelSettings>(`/api/settings/models/${role}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    }),
+  information: <T = unknown>(path: string, body?: unknown, method?: string) => request<T>(`/api${path}`, {
+    method: method ?? (body === undefined ? "GET" : "POST"),
+    ...(body === undefined ? {} : { headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify(body) }),
+  }),
+  tasks: (filters: Record<string, string> = {}) => request<{ items: TaskSummary[]; next_cursor?: string | null }>(`/api/tasks?${new URLSearchParams({ view: "page", ...filters })}`),
+  task: (taskId: string) => request<TaskDetail>(`/api/tasks/${encodeURIComponent(taskId)}?view=summary`),
   historicalTask: (taskId: string) => request<HistoricalTask>(`/api/tasks/${encodeURIComponent(taskId)}/history`),
   createTask: (body: TaskCreate) =>
     request<{ task_id: string }>("/api/tasks", {
@@ -273,6 +296,13 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  uploadAttachment: (taskId: string, file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return request<components["schemas"]["AttachmentResponse"]>(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, {
+      method: "POST", body,
+    });
+  },
   startRun: (taskId: string, body: RunRequest) =>
     request<RunRef>(`/api/tasks/${encodeURIComponent(taskId)}/runs`, {
       method: "POST",
@@ -281,6 +311,12 @@ export const api = {
         "Idempotency-Key": crypto.randomUUID(),
       },
       body: JSON.stringify(body),
+    }),
+  compactContext: (taskId: string, budget: components["schemas"]["BudgetSpec"], key: string) =>
+    request<RunRef>(`/api/tasks/${encodeURIComponent(taskId)}/context/compact`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+      body: JSON.stringify({ budget }),
     }),
   cancelRun: (runId: string) =>
     request<{ run_id: string; status: string }>(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
@@ -303,6 +339,12 @@ export const api = {
         "Content-Type": "application/json",
         "Idempotency-Key": crypto.randomUUID(),
       },
+      body: JSON.stringify(body),
+    }),
+  submitFeedback: (taskId: string, body: components["schemas"]["AutomaticFeedbackRequest"], key: string) =>
+    request<components["schemas"]["AutomaticRevisionResponse"]>(`/api/tasks/${encodeURIComponent(taskId)}/feedback/auto`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": key },
       body: JSON.stringify(body),
     }),
   revisionPlan: (taskId: string, planId: string) =>
@@ -339,6 +381,18 @@ export const api = {
     headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
     body: JSON.stringify(body),
   }),
+  capabilityBenchmarks: (taskId: string) => request<{ items: Array<Record<string, unknown>> }>(`/api/tasks/${encodeURIComponent(taskId)}/capability-benchmarks`),
+  startCapabilityBenchmark: (taskId: string, body: { repeats: number; max_tokens: number; max_model_calls?: number; wall_seconds?: number; conditions?: string[] }) => request<{ task_id: string; run_id: string }>(`/api/tasks/${encodeURIComponent(taskId)}/capability-benchmarks`, {
+    method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify(body),
+  }),
+  blindCapabilityCases: (taskId: string, jobId: string) => request<{ items: Array<Record<string, unknown>> }>(`/api/tasks/${encodeURIComponent(taskId)}/capability-benchmarks/${encodeURIComponent(jobId)}/blind-cases`),
+  reviewCapabilityCase: (taskId: string, jobId: string, body: Record<string, unknown>) => request<Record<string, unknown>>(`/api/tasks/${encodeURIComponent(taskId)}/capability-benchmarks/${encodeURIComponent(jobId)}/reviews`, {
+    method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify(body),
+  }),
+  capabilityLearning: (taskId: string) => request<{ items: Array<Record<string, unknown>> }>(`/api/tasks/${encodeURIComponent(taskId)}/capability-learning`),
+  startCapabilityLearning: (taskId: string, body: { source_run_id: string; max_candidates?: number; max_executions?: number; wall_seconds?: number; search_mode?: "directed" | "random" }) => request<{ task_id: string; run_id: string }>(`/api/tasks/${encodeURIComponent(taskId)}/capability-learning`, {
+    method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify(body),
+  }),
   skills: () => request<{ items: LocalSkill[] }>("/api/skills"),
   procedures: () => request<{ items: Procedure[] }>("/api/procedures"),
   procedure: (skillId: string) => request<Procedure>(`/api/procedures/${encodeURIComponent(skillId)}`),
@@ -349,7 +403,7 @@ export const api = {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ review_note: reviewNote }),
   }),
   disableProcedure: (skillId: string) => request<Procedure>(`/api/procedures/${encodeURIComponent(skillId)}/disable`, { method: "POST" }),
-  skillSources: () => request<{ items: SkillExecutionSource[] }>("/api/skills/sources"),
+  skillSources: () => request<{ items: SkillExecutionSource[]; invalidated_by_task?: Record<string, number> }>("/api/skills/sources"),
   createSkill: (body: SkillCreate) =>
     request<LocalSkill>("/api/skills", {
       method: "POST",
@@ -367,6 +421,9 @@ export const api = {
       `/api/skills/${encodeURIComponent(skillId)}/disable`,
       { method: "POST" },
     ),
+  enableSkill: (skillId: string) => request<{ skill_id: string; status: SkillStatus }>(
+    `/api/skills/${encodeURIComponent(skillId)}/enable`, { method: "POST" },
+  ),
   history: () => request<{ items: HistorySession[] }>("/api/history/sessions"),
   importHistory: (sessionId: string) =>
     request<{ task_id: string }>("/api/history/import", {

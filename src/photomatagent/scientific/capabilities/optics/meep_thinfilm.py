@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from photomatagent.scientific.applicability import reject_outside_domain, with_domain_input
 from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
@@ -304,7 +305,11 @@ class MeepThinFilmTool(Tool):
         "required": ["wavelength_um", "thickness_um"],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("fdtd-thin-film", arguments):
+            return rejected
         wavelength = float(arguments["wavelength_um"])
         thickness = float(arguments["thickness_um"])
         vasprun = arguments.get("vasprun_xml")

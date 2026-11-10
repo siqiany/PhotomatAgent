@@ -8,11 +8,12 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from rich.console import Console
 
 from photomatagent.cli.render import ChatRenderer
+from photomatagent.cli.research_mode import ResearchMode
 from photomatagent.errors import ToolExecutionError
 from photomatagent.logging.event_logger import EventLogger
 from photomatagent.redaction import redact_text
@@ -64,6 +65,16 @@ ExpertTaskKind = Literal["proposal", "validation"]
 
 
 COMMANDS = (
+    CommandSpec("/project list|create|use|show|rename|archive|unarchive", "管理研究课题"),
+    CommandSpec("/task list|show|rename|move|state|tag|archive|unarchive|input|replace-input", "管理任务与关联输入"),
+    CommandSpec("/search 关键词 [--workspace]", "检索当前课题或工作区历史"),
+    CommandSpec("/data status|doctor|import|refresh|reindex|export|backup|restore", "数据管理与恢复说明"),
+    CommandSpec("/research [--session ID|--task ID]", "进入自动研究；后续输入为专家评审。/back 返回普通聊天"),
+    CommandSpec("/research methods|sources|documents|reproduce|process <需求>", "从聊天进入材料方法、来源、文档、复现或工艺流程"),
+    CommandSpec("/image <工作区相对路径|附件 ID> <问题>", "在普通聊天或科研任务中发送图像"),
+    CommandSpec("/make skill [task_ID|session_ID]", "从历史提炼待审阅技能，保留科学证据边界"),
+    CommandSpec("/goal <新目标>", "明确更换当前目标；普通后续输入默认补充原目标"),
+    CommandSpec("/stop", "科研模式中取消后台当前轮；普通运行使用 Ctrl+C"),
     CommandSpec("/help", "显示所有聊天命令及功能"),
     CommandSpec("/approve -o", "本次聊天任务完全允许所有工具"),
     CommandSpec("/approve -a", "在当前工作区持久保持完全允许"),
@@ -75,6 +86,7 @@ COMMANDS = (
     CommandSpec("/skills [list]", "查看可用技能"),
     CommandSpec("/scientific [status]", "查看所有科学能力包及依赖状态"),
     CommandSpec("/rag [status]", "查看并操作 Qdrant 文献 RAG"),
+    CommandSpec("/research [list|start|show|feedback|watch|events|compact|abilities]", "与 Web 共用科研任务、自然语言返修和能力库"),
     CommandSpec("/scientific approve <decision-id>", "显示并确认批准 VASP 应用级决策（仅用户）"),
     CommandSpec("/scientific scnet-doctor", "诊断 SCNet、Slurm 与科学应用"),
     CommandSpec("/mcp [list]", "列出 MCP 服务配置"),
@@ -97,11 +109,20 @@ COMMANDS = (
         "/expert [session-id|history] [--task-kind proposal|validation]",
         "启动内部专家评审向导；默认 validation，模式由命令参数明确选择",
     ),
-    CommandSpec("/configure [options]", "配置工作区 LLM（可能交互询问）"),
+    CommandSpec("/configure [--role main|judge|feedback]", "在聊天内配置模型和独立 key；/configure --help 查看选项"),
     CommandSpec("/compact", "立即压缩工作上下文，保留完整历史"),
     CommandSpec("/resume <id|目录|latest>", "回溯加载历史 session，并在其基础上继续追问"),
     CommandSpec("/exit 或 /quit", "退出当前聊天"),
 )
+
+
+_RESEARCH_ENTRY_POINTS = {
+    "methods": "用 method_search 比较本地方法及已验证归档。必要时经授权用 method_search_external 查询外部来源；用 method_inspect 查看候选范围和证据。需要保存决策或依据明确的方法缺口时用 decision.record。",
+    "sources": "按问题选择 web.search、literature.search 或已有本地来源。逐项报告来源状态。",
+    "documents": "使用 literature.read_paper 或 literature.read_object 按来源锚点阅读。需要检索时可按授权使用 literature.index_document。",
+    "reproduce": "使用 reproduction.prepare 检查复现条件。明确准备、执行、参考值检查及适用性状态。",
+    "process": "从有条件的工艺证据提出方案。用 process.register_plan 保存提案并保留证据缺口。",
+}
 
 
 class ChatCommandRouter:
@@ -112,6 +133,7 @@ class ChatCommandRouter:
         "skills",
         "scientific",
         "rag",
+        "research",
         "mcp",
         "sessions",
         "experiments",
@@ -122,6 +144,7 @@ class ChatCommandRouter:
         "skills": "list",
         "scientific": "status",
         "rag": "status",
+        "research": "list",
         "mcp": "list",
         "sessions": "list",
         "evolve": "list",
@@ -143,6 +166,9 @@ class ChatCommandRouter:
         self.logger = logger
         self.sessions_dir = sessions_dir
         self.prompt_session = prompt_session
+        self.research_mode: ResearchMode | None = None
+        from photomatagent.cli.information import InformationCommands
+        self.information = InformationCommands(console)
 
     async def execute(self, line: str) -> bool:
         try:
@@ -155,7 +181,14 @@ class ChatCommandRouter:
         first_token = parts[0]
         command = first_token.lower()
         args = parts[1:]
-        if command == "/help":
+        if command in {"/project", "/task", "/search", "/data"}:
+            try:
+                await self.information.execute(command, args)
+                if self.research_mode is not None:
+                    self.research_mode.project_id = self.information.project_id
+            except ValueError as exc:
+                self.console.print(str(exc), markup=False)
+        elif command == "/help":
             self._help()
         elif command == "/approve":
             self._approve(args)
@@ -163,10 +196,50 @@ class ChatCommandRouter:
             await self._compact(args)
         elif command == "/resume":
             await self._resume(args)
+        elif command == "/sessions" and args[:1] == ["resume"]:
+            await self._resume(args[1:] or ["latest"])
+        elif command == "/image":
+            if len(args) < 2:
+                self.console.print("用法：/image <工作区相对路径或科研任务附件 ID> <问题>")
+            elif self.research_mode is not None:
+                await self.research_mode.submit_image(args[0], " ".join(args[1:]))
+            else:
+                from photomatagent.cli.chat import run_goal
+
+                await run_goal(self.console, self.runtime, " ".join(args[1:]), image_paths=(args[0],),
+                               session_dir=self.logger.session_dir if self.logger else None)
+        elif command == "/research" and args and args[0] in _RESEARCH_ENTRY_POINTS:
+            await self._research_entry(args)
+        elif command in {"/research", "/resarch"} and (not args or args[0] in {"--session", "--task", "task", "chat"}):
+            if self.prompt_session is None:
+                self.console.print("科研交互需要聊天输入会话。")
+                return True
+            if self.research_mode is None:
+                self.research_mode = ResearchMode(self.console, self.prompt_session)
+                self.research_mode.project_id = self.information.project_id
+            await self.research_mode.select(args[1:] if args[:1] == ["chat"] else args)
+        elif command == "/back":
+            self.research_mode = None
+            self.console.print("已返回普通聊天；后台科研任务保留。")
+        elif command == "/make" and args[:1] == ["skill"]:
+            if self.prompt_session is None:
+                return True
+            mode = self.research_mode or ResearchMode(self.console, self.prompt_session)
+            source = args[1] if len(args) > 1 else (None if mode.task_id else (self.logger.session_id if self.logger else None))
+            await mode.make_skill(source)
+        elif command == "/stop" and self.research_mode is not None:
+            await self.research_mode.stop()
+        elif command == "/events" and self.research_mode is not None and self.research_mode.task_id is not None:
+            self.console.print(await asyncio.to_thread(self.research_mode.client.events, self.research_mode.task_id), markup=False)
         elif command == "/doctor":
             await self._run_cli(["doctor", *args])
         elif command == "/configure":
-            await self._run_cli(["configure", *args])
+            from photomatagent.cli.configure import ConfigurationPrompt, configure_in_chat
+            from photomatagent.cli.prompt import make_prompt_session
+            await configure_in_chat(
+                args=args, session=cast(ConfigurationPrompt, self.prompt_session or make_prompt_session()),
+                console=self.console, workspace=self.workspace, runtime=self.runtime,
+            )
         elif first_token == "/evolve":
             await self._evolve(args)
         elif command == "/expert":
@@ -182,6 +255,19 @@ class ChatCommandRouter:
         else:
             self.console.print(f"[yellow]未知命令：{command}。输入 /help 查看可用命令。[/]")
         return True
+
+    async def _research_entry(self, args: list[str]) -> None:
+        from photomatagent.cli.chat import run_goal
+
+        if len(args) < 2:
+            self.console.print(f"用法：/research {args[0]} <需求>")
+            return
+        text = f"{_RESEARCH_ENTRY_POINTS[args[0]]}\n用户需求：{' '.join(args[1:])}"
+        if self.research_mode is not None:
+            await self.research_mode.submit(text)
+        else:
+            await run_goal(self.console, self.runtime, text, intent="supplement",
+                           session_dir=self.logger.session_dir if self.logger else None)
 
     async def _evolve(self, args: list[str]) -> None:
         """Route interactive evolve forms without redirecting process stdin."""
@@ -329,6 +415,9 @@ class ChatCommandRouter:
         if args:
             self.console.print("用法：/compact")
             return
+        if self.research_mode is not None:
+            await self.research_mode.compact()
+            return
         if not self.runtime.conversation_state.messages:
             self.console.print("[dim]没有可压缩的旧上下文[/]")
             return
@@ -409,24 +498,43 @@ class ChatCommandRouter:
         except TraceError as exc:
             self.console.print(f"[red]{exc}[/]")
             return
+        from photomatagent.sessions.binding import managed_task, attach_session
+        task_id = managed_task(session_dir)
+        if task_id is not None:
+            if self.prompt_session is None:
+                self.console.print(f"此会话属于科研任务 {task_id}，请用 /research --task {task_id} 继续。")
+                return
+            mode = ResearchMode(self.console, self.prompt_session)
+            mode.project_id = self.information.project_id
+            await mode.select(["--task", task_id])
+            self.research_mode = mode
+            return
         if not session_is_resumable(session_dir):
             self.console.print(
                 f"[red]session {session_dir.name} 没有可恢复的状态（只有离线轨迹），"
-                "只能 /sessions replay。[/]"
+                "可用 /sessions replay 查看；若快照含未完成工具调用，需先核对实际副作用。[/]"
             )
             return
+        snapshot = load_session_snapshot(session_dir)
+        self.runtime._validate_engine_snapshot(snapshot.conversation.messages, snapshot.engine)
         if self.logger is not None:
             # Persist the current in-chat session state before switching away.
-            save_session_snapshot(
-                self.logger.session_dir,
-                conversation=self.runtime.conversation_state,
-                scientific=self.runtime.scientific_state,
-                engine=self.runtime.context_engine.snapshot(),
-            )
-        snapshot = load_session_snapshot(session_dir)
+            if self.runtime.persistence is not None:
+                await self.runtime.persistence.checkpoint(self.runtime, "session_switch")
+            else:
+                save_session_snapshot(
+                    self.logger.session_dir,
+                    conversation=self.runtime.conversation_state,
+                    scientific=self.runtime.scientific_state,
+                    engine=self.runtime.context_engine.snapshot(),
+                )
         try:
-            self.runtime.restore_session(snapshot)
-        except ValueError as exc:
+            forked = False
+            if self.logger is not None:
+                forked = attach_session(self.runtime, self.logger, session_dir, snapshot)
+            else:
+                self.runtime.restore_session(snapshot)
+        except (ValueError, RuntimeError, OSError) as exc:
             self.console.print(
                 f"[red]无法恢复 session：{redact_text(str(exc))}[/]",
                 markup=False,
@@ -438,11 +546,9 @@ class ChatCommandRouter:
             if diagnostic_codes
             else ""
         )
-        if self.logger is not None:
-            # Follow-up turns continue in the resumed session's trace.
-            self.logger.session_id = session_dir.name
-            self.logger.session_dir = session_dir
-            self.logger.events_path = session_dir / "events.jsonl"
+        self.research_mode = None
+        if forked:
+            self.console.print(f"原会话是只读历史来源；已创建续聊会话 {self.logger.session_id if self.logger else ''}，保留原始记录。")
         self.console.print(
             f"[green]已回溯到 session {session_dir.name}："
             f"{len(snapshot.conversation.messages)} 条消息，"
@@ -457,7 +563,9 @@ class ChatCommandRouter:
 
         from photomatagent.cli.app import app
 
-        if "--workspace" not in args and args[0] not in {"sessions", "skills"}:
+        if args[:2] == ["sessions", "list"] and self.sessions_dir is not None and "--sessions-dir" not in args:
+            args.extend(["--sessions-dir", str(self.sessions_dir)])
+        if "--workspace" not in args and args[0] not in {"sessions", "skills", "research"}:
             args.extend(["--workspace", str(self.workspace.root)])
         # CliRunner temporarily replaces process-global standard streams.  On
         # some Click/Python combinations that can lose the event-loop wakeup

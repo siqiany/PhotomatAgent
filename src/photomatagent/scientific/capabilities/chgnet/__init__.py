@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
 
+from photomatagent.scientific.applicability import reject_outside_domain, with_domain_input
 from photomatagent.scientific.capabilities.base import (
     CapabilityPack,
     CapabilityStatus,
@@ -256,6 +257,7 @@ class CHGNetScreenTool(_CHGNetTool):
         },
         "required": ["paths"],
     }
+    input_schema = with_domain_input(input_schema)
 
     def __init__(
         self,
@@ -270,6 +272,8 @@ class CHGNetScreenTool(_CHGNetTool):
         )
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejection := reject_outside_domain("structure-relaxation", arguments):
+            return rejection
         try:
             paths = _screen_input_paths(arguments)
             if not paths:
@@ -458,6 +462,7 @@ class CHGNetRelaxTool(_CHGNetTool):
         },
         "required": ["path"],
     }
+    input_schema = with_domain_input(input_schema)
 
     def __init__(
         self,
@@ -476,6 +481,8 @@ class CHGNetRelaxTool(_CHGNetTool):
         self._optimizer_factory = optimizer_factory or _default_optimizer_factory
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejection := reject_outside_domain("structure-relaxation", arguments):
+            return rejection
         # Resolve every model-visible argument before loading either CHGNet
         # model or optimizer.  This keeps invalid paths/limits side-effect free.
         try:

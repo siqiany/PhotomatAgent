@@ -19,7 +19,7 @@ from photomatagent.capability_acquisition.container_backend import PodmanSandbox
 from photomatagent.capability_acquisition.models import EnvironmentRecord
 from photomatagent.capability_acquisition.sandbox import SandboxService
 from photomatagent.capability_acquisition.tools import ScriptRunTool
-from photomatagent.config import DotEnvConfig, read_preferred_config
+from photomatagent.model_settings import selection, values
 from photomatagent.models.base import ModelProvider
 from photomatagent.models.factory import create_provider
 from photomatagent.runtime.permissions import (
@@ -39,6 +39,7 @@ from photomatagent.scientific.evolution.qd.operators import ModelProposalEngine
 from photomatagent.scientific.evolution.qd.store import QDStore
 from photomatagent.scientific.evolution.qd.validation import ContractValidator
 from photomatagent.tools.base import Tool, ToolResult
+from photomatagent.tools.exposure import ToolExposure
 from photomatagent.workspace import Workspace
 
 
@@ -142,15 +143,9 @@ class QDRuntimeAdapter:
             )
             # Historical environments without a frozen plan still execute, but cannot
             # become cross-task local method candidates.
-            plan = None
-            plan_path = self.workspace.root / ".photomatagent" / "capability-plans" / f"{environment.plan_sha256}.json"
-            if plan_path.is_file() and not plan_path.is_symlink():
-                import json
-                from datetime import datetime, timedelta, timezone
-                from photomatagent.capability_acquisition.models import InstallPlan
-                raw = json.loads(plan_path.read_text())
-                raw["expires_at"] = datetime.now(timezone.utc) + timedelta(days=1)
-                plan = InstallPlan.model_validate(raw)
+            from photomatagent.capability_acquisition.sandbox import load_persisted_install_plan
+
+            plan = load_persisted_install_plan(self.workspace.root, environment.plan_sha256)
             sandbox.register_environment(environment, plan=plan)
             delegate = ScriptRunTool(sandbox)
             declared = _declared_output_paths(trial, contract)
@@ -187,12 +182,12 @@ class QDRuntimeAdapter:
 
 
 def _configured_model(workspace: Path) -> ModelProvider:
-    config = read_preferred_config(DotEnvConfig(workspace))
-    if config is None or config.provider == "fake" or not config.model:
+    provider, model, key, _ = selection(values(workspace), "main")
+    if provider == "fake" or not model:
         raise ValueError("QD_MODEL_NOT_CONFIGURED")
-    if config.api_key_env is None:
+    if not key:
         raise ValueError("QD_MODEL_CREDENTIALS_NOT_CONFIGURED")
-    return create_provider(config.provider, config.model)
+    return create_provider(provider, model, workspace=workspace)
 
 
 def _workspace_path(workspace: Workspace, value: str) -> Path:
@@ -354,6 +349,9 @@ class _QDArtifactScriptTool(Tool):
         self.declared_paths = declared_paths
         for field in ("name", "description", "short_description", "input_schema", "exposure", "namespace", "source", "tags", "searchable", "cost_class"):
             setattr(self, field, getattr(delegate, field))
+        # A QD trial has one known, frozen script binding. Expose its full schema
+        # directly so the runtime can execute it without discovery round trips.
+        self.exposure = ToolExposure.DIRECT
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         result = await self.delegate.execute(arguments)

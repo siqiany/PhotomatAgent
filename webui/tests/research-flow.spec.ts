@@ -5,6 +5,7 @@ import { expect, test, type Page } from "@playwright/test";
 // numeric rules below check software behavior, not a materials-science claim.
 type Task = { task: { task_id: string; title: string }; runs: Array<{ run_id: string; status: string; request: { text: string } }>; artifacts: Array<{ artifact_id: string; filename: string; run_id: string | null; sha256: string }> };
 type Event = { run_id: string; type: string; payload: Record<string, unknown> };
+type SkillSources = { items: Array<{ task_id: string; run_id: string; execution_id: string; artifacts: string[] }>; invalidated_by_task: Record<string, number> };
 
 async function createTask(page: Page, title: string, goal: string): Promise<string> {
   await page.getByRole("button", { name: "新建任务" }).click();
@@ -58,7 +59,7 @@ test("engineering research journey persists feedback, real script execution, cro
   expect((await prepared.json() as { kind: string }).kind).toBe("engineering-only");
   await page.getByLabel("本轮需求").fill("执行教学求和脚本，并标注材料结论仍待验证。");
   await page.getByRole("button", { name: "提交给智能体" }).click();
-  await expect(page.locator(".run-status")).toHaveText("已完成", { timeout: 20_000 });
+  await expect(page.locator(".run-status")).toHaveText("运行结束", { timeout: 20_000 });
   await expect(page.getByRole("region", { name: "本轮报告" })).toContainText("不代表材料科学结论");
   const sourceRun = (await detail(page, taskA)).runs.at(-1)!;
   expect(sourceRun.request.text).toContain("执行教学求和脚本");
@@ -66,7 +67,7 @@ test("engineering research journey persists feedback, real script execution, cro
   expect(sourceEvents.some((event) => event.run_id === sourceRun.run_id && event.type === "tool_completed" && JSON.stringify(event.payload).includes("script_run"))).toBeTruthy();
   expect(sourceEvents.some((event) => event.run_id === sourceRun.run_id && event.type === "run_completed" && "cost" in event.payload)).toBeTruthy();
   const sourceResponse = await page.request.get("/api/skills/sources");
-  const source = (await sourceResponse.json() as { items: Array<{ task_id: string; run_id: string; execution_id: string; artifacts: string[] }> }).items.find((item) => item.run_id === sourceRun.run_id);
+  const source = (await sourceResponse.json() as SkillSources).items.find((item) => item.run_id === sourceRun.run_id);
   expect(source?.task_id).toBe(taskA);
   expect(source?.artifacts).toContain("result.json");
 
@@ -81,21 +82,26 @@ test("engineering research journey persists feedback, real script execution, cro
   await expect(page.getByLabel("基于哪一轮结果改进")).toHaveValue(sourceRun.run_id);
   await page.getByRole("checkbox", { name: "SAM 演示指标.md" }).check();
   await page.getByLabel("对这轮结果的意见").fill("请确认目标边界，并补充可核验的一手来源。");
-  const feedbackResponse = page.waitForResponse((response) => response.request().method() === "POST" && new URL(response.url()).pathname === `/api/tasks/${taskA}/feedback`);
-  await page.getByRole("button", { name: "分析意见并生成计划" }).click();
-  const sourcePlan = await (await feedbackResponse).json() as { plan_id: string; task_id: string; source_run_id: string; source_digest: string; source_artifacts: Array<{ artifact_id: string }> };
+  const feedbackResponse = page.waitForResponse((response) => response.request().method() === "POST" && new URL(response.url()).pathname === `/api/tasks/${taskA}/feedback/auto`);
+  await page.getByRole("button", { name: "提交意见并自动返修" }).click();
+  const { plan: sourcePlan } = await (await feedbackResponse).json() as { plan: { plan_id: string; task_id: string; source_run_id: string; source_digest: string; source_artifacts: Array<{ artifact_id: string }> } };
   expect(sourcePlan.task_id).toBe(taskA);
   expect(sourcePlan.source_run_id).toBe(sourceRun.run_id);
   expect(sourcePlan.source_digest).toMatch(/^[0-9a-f]{64}$/);
-  expect(sourcePlan.source_artifacts.map((artifact) => artifact.artifact_id)).toEqual([sourceArtifactId]);
+  const sourceSnapshots = (await detail(page, taskA)).artifacts.filter((artifact) => artifact.run_id === sourceRun.run_id);
+  const latestSnapshots = [...new Map(sourceSnapshots.map((artifact) => [artifact.filename, artifact.artifact_id])).values()];
+  expect(sourcePlan.source_artifacts.map((artifact) => artifact.artifact_id).sort()).toEqual(latestSnapshots.sort());
+  expect(latestSnapshots).toContain(sourceArtifactId);
   await expect(page.getByRole("region", { name: "修订计划" })).toContainText("需要补充目标说明");
   await page.getByLabel("补充目标说明").fill("仅演示数值程序检查，不提出已验证的材料结论。");
   await page.getByRole("button", { name: "用补充说明重新生成计划" }).click();
+  const revisionSummary = page.getByText("查看返修计划与检查依据", { exact: true });
+  await expect(revisionSummary.locator("..")).toHaveJSProperty("open", false);
+  await revisionSummary.click();
   await expect(page.getByRole("region", { name: "修订计划" })).toContainText("UNKNOWN");
   const durablePlan = await (await page.request.get(`/api/tasks/${taskA}/revisions/${sourcePlan.plan_id}`)).json() as { source_run_id: string; issues: unknown[] };
   expect(durablePlan.source_run_id).toBe(sourceRun.run_id);
   expect(durablePlan.issues.length).toBeGreaterThan(0);
-  await page.getByRole("button", { name: "开始补充工作" }).click();
   await expect(page.getByRole("region", { name: "新旧结果对照" })).toContainText("待核查（UNKNOWN）", { timeout: 20_000 });
   await page.reload();
   await page.getByRole("button", { name: "产物与自进化", exact: true }).click();
@@ -104,7 +110,22 @@ test("engineering research journey persists feedback, real script execution, cro
 
   const skillPanel = page.getByRole("region", { name: "技能复用" });
   await skillPanel.getByText("从本任务执行记录创建候选").click();
-  await expect(page.getByLabel("来源执行")).toHaveValue(source!.execution_id);
+  await expect(skillPanel.getByRole("status")).toContainText("1 条来源执行已失效");
+  await expect(skillPanel.getByLabel("来源执行")).toHaveCount(0);
+  const invalidatedSources = await (await page.request.get("/api/skills/sources")).json() as SkillSources;
+  expect(invalidatedSources.items.some((item) => item.execution_id === source!.execution_id)).toBe(false);
+  expect(invalidatedSources.invalidated_by_task[taskA]).toBe(1);
+
+  const freshRequest = "重新执行教学求和脚本，核对修订后使用的输入。";
+  await page.getByLabel("本轮需求").fill(freshRequest);
+  await page.getByRole("button", { name: "提交给智能体" }).click();
+  await expect.poll(async () => (await detail(page, taskA)).runs.find((run) => run.request.text === freshRequest)?.status).toBe("SUCCEEDED");
+  const freshRun = (await detail(page, taskA)).runs.find((run) => run.request.text === freshRequest)!;
+  const freshSources = await (await page.request.get("/api/skills/sources")).json() as SkillSources;
+  const freshSource = freshSources.items.find((item) => item.run_id === freshRun.run_id);
+  expect(freshSource?.artifacts).toContain("result.json");
+  await skillPanel.getByLabel("来源执行").selectOption(freshSource!.execution_id);
+  await expect(skillPanel.getByLabel("来源执行")).toHaveValue(freshSource!.execution_id);
   await page.getByLabel("技能名称").fill("numeric-bounds");
   await page.getByLabel("方法说明").fill("教学数组求和，数值上界为十。");
   await page.getByLabel("适用范围").fill("教学数值数组");
@@ -115,7 +136,7 @@ test("engineering research journey persists feedback, real script execution, cro
   await page.getByRole("button", { name: "保存候选" }).click();
   await expect(skillPanel).toContainText("源检查");
   let skills = await (await page.request.get("/api/skills")).json() as { items: Array<{ skill_id: string; source: { task_id: string; run_id: string }; source_evidence: { status: string }; status: string; uses: Array<{ checker: { status: string }; input_sha256: Record<string, string>; task_id: string }> }> };
-  const skillId = skills.items.find((item) => item.source?.run_id === sourceRun.run_id)?.skill_id;
+  const skillId = skills.items.find((item) => item.source?.run_id === freshRun.run_id)?.skill_id;
   expect(skillId).toMatch(/^skill_[0-9a-f]{32}$/);
   expect(skills.items.find((item) => item.skill_id === skillId)?.source_evidence.status).toBe("PASS");
   await skillPanel.getByRole("button", { name: "回放到当前任务" }).click();
@@ -193,6 +214,6 @@ test("a cancelled engineering run keeps its cost record and can be followed by a
   expect((await events(page, taskId)).some((event) => event.run_id === cancelledRun && event.type === "run_cancelled" && "cost" in event.payload)).toBeTruthy();
   await page.getByLabel("本轮需求").fill("取消后重试：仅输出待验证的演示说明。");
   await page.getByRole("button", { name: "提交给智能体" }).click();
-  await expect(page.locator(".run-status")).toHaveText("已完成", { timeout: 10_000 });
+  await expect(page.locator(".run-status")).toHaveText("运行结束", { timeout: 10_000 });
   expect((await detail(page, taskId)).runs).toHaveLength(2);
 });

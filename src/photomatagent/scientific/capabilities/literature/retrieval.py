@@ -19,6 +19,7 @@ from typing import Any
 from photomatagent.scientific.capabilities.literature.models import (
     LITERATURE_CHUNK_SCHEMA_VERSION,
     LiteratureSourceKind,
+    StructuredPassageReference,
 )
 from photomatagent.scientific.capabilities.literature.qdrant_store import (
     SearchCandidate,
@@ -53,6 +54,14 @@ class RetrievalDiagnostics:
 
 
 @dataclass(frozen=True, slots=True)
+class StructuredDocumentScope:
+    indexed_id: str
+    source_sha256: str
+    document_id: str
+    revision: str
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievedPassage:
     """One provenance-carrying passage returned by :class:`LiteratureRetriever`."""
 
@@ -83,6 +92,7 @@ class RetrievedPassage:
     pmcid: str = ""
     journal: str = ""
     relevance_tier: str = ""
+    structured_ref: StructuredPassageReference | None = None
 
     def __post_init__(self) -> None:
         source_kind = LiteratureSourceKind(self.source_kind)
@@ -156,6 +166,7 @@ class RetrievedPassage:
             "pmcid": self.pmcid,
             "journal": self.journal,
             "relevance_tier": self.relevance_tier,
+            **({"structured_ref": self.structured_ref.model_dump(mode="json")} if self.structured_ref else {}),
         }
 
 
@@ -347,6 +358,7 @@ class LiteratureRetriever:
         *,
         workspace_id: str,
         source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT,
+        document_scope: StructuredDocumentScope | None = None,
     ) -> tuple[list[tuple[str, float, dict[str, Any]]], str, tuple[str, ...]]:
         await self._validate_current_generation()
         dense: list[float] | None = None
@@ -370,12 +382,13 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     source_kind=source_kind,
                     limit=MAX_CANDIDATES,
+                    document_scope=document_scope,
                 )
             except Exception as exc:
                 raise RagRetrievalError(
                     "retrieval_unavailable", "dense and sparse retrieval are unavailable"
                 ) from exc
-            return self._normalize_candidates(sparse, workspace_id, source_kind), "sparse_only", (
+            return self._normalize_candidates(sparse, workspace_id, source_kind, document_scope), "sparse_only", (
                 "dense_unavailable",
             )
 
@@ -387,6 +400,7 @@ class LiteratureRetriever:
                 workspace_id=workspace_id,
                 source_kind=source_kind,
                 limit=MAX_CANDIDATES,
+                document_scope=document_scope,
             )
         except Exception:
             try:
@@ -396,15 +410,16 @@ class LiteratureRetriever:
                     workspace_id=workspace_id,
                     source_kind=source_kind,
                     limit=MAX_CANDIDATES,
+                    document_scope=document_scope,
                 )
             except Exception as exc:
                 raise RagRetrievalError(
                     "retrieval_unavailable", "dense and sparse retrieval are unavailable"
                 ) from exc
-            return self._normalize_candidates(dense_only, workspace_id, source_kind), "dense_only", (
+            return self._normalize_candidates(dense_only, workspace_id, source_kind, document_scope), "dense_only", (
                 "sparse_unavailable",
             )
-        return self._normalize_candidates(hybrid, workspace_id, source_kind), "hybrid_rrf", ()
+        return self._normalize_candidates(hybrid, workspace_id, source_kind, document_scope), "hybrid_rrf", ()
 
     async def _call_candidate_store(
         self,
@@ -413,6 +428,7 @@ class LiteratureRetriever:
         workspace_id: str,
         source_kind: LiteratureSourceKind,
         limit: int,
+        document_scope: StructuredDocumentScope | None = None,
     ) -> Any:
         """Call a candidate route while tolerating pre-source-aware fakes.
 
@@ -440,6 +456,8 @@ class LiteratureRetriever:
             supports_source_kind = "source_kind" in parameters or supports_var_kwargs
         if not supports_source_kind:
             kwargs.pop("source_kind")
+        if document_scope is not None:
+            kwargs.update(document_id=document_scope.indexed_id, document_revision=document_scope.source_sha256)
         result = method(*args, **kwargs)
         if inspect.isawaitable(result):
             return await result
@@ -450,6 +468,7 @@ class LiteratureRetriever:
         candidates: Any,
         workspace_id: str,
         source_kind: LiteratureSourceKind = LiteratureSourceKind.FULLTEXT,
+        document_scope: StructuredDocumentScope | None = None,
     ) -> list[tuple[str, float, dict[str, Any]]]:
         if not isinstance(candidates, Sequence) or isinstance(
             candidates, (str, bytes, bytearray)
@@ -466,10 +485,24 @@ class LiteratureRetriever:
                 continue
             if _source_kind_value(payload.get("source_kind")) != source_kind.value:
                 continue
+            if document_scope is not None:
+                ref = payload.get("structured_ref")
+                if (_document_id(payload) != document_scope.indexed_id
+                        or _document_revision(payload) != document_scope.source_sha256
+                        or not isinstance(ref, Mapping)
+                        or ref.get("document_id") != document_scope.document_id
+                        or ref.get("revision") != document_scope.revision):
+                    continue
+                try:
+                    StructuredPassageReference.model_validate(ref)
+                except ValueError:
+                    continue
             state = payload.get("ingest_state")
             if _enum_value(state) != "ready":
                 continue
             key = (_document_id(payload), _normalized_text_hash(payload))
+            if document_scope is not None:
+                key = (str(payload["structured_ref"]["object_id"]), key[1])
             prior = unique.get(key)
             if prior is None or _candidate_sort_key(normalized) < _candidate_sort_key(prior):
                 unique[key] = normalized
@@ -704,6 +737,11 @@ class LiteratureRetriever:
             if source_kind_value is not None
             else LiteratureSourceKind.FULLTEXT
         )
+        try:
+            structured_ref = (StructuredPassageReference.model_validate(payload["structured_ref"])
+                              if payload.get("structured_ref") is not None else None)
+        except ValueError:
+            structured_ref = None
         return RetrievedPassage(
             passage_id=passage_id,
             workspace_id=workspace_id,
@@ -738,6 +776,7 @@ class LiteratureRetriever:
             pmcid=str(payload.get("pmcid", "") or ""),
             journal=str(payload.get("journal", "") or ""),
             relevance_tier=str(payload.get("relevance_tier", "") or ""),
+            structured_ref=structured_ref,
         )
 
     async def search(
@@ -749,12 +788,15 @@ class LiteratureRetriever:
         expand_radius: int = 1,
         context_chars: int = 300,
         source_kind: LiteratureSourceKind | str = LiteratureSourceKind.FULLTEXT,
+        document_scope: StructuredDocumentScope | None = None,
     ) -> RetrievalResult:
         """Search one workspace with bounded candidates and context."""
         normalized_source_kind = _source_kind_value(source_kind)
         if normalized_source_kind is None:
             raise ValueError("source_kind must be 'fulltext' or 'abstract'")
         requested_source_kind = LiteratureSourceKind(normalized_source_kind)
+        if document_scope is not None and requested_source_kind is not LiteratureSourceKind.FULLTEXT:
+            raise ValueError("structured document search requires fulltext")
         self._validate_request(
             query,
             workspace_id,
@@ -767,6 +809,7 @@ class LiteratureRetriever:
             query,
             workspace_id=workspace_id,
             source_kind=requested_source_kind,
+            document_scope=document_scope,
         )
         ranked, reranked, rerank_reasons = await self._rerank(query, candidates)
         final_rows = ranked[:top_k]

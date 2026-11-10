@@ -87,7 +87,18 @@ class _QDFrozenServiceTool(Tool):
         self.name = delegate.name
         self.description = delegate.description
         self.short_description = delegate.short_description
-        self.input_schema = delegate.input_schema
+        schema = dict(delegate.input_schema)
+        properties = dict(schema.get("properties", {}))
+        if self.name == "script_run":
+            schema["required"] = list(dict.fromkeys([*schema.get("required", []), "environment_id"]))
+        if (self.name == "script_run" and "timeout_seconds" not in schema.get("required", ())
+                and not any(step.binding_id == self.name and "timeout_seconds" in step.parameters
+                            for step in context.genome.steps)):
+            # QD binds execution parameters in the frozen genome. Keep the
+            # script runner's host default (60s) fixed instead of letting the
+            # model invent an optional timeout that invalidates the binding.
+            properties.pop("timeout_seconds", None)
+        self.input_schema = {**schema, "properties": properties}
         self.exposure = delegate.exposure
         self.namespace = delegate.namespace
         self.source = delegate.source
@@ -102,6 +113,28 @@ class _QDFrozenServiceTool(Tool):
         result = await self.delegate_execute(arguments)
         self.context.workflow_gate.finish(step_id, not result.is_error)
         return result
+
+
+class _ResearchFileTool(_QDAttemptFileTool):
+    """Research file tools create drafts/results, never edit runtime or frozen state."""
+
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        try:
+            value = str(arguments['path'])
+            raw = Path(value)
+            if raw.is_absolute() or '..' in raw.parts:
+                return ToolResult(output='RESEARCH_PATH_INVALID', is_error=True)
+            current = self.workspace.root
+            for part in raw.parts:
+                current /= part
+                if current.is_symlink():
+                    return ToolResult(output='RESEARCH_PATH_INVALID', is_error=True)
+            relative = self.workspace.relative(self.workspace.resolve(value, must_exist=False))
+            if not relative.startswith(('tmp/', 'user_output/')):
+                return ToolResult(output='RESEARCH_CORE_READ_ONLY: write research scripts under tmp/ and deliverables under user_output/.', is_error=True)
+        except (KeyError, ValueError, OSError):
+            return ToolResult(output='RESEARCH_PATH_INVALID', is_error=True)
+        return await self.delegate.execute(arguments)
 
 
 def _qd_registry(context: QDExecutionContext, config: ToolSurfaceConfig) -> ToolRegistry:
@@ -171,15 +204,20 @@ def create_default_registry(
     ]
     if evaluation_isolation:
         registry.register_all(safe_tools)
+        if getattr(local_skill_service, "frozen_evaluation", False):
+            registry.register_all([ReadTool(boundary),WriteTool(boundary)])
+            if capability_sandbox_service is not None:
+                from photomatagent.capability_acquisition.tools import ScriptRunTool
+                registry.register(ScriptRunTool(capability_sandbox_service))
     else:
         registry.register_all(
             [
                 ReadTool(boundary),
                 GlobTool(boundary),
                 GrepTool(boundary),
-                WriteTool(boundary),
-                EditTool(boundary),
-                BashTool(boundary),
+                *([_ResearchFileTool(tool, boundary, frozenset()) for tool in (WriteTool(boundary),EditTool(boundary))]
+                  if local_skill_task_id else [WriteTool(boundary),EditTool(boundary)]),
+                *([] if local_skill_task_id else [BashTool(boundary)]),
                 *safe_tools,
             ]
         )
@@ -196,10 +234,17 @@ def create_default_registry(
                 published_skill_source=getattr(effective_skill_loader, "published_source", None),
             )
         )
-    if local_skill_task_id is not None and not evaluation_isolation:
+    if local_skill_task_id is not None and (not evaluation_isolation or (getattr(local_skill_service, "frozen_evaluation", False) and bool(getattr(local_skill_service, 'allowed', {})))):
         from photomatagent.application.skills import LocalSkillService
         from photomatagent.tools.skill_run import SkillRunTool
-        registry.register(SkillRunTool(local_skill_service or LocalSkillService(boundary.root), local_skill_task_id, local_skill_run_id))
+        from photomatagent.tools.skill_search import SkillSearchTool
+        effective_local_skill_service = local_skill_service or LocalSkillService(boundary.root)
+        registry.register(SkillSearchTool(effective_local_skill_service))
+        registry.register(SkillRunTool(effective_local_skill_service, local_skill_task_id, local_skill_run_id))
+    if not evaluation_isolation and local_skill_task_id is not None:
+        from photomatagent.tools.research_history import ResearchHistorySearch, ResearchHistoryRead
+        history_root = workspace if isinstance(workspace, Workspace) else Workspace(workspace or Path.cwd())
+        registry.register_all([ResearchHistorySearch(history_root.root / ".photomatagent/workbench.sqlite3", local_skill_task_id), ResearchHistoryRead(history_root.root / ".photomatagent/workbench.sqlite3", local_skill_task_id)])
     config = surface_config or ToolSurfaceConfig()
     catalog = ToolCatalog(registry)
     registry.register_all(

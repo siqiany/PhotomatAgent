@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Union
+from uuid import uuid4
+from functools import cached_property
 
 from pydantic import BaseModel, Field, TypeAdapter
 
@@ -19,6 +21,10 @@ class RuntimeEvent(BaseModel):
     individual user turns inside a longer-lived interactive session.
     """
 
+    @cached_property
+    def trace_event_id(self) -> str:
+        """Transport identity; excluded from domain serialization and equality."""
+        return uuid4().hex
     schema_version: Literal["1.0"] = "1.0"
     kind: str
     timestamp: datetime = Field(default_factory=_now)
@@ -27,6 +33,8 @@ class RuntimeEvent(BaseModel):
 
 
 class LoopStarted(RuntimeEvent):
+    turn_intent: Literal["auto", "supplement", "replace"] = "auto"
+    request_preview: str = ""
     kind: Literal["loop_started"] = "loop_started"
     goal: str
     provider: str = "unknown"
@@ -163,6 +171,7 @@ class TextDelta(RuntimeEvent):
     kind: Literal["text_delta"] = "text_delta"
     iteration: int
     text: str
+    research_delivery: str | None = None
 
 
 class ToolCallStarted(RuntimeEvent):
@@ -469,6 +478,8 @@ class ScientificLoopCompleted(RuntimeEvent):
     best_candidate_id: str | None = None
     best_score: float = 0.0
     termination_reason: str = ""
+    delivery_status: str = ""
+    research_stop_reason: str = ""
     projection_diagnostics: list[str] = Field(default_factory=list)
 
 
@@ -683,4 +694,8 @@ _EVENT_ADAPTER: TypeAdapter[AnyRuntimeEvent] = TypeAdapter(AnyRuntimeEvent)
 
 
 def parse_event(payload: dict[str, object]) -> RuntimeEvent:
-    return _EVENT_ADAPTER.validate_python(payload)
+    event = _EVENT_ADAPTER.validate_python(payload)
+    trace_id = payload.get("trace_event_id")
+    if isinstance(trace_id, str) and trace_id:
+        event.__dict__["trace_event_id"] = trace_id
+    return event

@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from photomatagent.scientific.applicability import reject_outside_domain, with_domain_input
 from photomatagent.scientific.capabilities.base import (
     CapabilityPack,
     CapabilityStatus,
@@ -107,10 +108,14 @@ class KdotpyRunTool(Tool):
         ],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     def __init__(self, workspace: Workspace | None = None) -> None:
         self._workspace = workspace
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("kp-heterostructure", arguments):
+            return rejected
         args = (
             [str(item) for item in arguments.get("args", [])]
             if arguments.get("args")

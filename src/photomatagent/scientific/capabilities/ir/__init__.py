@@ -406,7 +406,9 @@ class CompileConstraintsTool(Tool):
         "Compile deterministic infrared photodetector constraints from a spectral "
         "band: photon energies, cutoff (band gap) requirement, thermal limits, "
         "ideal responsivity, blackbody photon flux, BLIP detectivity, and the "
-        "evidence required to validate a candidate material."
+        "evidence required to validate a candidate material. The optional EQE "
+        "input is a fixed scenario. For joint responsivity and EQE lower bounds "
+        "use photodetector.check_targets with eqe_relation='minimum'."
     )
     short_description = "IR constraint compiler: spectral band to physics constraints."
     exposure = ToolExposure.DEFERRED

@@ -1,21 +1,26 @@
+import type { ReactNode } from "react";
 import type { TaskSummary } from "../../api";
 import { statusLabel } from "../../components/RunStatus";
 
 interface Props {
+  managementControls?: ReactNode;
   tasks: TaskSummary[];
   selectedTaskId: string | null;
   onSelect: (taskId: string) => void;
   onCreate: () => void;
   onImportHistory: () => void;
+  onConfigure?: () => void;
   loading: boolean;
 }
 
 export function TaskList({
+  managementControls,
   tasks,
   selectedTaskId,
   onSelect,
   onCreate,
   onImportHistory,
+  onConfigure,
   loading,
 }: Props) {
   return (
@@ -27,6 +32,7 @@ export function TaskList({
           <span>科研工作台</span>
         </div>
       </div>
+      {managementControls}
       <div className="sidebar-actions">
         <button className="button button-primary button-full" onClick={onCreate}>
           <span aria-hidden="true">＋</span> 新建任务
@@ -66,6 +72,7 @@ export function TaskList({
       </nav>
       <footer className="sidebar-footer">
         <span className="connection-dot" /> 本地工作区已连接
+        {onConfigure && <button className="button button-subtle button-full model-settings-button" onClick={onConfigure}>模型配置</button>}
       </footer>
     </aside>
   );

@@ -83,7 +83,7 @@ async def run_experiment(
             scientific, workspace, surface_config=surface_config
         )
         runtime = AgentRuntime(
-            model=create_provider(provider, model),
+            model=create_provider(provider, model, workspace=workspace.root),
             tools=registry,
             workspace=workspace,
             scientific_state=scientific,

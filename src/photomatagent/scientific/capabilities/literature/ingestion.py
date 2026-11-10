@@ -28,6 +28,8 @@ from photomatagent.scientific.capabilities.literature.models import (
     LITERATURE_CHUNK_SCHEMA_VERSION,
     LiteratureSourceKind,
     PaperRecord,
+    PassageRecord,
+    STRUCTURED_INDEX_PREFIX,
     validate_relative_source_path,
 )
 from photomatagent.scientific.capabilities.literature.parser import (
@@ -82,6 +84,7 @@ class IngestionPlanItem:
     # workspace-relative, so path reconstruction must not infer prefixes from
     # directory basenames.
     plan_relative_path: str | None = None
+    projection: tuple[PaperRecord, list[PassageRecord]] | None = None
 
     def __post_init__(self) -> None:
         validate_relative_source_path(self.relative_source_path)
@@ -174,7 +177,8 @@ def _enumerate_pdf_files(root: Path) -> list[Path]:
                 continue
             entry_stat = entry.stat(follow_symlinks=False)
             if stat.S_ISDIR(entry_stat.st_mode):
-                visit(path)
+                if path.parts[-3:] != STRUCTURED_INDEX_PREFIX.parts:
+                    visit(path)
                 continue
             if stat.S_ISREG(entry_stat.st_mode) and path.suffix == ".pdf":
                 result.append(path)
@@ -352,6 +356,8 @@ class LiteratureIngestionService:
         )
         if not resolved_root.exists() or not resolved_root.is_dir():
             raise RagIngestionError("source_root_missing", "source root does not exist")
+        if Path(relative_root).is_relative_to(STRUCTURED_INDEX_PREFIX):
+            raise RagIngestionError("source_root_invalid", "registered object snapshots require index_document")
         generation = await self._expected_generation()
 
         # Enumerate and hash every source file before consulting missing
@@ -415,7 +421,9 @@ class LiteratureIngestionService:
             )
         # A successful full enumeration is the safety gate for deletions.
         for document_id, manifest in manifests.items():
-            if manifest.workspace_id != workspace_id:
+            if (manifest.workspace_id != workspace_id
+                    or Path(manifest.relative_source_path).is_relative_to(STRUCTURED_INDEX_PREFIX)
+                    or not Path(manifest.relative_source_path).is_relative_to(relative_root)):
                 continue
             try:
                 if LiteratureSourceKind(manifest.source_kind) is not LiteratureSourceKind.FULLTEXT:
@@ -442,6 +450,27 @@ class LiteratureIngestionService:
             relative_root=relative_root,
             complete=True,
         )
+
+    async def index_registered(
+        self, workspace: Any, source: Path, record: PaperRecord, passages: list[PassageRecord],
+    ) -> tuple[IngestionStats, CollectionGeneration]:
+        """Index one immutable projection without constructing deletion candidates."""
+        root, workspace_id, workspace_root, relative_root = _workspace_context(source.parent, workspace)
+        relative = _relative_source(source, root, workspace_root)
+        if (not Path(relative).is_relative_to(STRUCTURED_INDEX_PREFIX)
+                or not source.is_file() or source.is_symlink() or _sha256(source) != record.sha256):
+            raise RagIngestionError("source_changed", "registered source snapshot is invalid")
+        generation = await self._expected_generation()
+        doc_id = document_id_for(workspace_id, relative)
+        manifests = await self.store.get_document_manifests(
+            workspace_id, [doc_id], generation=generation, source_kind=LiteratureSourceKind.FULLTEXT,
+        )
+        item = IngestionPlanItem(
+            doc_id, relative, record.sha256, _manifest_kind(manifests.get(doc_id), record.sha256),
+            plan_relative_path=source.name, projection=(record, passages),
+        )
+        plan = IngestionPlan(workspace_id, generation, (item,), source_root=root, relative_root=relative_root)
+        return await self.index_batch(plan, max_documents=1), generation
 
     def _source_path(self, plan: IngestionPlan, item: IngestionPlanItem) -> Path:
         if plan.source_root is None:
@@ -647,7 +676,7 @@ class LiteratureIngestionService:
             keep_revision=revision,
             workspace_id=plan.workspace_id,
         )
-        record, passages = parse_pdf(path)
+        record, passages = item.projection if item.projection is not None else parse_pdf(path)
         # Parsing can be slow enough for a user/editor to replace the source
         # after the initial plan check.  Re-hash immediately after parsing and
         # fail before embedding or writing any new passage vectors when the

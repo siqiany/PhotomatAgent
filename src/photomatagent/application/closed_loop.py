@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from photomatagent.application.models import EvolutionOptions
 from photomatagent.application.skills import CHECKERS
 from photomatagent.application.store import WorkbenchStore
+from photomatagent.models.types import UserMessage
 from photomatagent.workspace import Workspace
 
 Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -67,6 +68,20 @@ def check_delivery(store: WorkbenchStore, workspace: Workspace | None, run: Any,
         except (OSError, ValueError, TypeError):
             issue("ARTIFACT_INTEGRITY_UNKNOWN", f"Snapshot {name} cannot be verified.", False)
     inputs: dict[str, Path] = {}
+    # Check user-declared formatting even for script-created artifacts; model
+    # recall and an exit code are not delivery validation.
+    from photomatagent.runtime.commitments import collect_user_commitments, delivery_constraint_error, is_report_path
+    from photomatagent.sessions.sqlite_store import SessionRepository
+    try:
+        session = SessionRepository(store.database).load(store.task(run.task_id).session_id)
+        requirements = collect_user_commitments(session.conversation.messages, session.scientific)
+    except FileNotFoundError:
+        requirements = collect_user_commitments([UserMessage(content=run.request.text)])
+    for name, path in verified.items():
+        if is_report_path(name, requirements):
+            diagnostic = delivery_constraint_error(path.read_text(encoding="utf-8", errors="replace"), requirements)
+            if diagnostic:
+                issue("DELIVERY_CONSTRAINT_VIOLATION", f"{name}: {diagnostic}")
     if workspace is not None:
         for key, artifact_id in options.input_artifact_ids.items():
             try:
@@ -163,6 +178,17 @@ class ResearchClosedLoop:
                   drive: Callable[[str], Awaitable[str]]) -> None:
         options = run.request.evolution
         prompt = original
+        task = self.store.task(run.task_id)
+        await emit('research_contract', {'goal': task.goal, 'required_artifacts': options.required_artifacts,
+            'explicit_scientific_target': options.target.model_dump(mode='json') if options.target else None,
+            'goal_coverage': 'REQUIRES_SCIENTIFIC_REVIEW', 'unspecified_numeric_targets': 'NOT_INVENTED'})
+        prompt += ("\n\nFor reusable numerical code, prefer task-local capability scripts with PHOTOMAT_INPUT_DIR inputs. "
+                   "Write reusable outputs in PHOTOMAT_OUTPUT_DIR or current working directory, never beside staged __file__. "
+                   "If implementing passive RC graphs, data must contain nodes/components/frequencies_hz/injection_node/output_node, "
+                   "with positive SI elements and explicit invalid-input rejection; output result.json samples with frequency_hz/real_ohm/imag_ohm. "
+                   "For report checking bind data.tables[{heading,columns,rows}] and report input; output result.json mismatches. "
+                   "Set scientific_status UNKNOWN; these contracts enable independent post-run learning, not device validation. "
+                   "Do not transform an unrelated scientific task to satisfy these interfaces or modify core runtime/checkers.")
         if self.knowledge is not None:
             guidance = self.knowledge.guidance(run.task_id, run.run_id, original)
             if guidance:
@@ -176,15 +202,29 @@ class ResearchClosedLoop:
         status = "ROUND_LIMIT"
         action = "STATIC"
         policy: dict[str, Any] = {"action": action, "strategy_arm": "STATIC", "policy": "fixed"}
-        for round_index in range(1, options.max_rounds + 1):
+        persistence = getattr(runtime, "persistence", None)
+        original_sha = hashlib.sha256(original.encode()).hexdigest()
+        restored = persistence.restored_components.get("application_closed_loop", {}) if persistence is not None else {}
+        starting_round = 0
+        if restored.get("original_sha") == original_sha:
+            starting_round = int(restored.get("round_index", 0))
+            repeats = int(restored.get("repeats", 0))
+            previous_signature = str(restored.get("previous_signature", ""))
+        round_index = starting_round
+        for round_index in range(starting_round + 1, options.max_rounds + 1):
+            if persistence is not None:
+                persistence.components["application_closed_loop"] = {"version": 1, "original_sha": original_sha, "round_index": round_index, "repeats": repeats, "previous_signature": previous_signature, "status": "IN_PROGRESS"}
             await emit("closed_loop_round_started", {"round_index": round_index, "phase": "research" if round_index == 1 else "repair", "action": action})
             reason = await drive(prompt)
-            if reason not in {"final_response", "completed"}:
+            if reason not in {"final_response", "completed", "research_delivery"}:
                 status = "BUDGET_EXHAUSTED" if reason in {"max_iterations", "token_budget_exhausted"} else "EXECUTION_STOPPED"
                 break
             last = check_delivery(self.store, self.workspace, run, options, getattr(runtime, "scientific_state", None))
             last["round_index"] = round_index
             await emit("closed_loop_checked", last)
+            if persistence is not None:
+                persistence.components["application_closed_loop"].update({"status": "CHECKED", "last": last, "repeats": repeats, "previous_signature": previous_signature})
+                await persistence.checkpoint(runtime, "application_checked")
             if previous is not None and self.knowledge is not None:
                 self.knowledge.observe(run.task_id, run.run_id, round_index, previous, last, policy)
             repairable = [i for i in last["issues"] if i["repairable"]]

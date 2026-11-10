@@ -45,5 +45,6 @@ describe("RevisionPlan", () => {
   it.each(["SUCCEEDED", "PARTIAL", "RUNNING", "QUEUED", "CANCEL_REQUESTED"])("does not offer retry after %s", async (status) => {
     const host = await render(status);
     expect(host.querySelector("button")).toBeNull();
+    expect(host.querySelector(".revision-plan-state")?.textContent).not.toBe("待开始");
   });
 });

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.shortcuts import PromptSession
 
@@ -17,7 +19,12 @@ class CLIApprovalHandler:
         self.session = session
 
     async def request_approval(self, request: ApprovalRequest) -> bool:
-        answer = await self.session.prompt_async("  [y] Allow once  [n] Deny > ")
+        try:
+            answer = await self.session.prompt_async("  [y] Allow once  [n] Deny > ")
+        except (KeyboardInterrupt, EOFError) as exc:
+            # Convert before the task exits: asyncio treats raw KeyboardInterrupt
+            # as process-level shutdown even if the outer UI appears to recover.
+            raise asyncio.CancelledError("approval interrupted by user") from exc
         return answer.strip().lower() in {"y", "yes"}
 
 

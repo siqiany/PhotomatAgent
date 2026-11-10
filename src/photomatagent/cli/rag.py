@@ -1701,6 +1701,9 @@ def rag_activate(
         "--bootstrap",
         help="Explicitly allow activating an empty generation for a new corpus.",
     ),
+    partial: bool = typer.Option(
+        False, "--partial", help="Activate ready documents while retaining incomplete runs and staged records.",
+    ),
     require_stage: list[str] = typer.Option(
         [],
         "--require-stage",
@@ -1761,15 +1764,15 @@ def rag_activate(
                 if hasattr(generation, "__await__"):
                     generation = await generation
             activate_method = getattr(store, "activate_generation")
-            result = activate_method(
-                generation,
-                allow_empty_bootstrap=bootstrap,
-            )
+            options: dict[str, Any] = {"allow_empty_bootstrap": bootstrap}
+            if partial is True:
+                options["allow_partial"] = True
+            result = activate_method(generation, **options)
             if hasattr(result, "__await__"):
-                await result
-            return generation
+                result = await result
+            return generation, result
 
-        generation = asyncio.run(activate())
+        generation, activation_status = asyncio.run(activate())
     except Exception as exc:
         _print_error(exc)
         raise typer.Exit(code=1) from exc
@@ -1777,6 +1780,8 @@ def rag_activate(
         json.dumps(
             {
                 "activated": True,
+                "partial_requested": partial is True,
+                "activation_status": activation_status,
                 "fingerprint": str(getattr(generation, "fingerprint", "")),
                 "documents": str(getattr(generation, "documents_physical", "")),
                 "passages": str(getattr(generation, "passages_physical", "")),

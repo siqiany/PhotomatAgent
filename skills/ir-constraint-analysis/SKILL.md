@@ -8,7 +8,16 @@ license: MIT
 
 # IR Constraint Analysis
 
-Always start an IR task with `ir.compile_constraints` (namespace `ir`).
+Use `ir.compile_constraints` (namespace `ir`) when a task requires numeric
+spectral or device constraints. Reuse a compatible result already in context;
+recompute if supplied targets or operating conditions change. A conceptual
+explanation or literature-only request does not require a calculation unless
+it needs these bounds. Preserve unspecified inputs as assumptions and distinguish
+tool defaults from user constraints.
+The gap/cutoff comparison assumes the relevant band-to-band absorption model;
+check the detector mechanism before treating it as a screening criterion for
+thermal detectors or other response mechanisms. Ideal bounds remain conditional
+calculations rather than measured performance.
 
 Key derived quantities and their meaning:
 

@@ -19,7 +19,7 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
 )
-from photomatagent.tools.base import Tool
+from photomatagent.tools.base import DeliveryReview, DeliveryReviewSource, Tool, ToolResult
 from photomatagent.tools.exposure import ToolExposure
 
 HC_EV_UM = 1.239841984  # h*c in eV*um; R = EQE * gain * lambda / 1.23984 A/W
@@ -229,8 +229,28 @@ class EQEFromResponsivityTool(Tool):
         )
 
 
-class CheckTargetsTool(Tool):
+class CheckTargetsTool(Tool, DeliveryReviewSource):
     name = "photodetector.check_targets"
+
+    def review_result(self, result: ToolResult) -> DeliveryReview | None:
+        if result.is_error:
+            return None
+        relation = result.data.get("eqe_relation")
+        if relation == "exact":
+            return DeliveryReview(
+                "optical:fixed_eqe_scope", lambda _: None,
+                "A fixed-EQE result describes a single value. If the requested EQE is a floor, "
+                "run the minimum-mode Checker for each requested condition before stating joint bounds.",
+            )
+        if relation != "minimum":
+            return None
+        from pydantic import ValidationError
+        from photomatagent.scientific.capabilities.photodetector.delivery import DetectorCheckReceipt
+
+        try:
+            return DetectorCheckReceipt.model_validate(result.data).delivery_review()
+        except ValidationError:
+            return None
     description = (
         "Check whether a target responsivity and target EQE are mutually "
         "consistent using R = EQE * gain * lambda / 1.23984, under an "
@@ -242,7 +262,8 @@ class CheckTargetsTool(Tool):
         "wavelength_um, which must lie inside the band). Reports required "
         "EQE for the R target at the checked wavelength, required R for the "
         "EQE target, the required gain when inconsistent, and the semantics "
-        "used. A peak-in-band requirement is never silently interpreted as "
+        "used. Set eqe_relation='minimum' for EQE ≥ a stated threshold; the "
+        "default 'exact' checks a fixed EQE scenario. A peak-in-band requirement is never silently interpreted as "
         "a whole-band requirement. This checks physical consistency only -- "
         "it never claims a device is realizable."
     )
@@ -262,6 +283,7 @@ class CheckTargetsTool(Tool):
             "target_responsivity_a_w": {"type": "number", "minimum": 0},
             "eqe_fraction": {"type": "number", "minimum": 0, "maximum": 1},
             "eqe_percent": {"type": "number", "minimum": 0, "maximum": 100},
+            "eqe_relation": {"type": "string", "enum": ["exact", "minimum", "maximum"], "default": "exact"},
             "photoconductive_gain": {"type": "number", "minimum": 0},
             "mode": {
                 "type": "string",
@@ -301,6 +323,9 @@ class CheckTargetsTool(Tool):
         eqe = _split_eqe(arguments)
         if isinstance(eqe, str):
             return _invalid(eqe)
+        eqe_relation = arguments.get("eqe_relation", "exact")
+        if eqe_relation not in ("exact", "minimum", "maximum"):
+            return _invalid("eqe_relation must be exact, minimum or maximum")
         gain = arguments.get("photoconductive_gain", 1.0)
         gain = 1.0 if gain is None else float(gain)
         if gain <= 0:
@@ -356,13 +381,11 @@ class CheckTargetsTool(Tool):
         }
         required_eqe_at_checked = target_r * HC_EV_UM / (gain * checked_wavelength)
         achieved_r_at_checked = _responsivity_from_eqe(checked_wavelength, eqe[0], gain)
-        consistent_at_gain = (
-            required_eqe_at_checked <= 1.0 and achieved_r_at_checked >= target_r
+        allowed_eqe_max = 1.0 if eqe_relation == "minimum" else eqe[0]
+        consistent_at_gain = required_eqe_at_checked <= allowed_eqe_max
+        needed_gain = gain if consistent_at_gain else (
+            target_r * HC_EV_UM / (allowed_eqe_max * checked_wavelength) if allowed_eqe_max else None
         )
-        if not consistent_at_gain:
-            needed_gain = target_r * HC_EV_UM / (eqe[0] * checked_wavelength)
-        else:
-            needed_gain = gain
         payload = {
             "spectral_band_um": [band_min, band_max],
             "mode": mode,
@@ -371,17 +394,16 @@ class CheckTargetsTool(Tool):
             "target_responsivity_a_w": target_r,
             "target_eqe_fraction": round(eqe[0], 6),
             "target_eqe_percent": round(eqe[0] * 100.0, 4),
+            "eqe_relation": eqe_relation,
             "photoconductive_gain": gain,
-            "achieved_responsivity_at_checked_a_w": round(
-                achieved_r_at_checked, 5
-            ),
+            "responsivity_at_declared_eqe_a_w": round(achieved_r_at_checked, 5),
             "required_eqe_at_checked_fraction": round(
                 required_eqe_at_checked, 5
             ),
             "required_eqe_for_r_target": required_eqe_for_r,
             "required_responsivity_for_eqe_target": required_r_for_eqe,
             "mutually_consistent": consistent_at_gain,
-            "required_gain_if_not_consistent": round(needed_gain, 4),
+            "required_gain_if_not_consistent": round(needed_gain, 4) if needed_gain is not None else None,
             "wavelength_dependence": {
                 "responsivity_scales_as": "R ~ lambda (linear) at fixed EQE",
                 "best_case_wavelength_um": band_max,
@@ -396,6 +418,17 @@ class CheckTargetsTool(Tool):
                 "dark current, and noise evidence"
             ),
         }
+        if eqe_relation == "exact":
+            payload["achieved_responsivity_at_checked_a_w"] = round(achieved_r_at_checked, 5)
+        elif eqe_relation == "minimum":
+            payload["joint_min_eqe_fraction"] = round(max(eqe[0], required_eqe_at_checked), 5)
+            payload["lower_bound_conclusion"] = (
+                "The two lower bounds are compatible at the checked wavelength and assumed gain. "
+                "Keep the original requirements and report the derived joint minimum separately. "
+                "A fixed EQE at the user's minimum can miss the responsivity target without creating a conflict."
+                if consistent_at_gain else
+                "The required EQE exceeds the allowed ceiling at the checked wavelength and assumed gain."
+            )
         evidence = [
             ScientificEvidence(
                 subject="photodetector_targets",

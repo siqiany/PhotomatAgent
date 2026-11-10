@@ -7,6 +7,7 @@ import json
 import hashlib
 import re
 import socket
+import os
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -71,7 +72,16 @@ def validate_public_https_url(url: str, *, resolve: bool = False) -> str:
                 ]
             except (OSError, ValueError) as exc:
                 raise ValueError("HOST_RESOLUTION_FAILED") from exc
-    if any(not address.is_global for address in addresses):
+    # Operator-only compatibility for transparent proxies with synthetic DNS.
+    # Never accept private LAN targets, literal synthetic addresses, or custom
+    # provider/redirect hosts. TLS verification and wheel hashes remain required.
+    official_fake_dns = (
+        os.environ.get('PHOTOMATAGENT_CAPABILITY_OFFICIAL_FAKE_DNS') == '1'
+        and hostname in {'pypi.org', 'files.pythonhosted.org'}
+        and bool(addresses)
+        and all(address.version == 4 and address in ipaddress.ip_network('198.18.0.0/15') for address in addresses)
+    )
+    if any(not address.is_global for address in addresses) and not official_fake_dns:
         raise ValueError("PRIVATE_NETWORK_REDIRECT")
     return url
 
@@ -296,7 +306,9 @@ class CapabilityDiscoveryService:
             if network_code:
                 prefix = "SEARCH_BLOCKED" if network_code == "NETWORK_BLOCKED" else "SEARCH_FAILED"
                 return DiscoveryResult(code=network_code, diagnostics=(f"{prefix}:{exc}",))
-            return DiscoveryResult(code="INVALID_RESPONSE", diagnostics=(f"INVALID_SEARCH_RESPONSE:{type(exc).__name__}",))
+            detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            hint = ':retry with an exact name==version' if detail == 'RESPONSE_TOO_LARGE' else ''
+            return DiscoveryResult(code="INVALID_RESPONSE", diagnostics=(f"INVALID_SEARCH_RESPONSE:{detail[:200]}{hint}",))
         except Exception as exc:
             return DiscoveryResult(code="NETWORK_ERROR", diagnostics=(f"SEARCH_FAILED:{type(exc).__name__}",))
         deadline = asyncio.get_running_loop().time() + 30.0
@@ -371,6 +383,21 @@ class CapabilityDiscoveryService:
             self.plan_resolver.resolve(candidate.normalized_name, candidate.version),
             timeout=60.0,
         )
+        self._plans[plan.plan_id] = plan
+        return plan
+
+    async def resolve_install_plan_many(self, candidate_ids: list[str]) -> InstallPlan:
+        if not 1 <= len(candidate_ids) <= 32 or len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("INVALID_CANDIDATE_IDS")
+        candidates = [self._candidates.get(candidate_id) for candidate_id in candidate_ids]
+        if any(candidate is None for candidate in candidates):
+            raise LookupError("CANDIDATE_NOT_FOUND")
+        if self.plan_resolver is None:
+            raise RuntimeError("INSTALL_RESOLUTION_UNAVAILABLE")
+        coordinates = [(candidate.normalized_name, candidate.version) for candidate in candidates if candidate is not None]
+        plan = await asyncio.wait_for(self.plan_resolver.resolve_many(coordinates), timeout=60.0)
+        if set(plan.direct_requirements) != {f"{name}=={version}" for name, version in coordinates}:
+            raise ValueError("INSTALL_PLAN_CHANGED")
         self._plans[plan.plan_id] = plan
         return plan
 

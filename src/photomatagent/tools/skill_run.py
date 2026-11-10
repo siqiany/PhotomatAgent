@@ -12,7 +12,7 @@ from photomatagent.tools.base import Tool, ToolResult
 class SkillRunTool(Tool):
     name = "skill_run"
     namespace = "skills"
-    description = "Execute a validated local method with current task inputs and its frozen trusted checker. Discover methods using skill_view."
+    description = "Execute a validated local method with current task inputs and its frozen trusted checker. First use skill_search to find its exact skill_id, scope, and input contract; skill_view loads static instructions only."
     tags = ("skill", "method", "replay", "execution")
     input_schema = {"type": "object", "additionalProperties": False,
                     "properties": {"skill_id": {"type": "string"}, "scope": {"type": "string"},

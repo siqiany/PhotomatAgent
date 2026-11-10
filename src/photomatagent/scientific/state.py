@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SerializerFunctionWrapHandler, model_serializer, model_validator
 
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.capabilities.contracts import ScientificEvidence
@@ -14,6 +14,7 @@ from photomatagent.scientific.evidence import Evidence
 from photomatagent.scientific.discovery.models import ScientificHypothesis
 from photomatagent.scientific.discovery.structures import StructureDerivation
 from photomatagent.scientific.tasks import ScientificTask
+from photomatagent.scientific.process import DecisionRecord, MethodNeedRecord, ProcessPlan, ResearchDelivery
 
 DEFAULT_TRUSTED_EVIDENCE_TOOLS = frozenset(
     {
@@ -95,10 +96,25 @@ class ScientificState(BaseModel):
     open_questions: list[str] = Field(default_factory=list)
     contradictions: list[str] = Field(default_factory=list)
     pending_tasks: list[ScientificTask] = Field(default_factory=list)
+    process_plans: list[ProcessPlan] = Field(default_factory=list)
+    decisions: list[DecisionRecord] = Field(default_factory=list)
+    method_needs: list[MethodNeedRecord] = Field(default_factory=list)
+    research_deliveries: list[ResearchDelivery] = Field(default_factory=list)
     _runtime_authority_capability: object | None = PrivateAttr(default=None)
     _runtime_attestations: dict[str, EvidenceAttestation] = PrivateAttr(
         default_factory=dict
     )
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_decisions(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload: dict[str, Any] = handler(self)
+        if not self.decisions:
+            payload.pop("decisions", None)
+        if not self.method_needs:
+            payload.pop("method_needs", None)
+        if not self.research_deliveries:
+            payload.pop("research_deliveries", None)
+        return payload
 
     def model_copy(
         self,
@@ -229,6 +245,39 @@ class ScientificState(BaseModel):
     def add_calculation(self, record: CalculationRecord) -> CalculationRecord:
         self.calculations.append(record)
         return record
+
+    def add_process_plan(self, plan: ProcessPlan) -> None:
+        if not any(item.id == plan.id for item in self.process_plans):
+            self.process_plans.append(plan)
+
+    def add_method_need(self, item: MethodNeedRecord) -> None:
+        if item not in self.method_needs:
+            self.method_needs.append(item)
+
+    def add_decision(self, decision: DecisionRecord) -> None:
+        evidence = {item.id for item in self.evidence}
+        references = set(decision.evidence_ids)
+        for alternative in decision.alternatives:
+            references.update(alternative.evidence_ids)
+        if not references <= evidence or not set(decision.process_plan_ids) <= {plan.id for plan in self.process_plans}:
+            raise ValueError("DECISION_REFERENCE_UNAVAILABLE")
+        ids = {item.id for item in self.decisions}
+        if decision.previous_decision_id and decision.previous_decision_id not in ids:
+            raise ValueError("DECISION_PREDECESSOR_UNAVAILABLE")
+        if decision.research_stop:
+            plans = [plan for plan in self.process_plans if plan.id in decision.process_plan_ids]
+            if decision.research_stop.reason == "HARD_CONFLICT":
+                if plans or decision.selected_method_id:
+                    raise ValueError("RESEARCH_CONFLICT_HAS_SELECTED_ROUTE")
+            elif not plans or any(plan.proposal is None for plan in plans):
+                raise ValueError("RESEARCH_DELIVERY_PROPOSAL_REQUIRED")
+        if decision.id not in ids:
+            self.decisions.append(decision)
+
+    @property
+    def research_delivery(self) -> ResearchDelivery | None:
+        return next((item for item in reversed(self.research_deliveries)
+                     if item.goal == self.goal and not item.superseded), None)
 
     def add_task(self, task: ScientificTask) -> ScientificTask:
         self.pending_tasks.append(task)

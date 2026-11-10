@@ -206,6 +206,8 @@ class ScientificLoopSummary(BaseModel):
     unresolved_violations: list[ConstraintViolation] = Field(default_factory=list)
     unresolved_evidence_gaps: list[str] = Field(default_factory=list)
     termination_reason: str = ""
+    delivery_status: str = ""
+    research_stop_reason: str = ""
     judge_report: JudgeReport | None = None
     projection_diagnostics: list[str] = Field(default_factory=list)
 

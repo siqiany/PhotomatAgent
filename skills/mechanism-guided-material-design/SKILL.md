@@ -29,8 +29,12 @@ property, a structure calculation, or a scientific PASS.
    known candidate or prior. Retrieval is not new generation and does not prove
    novelty or performance.
 
-Do not infer a route from a candidate answer. If the request is ambiguous, ask
-which source path the user authorizes and state the choice in the report.
+Choose the route from the user's requested outcome and available evidence, not
+from a preferred candidate answer. For an open-ended design request, use
+mechanism reasoning with known-material evidence as priors and state that
+choice. Ask only when the distinction changes the requested result, scientific
+constraints, or authorization. Keep sources distinct when combining routes;
+an explicit model-sampling request still requires that model.
 
 ## Goal and constraint contract
 
@@ -60,6 +64,15 @@ point to an actual corresponding tool result with source, method, conditions,
 units, and limitations. Generated formulas and structures remain
 `UNVALIDATED_GENERATED_STRUCTURE` until independent evidence is accepted by
 the Checker.
+
+## Method and process records
+
+Treat method selection as a separate decision when a proposed mechanism depends
+on a calculation or characterization outside the current tool's scope. Use
+`method_search` to identify alternatives and `process.register_plan` to preserve
+the ordered process proposal, assumptions and unresolved inputs. Keep values
+reported for source specimens separate from transferred settings and new
+proposals.
 
 ## Validation hand-off
 
@@ -104,3 +117,5 @@ The x=0.25 example is only a fixed-ratio composition test. Test fixtures and
 fake backends demonstrate provenance and boundary behavior; they are not
 predictions, DFT results, or experimental evidence. A whole composition family
 may be rejected when the parent-structure or evidence assumptions fail.
+
+For process interventions, load the relevant card under `materials-process-design` and record sample IDs, controls and failure branches with `process.register_plan`.

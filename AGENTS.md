@@ -7,8 +7,9 @@ scientific-integrity boundaries below.
 
 ## Project Mission
 
-PhotomatAgent is a Python 3.12 scientific-agent runtime for materials research,
-with emphasis on infrared optoelectronic materials and detectors. It combines
+PhotomatAgent is a Python 3.12 scientific-agent runtime for general research
+execution and capability learning. Materials research, including infrared
+optoelectronic materials and detectors, is a specialist domain. It combines
 an explicit model/tool loop, structured scientific state and evidence, optional
 capability packs, resumable sessions, MCP adapters, and gated SCNet/Slurm
 workflows for VASP, Hefei-NAMD, and MAGUS.
@@ -129,8 +130,13 @@ Authoritative areas:
   focused tests.
 - Keep stable instructions and capability descriptions cache-friendly; keep
   live state in dynamic context.
-- Keep `src/photomatagent/cli/commands.py` as the slash-command router and reuse
-  existing Typer implementations.
+- Every new user-facing CLI capability must have an in-chat `/` command entry.
+  Users must not need to exit the agent to configure or use CLI features.
+  Keep `src/photomatagent/cli/commands.py` as the slash-command router and reuse
+  existing application services and Typer implementations where appropriate.
+  Interactive forms must use the chat terminal's async input; keep API keys out
+  of model messages, transcripts, and input history. Standalone CLI commands may
+  remain optional adapters, but must not be the only entry point.
 - Put user-facing deliverables in `user_output/<task-name>/` and disposable
   intermediates in `tmp/`.
 - If a requested change intentionally alters a MUST invariant, state the impact

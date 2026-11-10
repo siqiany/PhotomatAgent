@@ -178,7 +178,8 @@ class HistoricalSessionImporter:
                 raise EvolutionOperationConflict("historical scientific state conflicts")
         running = self.service.mark_episode_running(evolution_id, "v001", owner_token=owner, runtime_session_id=preview.session_id, event_log_path=preview.event_log_path).entity
         completed = running.model_copy(update={"artifact": artifact, "scientific_state_path": f".photomatagent/evolutions/{evolution_id}/episodes/v001.scientific.json"})
-        return self.service.complete_episode(evolution_id, "v001", result=completed, owner_token=owner).entity and self.service.get(evolution_id)
+        self.service.complete_episode(evolution_id, "v001", result=completed, owner_token=owner)
+        return self.service.get(evolution_id)
 
     @staticmethod
     def _materialize(canonical: Path, payload: bytes, expected_sha: str) -> None:

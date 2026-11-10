@@ -205,6 +205,14 @@ class ScientificLoopController:
         feedback: FeedbackSignal | None = None
         self.state.status = "RUNNING"
         dry_evidence_rounds = 0
+        persistence = getattr(self.runtime, "persistence", None)
+        restored = persistence.restored_components.get("scientific_loop", {}) if persistence is not None else {}
+        if restored.get("target") == self.target.model_dump(mode="json"):
+            self.state.round = int(restored.get("round", 0))
+            self.stagnation._no_progress_rounds = int(restored.get("no_progress_rounds", 0))
+            self.state.no_progress_rounds = self.stagnation.no_progress_rounds
+            # Historical assessments stay auditable in the checkpoint, but are
+            # not restored as current validated candidates or private authority.
 
         yield await self._emit(
             ScientificLoopStarted(
@@ -230,7 +238,9 @@ class ScientificLoopController:
             started = time.monotonic()
             self.state.round += 1
             instruction = self._round_instruction(effective_goal, feedback)
-            async for event in self.runtime.run(instruction):
+            resumed_search = self.state.round > 1 and self.runtime.scientific_state.research_delivery is not None
+            maker = self.runtime.run(instruction, intent="supplement") if resumed_search else self.runtime.run(instruction)
+            async for event in maker:
                 yield event
             round_meta = self.runtime.last_run_meta
             # Only a wait whose workflow is still active at round end exempts
@@ -349,6 +359,11 @@ class ScientificLoopController:
                 inconclusive_reason=inconclusive_reason,
                 judge=self._last_judge_report,
             )
+            if round_meta.get("research_delivery_status") and decision.action in {"CONTINUE", "ESCALATE"}:
+                decision = ScientificLoopDecision(
+                    action="INCONCLUSIVE", reason=str(round_meta["research_stop_reason"]),
+                    best_candidate_id=self.state.best_candidate_id,
+                )
             yield await self._emit(
                 ScientificLoopDecisionMade(
                     round=self.state.round,
@@ -360,6 +375,9 @@ class ScientificLoopController:
             )
 
             self.state.status = decision.action
+            if persistence is not None:
+                persistence.components["scientific_loop"] = self.state.model_dump(mode="json")
+                await persistence.checkpoint(self.runtime, "scientific_checked")
             if decision.action in {"SUCCESS", "STALLED", "INCONCLUSIVE", "BUDGET_EXHAUSTED"}:
                 break
             # CONTINUE / ESCALATE: turn feedback into the next maker turn.
@@ -396,6 +414,8 @@ class ScientificLoopController:
                     best_candidate_id=self.summary.best_candidate_id,
                     best_score=self.summary.best_score,
                     termination_reason=self.summary.termination_reason,
+                    delivery_status=self.summary.delivery_status,
+                    research_stop_reason=self.summary.research_stop_reason,
                     projection_diagnostics=self.summary.projection_diagnostics,
                 )
             )
@@ -574,6 +594,7 @@ class ScientificLoopController:
         final_evaluation: EvaluationReport | None = (
             self.state.evaluations[-1] if self.state.evaluations else None
         )
+        delivery = self.runtime.scientific_state.research_delivery
         return ScientificLoopSummary(
             status=decision.action,  # type: ignore[arg-type]
             rounds=self.state.round,
@@ -590,6 +611,8 @@ class ScientificLoopController:
                 else []
             ),
             termination_reason=decision.reason,
+            delivery_status=delivery.status if delivery else "",
+            research_stop_reason=delivery.stop_reason if delivery else "",
             judge_report=self._last_judge_report,
             projection_diagnostics=list(self._projection_diagnostics),
         )

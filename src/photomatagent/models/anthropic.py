@@ -28,12 +28,13 @@ from photomatagent.models.types import (
     ToolDefinition,
     ToolResultMessage,
     UserMessage,
+    active_image_entries,
 )
-from photomatagent.models.utils import as_dict, safe_provider_message
+from photomatagent.models.utils import as_dict, provider_failure_code, safe_provider_message
 
 
 def anthropic_input(
-    messages: Sequence[ModelMessage],
+    messages: Sequence[ModelMessage], *, image_assets: dict[str, str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     system_parts: list[str] = []
     converted: list[dict[str, Any]] = []
@@ -44,11 +45,23 @@ def anthropic_input(
         else:
             converted.append({"role": role, "content": blocks})
 
-    for message in messages:
+    active_images = active_image_entries(messages)
+
+    def content_with_images(text: str, index: int) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        for image in active_images.get(index, ()):
+            encoded = (image_assets or {}).get(image.sha256)
+            if not encoded:
+                raise ProviderError("anthropic", "Requested image asset is unavailable", code="IMAGE_ASSET_MISSING")
+            content.append({"type": "image", "source": {"type": "base64",
+                            "media_type": image.media_type, "data": encoded}})
+        return content
+
+    for index, message in enumerate(messages):
         if isinstance(message, SystemMessage):
             system_parts.append(message.content)
         elif isinstance(message, UserMessage):
-            append("user", [{"type": "text", "text": message.content}])
+            append("user", content_with_images(message.content, index))
         elif isinstance(message, AssistantMessage):
             blocks: list[dict[str, Any]] = []
             if message.text:
@@ -70,7 +83,7 @@ def anthropic_input(
                     {
                         "type": "tool_result",
                         "tool_use_id": message.tool_call_id,
-                        "content": message.content,
+                        "content": content_with_images(message.content, index) if index in active_images else message.content,
                         "is_error": message.is_error,
                     }
                 ],
@@ -250,6 +263,7 @@ class AnthropicProvider:
         model: str,
         *,
         api_key: str | None = None,
+        base_url: str | None = None,
         max_tokens: int = 4096,
         client: Any = None,
     ) -> None:
@@ -258,7 +272,7 @@ class AnthropicProvider:
         if client is None:
             from anthropic import AsyncAnthropic
 
-            client = AsyncAnthropic(api_key=api_key)
+            client = AsyncAnthropic(api_key=api_key, base_url=base_url)
         self._client = client
 
     async def aclose(self) -> None:
@@ -269,7 +283,7 @@ class AnthropicProvider:
                 await result
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        system, messages = anthropic_input(request.messages)
+        system, messages = anthropic_input(request.messages, image_assets=request.image_assets)
         mapper = AnthropicStreamMapper(self.model)
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -287,4 +301,4 @@ class AnthropicProvider:
         except ProviderError:
             raise
         except Exception as exc:
-            raise ProviderError(self.provider, safe_provider_message(exc)) from exc
+            raise ProviderError(self.provider, safe_provider_message(exc), code=provider_failure_code(exc)) from exc

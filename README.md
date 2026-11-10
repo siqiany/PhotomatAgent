@@ -297,16 +297,19 @@ automatic compaction, display, and the final hard guard:
 
 - `H = C - response_reserve_tokens - safety_margin_tokens` is the hard estimated
   input limit for a normal model request.
-- `A = min(compact_trigger_tokens, floor(0.9 * H))` is the automatic compaction
-  trigger.  Absolute mode starts pruning at `A` too.
-- `T = min(compact_target_tokens, floor(0.6 * A))` is the compaction target.
+- Default ratio mode uses `A = min(floor(0.82 * C), floor(0.9 * H))`.
+  Pruning begins at `min(floor(0.70 * C), A)`.
+- An explicit `compact_trigger_tokens` selects absolute mode, with
+  `A = min(compact_trigger_tokens, floor(0.9 * H))`; pruning begins at `A`.
+- The target is bounded by `compact_target_tokens` and `floor(0.6 * A)`;
+  ratio mode also bounds it by `floor(0.60 * C)`.
 
-When the model window is unknown, the schema default is the conservative
-`C=128000` policy, which resolves to `H=111616`, `A=100454`, and `T=60272`
-(estimated tokens).  A configured window of `256000` resolves to
-`H=239616`, `A=215654`, and `T=128000`; `512000` is only an example and
-resolves to `H=495616`, `A=256000`, and `T=128000`.  `256k` means exactly
-`256000`, not `262144`.
+The default policy is **512k**, meaning exactly `C=512000`. With the default
+reply and safety reserves, `H=495616`, `A=419840`, pruning begins at `358400`,
+and the target is `251904` estimated tokens. Explicit environment/CLI values
+still take precedence. This configuration is not a claim about a provider's
+verified capacity. A smaller `128000` window safely clamps the trigger to
+`100454` and target to `60272`.
 
 Automatic compaction is checked before every normal model request, including
 between tool calls inside one user turn.  A single user goal with many completed
@@ -333,6 +336,18 @@ The runtime sets the normal model request output cap from
 `4096` by their own default; routed runtime requests now use the configured
 reserve unless explicitly changed.  Summary requests are always `tools=[]` and
 are capped by `min(summary_max_tokens, response_reserve_tokens)`.
+The initial summary output cap is `4096`. A `max_tokens` summary retries the
+same input with a larger bounded output cap; an incomplete candidate is never
+installed, even if its JSON prefix can be repaired. Old pending actions are
+not merged into new completion facts as a truncation fallback.
+
+Explicit frozen user-constraint maps and textual task-status declarations are
+rendered independently of model summaries from the durable transcript. Their
+JSON types are retained. Scientific task `status` and `backend` are shown as
+separate fields; a waiting reason never grants runtime permission. When a user
+explicitly specifies decimal places for reports, the runtime checks prose
+written to `user_output/*.md`, explicitly named/bound text reports and final replies, and returns a bounded
+repair diagnostic. It does not round raw scientific data or change source inputs.
 
 Configure the public numeric policy without editing `.env`:
 

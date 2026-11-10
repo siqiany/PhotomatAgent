@@ -27,7 +27,7 @@ from photomatagent.application.models import (
 
 _ACTIVE_STATES = ("QUEUED", "RUNNING", "WAITING_INPUT", "CANCEL_REQUESTED")
 _TERMINAL_STATES = ("SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "INTERRUPTED")
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 _StoreMethod = TypeVar("_StoreMethod", bound=Callable[..., Any])
 
 
@@ -64,15 +64,40 @@ class WorkbenchStore:
     def __init__(self, database_path: Path | str) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._connection = sqlite3.connect(
-            self.database_path, isolation_level=None, check_same_thread=False
-        )
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._connection.execute("PRAGMA busy_timeout = 5000")
-        self._initialize()
+        from photomatagent.persistence.database import Database
+        from photomatagent.persistence.migrations import upgrade, VERSION
+        self.database = Database(self.database_path)
+        self._lock = self.database.lock
+        self._connection = self.database.connection
+        from contextlib import ExitStack
+        from photomatagent.persistence.database import OwnershipLock
+        with OwnershipLock(self.database_path.with_suffix(".migration.lock")), ExitStack() as guards:
+            existing = self._connection.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone()
+            version = self._connection.execute("SELECT version FROM schema_version WHERE id=1").fetchone() if existing else None
+            if version and version[0] > VERSION:
+                self._connection.close()
+                raise WorkbenchStoreError("DATABASE_TOO_NEW")
+            if version is None or version[0] < VERSION:
+                guards.enter_context(OwnershipLock(self.database_path.with_suffix(".owner.lock")))
+                if version:
+                    backup = self.database_path.with_name(self.database_path.name + f".pre-v{VERSION}.bak")
+                    self.database.backup_once(backup, int(version[0]))
+            self._initialize()
+            upgrade(self.database, _now())
+        from photomatagent.application.projects import ProjectRepository
+        self.projects = ProjectRepository(self.database)
+        self.projects.initialize_search()
+        self._connection.execute("""CREATE TRIGGER IF NOT EXISTS run_management_gate BEFORE INSERT ON runs
+            WHEN EXISTS(SELECT 1 FROM tasks JOIN projects USING(project_id) WHERE tasks.task_id=NEW.task_id AND (tasks.management_status!='OPEN' OR tasks.archived_at IS NOT NULL OR projects.archived_at IS NOT NULL))
+            BEGIN SELECT RAISE(ABORT,'TASK_NOT_OPEN'); END""")
+        self._connection.execute("""CREATE TRIGGER IF NOT EXISTS run_summary AFTER INSERT ON runs BEGIN
+            INSERT OR IGNORE INTO run_usage(run_id) VALUES (NEW.run_id);
+            UPDATE runs SET project_id_at_start=(SELECT project_id FROM tasks WHERE task_id=NEW.task_id),base_checkpoint_id=(SELECT latest_checkpoint_id FROM sessions WHERE task_id=NEW.task_id) WHERE run_id=NEW.run_id;
+            UPDATE task_summaries SET latest_run_id=NEW.run_id,last_activity_at=NEW.created_at WHERE task_id=NEW.task_id;
+            END""")
+        self._connection.execute("""CREATE TRIGGER IF NOT EXISTS event_summary AFTER INSERT ON events BEGIN
+            UPDATE task_summaries SET last_activity_at=NEW.created_at,last_event_seq=NEW.seq WHERE task_id=NEW.task_id;
+            END""")
 
     @_serialized
     def close(self) -> None:
@@ -334,11 +359,19 @@ class WorkbenchStore:
     @_serialized
     def create_task(self, request: TaskCreate) -> str:
         task_id = f"task_{uuid.uuid4().hex}"
-        now = _now()
-        self._connection.execute(
-            "INSERT INTO tasks (task_id, session_id, title, goal, attachment_ids_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, task_id, request.title, request.goal, _json(request.attachment_ids), now),
-        )
+        with self._transaction():
+            project = self.projects.project(request.project_id)
+            if project["archived_at"]:
+                from photomatagent.application.errors import ServiceError
+                raise ServiceError("PROJECT_ARCHIVED", "课题已归档。", status_code=409)
+            now = _now()
+            self._connection.execute(
+                "INSERT INTO tasks (task_id,session_id,title,goal,attachment_ids_json,created_at,project_id,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                (task_id,task_id,request.title,request.goal,_json(request.attachment_ids),now,request.project_id,now),
+            )
+            self._connection.execute("INSERT INTO task_summaries(task_id,last_activity_at) VALUES (?,?)", (task_id,now))
+            self.projects._set_tags("task", task_id, request.tags)
+            self.projects.index_task(task_id)
         return task_id
 
     @_serialized
@@ -374,6 +407,9 @@ class WorkbenchStore:
                 "INSERT INTO links (task_id, source_type, source_id, source_digest, snapshot_digest, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (task_id, source_type, source_id, source_digest, snapshot_digest, now),
             )
+            self._connection.execute("UPDATE tasks SET updated_at=created_at WHERE task_id=?", (task_id,))
+            self._connection.execute("INSERT INTO task_summaries(task_id,last_activity_at) VALUES (?,?)", (task_id,now))
+            self.projects.index_task(task_id)
             return task_id
 
     @_serialized
@@ -407,6 +443,7 @@ class WorkbenchStore:
                 ):
                     raise IdempotencyConflict("request key was used with a different request")
                 return RunRef(task_id=task_id, run_id=str(existing["run_id"]))
+            self.projects.require_runnable(task_id)
             active = self._connection.execute(
                 "SELECT run_id FROM runs WHERE task_id = ? AND status IN ('QUEUED', 'RUNNING', 'WAITING_INPUT', 'CANCEL_REQUESTED')",
                 (task_id,),
@@ -453,6 +490,7 @@ class WorkbenchStore:
                 if row is None or row["evaluation_id"] != evaluation_id or row["manifest_json"] != manifest_json:
                     raise WorkbenchStoreError("evaluation request key is not bound to its manifest")
                 return RunRef(task_id=task_id, run_id=str(existing["run_id"]))
+            self.projects.require_runnable(task_id)
             active = self._connection.execute(
                 "SELECT run_id FROM runs WHERE task_id = ? AND status IN "
                 "('QUEUED', 'RUNNING', 'WAITING_INPUT', 'CANCEL_REQUESTED')",
@@ -562,12 +600,23 @@ class WorkbenchStore:
                 (task_id, feedback_id),
             ).fetchone()["attempt"]) + 1
             plan_id = f"revision_{uuid.uuid4().hex}"
+            pending_ids = self.result_invalidations(task_id).get(request.source_run_id, ())
+            carried = [
+                {"plan_id": row["plan_id"], "feedback_text": row["feedback_text"]}
+                for row in self._connection.execute(
+                    "SELECT p.plan_id, f.feedback_text FROM revision_plans p "
+                    "JOIN revision_feedback f USING(feedback_id) WHERE p.task_id=? "
+                    "ORDER BY p.created_at, p.plan_id", (task_id,),
+                )
+                if row["plan_id"] in pending_ids
+            ]
             self._connection.execute(
                 "INSERT INTO revision_plans "
                 "(plan_id, task_id, feedback_id, source_run_id, source_digest, attempt, status, "
                 "plan_json, error, prepare_key, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'PREPARING', '{}', NULL, ?, ?, ?)",
-                (plan_id, task_id, feedback_id, request.source_run_id, source_digest, attempt, request_key, now, now),
+                "VALUES (?, ?, ?, ?, ?, ?, 'PREPARING', ?, NULL, ?, ?, ?)",
+                (plan_id, task_id, feedback_id, request.source_run_id, source_digest, attempt,
+                 _json({"carried_feedback": carried}) if carried else "{}", request_key, now, now),
             )
             self._connection.execute(
                 "INSERT INTO request_keys VALUES (?, ?, 'prepare_revision', ?, ?, ?)",
@@ -610,6 +659,13 @@ class WorkbenchStore:
         }
 
     @_serialized
+    def revision_carried_feedback(self, plan_id: str) -> list[dict[str, str]]:
+        row = self._connection.execute("SELECT plan_json FROM revision_plans WHERE plan_id=?", (plan_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown revision plan {plan_id}")
+        return cast(list[dict[str, str]], json.loads(row["plan_json"]).get("carried_feedback", []))
+
+    @_serialized
     def save_revision_plan(
         self,
         plan_id: str,
@@ -626,6 +682,11 @@ class WorkbenchStore:
             ).fetchone()
             if row is None:
                 raise KeyError(f"unknown revision plan {plan_id}")
+            carried = json.loads(row["plan_json"]).get("carried_feedback")
+            if carried:
+                plan_json = {**plan_json, "carried_feedback": carried}
+            elif "carried_feedback" in plan_json:
+                raise ValueError("carried feedback must be reserved with the revision source")
             if row["status"] != "PREPARING":
                 if row["status"] == status and row["plan_json"] == _json(plan_json) and row["error"] == error:
                     return
@@ -681,6 +742,7 @@ class WorkbenchStore:
             "compiler_model": payload.get("compiler_model"),
             "error": row["error"],
             "instruction": payload.get("instruction"),
+            "carried_feedback_plan_ids": [item["plan_id"] for item in payload.get("carried_feedback", [])],
             "attempt": row["attempt"],
             "created_at": row["created_at"],
             "run_id": row["run_id"],
@@ -736,6 +798,7 @@ class WorkbenchStore:
                 if prior["status"] not in {"FAILED", "CANCELLED", "INTERRUPTED"}:
                     raise ActiveRunConflict("this revision plan already has a run")
             self._require_task(task_id)
+            self.projects.require_runnable(task_id)
             active = self._connection.execute(
                 "SELECT run_id FROM runs WHERE task_id = ? AND status IN ('QUEUED', 'RUNNING', 'WAITING_INPUT', 'CANCEL_REQUESTED')",
                 (task_id,),
@@ -771,6 +834,12 @@ class WorkbenchStore:
             raise KeyError(f"unknown run {run_id}")
 
     @_serialized
+    def complete_run(self, run_id: str, status: str, event_type: str, payload: dict[str, object]) -> None:
+        with self._transaction():
+            self.finish_run(run_id, status)
+            self.append_event_for_run(run_id, event_type, payload)
+
+    @_serialized
     def transition_run(self, run_id: str, status: str) -> None:
         """Persist an active lifecycle state without bypassing the run index."""
         if status not in _ACTIVE_STATES:
@@ -800,6 +869,18 @@ class WorkbenchStore:
                 (event.task_id, event.run_id, event.seq, event.type, _json(event.payload), event.created_at),
             )
 
+    def _event_payload(self, raw: str) -> dict[str, object]:
+        payload = json.loads(raw)
+        reference = payload.pop("_runtime_ref", None)
+        if reference:
+            source = self._connection.execute("SELECT payload_json FROM runtime_events WHERE event_id=?", (reference,)).fetchone()
+            if source is None:
+                raise WorkbenchStoreError("RUNTIME_EVENT_SOURCE_MISSING")
+            full = json.loads(source[0])
+            full.pop("kind", None)
+            return full | payload
+        return payload
+
     @_serialized
     def append_event_for_run(
         self, run_id: str, event_type: str, payload: dict[str, object]
@@ -824,9 +905,24 @@ class WorkbenchStore:
                 payload=payload,
                 created_at=_now(),
             )
+            stored_payload = dict(payload)
+            event_id = payload.get("trace_event_id")
+            if event_type in {"text_delta", "tool_completed"} and event_id and self._connection.execute("SELECT 1 FROM runtime_events WHERE event_id=?", (event_id,)).fetchone():
+                stored_payload.pop("text", None)
+                stored_payload.pop("output", None)
+                stored_payload["_runtime_ref"] = event_id
+            if event_type == "model_request_started":
+                self._connection.execute("INSERT OR IGNORE INTO run_usage(run_id) VALUES (?)", (run_id,))
+                self._connection.execute("UPDATE run_usage SET unsettled_requests=unsettled_requests+1 WHERE run_id=?", (run_id,))
+            elif event_type == "model_response_completed":
+                usage = payload.get("usage")
+                usage = usage if isinstance(usage, dict) else {}
+                tokens = int(usage.get("total_tokens") or (int(usage.get("input_tokens") or 0)+int(usage.get("output_tokens") or 0)))
+                self._connection.execute("INSERT OR IGNORE INTO run_usage(run_id) VALUES (?)", (run_id,))
+                self._connection.execute("UPDATE run_usage SET model_calls=model_calls+1,known_tokens=known_tokens+?,unsettled_requests=MAX(unsettled_requests-1,0) WHERE run_id=?", (tokens,run_id))
             self._connection.execute(
                 "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?)",
-                (task_id, run_id, seq, event_type, _json(payload), event.created_at),
+                (task_id, run_id, seq, event_type, _json(stored_payload), event.created_at),
             )
             return event
 
@@ -854,7 +950,7 @@ class WorkbenchStore:
             parameters += (limit,)
         rows = self._connection.execute(query, parameters).fetchall()
         return [
-            WorkbenchEvent(task_id=row["task_id"], run_id=row["run_id"], seq=row["seq"], type=row["type"], payload=json.loads(row["payload_json"]), created_at=row["created_at"])
+            WorkbenchEvent(task_id=row["task_id"], run_id=row["run_id"], seq=row["seq"], type=row["type"], payload=self._event_payload(row["payload_json"]), created_at=row["created_at"])
             for row in rows
         ]
 
@@ -863,7 +959,9 @@ class WorkbenchStore:
         row = self._connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown task {task_id}")
-        return _task(row)
+        item = _task(row)
+        item.tags = self.projects._tags("task", task_id)
+        return item
 
     @_serialized
     def tasks(self) -> list[ResearchTask]:
@@ -881,7 +979,178 @@ class WorkbenchStore:
         row = self._connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown run {run_id}")
-        return _run(row)
+        record = _run(row)
+        record.result_invalidation_ids = self.result_invalidations(record.task_id).get(run_id, [])
+        return record
+
+    @_serialized
+    def result_invalidations(self, task_id: str) -> dict[str, list[str]]:
+        """Project historical results from committed feedback and explicit run dependencies."""
+        related_tasks = """
+            WITH RECURSIVE related(task_id) AS (
+                SELECT ? UNION
+                SELECT origin.task_id FROM related
+                JOIN artifacts linked ON linked.task_id=related.task_id
+                JOIN artifacts origin ON origin.artifact_id=linked.origin_artifact_id
+            )
+        """
+        feedback = self._connection.execute(
+            related_tasks + "SELECT p.plan_id, p.task_id, p.feedback_id, p.source_run_id, p.plan_json, "
+            "p.updated_at, f.feedback_text "
+            "FROM revision_plans p JOIN revision_feedback f USING(feedback_id) "
+            "WHERE p.task_id IN (SELECT task_id FROM related) AND p.status='READY' "
+            "ORDER BY p.created_at, p.plan_id", (task_id,),
+        ).fetchall()
+        corrections = [
+            row for row in feedback
+            if any(issue.get("status") == "CORRECTION" and issue.get("category") in {
+                "TASK_DEFINITION", "SCIENTIFIC_CORRECTNESS", "EVIDENCE_SUFFICIENCY", "SAFETY",
+            } and (span := " ".join(issue.get("original_feedback_span", "").split()).casefold())
+                and span in " ".join(row["feedback_text"].split()).casefold()
+                for issue in json.loads(row["plan_json"]).get("issues", ()))
+        ]
+        if not corrections:
+            return {}
+        dependencies = self._connection.execute(
+            related_tasks + "SELECT r.run_id, r.task_id, r.resumes_run_id, c.run_id AS checkpoint_run_id, "
+            "p.source_run_id, p.feedback_id, p.plan_json, r.status, r.created_at, "
+            "json_extract(r.request_json, '$.host_operation') AS host_operation FROM runs r "
+            "LEFT JOIN checkpoints c ON c.checkpoint_id=r.base_checkpoint_id "
+            "LEFT JOIN revision_runs rr ON rr.run_id=r.run_id "
+            "LEFT JOIN revision_plans p ON p.plan_id=rr.plan_id "
+            "WHERE r.task_id IN (SELECT task_id FROM related)", (task_id,),
+        )
+        descendants: dict[str, set[str]] = {}
+        applied_feedback: dict[str, str] = {}
+        carried_by_run: dict[str, set[str]] = {}
+        run_tasks: dict[str, str] = {}
+        completed_rechecks: dict[str, str] = {}
+        for row in dependencies:
+            child = row["run_id"]
+            run_tasks[child] = row["task_id"]
+            if row["status"] == "SUCCEEDED" and row["host_operation"] is None:
+                completed_rechecks[child] = row["created_at"]
+            if row["feedback_id"] and row["status"] == "SUCCEEDED":
+                applied_feedback[child] = row["feedback_id"]
+            if row["plan_json"] and row["status"] == "SUCCEEDED":
+                carried_by_run[child] = {item["plan_id"]
+                                         for item in json.loads(row["plan_json"]).get("carried_feedback", [])}
+            for parent in (row["resumes_run_id"], row["checkpoint_run_id"], row["source_run_id"]):
+                if parent and parent != child:
+                    descendants.setdefault(parent, set()).add(child)
+        replacements = {
+            row["previous_id"]: (row["replacement_id"], row["created_at"])
+            for row in self._connection.execute(
+                related_tasks + "SELECT json_extract(payload_json, '$.previous_artifact_id') AS previous_id, "
+                "json_extract(payload_json, '$.replacement_artifact_id') AS replacement_id, "
+                "created_at FROM management_events WHERE kind='task_input_replaced' "
+                "AND entity_id IN (SELECT task_id FROM related)", (task_id,),
+            )
+        }
+        checked_inputs = {
+            row["run_id"]: set(json.loads(row["payload_json"])["artifact_ids"])
+            for row in self._connection.execute(
+                related_tasks + "SELECT run_id,payload_json FROM events WHERE type='replacement_inputs_checked' "
+                "AND task_id IN (SELECT task_id FROM related) ORDER BY seq", (task_id,),
+            )
+        } if replacements else {}
+
+        def used_replacement(run_id: str, artifact_id: str) -> bool:
+            reserved = completed_rechecks.get(run_id)
+            if reserved is None or artifact_id not in replacements:
+                return False
+            current = artifact_id
+            while current in replacements and replacements[current][1] <= reserved:
+                current = replacements[current][0]
+            return current != artifact_id and current in checked_inputs.get(run_id, ())
+
+        links = self._connection.execute(
+            related_tasks + """,
+            origins(link_id, origin_id) AS (
+                SELECT a.artifact_id, a.origin_artifact_id FROM artifacts a
+                JOIN related USING(task_id) WHERE a.origin_artifact_id IS NOT NULL
+                UNION
+                SELECT origins.link_id, a.origin_artifact_id FROM origins
+                JOIN artifacts a ON a.artifact_id=origins.origin_id WHERE a.origin_artifact_id IS NOT NULL
+            )
+            SELECT source.run_id AS parent, r.run_id AS child, r.created_at, linked.artifact_id
+            FROM origins JOIN artifacts source ON source.artifact_id=origins.origin_id
+            JOIN artifacts linked ON linked.artifact_id=origins.link_id
+            JOIN runs r ON r.task_id=linked.task_id AND r.created_at>=linked.created_at
+            WHERE source.run_id IS NOT NULL AND source.run_id<>r.run_id
+            """, (task_id,),
+        )
+        linked_descendants: dict[str, list[tuple[str, str]]] = {}
+        for row in links:
+            retired_at = replacements.get(row["artifact_id"])
+            if retired_at is None or row["created_at"] < retired_at[1]:
+                linked_descendants.setdefault(row["parent"], []).append((row["child"], row["artifact_id"]))
+        historical: dict[str, list[str]] = {}
+        for row in corrections:
+            pending: list[tuple[str, str | None]] = [(row["source_run_id"], None)]
+            visited: set[tuple[str, str | None]] = set()
+            affected: set[str] = set()
+            while pending:
+                run_id, attachment = pending.pop()
+                if ((run_id, attachment) in visited or applied_feedback.get(run_id) == row["feedback_id"]
+                        or row["plan_id"] in carried_by_run.get(run_id, ())):
+                    continue
+                visited.add((run_id, attachment))
+                if attachment is not None and used_replacement(run_id, attachment):
+                    continue
+                if run_tasks.get(run_id) == task_id and run_id not in affected:
+                    historical.setdefault(run_id, []).append(row["plan_id"])
+                    affected.add(run_id)
+                pending.extend((child, attachment) for child in descendants.get(run_id, ()))
+                pending.extend((child, linked if run_tasks.get(child) != run_tasks.get(run_id) else attachment)
+                               for child, linked in linked_descendants.get(run_id, ()))
+        return historical
+
+    @_serialized
+    def replacement_input_ids(self, task_id: str) -> set[str]:
+        return {
+            row[0] for row in self._connection.execute(
+                "SELECT json_extract(payload_json, '$.replacement_artifact_id') FROM management_events "
+                "WHERE kind='task_input_replaced' AND entity_id=?", (task_id,),
+            )
+        }
+
+    @_serialized
+    def bind_replacement_input(self, task_id: str, previous_id: str, replacement_id: str, source_id: str) -> None:
+        """Retire an active link while retaining both artifact rows and their provenance."""
+        with self._transaction():
+            task = self.task(task_id)
+            if previous_id not in task.attachment_ids or replacement_id not in task.attachment_ids:
+                raise ValueError("REPLACEMENT_INPUT_BINDING_CHANGED")
+            ids = [replacement_id if item == previous_id else item
+                   for item in task.attachment_ids if item != replacement_id]
+            now = _now()
+            self._connection.execute(
+                "UPDATE tasks SET attachment_ids_json=?, revision=revision+1, updated_at=? WHERE task_id=?",
+                (_json(ids), now, task_id),
+            )
+            self._connection.execute(
+                "INSERT INTO management_events(entity_id,revision,kind,payload_json,created_at) VALUES (?,?,?,?,?)",
+                (task_id, task.revision + 1, "task_input_replaced", _json({
+                    "previous_artifact_id": previous_id, "replacement_artifact_id": replacement_id,
+                    "source_artifact_id": source_id,
+                }), now),
+            )
+
+    @_serialized
+    def artifact_result_invalidations(self, artifact_id: str) -> list[str]:
+        ancestors = self._connection.execute(
+            """
+            WITH RECURSIVE lineage(artifact_id, task_id, run_id, origin_artifact_id) AS (
+                SELECT artifact_id, task_id, run_id, origin_artifact_id FROM artifacts WHERE artifact_id=?
+                UNION
+                SELECT a.artifact_id, a.task_id, a.run_id, a.origin_artifact_id
+                FROM artifacts a JOIN lineage l ON a.artifact_id=l.origin_artifact_id
+            ) SELECT DISTINCT task_id, run_id FROM lineage WHERE run_id IS NOT NULL
+            """, (artifact_id,),
+        ).fetchall()
+        return sorted({plan_id for row in ancestors
+                       for plan_id in self.result_invalidations(row["task_id"]).get(row["run_id"], ())})
 
     @_serialized
     def unfinished_runs(self) -> list[RunRecord]:
@@ -912,7 +1181,11 @@ class WorkbenchStore:
         rows = self._connection.execute(
             "SELECT * FROM runs WHERE task_id = ? ORDER BY created_at, rowid", (task_id,)
         )
-        return [_run(row) for row in rows]
+        historical = self.result_invalidations(task_id)
+        return [
+            _run(row).model_copy(update={"result_invalidation_ids": historical.get(row["run_id"], [])})
+            for row in rows
+        ]
 
     @_serialized
     def register_artifact(
@@ -934,6 +1207,9 @@ class WorkbenchStore:
             "INSERT INTO artifacts (artifact_id, task_id, run_id, path, filename, sha256, media_type, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (artifact_id, task_id, run_id, path, filename, sha256, media_type, size_bytes, _now()),
         )
+
+        project_id = self.task(task_id).project_id
+        self.projects.index_document("artifact:" + artifact_id, "artifact", filename, path, project_id, task_id)
 
     @_serialized
     def register_attachment(
@@ -964,6 +1240,8 @@ class WorkbenchStore:
                     "UPDATE tasks SET attachment_ids_json = ? WHERE task_id = ?",
                     (_json(ids), task_id),
                 )
+
+            self.projects.index_document("artifact:" + artifact_id, "artifact", filename, path, self.task(task_id).project_id, task_id)
 
     @_serialized
     def artifact(self, artifact_id: str) -> sqlite3.Row:
@@ -1051,7 +1329,7 @@ class WorkbenchStore:
             raise KeyError(f"unknown task {task_id}")
 
     def _transaction(self):
-        return _ImmediateTransaction(self._connection)
+        return self.database.transaction()
 
 
 class _ImmediateTransaction:
@@ -1078,11 +1356,11 @@ def _digest(value: object) -> str:
 
 
 def _task(row: sqlite3.Row) -> ResearchTask:
-    return ResearchTask(task_id=row["task_id"], session_id=row["session_id"], title=row["title"], goal=row["goal"], attachment_ids=json.loads(row["attachment_ids_json"]), created_at=row["created_at"])
+    return ResearchTask(task_id=row["task_id"], session_id=row["session_id"], title=row["title"], goal=row["goal"], attachment_ids=json.loads(row["attachment_ids_json"]), created_at=row["created_at"], project_id=row["project_id"], management_status=row["management_status"], archived_at=row["archived_at"], updated_at=row["updated_at"], revision=row["revision"])
 
 
 def _run(row: sqlite3.Row) -> RunRecord:
-    return RunRecord(run_id=row["run_id"], task_id=row["task_id"], request=RunRequest.model_validate_json(row["request_json"]), status=row["status"], created_at=row["created_at"])
+    return RunRecord(run_id=row["run_id"], task_id=row["task_id"], request=RunRequest.model_validate_json(row["request_json"]), status=row["status"], created_at=row["created_at"], base_checkpoint_id=row["base_checkpoint_id"], final_checkpoint_id=row["final_checkpoint_id"], recovery_status=row["recovery_status"], resumes_run_id=row["resumes_run_id"])
 
 
 __all__ = [

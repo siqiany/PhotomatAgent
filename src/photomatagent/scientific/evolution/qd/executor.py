@@ -21,7 +21,7 @@ from photomatagent.redaction import redact_secrets
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context import ContextBuilder
 from photomatagent.runtime.events import (
-    LoopCompleted, QDGenomeMismatch, QDTrialCollected, QDTrialFailed, QDTrialStarted,
+    BudgetUpdated, LoopCompleted, ModelResponseCompleted, QDGenomeMismatch, QDTrialCollected, QDTrialFailed, QDTrialStarted,
     RuntimeEvent, TextDelta, ToolApprovalRequired, ToolCallArgumentsDelta,
     ToolCallCompleted, ToolCompleted, ToolFailed, ToolPermissionDenied,
     ToolRequested, parse_event,
@@ -318,8 +318,9 @@ class TrialExecutor:
         logger = EventLogger(sessions_root, session_id=trial.session_id)
         events: list[RuntimeEvent] = []
         current_trial = trial.model_copy(update={"runtime_trace_ref": trace_ref})
+        pending_text = ""
 
-        async def record(event: RuntimeEvent, *, terminal: bool = False) -> bool:
+        async def append_trace(event: RuntimeEvent, *, terminal: bool = False) -> bool:
             limit = self.max_trace_events if terminal else self.max_trace_events - 1
             if len(events) >= limit:
                 return False
@@ -337,6 +338,22 @@ class TrialExecutor:
             events.append(safe)
             await logger.log(safe)
             return True
+
+        async def record(event: RuntimeEvent, *, terminal: bool = False) -> bool:
+            nonlocal pending_text
+            # Provider chunking is arbitrary. Keep one bounded model-text record
+            # per response, and use complete tool-call events for arguments.
+            if isinstance(event, TextDelta):
+                pending_text = (pending_text + event.text)[:4000]
+                return True
+            if isinstance(event, ToolCallArgumentsDelta):
+                return True
+            if isinstance(event, ModelResponseCompleted) and pending_text:
+                merged = TextDelta(iteration=event.iteration, text=pending_text)
+                pending_text = ""
+                if not await append_trace(merged):
+                    return False
+            return await append_trace(event, terminal=terminal)
 
         async def failed(reason: str, *, mismatch: bool = False) -> TrialOutcome:
             recorded_cost = dict(current_trial.cost)
@@ -401,6 +418,7 @@ class TrialExecutor:
         tool_failed = False
         overflow = False
         completed_reason: str | None = None
+        frozen_workflow_complete = False
         execution_started_at = time.monotonic()
         service_names = frozenset(service_refs)
         workflow_steps = []
@@ -423,9 +441,10 @@ class TrialExecutor:
         instruction = (
             f"Execute frozen workflow {genome.genome_id} for trial {trial.trial_id}. "
             "Follow this host-provided, immutable execution manifest exactly. "
-            "Call each step only after its dependencies complete; use the listed registered tool, "
+            "The host has already verified the frozen script and input digests; call the listed "
+            "registered tool immediately. Call each step only after its dependencies complete; use the "
             "script path, input references, arguments, and trusted environment ID. "
-            "Do not invent or alter parameters. Manifest: "
+            "Do not inspect files, write a report, or invent or alter parameters. Manifest: "
             + json.dumps({
                 "genome_id": genome.genome_id, "content_sha256": genome.content_sha256,
                 "entrypoint": genome.entrypoint, "steps": workflow_steps,
@@ -469,6 +488,18 @@ class TrialExecutor:
                         tool_failed = True
                         if "GENOME_MISMATCH" in event.error:
                             mismatch = True
+                    elif (isinstance(event, BudgetUpdated) and not (mismatch or denied or tool_failed)
+                          and context.workflow_gate.all_complete and contract_paths):
+                        # BudgetUpdated follows every tool call in the response.
+                        # Finish only after the complete batch has passed the
+                        # runtime and the frozen workflow gate.
+                        try:
+                            refs = _output_refs(self.workspace, contract_paths, self.max_output_bytes)
+                        except (OSError, ValueError):
+                            refs = ()
+                        if len(refs) == len(contract_paths):
+                            frozen_workflow_complete = True
+                            break
                     elif isinstance(event, LoopCompleted):
                         completed_reason = event.reason
             finally:
@@ -477,6 +508,12 @@ class TrialExecutor:
             snapshot_runtime()
             return await interrupted("RUNTIME_FAILED")
         snapshot_runtime()
+        if frozen_workflow_complete and not await record(LoopCompleted(
+            iterations=runtime.budget.iterations,
+            reason="FROZEN_WORKFLOW_COMPLETE",
+            duration_ms=max(0.0, (time.monotonic() - execution_started_at) * 1000),
+        )):
+            overflow = True
         if context.workflow_gate.mismatch or not _frozen_files_match(self.workspace, attempt, trial, genome):
             mismatch = True
         if mismatch:
@@ -487,7 +524,7 @@ class TrialExecutor:
             return await failed("TOOL_EXECUTION_FAILED")
         if overflow:
             return await failed("TRACE_LIMIT_EXCEEDED")
-        if completed_reason != "final_response":
+        if completed_reason != "final_response" and not frozen_workflow_complete:
             return await failed("RUNTIME_INCOMPLETE")
         if completed == 0:
             return await failed("WORKFLOW_NOT_EXECUTED")

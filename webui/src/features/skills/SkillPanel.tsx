@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 
 import { api, type Artifact, type LocalSkill, type RunRef, type SkillCheckerSpec, type SkillExecutionSource, type SkillSourceRef, type SkillUse } from "../../api";
 
@@ -16,12 +16,15 @@ type CheckerKind = "none" | SkillCheckerSpec["checker_id"];
 export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "", onRunQueued, onChanged }: Props) {
   const [skills, setSkills] = useState<LocalSkill[]>([]);
   const [sources, setSources] = useState<SkillExecutionSource[]>([]);
+  const [invalidatedSources, setInvalidatedSources] = useState(0);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedSource, setSelectedSource] = useState("");
   const [name, setName] = useState("");
+  const [parentSkill, setParentSkill] = useState("");
+  const [configurations, setConfigurations] = useState<Record<string, string>>({});
   const [description, setDescription] = useState("");
   const [scope, setScope] = useState("");
   const [checkerKind, setCheckerKind] = useState<CheckerKind>("none");
@@ -34,22 +37,26 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
   const [units, setUnits] = useState("unspecified");
   const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
   const [inputSelections, setInputSelections] = useState<Record<string, string>>({});
+  const latestReload = useRef(0);
 
   const reload = useCallback(async () => {
+    const requestId = ++latestReload.current;
     setLoading(true);
     setError(null);
     try {
       const [skillResult, sourceResult] = await Promise.all([api.skills(), api.skillSources()]);
+      if (requestId !== latestReload.current) return;
       setSkills(skillResult.items);
       const taskSources = sourceResult.items.filter((item) => item.task_id === taskId);
       setSources(taskSources);
+      setInvalidatedSources(sourceResult.invalidated_by_task?.[taskId] ?? 0);
       setSelectedSource((current) => taskSources.some((item) => item.execution_id === current)
         ? current
         : taskSources.at(-1)?.execution_id ?? "");
     } catch (reason) {
-      setError(messageOf(reason));
+      if (requestId === latestReload.current) setError(messageOf(reason));
     } finally {
-      setLoading(false);
+      if (requestId === latestReload.current) setLoading(false);
     }
   }, [taskId]);
 
@@ -68,6 +75,18 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
 
   const buildChecker = (): SkillCheckerSpec | null => {
     if (checkerKind === "none") return null;
+    if (checkerKind === "rc_network" || checkerKind === "report_tables" || checkerKind === "fresnel_film") {
+      if (!source?.input_keys.includes("data") || !source.artifacts.includes("result.json") || (checkerKind === "report_tables" && !source.input_keys.includes("report"))) {
+        throw new Error("独立检查要求 data 输入、result.json 产物；表格检查还需 report 输入。");
+      }
+      return { checker_id: checkerKind, input_key: "data", output_path: "result.json", field: { rc_network: "samples", report_tables: "mismatches", fresnel_film: "R" }[checkerKind] };
+    }
+    if (checkerKind === "mwir_noise_budget") {
+      if (!source?.input_keys.includes("data") || !source.artifacts.includes("result.json")) {
+        throw new Error("MWIR 噪声预算检查要求来源执行包含 data 输入和 result.json 产物。");
+      }
+      return { checker_id: checkerKind, input_key: "data", output_path: "result.json", field: "detectivity_jones" };
+    }
     if (!outputPath.trim() || !field.trim()) throw new Error("请填写检查产物和 JSON 字段。");
     if (checkerKind === "json_numeric_sum") {
       if (!inputKey) throw new Error("请选择求和输入项。");
@@ -97,6 +116,7 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
         name: name.trim(), description: description.trim(), scope: scope.trim(),
         source: sourceReference(source),
         checker: buildChecker(),
+        ...(parentSkill ? { parent_skill_id: parentSkill } : {}),
       });
       await reload();
       setExpandedSkill(created.skill_id);
@@ -106,6 +126,7 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
       setName("");
       setDescription("");
       setScope("");
+      setParentSkill("");
       onChanged?.();
     } catch (reason) {
       setError(messageOf(reason));
@@ -115,7 +136,7 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
   };
 
   const replay = async (skill: LocalSkill) => {
-    const keys = Object.keys(skill.request?.input_refs ?? {});
+    const keys = skill.input_keys ?? Object.keys(skill.request?.input_refs ?? {});
     const refs: Record<string, string> = {};
     for (const key of keys) {
       const artifactId = inputSelections[`${skill.skill_id}:${key}`];
@@ -136,6 +157,7 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
       const reference = await api.replaySkill(skill.skill_id, {
         task_id: taskId,
         scope: skill.scope ?? "",
+        ...(configurations[skill.skill_id] ? { argv: JSON.parse(configurations[skill.skill_id]) as string[] } : {}),
         ...(Object.keys(refs).length ? { input_refs: refs } : {}),
       });
       onRunQueued?.(reference);
@@ -163,6 +185,21 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
     }
   };
 
+  const enableSkill = async (skill: LocalSkill) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.enableSkill(skill.skill_id);
+      await reload();
+      setNotice("已恢复此固定版本；科学有效性与跨任务收益仍分别判断。");
+      onChanged?.();
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section className="inspector-card skill-card" aria-label="技能复用">
       <div className="card-heading compact-heading">
@@ -182,7 +219,7 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
         {skills.map((skill) => {
           const evidence = skill.source_evidence?.status ?? "UNKNOWN";
           const canReplay = evidence === "PASS" && !["DISABLED", "REVALIDATION_REQUIRED"].includes(skill.status);
-          const inputKeys = Object.keys(skill.request?.input_refs ?? {});
+          const inputKeys = skill.input_keys ?? Object.keys(skill.request?.input_refs ?? {});
           return (
             <article className="revision-plan skill-item" key={skill.skill_id}>
               <button className="revision-section-heading" style={{ width: "100%", padding: 0, border: 0, background: "transparent", color: "inherit", textAlign: "left" }} aria-expanded={expandedSkill === skill.skill_id} onClick={() => setExpandedSkill((current) => current === skill.skill_id ? null : skill.skill_id)}>
@@ -195,6 +232,8 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
               {expandedSkill === skill.skill_id ? (
                 <div className="skill-detail">
                   {skill.scope ? <p><strong>适用范围</strong>{skill.scope}</p> : null}
+                  {skill.interface ? <><label>冻结参数配置<select aria-label="冻结参数配置" value={configurations[skill.skill_id] ?? JSON.stringify(skill.interface.argv_choices[0])} onChange={(event) => setConfigurations((previous) => ({ ...previous, [skill.skill_id]: event.target.value }))}>{skill.interface.argv_choices.map((argv) => <option key={JSON.stringify(argv)} value={JSON.stringify(argv)}>{argv.length ? argv.join(" ") : "默认参数"}</option>)}</select></label><details><summary>输入输出接口、单位与边界</summary><pre>{JSON.stringify(skill.interface, null, 2)}</pre></details></> : null}
+                  {skill.version ? <p><strong>固定版本</strong>{skill.version}<br />{skill.parent_skill_id ? `父版本：${skill.parent_skill_id}` : "首个版本"}<br />{skill.contract_sha256 ? `合同摘要：${skill.contract_sha256}` : ""}</p> : null}
                   <p><strong>源检查</strong><CheckerBadge status={evidence} />{skill.source_evidence?.gap ? ` · ${skill.source_evidence.gap}` : ""}</p>
                   {skill.source_evidence?.limitations?.map((limitation) => <p className="revision-warning" key={limitation}>{limitation}</p>)}
                   {skill.status === "REVALIDATION_REQUIRED" ? <p className="revision-warning">技能文件或合同摘要已变化，需重新创建候选并检查。</p> : null}
@@ -219,6 +258,7 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
                   <div className="revision-plan-actions">
                     {canReplay ? <button className="button button-secondary" disabled={disabled || busy} onClick={() => void replay(skill)}>回放到当前任务</button> : null}
                     {skill.status !== "DISABLED" && skill.status !== "REVALIDATION_REQUIRED" ? <button className="text-button danger-text" disabled={disabled || busy} onClick={() => void disableSkill(skill)}>停用</button> : null}
+                    {skill.status === "DISABLED" ? <button className="button button-secondary" disabled={disabled || busy} onClick={() => void enableSkill(skill)}>恢复此版本</button> : null}
                   </div>
                   <div className="revision-manual-note" aria-label="回放历史">
                     <strong>回放与复用记录 · {skill.uses.length}</strong>
@@ -233,7 +273,8 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
 
       <details className="budget-controls skill-create-details">
         <summary>从本任务执行记录创建候选</summary>
-        {sources.length === 0 ? <p className="muted small-copy">本任务还没有可用的真实脚本执行记录。</p> : (
+        {invalidatedSources > 0 && <p className="muted small-copy" role="status">{invalidatedSources} 条来源执行已失效。请在处理反馈后重新运行脚本，再选择新的来源执行。</p>}
+        {sources.length === 0 ? !loading && invalidatedSources === 0 && <p className="muted small-copy">本任务还没有可用的真实脚本执行记录。</p> : (
           <form className="revision-feedback-form skill-create-form" onSubmit={(event) => void create(event)}>
             <label>来源执行<select aria-label="来源执行" value={selectedSource} onChange={(event) => {
               setSelectedSource(event.target.value);
@@ -244,19 +285,44 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
               {sources.map((item) => <option key={item.execution_id} value={item.execution_id}>{(item.trial_id ?? item.run_id ?? item.execution_id).slice(-8)} · {item.script_path.split("/").at(-1)} · {item.state ?? "已记录"}</option>)}
             </select></label>
             <label>技能名称（英文小写、数字、连字符）<input aria-label="技能名称" required pattern="[a-z][a-z0-9-]{1,60}" maxLength={61} value={name} onChange={(event) => setName(event.target.value)} placeholder="numeric-sum" /></label>
+            <label>父版本（可选）<select aria-label="父版本" value={parentSkill} onChange={(event) => {
+              setParentSkill(event.target.value);
+              const parent = skills.find((item) => item.skill_id === event.target.value);
+              if (parent?.logical_name) setName(parent.logical_name);
+            }}>
+              <option value="">创建新方法</option>
+              {skills.filter((item) => item.status !== "REVALIDATION_REQUIRED").map((item) => <option key={item.skill_id} value={item.skill_id}>{item.name} · {item.skill_id.slice(-8)}</option>)}
+            </select></label>
             <label>方法说明<input aria-label="方法说明" required maxLength={500} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明脚本处理步骤" /></label>
             <label>适用范围<input aria-label="适用范围" required maxLength={200} value={scope} onChange={(event) => setScope(event.target.value)} placeholder="例如：结构化数值数据的汇总" /></label>
             <label>独立规则检查<select aria-label="独立规则检查" value={checkerKind} onChange={(event) => {
               const next = event.target.value as CheckerKind;
               setCheckerKind(next);
               if (next === "json_numeric_sum") setInputKey(source?.input_keys[0] ?? "");
-              if (next !== "none") setOutputPath(source?.artifacts[0] ?? "");
+              if (next === "mwir_noise_budget") {
+                setInputKey("data");
+                setOutputPath("result.json");
+                setField("detectivity_jones");
+              }
+              if (next !== "none" && next !== "mwir_noise_budget") setOutputPath(source?.artifacts[0] ?? "");
             }}>
               <option value="none">不设置（证据为 UNKNOWN，不能回放）</option>
               <option value="json_numeric_sum">JSON 数组求和检查</option>
               <option value="json_numeric_bounds">JSON 数值范围检查</option>
+              <option value="mwir_noise_budget">中红外噪声预算核验</option>
+              <option value="rc_network">被动 RC 电路独立节点求解</option>
+              <option value="report_tables">报告本体逐格核验</option>
+              <option value="fresnel_film">无损单层膜正入射反射率</option>
             </select></label>
             {checkerKind !== "none" ? <>
+              {checkerKind === "rc_network" || checkerKind === "report_tables" || checkerKind === "fresnel_film" ? <>
+                <p className="small-copy">固定绑定 data 输入和 result.json 输出。{{ rc_network: "使用独立复数 KCL 节点矩阵核对各频点跨阻，支持最多 8 个节点的被动 RC 网络。", report_tables: "还需 report 输入。直接读取 Markdown 报告表格，核对列、行与每个值。", fresnel_film: "使用独立特征矩阵核对无损单层膜的正入射反射率 R。" }[checkerKind]}通过仅表示数值合同一致，科研结论仍需证据。</p>
+              </> : checkerKind === "mwir_noise_budget" ? <>
+                <p className="small-copy">固定读取 data 输入及 result.json，核验面积换算、NEP 与比探测率计算。shot_only 会标为噪声证据不足；科研结论保持 UNKNOWN。</p>
+                {(!source?.input_keys.includes("data") || !source.artifacts.includes("result.json"))
+                  ? <p className="revision-warning">当前来源必须实际执行并记录 data 输入和 result.json 产物，才能使用此检查器。</p>
+                  : <p className="small-copy">输入绑定：data · 输出绑定：result.json · 输出字段：area_cm2、nep_w_sqrt_hz、detectivity_jones、assessment、scientific_status</p>}
+              </> : <>
               <label>输出产物<select aria-label="检查输出产物" value={outputPath} required onChange={(event) => setOutputPath(event.target.value)}>
                 {source?.artifacts.map((path) => <option key={path} value={path}>{path}</option>)}
                 {!source?.artifacts.length ? <option value="">没有可检查产物</option> : null}
@@ -274,8 +340,9 @@ export function SkillPanel({ taskId, artifacts, disabled = false, refreshKey = "
                 <label>单位<input aria-label="检查单位" value={units} onChange={(event) => setUnits(event.target.value)} placeholder="unspecified" /></label>
                 <p className="revision-warning">边界由操作者预先冻结；范围检查不验证科学假设。</p>
               </>}
+              </>}
             </> : null}
-            <button className="button button-primary" type="submit" disabled={disabled || busy || !source}>{busy ? "正在保存…" : "保存候选"}</button>
+            <button className="button button-primary" type="submit" disabled={disabled || busy || !source || (checkerKind === "mwir_noise_budget" && (!source.input_keys.includes("data") || !source.artifacts.includes("result.json")))}>{busy ? "正在保存…" : "保存候选"}</button>
           </form>
         )}
       </details>

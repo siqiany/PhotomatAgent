@@ -42,6 +42,8 @@ class StopPolicy:
             # fragments are present, they are not a trustworthy request and
             # must not take the normal tool execution path.
             return StopDecision(True, "output_truncated")
+        if finish_reason == "invalid_tool_markup":
+            return StopDecision(True, "invalid_tool_markup")
         if finish_reason == "error":
             return StopDecision(True, "error")
         if finish_reason == "cancelled":

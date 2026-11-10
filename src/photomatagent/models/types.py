@@ -6,13 +6,14 @@ Runtime, state, tools, logging, and CLI depend exclusively on this module.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated, Literal, Union
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 
-FinishReason = Literal["stop", "tool_calls", "max_tokens", "cancelled", "error", "unknown"]
+FinishReason = Literal["stop", "tool_calls", "max_tokens", "invalid_tool_markup", "cancelled", "error", "unknown"]
 
 
 def _empty_schema() -> dict[str, object]:
@@ -43,15 +44,47 @@ class SystemMessage(BaseModel):
     content: str
 
 
+class ImageReference(BaseModel):
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    media_type: Literal["image/png", "image/jpeg", "image/webp"]
+    byte_size: int = Field(gt=0, le=4 * 1024 * 1024)
+
+
+class ProviderContinuation(BaseModel):
+    protocol: Literal["deepseek_responses"] = "deepseek_responses"
+    model: str
+    endpoint_key: str = ""
+    reasoning: tuple[str, ...] = Field(default=(), max_length=16, repr=False)
+
+
 class UserMessage(BaseModel):
     kind: Literal["user"] = "user"
     content: str
+    images: tuple[ImageReference, ...] = Field(default=(), max_length=4)
+    context_only: bool = False
+
+    @model_serializer(mode="wrap")
+    def serialize_message(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        payload: dict[str, object] = handler(self)
+        if not self.images:
+            payload.pop("images", None)
+        if not self.context_only:
+            payload.pop("context_only", None)
+        return payload
 
 
 class AssistantMessage(BaseModel):
     kind: Literal["assistant"] = "assistant"
     text: str = ""
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    continuation: ProviderContinuation | None = Field(default=None, repr=False)
+
+    @model_serializer(mode="wrap")
+    def serialize_message(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        payload: dict[str, object] = handler(self)
+        if self.continuation is None:
+            payload.pop("continuation", None)
+        return payload
 
 
 class ToolResultMessage(BaseModel):
@@ -62,11 +95,43 @@ class ToolResultMessage(BaseModel):
     is_error: bool = False
     protected: bool = False
 
+    images: tuple[ImageReference, ...] = Field(default=(), max_length=4)
+
+    @model_serializer(mode="wrap")
+    def serialize_message(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        payload: dict[str, object] = handler(self)
+        if not self.images:
+            payload.pop("images", None)
+        return payload
+
 
 ModelMessage = Annotated[
     Union[SystemMessage, UserMessage, AssistantMessage, ToolResultMessage],
     Field(discriminator="kind"),
 ]
+
+
+def active_image_entries(messages: Sequence[ModelMessage]) -> dict[int, tuple[ImageReference, ...]]:
+    """Select at most four distinct images for the active user turn."""
+    last_user = max((i for i, message in enumerate(messages)
+                     if isinstance(message, UserMessage) and not message.context_only), default=-1)
+    order = ([last_user] if last_user >= 0 else []) + list(range(len(messages) - 1, last_user, -1))
+    selected: dict[int, tuple[ImageReference, ...]] = {}
+    seen: set[str] = set()
+    for index in order:
+        message = messages[index]
+        if not isinstance(message, (UserMessage, ToolResultMessage)):
+            continue
+        if isinstance(message, UserMessage) and index != last_user:
+            continue
+        images = []
+        for image in message.images:
+            if image.sha256 not in seen and len(seen) < 4:
+                seen.add(image.sha256)
+                images.append(image)
+        if images:
+            selected[index] = tuple(images)
+    return selected
 
 
 class ModelUsage(BaseModel):
@@ -83,6 +148,7 @@ class ModelRequest(BaseModel):
     messages: list[ModelMessage]
     tools: list[ToolDefinition] = Field(default_factory=list)
     max_output_tokens: int | None = Field(default=None, ge=1)
+    image_assets: dict[str, str] = Field(default_factory=dict, exclude=True, repr=False)
 
 
 class ModelResponse(BaseModel):
@@ -93,6 +159,7 @@ class ModelResponse(BaseModel):
     finish_reason: FinishReason = "unknown"
     usage: ModelUsage = Field(default_factory=ModelUsage)
     response_id: str | None = None
+    continuation: ProviderContinuation | None = Field(default=None, repr=False)
 
 
 class ModelStreamStarted(BaseModel):

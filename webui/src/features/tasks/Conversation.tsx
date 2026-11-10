@@ -3,7 +3,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { RunRecord, WorkbenchEvent } from "../../api";
 import { isRunActive, statusLabel } from "../../components/RunStatus";
-import { repliesForRun, stopExplanation } from "./conversation";
+import { contextCompactionSummary, qdCompletionSummary, repliesForRun, stopExplanation } from "./conversation";
 
 export function Conversation({ runs, events, activeRunId, activeStatus, onInspect }: {
   runs: RunRecord[]; events: WorkbenchEvent[]; activeRunId: string | null;
@@ -26,6 +26,9 @@ export function Conversation({ runs, events, activeRunId, activeStatus, onInspec
       const status = run.run_id === activeRunId ? activeStatus : run.status;
       const active = isRunActive(status);
       const stopped = stopExplanation(runEvents, run.run_id);
+      const qdSummary = !active && !final ? qdCompletionSummary(runEvents, run.run_id) : null;
+      const compactOnly = run.request.host_operation?.operation === "context_compaction";
+      const compactSummary = compactOnly && !active ? contextCompactionSummary(runEvents, run.run_id) : null;
       return <article className="conversation-turn" key={run.run_id}>
         <div className="conversation-user">
           {run.request.text.length > 1200 ? <>
@@ -34,6 +37,10 @@ export function Conversation({ runs, events, activeRunId, activeStatus, onInspec
               <summary>展开完整需求</summary><p>{run.request.text}</p>
             </details>
           </> : <p>{run.request.text}</p>}
+          {run.request.image_attachment_ids?.map((id, index) =>
+            <a key={id} href={`/api/artifacts/${encodeURIComponent(id)}/content`} target="_blank" rel="noreferrer">
+              图像附件 {index + 1}
+            </a>)}
         </div>
         <div className="conversation-assistant">
           <span className="conversation-avatar" aria-hidden="true">P</span>
@@ -42,8 +49,9 @@ export function Conversation({ runs, events, activeRunId, activeStatus, onInspec
             {progress.length ? <details className="research-progress"><summary>{active ? "正在研究" : "查看研究过程"} · {progress.length} 段记录</summary>
               {progress.map((reply, i) => <div className="markdown-body progress-reply" key={i}><Markdown remarkPlugins={[remarkGfm]}>{reply.text}</Markdown></div>)}
             </details> : null}
-            {final ? <div className="markdown-body"><Markdown remarkPlugins={[remarkGfm]}>{final.text}</Markdown></div> :
-              <p className="reply-placeholder">{active ? "正在处理你的问题…" : "本轮没有完成最终回复。已有研究过程与产物可以查看。"}</p>}
+            {compactSummary ? <p className="reply-placeholder" role="status">{compactSummary}</p> : final ? <div className="markdown-body"><Markdown remarkPlugins={[remarkGfm]}>{final.text}</Markdown></div> : qdSummary ?
+              <p className="reply-placeholder qd-completion-summary" role="status">{qdSummary}</p> :
+              <p className="reply-placeholder">{active ? (compactOnly ? "正在压缩工作上下文…" : "正在处理你的问题…") : "本轮没有完成最终回复。已有研究过程与产物可以查看。"}</p>}
             {stopped ? <div className="stop-explanation" role="status">{stopped}</div> : null}
             <button type="button" className="text-button turn-inspect" onClick={() => onInspect(run.run_id)}>查看本轮详情</button>
           </div>

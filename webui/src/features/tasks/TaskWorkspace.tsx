@@ -1,3 +1,4 @@
+import { TaskManagement } from "./InformationPanel";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api, subscribeToTask, type Capability, type RevisionPlan as RevisionPlanRecord, type RevisionQDRequest, type RunRef, type TaskDetail, type WorkbenchEvent } from "../../api";
@@ -7,6 +8,7 @@ import { FeedbackForm } from "../revisions/FeedbackForm";
 import { RevisionComparison } from "../revisions/RevisionComparison";
 import { RevisionPlan } from "../revisions/RevisionPlan";
 import { QDRevisionPanel } from "../revisions/QDRevisionPanel";
+import { CapabilityLearningPanel } from "../skills/CapabilityLearningPanel";
 import { SkillPanel } from "../skills/SkillPanel";
 import { ProcedurePanel } from "../skills/ProcedurePanel";
 import { EvaluationPanel } from "../evaluations/EvaluationPanel";
@@ -15,6 +17,7 @@ import { budgetFailure, pendingApproval } from "./runDiagnostics";
 import { ActivityTimeline } from "./ActivityTimeline";
 import { ClosedLoopProgress } from "./ClosedLoopProgress";
 import { Conversation } from "./Conversation";
+import { contextCompactionSummary } from "./conversation";
 
 interface SavedRevisionContext {
   planId: string;
@@ -55,15 +58,21 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
   const [revisionRestoring, setRevisionRestoring] = useState(false);
   const [revisionRestoreError, setRevisionRestoreError] = useState<string | null>(null);
   const [revisionBusy, setRevisionBusy] = useState(false);
+  const feedbackSubmission = useRef<{ body: string; key: string } | null>(null);
+  const compactSubmission = useRef<{ body: string; key: string } | null>(null);
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [capabilityStatusUnavailable, setCapabilityStatusUnavailable] = useState(false);
   const [historical, setHistorical] = useState<Awaited<ReturnType<typeof api.historicalTask>> | null>(null);
   const [historyUnavailable, setHistoryUnavailable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [retryCount, setRetryCount] = useState(0);
+  const [imageSelection, setImageSelection] = useState<{ taskId: string; ids: string[] }>({ taskId, ids: [] });
+  const [imageUploading, setImageUploading] = useState(false);
+  const imageIds = imageSelection.taskId === taskId ? imageSelection.ids : [];
   const [submitting, setSubmitting] = useState(false);
   const [maxModelCalls, setMaxModelCalls] = useState(20);
   const [maxTokens, setMaxTokens] = useState(100_000);
+  const [compilerTokens, setCompilerTokens] = useState(65_536);
   const [wallSeconds, setWallSeconds] = useState(1800);
   const [autoRevision, setAutoRevision] = useState(true);
   const [evolutionRounds, setEvolutionRounds] = useState(3);
@@ -153,6 +162,7 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
     activeRunRef.current = null;
     setActiveRunId(null);
     setStatusOverride(null);
+    setSubmitting(false);
     setError(null);
     setNotice(null);
     setApprovalSubmitting(null);
@@ -353,8 +363,27 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
     setInspectorOpen(true);
   };
 
+  const uploadImage = async (file: File) => {
+    if (file.size > 4 * 1024 * 1024) {
+      setError("图像不能超过 4 MiB。");
+      return;
+    }
+    setImageUploading(true);
+    setError(null);
+    try {
+      const attachment = await api.uploadAttachment(taskId, file);
+      if (currentTaskIdRef.current !== taskId) return;
+      setImageSelection({ taskId, ids: [...imageIds, attachment.attachment_id] });
+      await loadTask();
+    } catch (reason) {
+      if (currentTaskIdRef.current === taskId) setError(messageOf(reason));
+    } finally {
+      setImageUploading(false);
+    }
+  };
+
   const submitRun = async () => {
-    if (!requestText.trim()) return;
+    if (!requestText.trim() || imageUploading) return;
     followLatest.current = true;
     setInspectedRunId(null);
     setSubmitting(true);
@@ -368,6 +397,7 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
       const runRequest: Parameters<typeof api.startRun>[1] = {
         text: requestText.trim(),
         strategy: "standard",
+        ...(imageIds.length ? { image_attachment_ids: imageIds } : {}),
         budget: {
           max_model_calls: maxModelCalls,
           max_tokens: maxTokens,
@@ -386,6 +416,7 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
       activeRunRef.current = reference.run_id;
       setActiveRunId(reference.run_id);
       setRequestText("");
+      setImageSelection({ taskId, ids: [] });
       const revisionAtRefresh = statusRevision.current;
       const refreshed = await loadTask();
       const currentRun = refreshed.runs.find((run) => run.run_id === reference.run_id);
@@ -409,6 +440,37 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
       await loadTask();
     } catch (reason) {
       setError(messageOf(reason));
+    }
+  };
+
+  const compactContext = async () => {
+    setSubmitting(true);
+    setError(null);
+    setNotice(null);
+    const budget = { max_model_calls: maxModelCalls, max_tokens: maxTokens, wall_seconds: wallSeconds };
+    const body = JSON.stringify({ taskId, budget });
+    if (compactSubmission.current?.body !== body) compactSubmission.current = { body, key: crypto.randomUUID() };
+    try {
+      const reference = await api.compactContext(taskId, budget, compactSubmission.current.key);
+      compactSubmission.current = null;
+      if (currentTaskIdRef.current !== taskId) return;
+      activeRunRef.current = reference.run_id;
+      setActiveRunId(reference.run_id);
+      setEvents([]);
+      setStatusOverride("QUEUED");
+      const revisionAtRefresh = statusRevision.current;
+      const value = await api.task(taskId);
+      if (currentTaskIdRef.current !== taskId) return;
+      detailRef.current = value;
+      setDetail(value);
+      refreshRef.current();
+      const current = value.runs.find((run) => run.run_id === reference.run_id);
+      if (current && canApplyStatusRefresh(revisionAtRefresh, statusRevision.current)) setStatusOverride(current.status);
+      setNotice("手动压缩已加入后台队列，摘要调用使用本次预算；完成后自动用于后续科研运行。完整历史保留。");
+    } catch (reason) {
+      if (currentTaskIdRef.current === taskId) setError(messageOf(reason));
+    } finally {
+      if (currentTaskIdRef.current === taskId) setSubmitting(false);
     }
   };
 
@@ -453,29 +515,56 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
   };
 
   const prepareRevision = async (sourceRunId: string, feedback: string, artifactIds: string[]) => {
+    const requestedTaskId = taskId;
     setRevisionBusy(true);
     setError(null);
     try {
-      const plan = await api.prepareFeedback(taskId, {
+      const body = {
         source_run_id: sourceRunId,
         text: feedback,
         artifact_ids: artifactIds,
-        budget: { max_model_calls: 1, max_tokens: maxTokens, wall_seconds: wallSeconds },
-      });
+        budget: { max_model_calls: 1, max_tokens: Math.min(maxTokens, compilerTokens), wall_seconds: wallSeconds },
+        revision_budget: { max_model_calls: maxModelCalls, max_tokens: maxTokens, wall_seconds: wallSeconds },
+      };
+      const identity = JSON.stringify({ taskId, body });
+      if (feedbackSubmission.current?.body !== identity) {
+        const storageKey = `photomatagent:auto-feedback:${taskId}`;
+        let saved: { body: string; key: string } | null = null;
+        try {
+          const value: unknown = JSON.parse(window.sessionStorage.getItem(storageKey) ?? "null");
+          if (value && typeof value === "object" && "body" in value && value.body === identity && "key" in value && typeof value.key === "string") saved = { body: identity, key: value.key };
+        } catch { /* Storage is optional; the in-memory key still survives retries. */ }
+        feedbackSubmission.current = saved ?? { body: identity, key: crypto.randomUUID() };
+        try { window.sessionStorage.setItem(storageKey, JSON.stringify(feedbackSubmission.current)); } catch { /* optional */ }
+      }
+      const result = await api.submitFeedback(taskId, body, feedbackSubmission.current.key);
+      if (currentTaskIdRef.current !== requestedTaskId) return;
+      const plan = result.plan;
       setRevisionFeedback(feedback);
       setRevisionSourceRunId(sourceRunId);
       setCurrentRevisionPlan(plan);
-      setRevisionRunId(null);
+      setRevisionRunId(result.run?.run_id ?? null);
       saveRevisionContext(taskId, {
         planId: plan.plan_id,
         sourceRunId,
-        revisionRunId: null,
+        revisionRunId: result.run?.run_id ?? null,
       });
-      setNotice(plan.status === "READY" ? "意见已整理成修订计划；请检查每一项后再启动补充工作。" : "反馈已保留，但计划暂时无法生成；可以重试。 ");
+      if (result.run) {
+        activeRunRef.current = result.run.run_id;
+        setActiveRunId(result.run.run_id);
+        setEvents([]);
+        setStatusOverride("QUEUED");
+        await loadTask();
+        if (currentTaskIdRef.current !== requestedTaskId) return;
+        setNotice("意见已整理，正在自动返修；可展开查看计划或中止运行。");
+      } else {
+        setNotice(result.diagnostic ?? (result.status === "NEEDS_CLARIFICATION" ? "请补充目标说明后继续。" : "反馈和计划已保留，尚未启动返修。"));
+        setRevisionOpen(true);
+      }
     } catch (reason) {
-      setError(messageOf(reason));
+      if (currentTaskIdRef.current === requestedTaskId) setError(messageOf(reason));
     } finally {
-      setRevisionBusy(false);
+      if (currentTaskIdRef.current === requestedTaskId) setRevisionBusy(false);
     }
   };
 
@@ -633,6 +722,10 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
   const tokenFailure = budgetFailure(events, activeRunId);
   const evolution = capabilities.find((capability) => capability.id === "evolution");
   const acquisition = capabilities.find((capability) => capability.id === "local_tool_acquisition");
+  const latestContextRequest = allEvents.filter((event) => event.type === "model_request_started").at(-1);
+  const latestCompaction = allEvents.filter((event) => ["context_compaction_completed", "context_compaction_failed", "context_compaction_skipped"].includes(event.type)).at(-1);
+  const contextTokens = latestCompaction?.type === "context_compaction_completed" && latestCompaction.seq > (latestContextRequest?.seq ?? 0)
+    ? latestCompaction.payload.tokens_after : latestContextRequest?.payload.estimated_current_prompt_tokens;
 
   return (
     <section className={`task-workspace ${inspectorOpen ? "inspector-open" : ""}`} data-mobile-panel={mobilePanel} data-workbench-panel="workspace">
@@ -640,12 +733,19 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
         <header className="workspace-header">
           <div className="breadcrumbs"><h1>{task.title}</h1><code className="run-id" data-testid="active-run-id">{activeRunId}</code></div>
           <div className="header-actions">
-            <button className="button button-secondary revision-entry" disabled={active || submitting || revisionBusy || revisionRestoring || !detail.runs.some((run) => ["SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "INTERRUPTED"].includes(run.status))} onClick={() => setRevisionOpen((open) => !open)}>{revisionOpen ? "收起改进" : "继续改进"}</button>
+            <button className="button button-secondary revision-entry" disabled={active || submitting || revisionBusy || revisionRestoring || !detail.runs.some((run) => run.request.host_operation?.operation !== "context_compaction" && ["SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "INTERRUPTED"].includes(run.status))} onClick={() => setRevisionOpen(!revisionOpen)}>{revisionOpen ? "收起改进" : "继续改进"}</button>
             <RunStatus run={displayedRun} />
             <button className="button button-subtle" type="button" aria-expanded={inspectorOpen} onClick={() => setInspectorOpen((open) => !open)}>{inspectorOpen ? "收起详情" : "产物与自进化"}</button>
           </div>
         </header>
 
+        {(detail.pagination?.runs_before || detail.pagination?.artifacts_before) && <button className="button button-subtle" onClick={() => {
+          const requests: Promise<void>[] = [];
+          if (detail.pagination?.runs_before) requests.push(api.information<{ items: TaskDetail["runs"]; next_before: string | null }>(`/tasks/${taskId}/runs?before=${encodeURIComponent(detail.pagination.runs_before)}`).then((page) => setDetail((previous) => previous ? { ...previous, runs: [...page.items, ...previous.runs], pagination: { ...previous.pagination, runs_before: page.next_before } } : previous)));
+          if (detail.pagination?.artifacts_before) requests.push(api.information<{ items: TaskDetail["artifacts"]; next_before: string | null }>(`/tasks/${taskId}/artifacts?before=${encodeURIComponent(detail.pagination.artifacts_before)}`).then((page) => setDetail((previous) => previous ? { ...previous, artifacts: [...previous.artifacts, ...page.items], pagination: { ...previous.pagination, artifacts_before: page.next_before } } : previous)));
+          void Promise.all(requests).catch((reason) => setError(String(reason)));
+        }}>加载更早的运行与产物</button>}
+        <TaskManagement task={task} onChanged={() => { onTaskChanged(); void api.task(taskId).then(setDetail).catch((reason) => setError(String(reason))); }} />
         <div className="workspace-scroll" ref={scrollRef} onScroll={(event) => { const el = event.currentTarget; followLatest.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100; }}>
           <details className="task-objective"><summary>研究目标与改进</summary><p>{task.goal}</p>
 
@@ -683,7 +783,7 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
                 </div>
               ) : null}
               <FeedbackForm
-                runs={detail.runs}
+                runs={detail.runs.filter((run) => run.request.host_operation?.operation !== "context_compaction")}
                 artifacts={detail.artifacts}
                 disabled={active || submitting || revisionBusy || revisionRestoring || Boolean(revisionRestoreError)}
                 submitting={revisionBusy}
@@ -696,6 +796,8 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
                 onPrepare={(sourceRunId, feedback, artifactIds) => void prepareRevision(sourceRunId, feedback, artifactIds)}
               />
               {revisionPlan ? (
+                <details open={revisionPlan.status !== "READY" || revisionPlan.issues?.some((issue) => issue.category === "TASK_DEFINITION" && issue.status === "QUERY")}>
+                <summary>查看返修计划与检查依据</summary>
                 <RevisionPlan
                   plan={revisionPlan}
                   busy={revisionBusy}
@@ -712,8 +814,10 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
                     (revisionPlan.source_artifacts ?? []).map((artifact) => artifact.artifact_id),
                   )}
                 />
+                </details>
               ) : null}
               {revisionPlan?.status === "READY" ? (
+                <details><summary>高级：有界参数搜索</summary>
                 <QDRevisionPanel
                   taskId={taskId}
                   disabled={active || submitting || revisionBusy || revisionRestoring}
@@ -722,6 +826,7 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
                   runId={revisionRunId}
                   onRun={(qd) => void executeRevision(qd)}
                 />
+                </details>
               ) : null}
               {revisionPlan && revisionRunId ? (
                 <RevisionComparison
@@ -835,6 +940,12 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
             void submitRun();
           }}
         >
+          <details className="budget-controls" aria-label="上下文管理">
+            <summary>上下文管理 <span>{typeof contextTokens === "number" ? `最近请求估计 ${contextTokens.toLocaleString()} tokens` : "自动压缩与手动压缩"}</span></summary>
+            <p>达到运行时阈值后自动压缩；保留最近交互、科研证据和完整历史。手动压缩使用下方预算，无需填写新需求；摘要会消耗模型调用和 Token。</p>
+            {latestCompaction ? <p role="status">{contextCompactionSummary(allEvents, latestCompaction.run_id)}</p> : null}
+            <button type="button" className="button button-secondary" disabled={active || submitting || revisionBusy || revisionRestoring || !detail.runs.length} onClick={() => void compactContext()}>压缩上下文</button>
+          </details>
           <label htmlFor="run-request">本轮需求</label>
           <textarea
             id="run-request"
@@ -846,12 +957,29 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
             rows={2}
             disabled={active || submitting}
           />
+          <details className="image-controls">
+            <summary>图像附件 <span>{imageIds.length} / 4</span></summary>
+            <label>上传图像<input type="file" aria-label="上传图像" accept="image/png,image/jpeg,image/webp"
+              disabled={active || submitting || imageUploading || imageIds.length >= 4}
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                event.currentTarget.value = "";
+                if (file) void uploadImage(file);
+              }} /></label>
+            {detail.artifacts.filter((item) => item.run_id === null && item.media_type.startsWith("image/") && item.size_bytes <= 4 * 1024 * 1024)
+              .map((item) => <label key={item.artifact_id}><input type="checkbox"
+                checked={imageIds.includes(item.artifact_id)}
+                disabled={active || submitting || imageUploading || (!imageIds.includes(item.artifact_id) && imageIds.length >= 4)}
+                onChange={(event) => setImageSelection({ taskId, ids: event.target.checked
+                  ? [...imageIds, item.artifact_id] : imageIds.filter((id) => id !== item.artifact_id) })} /> {item.filename}</label>)}
+          </details>
           <details className="budget-controls">
             <summary>本轮预算与自动修订 <span>{maxModelCalls} 次模型调用 · {maxTokens.toLocaleString()} tokens · {wallSeconds} 秒</span></summary>
             <div className="budget-inputs">
               <label>模型调用上限<input aria-label="模型调用上限" type="number" min={1} value={maxModelCalls} onChange={(event) => setMaxModelCalls(Math.max(1, Number(event.target.value) || 1))} disabled={active || submitting} /></label>
               <label>Token 上限<input aria-label="Token 上限" type="number" min={1} value={maxTokens} onChange={(event) => setMaxTokens(Math.max(1, Number(event.target.value) || 1))} disabled={active || submitting} /></label>
               <label>运行时间上限（秒）<input aria-label="运行时间上限（秒）" type="number" min={1} value={wallSeconds} onChange={(event) => setWallSeconds(Math.max(1, Number(event.target.value) || 1))} disabled={active || submitting} /></label>
+              <label>评审意见整理 Token 上限<input aria-label="评审意见整理 Token 上限" type="number" min={1} value={compilerTokens} onChange={(event) => setCompilerTokens(Math.max(1, Number(event.target.value) || 1))} disabled={revisionBusy} /></label>
             </div>
             <div className="evolution-controls">
               <label className="evolution-toggle"><input aria-label="启用自动修订" type="checkbox" checked={autoRevision} onChange={(event) => setAutoRevision(event.target.checked)} disabled={active || submitting} /> 自动检查并修订（默认开启）</label>
@@ -859,6 +987,7 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
               <label className="evolution-artifacts">必须交付的文件名<input aria-label="必须交付的文件名" value={requiredArtifactsText} onChange={(event) => setRequiredArtifactsText(event.target.value)} disabled={active || submitting} placeholder="例如 report.md, data.csv" /></label>
             </div>
             <p>自动修订沿用本轮累计预算。多个文件名用逗号分隔；科研结论仍需独立证据检查。</p>
+            <p>“继续改进”先使用独立的意见整理预算，再使用本轮预算运行返修。意见整理会保守预留原任务、报告与完整计划的空间；较长反馈可提高其上限。</p>
             <p>Token 上限累计计算本轮全部自动修订的模型输入和输出；请求前估计输入用量，获得真实用量后校准后续估计，余量不足时优先交付已有结果。估计并非精确计费上限。运行时间限制涵盖本轮研究和自动修订；到期停止本地运行，但不会取消已提交的外部科学计算作业。</p>
           </details>
           <div className="composer-footer">
@@ -877,7 +1006,7 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
               </label>
               <span className="composer-hint">Enter 发送 · Shift+Enter 换行</span>
             </div>
-            <button className="button button-primary submit-button" disabled={active || submitting || !requestText.trim()}>
+            <button className="button button-primary submit-button" disabled={active || submitting || imageUploading || !requestText.trim()}>
               {submitting ? "正在提交…" : "提交给智能体"}
               <span aria-hidden="true">↗</span>
             </button>
@@ -897,11 +1026,12 @@ export function TaskWorkspace({ taskId, mobilePanel, onTaskChanged }: Props) {
           status={detail.runs.find((run) => run.run_id === (inspectedRunId ?? activeRunId))?.status ?? status}
           error={null}
         />
+        <CapabilityLearningPanel taskId={task.task_id} sourceRunId={detail.runs.filter((run) => ["SUCCEEDED", "PARTIAL", "FAILED"].includes(run.status) && !run.request.host_operation).at(-1)?.run_id} />
         <SkillPanel
           taskId={task.task_id}
           artifacts={detail.artifacts}
           disabled={active || submitting || revisionBusy}
-          refreshKey={detail.runs.map((run) => `${run.run_id}:${run.status}`).join("|")}
+          refreshKey={detail.runs.map((run) => `${run.run_id}:${run.status}:${run.result_invalidation_ids?.join(",") ?? ""}`).join("|")}
           onRunQueued={acceptSkillReplay}
         />
         <ProcedurePanel
@@ -974,6 +1104,12 @@ function eventLabel(type: string, payload?: Record<string, unknown>): string {
     budget_updated: "运行预算更新",
     approval_pending: "等待工具审批",
     approval_resolved: "工具审批已处理",
+    context_prune_started: "裁减旧工具输出",
+    context_prune_completed: "旧工具输出裁减完成",
+    context_compaction_started: "正在压缩上下文",
+    context_compaction_completed: "上下文压缩完成",
+    context_compaction_failed: "上下文压缩未完成",
+    context_compaction_skipped: "上下文压缩已跳过",
   };
   return labels[type] ?? type.replaceAll("_", " ");
 }

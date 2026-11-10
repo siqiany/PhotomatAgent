@@ -28,9 +28,20 @@ from photomatagent.scientific.capabilities.contracts import (
     ScientificEvidence,
     ScientificToolResult,
 )
+from photomatagent.errors import ToolExecutionError
+from photomatagent.models.types import ImageReference
+from photomatagent.scientific.capabilities.literature.documents import (
+    DocumentArtifact,
+    DocumentError,
+    DocumentService,
+    IndexedDocumentQuery,
+    structured_index_path,
+)
 from photomatagent.scientific.capabilities.literature.models import (
+    DocumentStatus,
     LITERATURE_CHUNK_SCHEMA_VERSION,
     LiteratureSourceKind,
+    StructuredPassageReference,
 )
 from photomatagent.scientific.capabilities.literature.abstract_ingestion import (
     AbstractIngestionError,
@@ -56,12 +67,10 @@ def _version(name: str) -> str:
 
 
 TIERED_RETRIEVAL_GUIDANCE = (
-    "Search local full-text passages first (source_kind=fulltext). If they do "
-    "not directly support the answer or leave an evidence gap, search local "
-    "abstract passages (source_kind=abstract). Only then, or when the user "
-    "explicitly asks for recent work, call literature.search_arxiv. Abstract "
-    "and arXiv results do not mean full text was inspected. arXiv results are "
-    "not persisted."
+    "Route by evidence need. Use known paper identifiers for source lookup, local full-text "
+    "passages for archived material, and configured external search for broader or recent work. "
+    "Abstract and metadata results do not establish full-text coverage. Use structured "
+    "paper reading for precise methods, tables, figures or formulas."
 )
 
 
@@ -767,21 +776,36 @@ class LiteratureProbe(CapabilityPack):
     def tools(self) -> list[Tool]:
         from photomatagent.scientific.capabilities.literature.source_fetch import LiteratureFetchSourceTool
 
+        from photomatagent.scientific.capabilities.literature.federated import (
+            FederatedLiterature, LiteratureSearchTool, ResolveFulltextTool,
+        )
+
+        federated = FederatedLiterature.configured(self._documents)
+        allowed_hosts = frozenset(
+            host.strip().lower()
+            for host in os.environ.get("PHOTOMATAGENT_LITERATURE_FETCH_HOSTS", "").split(",")
+            if host.strip()
+        )
         return [
-            LiteratureFetchSourceTool(),
+            LiteratureFetchSourceTool(documents=self._documents, extra_hosts=allowed_hosts),
             LiteratureSearchArxivTool(self._config),
-            LiteratureSearchLocalTool(self._config, self._workspace),
+            LiteratureSearchTool(federated),
+            ResolveFulltextTool(federated),
+            LiteratureSearchLocalTool(self._config, self._workspace, self._documents),
             LiteratureListPapersTool(self._workspace),
-            LiteratureReadPaperTool(self._config, self._workspace),
+            LiteratureReadPaperTool(self._config, self._workspace, self._documents),
+            LiteratureReadObjectTool(self._config, self._workspace, self._documents),
             LiteratureIndexPapersTool(self._config, self._workspace),
+            LiteratureIndexDocumentTool(self._config, self._workspace, self._documents),
             LiteratureSearchPassagesTool(self._config, self._workspace),
             LiteratureReadPassageTool(self._config, self._workspace),
-            LiteratureExtractEvidenceTool(self._config, self._workspace),
+            LiteratureExtractEvidenceTool(self._config, self._workspace, documents=self._documents),
         ]
 
     def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
         self._config = config
         self._workspace = workspace
+        self._documents = DocumentService(workspace)
         self._status = {
             "server_version": "unknown",
             "alias_state": "not checked",
@@ -789,12 +813,23 @@ class LiteratureProbe(CapabilityPack):
         }
 
 
-def _papers_dir(workspace: Workspace) -> Path:
-    candidates = [workspace.root / "papers", Path.cwd() / "papers"]
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return candidates[0]
+def _papers_dir(workspace: Workspace) -> Path | None:
+    try:
+        return workspace.resolve("papers", must_exist=False)
+    except ToolExecutionError:
+        return None
+
+
+def _local_paper_names(workspace: Workspace, directory: Path) -> list[str]:
+    names = []
+    for entry in sorted(directory.glob("*.pdf")):
+        try:
+            path = workspace.resolve(f"papers/{entry.name}")
+        except ToolExecutionError:
+            continue
+        if path.parent == directory and path.is_file():
+            names.append(entry.name)
+    return names
 
 
 def _clean(text: str, limit: int) -> str:
@@ -927,6 +962,17 @@ def _stats_payload(stats: Any) -> dict[str, Any]:
     }
 
 
+def _structured_reference_payload(record: Any) -> dict[str, Any]:
+    value = _record_value(record, "structured_ref")
+    if value is None:
+        return {}
+    try:
+        ref = StructuredPassageReference.model_validate(value)
+    except ValueError:
+        return {}
+    return {"structured_ref": ref.model_dump(mode="json")}
+
+
 def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
     """Convert a Qdrant passage point to the stable public read contract."""
     text = str(_record_value(record, "text", "") or "")
@@ -939,6 +985,7 @@ def _passage_payload(record: Any, *, text_limit: int | None) -> dict[str, Any]:
     limitations = _public_limitations(record, source_kind)
     page = _record_value(record, "page", _record_value(record, "page_start"))
     return {
+        **_structured_reference_payload(record),
         "passage_id": str(_record_value(record, "passage_id", "") or ""),
         "paper_id": str(
             _record_value(record, "paper_id", _record_value(record, "document_id", ""))
@@ -1171,78 +1218,62 @@ class LiteratureSearchArxivTool(Tool):
 class LiteratureSearchLocalTool(Tool):
     name = "literature.search_local"
     description = (
-        "Search text of PDF papers in the workspace papers/ directory; returns "
-        "matching files with page-level snippets, strictly limited. "
-        + TIERED_RETRIEVAL_GUIDANCE
+        "Search cached structured PDF objects in the workspace papers/ directory. "
+        "Unparsed files are listed as candidates for literature.read_paper."
     )
-    short_description = "Full-text search over local PDF papers (papers/)."
+    short_description = "Search parsed local papers and find unparsed candidates."
     exposure = ToolExposure.DEFERRED
     namespace = "literature"
-    source = "pypdf"
+    source = "builtin"
     tags = ("literature", "pdf", "local search", "full text")
     input_schema = {
         "type": "object",
         "properties": {
-            "query": {"type": "string"},
+            "query": {"type": "string", "minLength": 1, "maxLength": 500},
             "max_files": {"type": "integer", "minimum": 1, "maximum": 10},
             "snippet_chars": {"type": "integer", "minimum": 50, "maximum": 600},
         },
         "required": ["query"],
     }
 
-    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
-        self._config = config
+    def __init__(
+        self, config: ScientificConfig, workspace: Workspace, documents: DocumentService | None = None,
+    ) -> None:
         self._workspace = workspace
+        self._documents = documents or DocumentService(workspace)
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
-        from pypdf import PdfReader
-
         query = str(arguments["query"]).casefold()
         max_files = min(int(arguments.get("max_files", 3)), 10)
-        snippet_chars = int(arguments.get("snippet_chars", 240))
+        snippet_chars = min(int(arguments.get("snippet_chars", 240)), 600)
         directory = _papers_dir(self._workspace)
-        if not directory.is_dir():
-            return ScientificToolResult(
-                output=f"no papers/ directory found (looked at {directory})",
-                is_error=True,
-                data={"error": "no_papers_dir"},
-            )
+        if directory is None or not directory.is_dir():
+            return ScientificToolResult(output="No accessible papers/ directory.",
+                                        is_error=True, data={"error": "no_papers_dir"})
         matches: list[dict[str, Any]] = []
-        for pdf_path in sorted(directory.glob("*.pdf"))[:max_files]:
+        for filename in _local_paper_names(self._workspace, directory)[:max_files]:
             try:
-                reader = PdfReader(str(pdf_path))
-                pages = [page.extract_text() or "" for page in reader.pages]
-            except Exception as exc:
-                matches.append(
-                    {"file": pdf_path.name, "error": f"{type(exc).__name__}: {exc}"}
-                )
+                artifact, parsed = await asyncio.to_thread(self._documents.cached, filename)
+            except (ValueError, OSError, ToolExecutionError):
+                matches.append({"file": filename, "diagnostic": "DOCUMENT_UNAVAILABLE"})
                 continue
-            snippets = []
-            for index, page_text in enumerate(pages):
-                lowered = page_text.casefold()
-                position = lowered.find(query)
-                if position < 0:
+            if parsed is None:
+                matches.append({"file": filename, "parsed": False, "next_tool": "literature.read_paper"})
+                continue
+            hits = []
+            for obj in parsed.objects:
+                index = obj.text.casefold().find(query)
+                if index < 0:
                     continue
-                start = max(0, position - snippet_chars // 2)
-                snippets.append(
-                    {
-                        "page": index + 1,
-                        "snippet": _clean(page_text[start : start + snippet_chars], snippet_chars),
-                    }
-                )
-                if len(snippets) >= 3:
+                start = max(0, index - snippet_chars // 3)
+                hits.append({"object_id": obj.object_id, "snippet": obj.text[start:start + snippet_chars]})
+                if len(hits) == 3:
                     break
-            if snippets:
-                matches.append({"file": pdf_path.name, "pages": snippets})
-        payload: dict[str, Any] = {
-            "query": arguments["query"],
-            "count": len(matches),
-            "matches": matches,
-        }
-        return ScientificToolResult(
-            output=json.dumps(payload, ensure_ascii=False),
-            data={"matches": matches},
-        )
+            if hits:
+                matches.append({"file": filename, "document_id": artifact.document_id,
+                                "parsed": True, "objects": hits})
+        payload = {"query": arguments["query"], "count": len(matches), "matches": matches}
+        return ScientificToolResult(output=json.dumps(payload, ensure_ascii=False), data=payload)
 
 
 class LiteratureListPapersTool(Tool):
@@ -1260,13 +1291,13 @@ class LiteratureListPapersTool(Tool):
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         directory = _papers_dir(self._workspace)
-        if not directory.is_dir():
+        if directory is None or not directory.is_dir():
             return ScientificToolResult(
                 output=f"no papers/ directory found (looked at {directory})",
                 is_error=True,
                 data={"error": "no_papers_dir"},
             )
-        files = [path.name for path in sorted(directory.glob("*.pdf"))]
+        files = _local_paper_names(self._workspace, directory)
         payload: dict[str, Any] = {
             "count": len(files),
             "papers": files,
@@ -1281,79 +1312,139 @@ class LiteratureListPapersTool(Tool):
 class LiteratureReadPaperTool(Tool):
     name = "literature.read_paper"
     description = (
-        "Extract text from one local PDF (first N chars, capped) plus its page "
-        "count and title metadata."
+        "Open a structured PDF by filename inside papers/ or registered document ID. "
+        "Without a selector, lists anchored objects and section headings. Choose one section_id, "
+        "object_ids, or query to read selected content. Query prefers the active index for this revision "
+        "and falls back to document text matching. Use cursor to continue the same selection. "
+        "max_chars is the UTF-8 content budget per page. Long text and table cells can continue inside an object. "
+        "Parsing uses locally provisioned Docling assets, with no raw-text fallback."
     )
-    short_description = "Read a local PDF paper with a strict character cap."
+    short_description = "Read structured paper objects with provenance."
     exposure = ToolExposure.DEFERRED
     namespace = "literature"
-    source = "pypdf"
-    tags = ("literature", "pdf", "read")
+    source = "docling"
+    tags = ("literature", "pdf", "read", "table", "formula")
     input_schema = {
         "type": "object",
         "properties": {
-            "file": {"type": "string", "description": "File name inside papers/."},
+            "file": {"type": "string", "minLength": 1, "maxLength": 255},
+            "document_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "section_id": {"type": "string", "minLength": 1, "maxLength": 200},
+            "object_ids": {"type": "array", "minItems": 1, "maxItems": 20,
+                           "items": {"type": "string", "maxLength": 200}},
+            "query": {"type": "string", "minLength": 1, "maxLength": 500},
+            "cursor": {"type": "string", "maxLength": 100},
             "max_chars": {"type": "integer", "minimum": 200, "maximum": 20000},
         },
-        "required": ["file"],
+        "oneOf": [{"required": ["file"]}, {"required": ["document_id"]}],
+        "additionalProperties": False,
     }
 
-    def __init__(self, config: ScientificConfig, workspace: Workspace) -> None:
+    def __init__(
+        self, config: ScientificConfig, workspace: Workspace, documents: DocumentService | None = None,
+        services: LiteratureServices | None = None,
+    ) -> None:
         self._config = config
         self._workspace = workspace
+        self._documents = documents or DocumentService(workspace)
+        self._services = services
+
+    async def _query_index(self, artifact: DocumentArtifact, revision: str, query: str) -> IndexedDocumentQuery:
+        from contextlib import suppress
+
+        from photomatagent.scientific.capabilities.literature.qdrant_store import document_id_for
+        from photomatagent.scientific.capabilities.literature.retrieval import StructuredDocumentScope
+
+        services = self._services
+        indexed: bool | None = None
+        try:
+            async with asyncio.timeout(30):
+                services = services or build_literature_services(self._config, self._workspace)
+                source = LiteratureSourceKind.FULLTEXT
+                relative = structured_index_path(artifact.document_id, revision).as_posix()
+                indexed_id = document_id_for(services.workspace_id, relative)
+                generation = await services.store.resolve_current_generation()
+                manifest = None
+                if generation is not None:
+                    manifests = await services.store.get_document_manifests(
+                        services.workspace_id, [indexed_id], generation=generation, source_kind=source,
+                    )
+                    manifest = manifests.get(indexed_id)
+                if (manifest is None or manifest.status is not DocumentStatus.READY
+                        or manifest.content_sha256 != artifact.sha256):
+                    return IndexedDocumentQuery(False, degraded_reasons=("DOCUMENT_INDEX_NOT_AVAILABLE",))
+                indexed = True
+                result = await services.retriever.search(
+                    query, workspace_id=services.workspace_id, top_k=10, expand_radius=0, source_kind=source,
+                    document_scope=StructuredDocumentScope(indexed_id, artifact.sha256, artifact.document_id, revision),
+                )
+                return IndexedDocumentQuery(
+                    indexed, tuple(row.structured_ref for row in result.passages if row.structured_ref is not None),
+                    result.diagnostics.mode, result.diagnostics.reranked, result.diagnostics.degraded_reasons,
+                )
+        except Exception:
+            return IndexedDocumentQuery(indexed, degraded_reasons=("DOCUMENT_INDEX_QUERY_UNAVAILABLE",))
+        finally:
+            if self._services is None and services is not None:
+                with suppress(Exception):
+                    await services.store.aclose()
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
-        from pypdf import PdfReader
-
-        file_name = str(arguments["file"])
-        max_chars = min(
-            int(arguments.get("max_chars", 4000)),
-            self._config.literature_max_chars,
-        )
-        directory = _papers_dir(self._workspace)
-        pdf_path = (directory / file_name).resolve()
-        if pdf_path.parent != directory.resolve() or not pdf_path.is_file():
-            return ScientificToolResult(
-                output=f"paper not found in {directory}: {file_name}",
-                is_error=True,
-                data={"error": "not_found"},
-            )
         try:
-            reader = PdfReader(str(pdf_path))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            metadata = reader.metadata
-        except Exception as exc:
-            return ScientificToolResult(
-                output=f"failed to read PDF: {type(exc).__name__}: {exc}",
-                is_error=True,
-                data={"error": type(exc).__name__},
+            data = await self._documents.read(
+                filename=arguments.get("file"), document_id=arguments.get("document_id"),
+                section_id=arguments.get("section_id", ""), object_ids=tuple(arguments.get("object_ids", ())),
+                query=arguments.get("query", ""), cursor=arguments.get("cursor", ""),
+                expected_revision=arguments.get("revision"),
+                index_query=self._query_index,
+                # Reserve room for source metadata and the continuation token in the runtime observation.
+                max_chars=min(int(arguments.get("max_chars", 4000)), self._config.literature_max_chars, 6_000),
             )
-        title = str(metadata.get("/Title", "")).strip() if metadata else ""
-        payload = {
-            "file": file_name,
-            "title": title,
-            "pages": len(reader.pages),
-            "chars": len(text),
-            "text": _clean(text, max_chars),
-        }
-        return ScientificToolResult(
-            output=json.dumps(payload, ensure_ascii=False),
-            data=payload,
-            evidence=[
-                ScientificEvidence(
-                    subject=title or file_name,
-                    property="literature_text",
-                    value=_clean(text, 300),
-                    unit="",
-                    source=file_name,
-                    source_type="literature",
-                    method="pypdf text extraction",
-                    summary=f"Read {len(reader.pages)} pages of {file_name}",
-                    limitations="Extraction can mangle equations and figures",
-                    provenance={"file": file_name, "tool": self.name},
-                )
-            ],
-        )
+        except (DocumentError, ImportError) as exc:
+            code = str(exc) if isinstance(exc, DocumentError) else "DOCLING_DEPENDENCY_UNAVAILABLE"
+            return ScientificToolResult(output=code, is_error=True, data={"error": code, "parsed": False})
+        except Exception as exc:
+            code = "DOCUMENT_PARSE_OR_STORAGE_FAILED"
+            return ScientificToolResult(output=code, is_error=True,
+                                        data={"error": code, "failure_type": type(exc).__name__, "parsed": False})
+        return ScientificToolResult(output=json.dumps(data, ensure_ascii=False, separators=(",", ":")), data=data)
+
+
+class LiteratureReadObjectTool(LiteratureReadPaperTool):
+    name = "literature.read_object"
+    description = "Read specific objects and optionally crop anchored regions of the registered PDF."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            **{key: LiteratureReadPaperTool.input_schema["properties"][key]
+               for key in ("document_id", "revision", "object_ids", "max_chars", "cursor")},
+            "include_images": {"type": "boolean"},
+        },
+        "required": ["document_id", "object_ids"],
+        "additionalProperties": False,
+    }
+
+    async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        result = await super().execute(arguments)
+        if result.is_error or not arguments.get("include_images") or not result.data.get("parsed"):
+            return result
+        data = dict(result.data)
+        images: tuple[ImageReference, ...] = ()
+        try:
+            rows, images, diagnostics = await asyncio.to_thread(
+                self._documents.crop_objects, data["document_id"], data["revision"],
+                tuple(obj["object_id"] for obj in data["objects"]),
+            )
+            data["crops"] = rows
+        except DocumentError as exc:
+            diagnostics = [str(exc)]
+        except ImportError:
+            diagnostics = ["DOCUMENT_CROP_DEPENDENCY_UNAVAILABLE"]
+        except Exception:
+            diagnostics = ["DOCUMENT_CROP_FAILED"]
+        data["crop_diagnostics"] = diagnostics
+        return ScientificToolResult(output=json.dumps(data, ensure_ascii=False, separators=(",", ":")), data=data, images=images)
 
 
 def _resolve_literature_root(config: ScientificConfig, workspace: Workspace) -> Path:
@@ -1436,6 +1527,65 @@ class LiteratureIndexPapersTool(Tool):
             output=json.dumps(payload, ensure_ascii=False),
             data=payload,
         )
+
+
+class LiteratureIndexDocumentTool(Tool):
+    name = "literature.index_document"
+    description = (
+        "Index text from one parsed PDF by document ID in the configured Qdrant generation. "
+        "Existing objects keep their document revision and object ID. Generation activation is separate."
+    )
+    short_description = "Index the text objects of one parsed document."
+    exposure = ToolExposure.DEFERRED
+    namespace = "literature"
+    source = "qdrant"
+    cost_class = "EXPENSIVE"
+    tags = ("literature", "rag", "index", "document")
+    input_schema = {
+        "type": "object",
+        "properties": {"document_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+        "required": ["document_id"],
+        "additionalProperties": False,
+    }
+
+    def __init__(
+        self, config: ScientificConfig, workspace: Workspace, documents: DocumentService,
+        services: LiteratureServices | None = None,
+    ) -> None:
+        self._config = config
+        self._workspace = workspace
+        self._documents = documents
+        self._services = services
+
+    async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        services = self._services
+        try:
+            path, record, passages, revision = await asyncio.to_thread(
+                self._documents.index_projection, arguments["document_id"],
+            )
+            services = services or build_literature_services(self._config, self._workspace)
+            stats, generation = await services.ingestion.index_registered(self._workspace, path, record, passages)
+            try:
+                active = await services.store.resolve_current_generation()
+                visible = active is not None and active.fingerprint == generation.fingerprint
+            except Exception:
+                visible = None
+        except DocumentError as exc:
+            return ScientificToolResult(output=str(exc), is_error=True, data={"error": str(exc)})
+        except Exception as exc:
+            return _error_result(exc, operation="literature document index")
+        finally:
+            if self._services is None and services is not None:
+                close = getattr(services.store, "aclose", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:
+                        pass
+        payload = _stats_payload(stats)
+        payload.update(document_id=record.paper_id, revision=revision, generation=generation.fingerprint,
+                       search_visible=(visible if stats.complete else False))
+        return ScientificToolResult(output=json.dumps(payload), data=payload, is_error=not stats.complete)
 
 
 class LiteratureSearchPassagesTool(Tool):
@@ -1612,6 +1762,7 @@ class LiteratureSearchPassagesTool(Tool):
                     str(_record_value(passage, "relevance_tier", "") or ""), 120
                 ),
             }
+            row.update(_structured_reference_payload(passage))
             rows.append(row)
         diagnostics_obj = _record_value(result, "diagnostics", None)
         diagnostics = {
@@ -1762,8 +1913,8 @@ class LiteratureExtractEvidenceTool(Tool):
         "Extract numerical scientific evidence (responsivity, detectivity, "
         "dark current, wavelength, temperature, bandgap, mobility, NETD) from "
         "passages. Each input item is either {'passage_id': ...} or "
-        "{'text': ..., 'page': ...}. Never guesses: only explicit numbers "
-        "with units are reported, as ScientificEvidence."
+        "a registered {'document_id': ..., 'object_id': ...}, or {'text': ...}. "
+        "Caller-supplied text produces unattested numerical candidates."
     )
     short_description = "Extract numbers + units as ScientificEvidence from passages."
     exposure = ToolExposure.DEFERRED
@@ -1780,6 +1931,8 @@ class LiteratureExtractEvidenceTool(Tool):
                     "type": "object",
                     "properties": {
                         "passage_id": {"type": "string"},
+                        "document_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                        "object_id": {"type": "string", "maxLength": 200},
                         "text": {"type": "string"},
                         "page": {"type": "integer"},
                     },
@@ -1804,10 +1957,12 @@ class LiteratureExtractEvidenceTool(Tool):
         config: ScientificConfig,
         workspace: Workspace,
         services: Any | None = None,
+        *, documents: DocumentService | None = None,
     ) -> None:
         self._config = config
         self._workspace = workspace
         self._services = services
+        self._documents = documents or DocumentService(workspace)
 
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         from photomatagent.scientific.capabilities.literature.evidence import (
@@ -1827,20 +1982,42 @@ class LiteratureExtractEvidenceTool(Tool):
                 operation="literature evidence",
             )
         resolved: list[dict[str, Any]] = []
-        try:
-            services = (
-                self._services
-                if self._services is not None
-                else build_literature_services(self._config, self._workspace)
-            )
-        except Exception as exc:
-            return _error_result(exc, operation="literature evidence")
+        services = self._services
         for item in passages:
             if not isinstance(item, dict):
                 continue
             passage_id = item.get("passage_id")
-            if passage_id:
+            document_id = item.get("document_id")
+            object_id = item.get("object_id")
+            if document_id or object_id:
+                if not document_id or not object_id or passage_id or item.get("text"):
+                    return _error_result(ValueError("document_id and object_id must be paired"),
+                                         operation="literature evidence")
                 try:
+                    doc = await self._documents.read(document_id=str(document_id), object_ids=(str(object_id),),
+                                                     max_chars=self._config.literature_max_chars, cached_only=True)
+                except (ValueError, OSError, ToolExecutionError) as exc:
+                    return _error_result(exc, operation="literature evidence")
+                for obj in doc["objects"]:
+                    if obj.get("text"):
+                        if obj.get("text_start", 0) != 0 or obj.get("text_total_chars", len(obj["text"])) != len(obj["text"]):
+                            return ScientificToolResult(
+                                output="DOCUMENT_EVIDENCE_TEXT_EXCEEDS_BUDGET", is_error=True,
+                                data={"diagnostic": "DOCUMENT_EVIDENCE_TEXT_EXCEEDS_BUDGET", "object_id": object_id},
+                            )
+                        resolved.append({
+                            "text": obj["text"], "source": doc["source_url"] or doc["path"],
+                            "source_kind": ("registered_pdf_object" if doc["media_type"] == "application/pdf"
+                                            else "registered_article_page_object"),
+                            "source_record_id": doc["document_id"],
+                            "document_revision": doc["revision"], "object_id": obj["object_id"],
+                            "source_sha256": doc["sha256"], "anchors": obj["anchors"],
+                            **({"publication": doc["publication"]} if "publication" in doc else {}),
+                        })
+            elif passage_id:
+                try:
+                    if services is None:
+                        services = build_literature_services(self._config, self._workspace)
                     store = _service_value(services, "store")
                     if store is None:
                         raise RuntimeError("literature store service is unavailable")
@@ -1921,8 +2098,7 @@ class LiteratureExtractEvidenceTool(Tool):
                             str(item.get("text") or ""),
                             self._config.literature_max_chars,
                         ),
-                        "page": item.get("page"),
-                        "source": str(item.get("source") or ""),
+                        "unattested": True,
                     }
                 )
         evidence = _enrich_literature_evidence(
@@ -1957,5 +2133,10 @@ class LiteratureExtractEvidenceTool(Tool):
         )
 
 
-def literature_pack(config: ScientificConfig, workspace: Workspace) -> CapabilityPack:
-    return LiteratureProbe(config, workspace)
+def literature_pack(
+    config: ScientificConfig, workspace: Workspace, *, resource_owners: list[object] | None = None,
+) -> CapabilityPack:
+    pack = LiteratureProbe(config, workspace)
+    if resource_owners is not None:
+        resource_owners.append(pack._documents)
+    return pack

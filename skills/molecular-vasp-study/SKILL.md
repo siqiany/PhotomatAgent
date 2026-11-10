@@ -12,6 +12,11 @@ It does **not** read PPT/PPTX (a generic document capability).
 
 ## Orchestration order
 
+For a new study use the planning steps below. For an existing workflow, continue
+from its recorded state using `vasp.status`, `vasp.wait`, `vasp.resume` or
+`vasp.collect` as appropriate; do not recreate the plan or resubmit completed jobs.
+A request for a plan or an interpretation does not itself authorize execution.
+
 1. Parse the user request into typed parameters (never call an LLM inside a
    tool):
    - systems (system_id / display_name / smiles / structure_path /
@@ -25,14 +30,16 @@ It does **not** read PPT/PPTX (a generic document capability).
 3. If the plan reports missing/assumed structures, note the reliability
    grades (C/D) and the mandated warning for the final report.
 4. Validate the calculation matrix and budget; check charges:
-   - DME-Li+ / TVM-Li+ are +1; TVM-TFSI- is -1 (never inferred from names);
+   - obtain every explicit charge and spin from the supplied identity record;
+     ambiguous names or formula labels are not charge assignments;
    - complex charge must equal the fragment charge sum.
 5. Execute only when the user asked for real computation AND
    `PHOTOMATAGENT_ALLOW_HPC_SUBMIT=1`: submit the planned study through `vasp.submit`/`vasp.resume` with
    `user_requested_computation=True`. Study-level authorization replaces
    per-stage prompting.
-6. Monitor with `vasp.status` / `vasp.resume`; never re-sbatch
-   on a status query failure; never resubmit a VALIDATED task.
+6. After submission prefer `vasp.wait` for bounded waiting. Use `vasp.status`
+   for a status request and `vasp.resume` for a supported transition or recovery;
+   never re-sbatch on a status query failure or resubmit a VALIDATED task.
 7. Collect and validate with `vasp.collect`.
 8. Generate the report with `vasp.report`.
 9. Return the report path, a result summary and every assumed-structure
@@ -52,7 +59,8 @@ It does **not** read PPT/PPTX (a generic document capability).
   bare-ion references (Li+) use the declared zero-electron reference model
   (E = 0 convention, ΔΔE recommended).
 - Missing VM/TVM connectivity produces ASSUMED_REPRESENTATIVE oligomers
-  (recorded defaults) or an explicit ASSUMED_PROXY; a proxy is never called
-  the real polymer, and one missing structure never blocks the study.
+  or an explicit ASSUMED_PROXY only when the study's structure policy permits
+  assumed structures. Otherwise identify the missing input and progress only
+  independent, fully specified systems. A proxy is never called the real polymer.
 - Over-budget studies stop starting new jobs and still produce a partial
   report.

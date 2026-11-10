@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
-from photomatagent.models.types import ModelMessage, ToolResultMessage
+from photomatagent.models.types import ModelMessage, ToolResultMessage, active_image_entries
 from photomatagent.tools.surface import ToolSurfaceStats, estimate_tokens
 
 if TYPE_CHECKING:
@@ -41,6 +41,10 @@ class ContextBudget(BaseModel):
     estimated_tool_result_tokens: int
 
 
+def _image_token_reserve(messages: Sequence[ModelMessage]) -> int:
+    return 4096 * sum(map(len, active_image_entries(messages).values()))
+
+
 def measure_prompt(
     messages: list[ModelMessage], surface: ToolSurfaceStats
 ) -> PromptMeasure:
@@ -63,7 +67,7 @@ def measure_prompt(
     chars += surface.visible_schema_chars
     return PromptMeasure(
         chars=chars,
-        tokens=estimate_tokens(chars),
+        tokens=estimate_tokens(chars) + _image_token_reserve(messages),
         messages=len(messages),
     )
 
@@ -84,7 +88,7 @@ def prompt_token_upper_bound(messages: Sequence[ModelMessage], tools: Sequence[A
         {"messages": serialized_messages, "tools": serialized_tools},
         ensure_ascii=False, separators=(",", ":"), allow_nan=False,
     ).encode("utf-8")
-    return len(payload) + 256 + 16 * (len(messages) + len(tools))
+    return len(payload) + 256 + 16 * (len(messages) + len(tools)) + _image_token_reserve(messages)
 
 
 class PromptTokenEstimator:
@@ -148,7 +152,7 @@ class PromptTokenEstimator:
             else:
                 added += len(part) - best[0] + 32  # retokenization/framing allowance
                 previous.remove(best[1])
-        calibrated = math.ceil(self._input_tokens * 1.25) + added + 512
+        calibrated = math.ceil(self._input_tokens * 1.25) + added + 512 + _image_token_reserve(messages)
         return min(bound, calibrated)
 
 
@@ -169,6 +173,7 @@ def resolve_thresholds(config: "ContextEngineConfig") -> ContextThresholds:
             trigger,
         )
         target = min(
+            config.compact_target_tokens,
             int(config.context_limit_tokens * config.target_ratio),
             int(trigger * 0.6),
         )

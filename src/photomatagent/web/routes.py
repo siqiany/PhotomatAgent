@@ -8,16 +8,18 @@ from collections.abc import AsyncIterator, Iterator
 import tempfile
 from time import monotonic
 
-from fastapi import APIRouter, File, Header, Request, UploadFile
+from fastapi import APIRouter, File, Header, Query, Request, UploadFile
 from starlette.background import BackgroundTask
 from fastapi.responses import StreamingResponse
 
 from photomatagent.application.skills import SkillCreate, SkillReplay
+from photomatagent.application.capability_evolution import CapabilityEvolutionRequest
+from photomatagent.application.capability_benchmark import CapabilityBenchmarkRequest, ScientificReviewRequest
 from photomatagent.application.procedural_skills import ProcedureCreate
 from photomatagent.application.procedure_workflow import ProcedureReview, ProcedureWorkflow
-from photomatagent.application.models import FeedbackRequest, RunRequest, TaskCreate
+from photomatagent.application.models import AutomaticFeedbackRequest, AutomaticRevisionResponse, ContextCompactRequest, FeedbackRequest, RunRequest, TaskCreate, WorkbenchEvent
 from photomatagent.application.errors import ServiceError
-from photomatagent.application.service import WorkbenchService
+from photomatagent.application.service import SKILL_SOURCE_RUN_STATUSES, WorkbenchService
 from photomatagent.web.schemas import (
     ApprovalDecisionRequest,
     ApprovalDecisionResponse,
@@ -93,18 +95,25 @@ def create_task(payload: TaskCreate, request: Request) -> dict[str, str]:
 
 
 @router.get("/tasks", response_model=TaskListResponse)
-def list_tasks(request: Request) -> dict[str, object]:
+def list_tasks(request: Request, view: str = "legacy", project_id: str | None = None, management_status: str | None = None, archived: bool = False, tag: str | None = None, q: str = "", cursor: str | None = None, limit: int = Query(50, ge=1, le=200)) -> dict[str, object]:
+    if view == "page":
+        return _service(request).store.projects.task_page(project_id=project_id, management_status=management_status, archived=archived, tag=tag, q=q, cursor=cursor, limit=limit)
     return {"items": _service(request).list_tasks()}
 
 
 @router.get("/tasks/{task_id}", response_model=TaskDetailResponse)
-def task_detail(task_id: str, request: Request) -> dict[str, object]:
-    return _service(request).task_detail(task_id)
+def task_detail(task_id: str, request: Request, view: str = "legacy") -> dict[str, object]:
+    return _service(request).summary_detail(task_id) if view == "summary" else _service(request).task_detail(task_id)
 
 
 @router.get("/tasks/{task_id}/history", response_model=HistoricalTaskResponse)
 def historical_task(task_id: str, request: Request) -> dict[str, object]:
     return _service(request).historical_task(task_id)
+
+
+@router.get("/tasks/{task_id}/history/source")
+def historical_source(task_id: str, request: Request) -> dict[str, object]:
+    return _service(request).historical_source(task_id)
 
 
 @router.post("/tasks/{task_id}/runs", status_code=202, response_model=RunRefResponse)
@@ -115,6 +124,17 @@ async def start_run(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, str]:
     reference = await _service(request).start_run(task_id, payload, _request_key(idempotency_key))
+    return reference.model_dump()
+
+
+@router.post("/tasks/{task_id}/context/compact", status_code=202, response_model=RunRefResponse)
+async def compact_context(
+    task_id: str,
+    payload: ContextCompactRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, str]:
+    reference = await _service(request).compact_context(task_id, payload, _request_key(idempotency_key))
     return reference.model_dump()
 
 
@@ -134,6 +154,17 @@ async def prepare_feedback(
         task_id, payload, _request_key(idempotency_key)
     )
     return service.revision_service.get(plan_id).model_dump(mode="json")
+
+
+@router.post("/tasks/{task_id}/feedback/auto", status_code=202, response_model=AutomaticRevisionResponse)
+async def submit_feedback(
+    task_id: str,
+    payload: AutomaticFeedbackRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, object]:
+    response = await _service(request).submit_feedback(task_id, payload, _request_key(idempotency_key))
+    return response.model_dump(mode="json")
 
 
 @router.get(
@@ -204,6 +235,16 @@ async def resume_run(
 ) -> dict[str, str]:
     reference = await _service(request).resume_run(run_id, _request_key(idempotency_key))
     return reference.model_dump()
+
+
+@router.get("/tasks/{task_id}/event-log", response_model=list[WorkbenchEvent])
+def event_log(
+    task_id: str, request: Request,
+    after: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> list[WorkbenchEvent]:
+    """Bounded replay for terminal clients; use the same journal as SSE."""
+    return list(_service(request).events_after(task_id, after, limit=limit))
 
 
 @router.get("/tasks/{task_id}/events")
@@ -321,7 +362,8 @@ def list_skills(request: Request) -> dict[str, object]:
 
 @router.get("/skills/sources")
 def skill_sources(request: Request) -> dict[str, object]:
-    return {"items": _service(request).skill_sources()}
+    items, invalidated_by_task = _service(request).skill_source_catalog()
+    return {"items": items, "invalidated_by_task": invalidated_by_task}
 
 
 @router.post("/skills", status_code=201)
@@ -329,12 +371,15 @@ def create_skill(payload: SkillCreate, request: Request) -> dict[str, object]:
     service = _service(request)
     service.task_detail(payload.source.task_id)
     if payload.source.kind == "ordinary_run":
-        if not any(run.run_id == payload.source.run_id and run.status in {"SUCCEEDED", "PARTIAL"} for run in service.store.runs_for_task(payload.source.task_id)):
+        if not any(run.run_id == payload.source.run_id and run.status in SKILL_SOURCE_RUN_STATUSES
+                   and not run.result_invalidation_ids for run in service.store.runs_for_task(payload.source.task_id)):
             raise ServiceError("SKILL_SOURCE_INVALID", "源运行不属于该任务。")
     else:
         if not any(link.source_type == "qd_trial" and link.source_id == payload.source.trial_id for link in service.store.links_for_task(payload.source.task_id)):
             raise ServiceError("SKILL_QD_SOURCE_INVALID", "QD trial 不属于当前任务。")
-    return service.skill_service.create(payload)
+    result = service.skill_service.create(payload)
+    service.storage.refresh(("local-skills/" + str(result["skill_id"]),))
+    return result
 
 
 @router.post("/skills/{skill_id}/replay", status_code=202, response_model=RunRefResponse)
@@ -347,6 +392,11 @@ async def replay_skill(skill_id: str, payload: SkillReplay, request: Request,
 @router.post("/skills/{skill_id}/disable")
 def disable_skill(skill_id: str, request: Request) -> dict[str, str]:
     return _service(request).skill_service.disable(skill_id)
+
+
+@router.post("/skills/{skill_id}/enable")
+def enable_skill(skill_id: str, request: Request) -> dict[str, str]:
+    return _service(request).skill_service.enable(skill_id)
 
 
 @router.get("/procedures")
@@ -379,3 +429,36 @@ def approve_procedure(skill_id: str, payload: ProcedureReview, request: Request)
 @router.post("/procedures/{skill_id}/disable")
 def disable_procedure(skill_id: str, request: Request) -> dict[str, object]:
     return ProcedureWorkflow(_service(request)).disable(skill_id)
+
+
+@router.get('/tasks/{task_id}/capability-learning')
+def capability_learning(task_id: str, request: Request) -> dict[str, object]:
+    return {'items': _service(request).capability_evolution.list_for_task(task_id)}
+
+
+@router.post('/tasks/{task_id}/capability-learning', status_code=202)
+async def start_capability_learning(task_id: str, payload: CapabilityEvolutionRequest, request: Request,
+                                    idempotency_key: str | None = Header(default=None, alias='Idempotency-Key')) -> dict[str, str]:
+    return await _service(request).capability_evolution.start(task_id, payload, _request_key(idempotency_key))
+
+
+@router.get('/tasks/{task_id}/capability-benchmarks')
+def capability_benchmarks(task_id: str, request: Request) -> dict[str, object]:
+    return {'items': _service(request).capability_benchmark.list_for_task(task_id)}
+
+
+@router.post('/tasks/{task_id}/capability-benchmarks', status_code=202)
+async def start_capability_benchmark(task_id: str, payload: CapabilityBenchmarkRequest, request: Request,
+                                     idempotency_key: str | None = Header(default=None, alias='Idempotency-Key')) -> dict[str, str]:
+    return await _service(request).capability_benchmark.start(task_id, payload, _request_key(idempotency_key))
+
+
+@router.get('/tasks/{task_id}/capability-benchmarks/{job_task_id}/blind-cases')
+def blind_capability_cases(task_id: str, job_task_id: str, request: Request) -> dict[str, object]:
+    return {'items': _service(request).capability_benchmark.blind_cases(task_id,job_task_id)}
+
+
+@router.post('/tasks/{task_id}/capability-benchmarks/{job_task_id}/reviews', status_code=201)
+def review_capability_case(task_id: str, job_task_id: str, payload: ScientificReviewRequest, request: Request,
+                           idempotency_key: str | None = Header(default=None, alias='Idempotency-Key')) -> dict[str, object]:
+    return _service(request).capability_benchmark.review(task_id,job_task_id,payload,_request_key(idempotency_key))

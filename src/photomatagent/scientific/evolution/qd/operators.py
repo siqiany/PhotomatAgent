@@ -89,6 +89,8 @@ def crossover_one_module(
         return CrossoverResult(None, "INCOMPATIBLE_UNITS")
     if not _module_schema_compatible(left_step, right_step):
         return CrossoverResult(None, "INCOMPATIBLE_SCHEMA")
+    if set(parent_left.applicability) != set(parent_right.applicability):
+        return CrossoverResult(None, "INCOMPATIBLE_APPLICABILITY")
     if left_step.assumptions != right_step.assumptions:
         return CrossoverResult(None, "INCOMPATIBLE_SCIENTIFIC_ASSUMPTIONS")
     if (left_step.depends_on != right_step.depends_on

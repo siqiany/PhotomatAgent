@@ -13,6 +13,7 @@ from photomatagent.workspace import Workspace
 
 
 class GlobTool(Tool):
+    effect_class = "READ_ONLY"
     name = "glob"
     description = "List workspace files matching a glob such as src/**/*.py. Results are bounded; narrow the pattern when truncated."
     exposure = ToolExposure.DIRECT

@@ -30,6 +30,19 @@ class ProcedureWorkflow:
             if run.task_id != payload.task_id or run.status not in {"SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "INTERRUPTED"}:
                 raise ValueError("PROCEDURE_RUN_SOURCE_INVALID")
             provenance["source_run_status"] = run.status
+            provenance["source_request_sha256"] = hashlib.sha256(run.request.text.encode()).hexdigest()
+            task = self.workbench.store.task(payload.task_id)
+            attachments = []
+            for attachment_id in task.attachment_ids:
+                artifact = self.workbench.store.artifact(attachment_id)
+                if artifact["task_id"] != payload.task_id:
+                    raise ValueError("PROCEDURE_ATTACHMENT_SOURCE_INVALID")
+                source_content, _, _ = self.workbench.artifacts.content(attachment_id)
+                source_content.close()
+                attachments.append({"artifact_id": attachment_id, "sha256": artifact["sha256"],
+                                    "filename": artifact["filename"]})
+            if attachments:
+                provenance["source_attachments"] = attachments
             if payload.plan_id is not None:
                 plan = self.workbench.store.revision_plan(payload.plan_id)
                 source_runs = {plan.source_run_id, *(item.run_id for item in plan.run_attempts)}

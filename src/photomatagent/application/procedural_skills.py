@@ -44,12 +44,14 @@ class ProcedureService:
         self.workspace = Path(workspace).expanduser().resolve()
         self.root = self.workspace / ".photomatagent" / "procedural-skills"
 
-    def create(self, payload: ProcedureCreate | dict[str, Any], *, provenance: dict[str, Any]) -> dict[str, Any]:
+    def create(self, payload: ProcedureCreate | dict[str, Any], *, provenance: dict[str, Any], capture_key: str | None = None) -> dict[str, Any]:
         request = payload if isinstance(payload, ProcedureCreate) else ProcedureCreate.model_validate(payload)
         if not isinstance(provenance, dict) or not provenance:
             raise ValueError("PROCEDURE_PROVENANCE_REQUIRED")
         self._ensure_root()
-        skill_id = f"procedure_{uuid4().hex}"
+        skill_id = "procedure_" + hashlib.sha256(capture_key.encode()).hexdigest()[:32] if capture_key else f"procedure_{uuid4().hex}"
+        if capture_key and (self.root / skill_id).exists():
+            return self._read_record(skill_id)
         index_name = f"procedure-{request.name}-{uuid4().hex[:8]}"
         directory = self.root / skill_id
         directory.mkdir(mode=0o700)
@@ -118,6 +120,32 @@ class ProcedureService:
         self._write_state(skill_id, record["candidate_sha256"], "APPROVED_PROCEDURE", note)
         return self._read_record(skill_id)
 
+    def activate_validated(self, skill_id: str) -> dict[str, Any]:
+        record = self._read_record(skill_id)
+        if record['status'] == 'DISABLED':
+            raise ValueError('PROCEDURE_DISABLED')
+        self._verify_validation(record)
+        self._write_state(skill_id, record['candidate_sha256'], 'VALIDATED_PROCEDURE',
+                          'Automatically validated executable workflow; scientific validity remains UNKNOWN.')
+        return self._read_record(skill_id)
+
+    def _verify_validation(self, candidate: dict[str, Any]) -> None:
+        from photomatagent.workspace import Workspace
+        from photomatagent.application.skills import LocalSkillService
+        evidence = candidate['provenance'].get('independent_validation')
+        if not isinstance(evidence, dict):
+            raise ValueError('PROCEDURE_VALIDATION_MISSING')
+        path = Workspace(self.workspace).resolve(evidence['path'], must_exist=True)
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != evidence['sha256']:
+            raise ValueError('PROCEDURE_VALIDATION_CHANGED')
+        report = json.loads(raw)
+        method = LocalSkillService(self.workspace).read(report['skill_id'])
+        if (report['status'] != 'PASS' or report['contract_sha256'] != method['contract_sha256']
+                or not report.get('cases') or not all(case['passed'] is True for case in report['cases'])
+                or not {'regression', 'transfer', 'negative'}.issubset({case['role'] for case in report['cases']})):
+            raise ValueError('PROCEDURE_VALIDATION_INVALID')
+
     def disable(self, skill_id: str) -> dict[str, Any]:
         record = self._read_record(skill_id)
         self._write_state(skill_id, record["candidate_sha256"], "DISABLED", None)
@@ -185,8 +213,10 @@ class ProcedureService:
             raise ValueError("PROCEDURE_CONTENT_CHANGED")
         if state.get("candidate_sha256") != candidate_sha256:
             raise ValueError("PROCEDURE_RECORD_CHANGED")
-        if state.get("status") not in {"CANDIDATE", "APPROVED_PROCEDURE", "DISABLED"}:
+        if state.get("status") not in {"CANDIDATE", "APPROVED_PROCEDURE", "VALIDATED_PROCEDURE", "DISABLED"}:
             raise ValueError("PROCEDURE_STATE_INVALID")
+        if state["status"] == "VALIDATED_PROCEDURE":
+            self._verify_validation(candidate)
         return self._public(candidate, candidate_sha256, state["status"], content, state.get("review_note"))
 
     def _public(

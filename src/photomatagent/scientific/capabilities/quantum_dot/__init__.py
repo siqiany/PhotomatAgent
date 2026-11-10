@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from photomatagent.scientific.applicability import reject_outside_domain, with_domain_input
 from photomatagent.scientific.capabilities.base import (
     CapabilityPack,
     CapabilityStatus,
@@ -210,7 +211,11 @@ class BrusTransitionEnergyTool(Tool):
         ],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("effective-mass-confinement", arguments):
+            return rejected
         kind, kind_error = _dielectric_kind_or_error(arguments)
         if kind_error is not None:
             return kind_error
@@ -329,7 +334,11 @@ class ExcitonicRegimeTool(Tool):
         ],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("effective-mass-confinement", arguments):
+            return rejected
         kind, kind_error = _dielectric_kind_or_error(arguments)
         if kind_error is not None:
             return kind_error
@@ -407,7 +416,11 @@ class SolveSizeForTransitionTool(Tool):
         ],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("effective-mass-confinement", arguments):
+            return rejected
         kind, kind_error = _dielectric_kind_or_error(arguments)
         if kind_error is not None:
             return kind_error
@@ -517,7 +530,11 @@ class SizeSweepTool(Tool):
         ],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("effective-mass-confinement", arguments):
+            return rejected
         kind, kind_error = _dielectric_kind_or_error(arguments)
         if kind_error is not None:
             return kind_error
@@ -616,7 +633,13 @@ class ScreenSizeCompositionTool(Tool):
         ],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("effective-mass-confinement", arguments):
+            return rejected
+        if rejected := reject_outside_domain("band-bowing", arguments):
+            return rejected
         try:
             result = screen_size_composition(
                 target_wavelength_min_um=float(
@@ -721,7 +744,11 @@ class BandgapBowingTool(Tool):
         ],
     }
 
+    input_schema = with_domain_input(input_schema)
+
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
+        if rejected := reject_outside_domain("band-bowing", arguments):
+            return rejected
         try:
             result = bandgap_bowing(
                 x=float(arguments["x"]),

@@ -5,6 +5,1109 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/projects": {
+      "get": {
+        "summary": "Projects",
+        "operationId": "projects_api_projects_get",
+        "parameters": [
+          {
+            "name": "archived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Archived"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Projects Api Projects Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Project",
+        "operationId": "create_project_api_projects_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Create Project Api Projects Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/projects/{project_id}": {
+      "get": {
+        "summary": "Project",
+        "operationId": "project_api_projects__project_id__get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Project Api Projects  Project Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Patch Project",
+        "operationId": "patch_project_api_projects__project_id__patch",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Patch Project Api Projects  Project Id  Patch"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/projects/{project_id}/{action}": {
+      "post": {
+        "summary": "Project Action",
+        "operationId": "project_action_api_projects__project_id___action__post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Action"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Project Action Api Projects  Project Id   Action  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}": {
+      "patch": {
+        "summary": "Patch Task",
+        "operationId": "patch_task_api_tasks__task_id__patch",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Patch Task Api Tasks  Task Id  Patch"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Task Detail",
+        "operationId": "task_detail_api_tasks__task_id__get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "legacy",
+              "title": "View"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDetailResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/move": {
+      "post": {
+        "summary": "Move Task",
+        "operationId": "move_task_api_tasks__task_id__move_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Move Task Api Tasks  Task Id  Move Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/archive": {
+      "post": {
+        "summary": "Archive Task",
+        "operationId": "archive_task_api_tasks__task_id__archive_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Archive Task Api Tasks  Task Id  Archive Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/unarchive": {
+      "post": {
+        "summary": "Unarchive Task",
+        "operationId": "unarchive_task_api_tasks__task_id__unarchive_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Unarchive Task Api Tasks  Task Id  Unarchive Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/search": {
+      "get": {
+        "summary": "Search",
+        "operationId": "search_api_search_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 30,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Search Api Search Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/checkpoints": {
+      "get": {
+        "summary": "Checkpoints",
+        "operationId": "checkpoints_api_sessions__session_id__checkpoints_get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Checkpoints Api Sessions  Session Id  Checkpoints Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/checkpoints/{checkpoint_id}": {
+      "get": {
+        "summary": "Checkpoint",
+        "operationId": "checkpoint_api_checkpoints__checkpoint_id__get",
+        "parameters": [
+          {
+            "name": "checkpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Checkpoint Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Checkpoint Api Checkpoints  Checkpoint Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/messages": {
+      "get": {
+        "summary": "Messages",
+        "operationId": "messages_api_tasks__task_id__messages_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "After"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Messages Api Tasks  Task Id  Messages Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/runs": {
+      "get": {
+        "summary": "Runs",
+        "operationId": "runs_api_tasks__task_id__runs_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Runs Api Tasks  Task Id  Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Start Run",
+        "operationId": "start_run_api_tasks__task_id__runs_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunRequest-Input"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunRefResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/artifacts": {
+      "get": {
+        "summary": "Artifacts",
+        "operationId": "artifacts_api_tasks__task_id__artifacts_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Artifacts Api Tasks  Task Id  Artifacts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/inputs": {
+      "post": {
+        "summary": "Link Input",
+        "operationId": "link_input_api_tasks__task_id__inputs_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InputReference"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Link Input Api Tasks  Task Id  Inputs Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/storage/status": {
+      "get": {
+        "summary": "Storage Status",
+        "operationId": "storage_status_api_storage_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Storage Status Api Storage Status Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/storage/diagnostics": {
+      "get": {
+        "summary": "Diagnostics",
+        "operationId": "diagnostics_api_storage_diagnostics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Diagnostics Api Storage Diagnostics Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/storage/{action}": {
+      "post": {
+        "summary": "Maintenance",
+        "operationId": "maintenance_api_storage__action__post",
+        "parameters": [
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Action"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaintenanceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Maintenance Api Storage  Action  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/storage/operations/{operation_id}": {
+      "get": {
+        "summary": "Maintenance Status",
+        "operationId": "maintenance_status_api_storage_operations__operation_id__get",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Operation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Maintenance Status Api Storage Operations  Operation Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/evaluations/capabilities": {
       "get": {
         "summary": "Evaluation Capabilities",
@@ -162,34 +1265,18 @@
       }
     },
     "/api/tasks": {
-      "get": {
-        "summary": "List Tasks",
-        "operationId": "list_tasks_api_tasks_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TaskListResponse"
-                }
-              }
-            }
-          }
-        }
-      },
       "post": {
         "summary": "Create Task",
         "operationId": "create_task_api_tasks_post",
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/TaskCreate"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "201": {
@@ -213,20 +1300,115 @@
             }
           }
         }
-      }
-    },
-    "/api/tasks/{task_id}": {
+      },
       "get": {
-        "summary": "Task Detail",
-        "operationId": "task_detail_api_tasks__task_id__get",
+        "summary": "List Tasks",
+        "operationId": "list_tasks_api_tasks_get",
         "parameters": [
           {
-            "name": "task_id",
-            "in": "path",
-            "required": true,
+            "name": "view",
+            "in": "query",
+            "required": false,
             "schema": {
               "type": "string",
-              "title": "Task Id"
+              "default": "legacy",
+              "title": "View"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "management_status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Management Status"
+            }
+          },
+          {
+            "name": "archived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Archived"
+            }
+          },
+          {
+            "name": "tag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tag"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
             }
           }
         ],
@@ -236,7 +1418,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TaskDetailResponse"
+                  "$ref": "#/components/schemas/TaskListResponse"
                 }
               }
             }
@@ -293,10 +1475,51 @@
         }
       }
     },
-    "/api/tasks/{task_id}/runs": {
+    "/api/tasks/{task_id}/history/source": {
+      "get": {
+        "summary": "Historical Source",
+        "operationId": "historical_source_api_tasks__task_id__history_source_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Historical Source Api Tasks  Task Id  History Source Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/context/compact": {
       "post": {
-        "summary": "Start Run",
-        "operationId": "start_run_api_tasks__task_id__runs_post",
+        "summary": "Compact Context",
+        "operationId": "compact_context_api_tasks__task_id__context_compact_post",
         "parameters": [
           {
             "name": "task_id",
@@ -329,7 +1552,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/RunRequest-Input"
+                "$ref": "#/components/schemas/ContextCompactRequest"
               }
             }
           }
@@ -406,6 +1629,71 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RevisionPlanResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/feedback/auto": {
+      "post": {
+        "summary": "Submit Feedback",
+        "operationId": "submit_feedback_api_tasks__task_id__feedback_auto_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticFeedbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticRevisionResponse"
                 }
               }
             }
@@ -689,6 +1977,73 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RunRefResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/event-log": {
+      "get": {
+        "summary": "Event Log",
+        "description": "Bounded replay for terminal clients; use the same journal as SSE.",
+        "operationId": "event_log_api_tasks__task_id__event_log_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "After"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkbenchEvent"
+                  },
+                  "title": "Response Event Log Api Tasks  Task Id  Event Log Get"
                 }
               }
             }
@@ -1154,6 +2509,49 @@
         }
       }
     },
+    "/api/skills/{skill_id}/enable": {
+      "post": {
+        "summary": "Enable Skill",
+        "operationId": "enable_skill_api_skills__skill_id__enable_post",
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Skill Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Enable Skill Api Skills  Skill Id  Enable Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/procedures": {
       "get": {
         "summary": "List Procedures",
@@ -1385,6 +2783,430 @@
           }
         }
       }
+    },
+    "/api/tasks/{task_id}/capability-learning": {
+      "get": {
+        "summary": "Capability Learning",
+        "operationId": "capability_learning_api_tasks__task_id__capability_learning_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Capability Learning Api Tasks  Task Id  Capability Learning Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Start Capability Learning",
+        "operationId": "start_capability_learning_api_tasks__task_id__capability_learning_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapabilityEvolutionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Start Capability Learning Api Tasks  Task Id  Capability Learning Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/capability-benchmarks": {
+      "get": {
+        "summary": "Capability Benchmarks",
+        "operationId": "capability_benchmarks_api_tasks__task_id__capability_benchmarks_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Capability Benchmarks Api Tasks  Task Id  Capability Benchmarks Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Start Capability Benchmark",
+        "operationId": "start_capability_benchmark_api_tasks__task_id__capability_benchmarks_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapabilityBenchmarkRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Start Capability Benchmark Api Tasks  Task Id  Capability Benchmarks Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/capability-benchmarks/{job_task_id}/blind-cases": {
+      "get": {
+        "summary": "Blind Capability Cases",
+        "operationId": "blind_capability_cases_api_tasks__task_id__capability_benchmarks__job_task_id__blind_cases_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "job_task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Blind Capability Cases Api Tasks  Task Id  Capability Benchmarks  Job Task Id  Blind Cases Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/{task_id}/capability-benchmarks/{job_task_id}/reviews": {
+      "post": {
+        "summary": "Review Capability Case",
+        "operationId": "review_capability_case_api_tasks__task_id__capability_benchmarks__job_task_id__reviews_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "job_task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Task Id"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScientificReviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Review Capability Case Api Tasks  Task Id  Capability Benchmarks  Job Task Id  Reviews Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/settings/models": {
+      "get": {
+        "summary": "Get Settings",
+        "operationId": "get_settings_api_settings_models_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "object",
+                  "title": "Response Get Settings Api Settings Models Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/settings/models/{role}": {
+      "put": {
+        "summary": "Update Settings",
+        "operationId": "update_settings_api_settings_models__role__put",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "main",
+                "judge",
+                "feedback"
+              ],
+              "type": "string",
+              "title": "Role"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelSettingsUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Update Settings Api Settings Models  Role  Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1460,6 +3282,13 @@
           "sha256": {
             "type": "string",
             "title": "Sha256"
+          },
+          "result_invalidation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Result Invalidation Ids"
           }
         },
         "type": "object",
@@ -1511,6 +3340,13 @@
             "type": "string",
             "title": "Sha256"
           },
+          "result_invalidation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Result Invalidation Ids"
+          },
           "attachment_id": {
             "type": "string",
             "title": "Attachment Id"
@@ -1528,6 +3364,99 @@
           "attachment_id"
         ],
         "title": "AttachmentResponse"
+      },
+      "AutomaticFeedbackRequest": {
+        "properties": {
+          "source_run_id": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source Run Id"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 8000,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "artifact_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Artifact Ids"
+          },
+          "budget": {
+            "$ref": "#/components/schemas/BudgetSpec"
+          },
+          "revision_budget": {
+            "$ref": "#/components/schemas/BudgetSpec"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_run_id",
+          "text"
+        ],
+        "title": "AutomaticFeedbackRequest",
+        "description": "Separate, visible budgets for feedback compilation and research repair."
+      },
+      "AutomaticRevisionResponse": {
+        "properties": {
+          "plan": {
+            "$ref": "#/components/schemas/WorkbenchRevisionPlan"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "STARTED",
+              "NEEDS_CLARIFICATION",
+              "PLAN_UNAVAILABLE",
+              "PREPARING",
+              "EXECUTION_BLOCKED"
+            ],
+            "title": "Status"
+          },
+          "run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diagnostic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagnostic"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan",
+          "status"
+        ],
+        "title": "AutomaticRevisionResponse"
       },
       "Body_upload_attachment_api_tasks__task_id__attachments_post": {
         "properties": {
@@ -1585,6 +3514,110 @@
         ],
         "title": "CancelRunResponse"
       },
+      "CapabilityBenchmarkRequest": {
+        "properties": {
+          "conditions": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "BASE",
+                "FEEDBACK_ONLY",
+                "FEEDBACK_MEMORY",
+                "SINGLE_BEST",
+                "FULL_QD",
+                "NO_TOOL_EVOLUTION",
+                "NO_VALIDATION_GATE"
+              ]
+            },
+            "type": "array",
+            "maxItems": 7,
+            "minItems": 1,
+            "title": "Conditions",
+            "default": [
+              "BASE",
+              "FEEDBACK_ONLY",
+              "FEEDBACK_MEMORY",
+              "SINGLE_BEST",
+              "FULL_QD"
+            ]
+          },
+          "repeats": {
+            "type": "integer",
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Repeats",
+            "default": 2
+          },
+          "max_model_calls": {
+            "type": "integer",
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Max Model Calls",
+            "default": 80
+          },
+          "max_tokens": {
+            "type": "integer",
+            "maximum": 1000000.0,
+            "minimum": 1.0,
+            "title": "Max Tokens",
+            "default": 150000
+          },
+          "wall_seconds": {
+            "type": "number",
+            "maximum": 7200.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Wall Seconds",
+            "default": 900
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "CapabilityBenchmarkRequest"
+      },
+      "CapabilityEvolutionRequest": {
+        "properties": {
+          "source_run_id": {
+            "type": "string",
+            "title": "Source Run Id"
+          },
+          "max_candidates": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Max Candidates",
+            "default": 3
+          },
+          "max_executions": {
+            "type": "integer",
+            "maximum": 64.0,
+            "minimum": 4.0,
+            "title": "Max Executions",
+            "default": 24
+          },
+          "wall_seconds": {
+            "type": "number",
+            "maximum": 1800.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Wall Seconds",
+            "default": 300
+          },
+          "search_mode": {
+            "type": "string",
+            "enum": [
+              "directed",
+              "random"
+            ],
+            "title": "Search Mode",
+            "default": "directed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "source_run_id"
+        ],
+        "title": "CapabilityEvolutionRequest"
+      },
       "CapabilityListResponse": {
         "properties": {
           "items": {
@@ -1636,7 +3669,11 @@
             "type": "string",
             "enum": [
               "json_numeric_sum",
-              "json_numeric_bounds"
+              "json_numeric_bounds",
+              "mwir_noise_budget",
+              "rc_network",
+              "report_tables",
+              "fresnel_film"
             ],
             "title": "Checker Id",
             "default": "json_numeric_sum"
@@ -1757,6 +3794,17 @@
         ],
         "title": "ConstraintSpec",
         "description": "One verifiable threshold on a scientific property."
+      },
+      "ContextCompactRequest": {
+        "properties": {
+          "budget": {
+            "$ref": "#/components/schemas/BudgetSpec"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ContextCompactRequest",
+        "description": "Host-requested maintenance; never a research instruction or tool call."
       },
       "EvaluationCapabilitiesResponse": {
         "properties": {
@@ -2442,6 +4490,118 @@
         ],
         "title": "HistorySessionResponse"
       },
+      "InputReference": {
+        "properties": {
+          "source_artifact_id": {
+            "type": "string",
+            "title": "Source Artifact Id"
+          },
+          "replaces_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replaces Artifact Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_artifact_id"
+        ],
+        "title": "InputReference"
+      },
+      "MaintenanceRequest": {
+        "properties": {
+          "full": {
+            "type": "boolean",
+            "title": "Full",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "MaintenanceRequest"
+      },
+      "ModelSettingsUpdate": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "openai",
+              "anthropic",
+              "fake"
+            ],
+            "title": "Provider"
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Model"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "password",
+                "writeOnly": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "provider",
+          "model"
+        ],
+        "title": "ModelSettingsUpdate"
+      },
+      "MoveRequest": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id"
+          },
+          "target_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Target Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "project_id",
+          "target_revision"
+        ],
+        "title": "MoveRequest"
+      },
       "NumericFieldRule": {
         "properties": {
           "value_path": {
@@ -2514,6 +4674,62 @@
           "execution_id"
         ],
         "title": "OrdinaryRunSource"
+      },
+      "PluginInterface": {
+        "properties": {
+          "input_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Input Schema"
+          },
+          "output_schema": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Output Schema"
+          },
+          "argv_choices": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Argv Choices",
+            "default": [
+              []
+            ]
+          },
+          "units": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "maxProperties": 32,
+            "title": "Units"
+          },
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "title": "Assumptions"
+          },
+          "limitations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 32,
+            "title": "Limitations"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "PluginInterface"
       },
       "ProcedureCreate": {
         "properties": {
@@ -2605,6 +4821,91 @@
         ],
         "title": "ProcedureReview"
       },
+      "ProjectCreate": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 20000,
+            "title": "Description",
+            "default": ""
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 30,
+            "title": "Tags"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "ProjectCreate"
+      },
+      "ProjectPatch": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 20000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 30
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision"
+        ],
+        "title": "ProjectPatch"
+      },
       "QDRevisionOptions": {
         "properties": {
           "execution_id": {
@@ -2693,6 +4994,44 @@
       },
       "ResearchTask": {
         "properties": {
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "project_unclassified"
+          },
+          "management_status": {
+            "type": "string",
+            "title": "Management Status",
+            "default": "OPEN"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At",
+            "default": ""
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision",
+            "default": 1
+          },
           "task_id": {
             "type": "string",
             "title": "Task Id"
@@ -2830,6 +5169,13 @@
             "type": "array",
             "title": "Warnings"
           },
+          "carried_feedback_plan_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Carried Feedback Plan Ids"
+          },
           "compiler_provider": {
             "anyOf": [
               {
@@ -2922,6 +5268,21 @@
         ],
         "title": "RevisionPlanResponse"
       },
+      "RevisionRequest": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision"
+        ],
+        "title": "RevisionRequest"
+      },
       "RevisionRunAttempt": {
         "properties": {
           "attempt": {
@@ -2976,6 +5337,57 @@
       },
       "RunRecord": {
         "properties": {
+          "base_checkpoint_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Checkpoint Id"
+          },
+          "final_checkpoint_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Checkpoint Id"
+          },
+          "recovery_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recovery Status"
+          },
+          "resumes_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resumes Run Id"
+          },
+          "result_invalidation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Result Invalidation Ids"
+          },
           "run_id": {
             "type": "string",
             "title": "Run Id"
@@ -3005,6 +5417,24 @@
           "created_at"
         ],
         "title": "RunRecord"
+      },
+      "RunRef": {
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_id",
+          "run_id"
+        ],
+        "title": "RunRef"
       },
       "RunRefResponse": {
         "properties": {
@@ -3041,7 +5471,9 @@
               "standard",
               "feedback",
               "qd",
-              "skill_replay"
+              "skill_replay",
+              "capability_evolution",
+              "capability_benchmark"
             ],
             "title": "Strategy",
             "default": "standard"
@@ -3060,6 +5492,14 @@
           },
           "evolution": {
             "$ref": "#/components/schemas/EvolutionOptions"
+          },
+          "image_attachment_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "title": "Image Attachment Ids"
           }
         },
         "type": "object",
@@ -3071,6 +5511,70 @@
       "RunRequest-Output": {
         "additionalProperties": true,
         "type": "object"
+      },
+      "ScientificReviewRequest": {
+        "properties": {
+          "blind_id": {
+            "type": "string",
+            "pattern": "^blind_[0-9a-f]{24}$",
+            "title": "Blind Id"
+          },
+          "reviewer": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Reviewer"
+          },
+          "scientific_quality": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Scientific Quality"
+          },
+          "goal_coverage": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Goal Coverage"
+          },
+          "severe_errors": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Severe Errors"
+          },
+          "repeated_errors": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Repeated Errors"
+          },
+          "expert_minutes": {
+            "type": "number",
+            "maximum": 10000.0,
+            "minimum": 0.0,
+            "title": "Expert Minutes"
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 5000,
+            "minLength": 1,
+            "title": "Notes"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "blind_id",
+          "reviewer",
+          "scientific_quality",
+          "goal_coverage",
+          "severe_errors",
+          "repeated_errors",
+          "expert_minutes",
+          "notes"
+        ],
+        "title": "ScientificReviewRequest"
       },
       "SkillCreate": {
         "properties": {
@@ -3118,6 +5622,28 @@
                 "type": "null"
               }
             ]
+          },
+          "interface": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PluginInterface"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parent_skill_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^skill_[0-9a-f]{32}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Skill Id"
           }
         },
         "additionalProperties": false,
@@ -3162,7 +5688,8 @@
                 "items": {
                   "type": "string"
                 },
-                "type": "array"
+                "type": "array",
+                "maxItems": 32
               },
               {
                 "type": "null"
@@ -3219,6 +5746,19 @@
       },
       "TaskCreate": {
         "properties": {
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "project_unclassified"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 30,
+            "title": "Tags"
+          },
           "title": {
             "type": "string",
             "maxLength": 500,
@@ -3248,6 +5788,27 @@
       },
       "TaskDetailResponse": {
         "properties": {
+          "pagination": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pagination"
+          },
           "task": {
             "$ref": "#/components/schemas/ResearchTask"
           },
@@ -3308,6 +5869,17 @@
             },
             "type": "array",
             "title": "Items"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
           }
         },
         "type": "object",
@@ -3316,8 +5888,105 @@
         ],
         "title": "TaskListResponse"
       },
+      "TaskPatch": {
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Expected Revision"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "management_status": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "OPEN",
+                  "PAUSED",
+                  "DONE"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Management Status"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "maxItems": 30
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_revision"
+        ],
+        "title": "TaskPatch"
+      },
       "TaskSummaryResponse": {
         "properties": {
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "default": "project_unclassified"
+          },
+          "management_status": {
+            "type": "string",
+            "title": "Management Status",
+            "default": "OPEN"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At",
+            "default": ""
+          },
+          "archived_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archived At"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision",
+            "default": 1
+          },
           "task_id": {
             "type": "string",
             "title": "Task Id"
@@ -3406,6 +6075,49 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WorkbenchEvent": {
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Seq"
+          },
+          "type": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Type"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Payload"
+          },
+          "created_at": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_id",
+          "run_id",
+          "seq",
+          "type",
+          "payload",
+          "created_at"
+        ],
+        "title": "WorkbenchEvent"
       },
       "WorkbenchLink": {
         "properties": {
@@ -3583,6 +6295,165 @@
           "confidence"
         ],
         "title": "WorkbenchRevisionIssue"
+      },
+      "WorkbenchRevisionPlan": {
+        "properties": {
+          "plan_id": {
+            "type": "string",
+            "title": "Plan Id"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "feedback_id": {
+            "type": "string",
+            "title": "Feedback Id"
+          },
+          "source_run_id": {
+            "type": "string",
+            "title": "Source Run Id"
+          },
+          "source_digest": {
+            "type": "string",
+            "title": "Source Digest"
+          },
+          "source_run_status": {
+            "type": "string",
+            "title": "Source Run Status"
+          },
+          "source_artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/RevisionArtifactSource"
+            },
+            "type": "array",
+            "title": "Source Artifacts"
+          },
+          "feedback_text": {
+            "type": "string",
+            "title": "Feedback Text"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "PREPARING",
+              "READY",
+              "UNAVAILABLE"
+            ],
+            "title": "Status"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/WorkbenchRevisionIssue"
+            },
+            "type": "array",
+            "title": "Issues"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "carried_feedback_plan_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Carried Feedback Plan Ids"
+          },
+          "compiler_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compiler Provider"
+          },
+          "compiler_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compiler Model"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "instruction": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instruction"
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Attempt"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "run_attempts": {
+            "items": {
+              "$ref": "#/components/schemas/RevisionRunAttempt"
+            },
+            "type": "array",
+            "title": "Run Attempts"
+          },
+          "compiler_cost": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Compiler Cost"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan_id",
+          "task_id",
+          "feedback_id",
+          "source_run_id",
+          "source_digest",
+          "source_run_status",
+          "feedback_text",
+          "status",
+          "attempt",
+          "created_at"
+        ],
+        "title": "WorkbenchRevisionPlan"
       }
     }
   }

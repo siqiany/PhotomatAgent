@@ -15,6 +15,7 @@ from photomatagent.workspace import Workspace
 
 
 class GrepTool(Tool):
+    effect_class = "READ_ONLY"
     name = "grep"
     description = "Search text with a regular expression inside the workspace. Search is bounded; narrow the path/glob when truncated."
     exposure = ToolExposure.DIRECT

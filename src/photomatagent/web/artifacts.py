@@ -7,6 +7,7 @@ import codecs
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import uuid
 
@@ -23,6 +24,7 @@ _ALLOWED_SUFFIXES = {
     ".csv": "text/csv",
     ".json": "application/json",
     ".png": "image/png",
+    ".webp": "image/webp",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
 }
@@ -53,7 +55,7 @@ class ArtifactService:
         suffix = Path(filename).suffix.lower()
         allowed_media_type = _ALLOWED_SUFFIXES.get(suffix)
         if allowed_media_type is None:
-            raise ServiceError("UNSUPPORTED_MEDIA_TYPE", "仅支持 TXT、Markdown、CSV、JSON、PNG 和 JPEG。", status_code=415)
+            raise ServiceError("UNSUPPORTED_MEDIA_TYPE", "仅支持 TXT、Markdown、CSV、JSON、PNG、JPEG 和 WebP。", status_code=415)
         media_type = allowed_media_type
         artifact_id = f"artifact_{uuid.uuid4().hex}"
         task_dir = self.upload_root / task_id
@@ -100,6 +102,11 @@ class ArtifactService:
                 with temporary.open("rb") as image:
                     if image.read(3) != b"\xff\xd8\xff":
                         raise ServiceError("INVALID_IMAGE", "JPEG 文件签名无效。", status_code=422)
+            elif suffix == ".webp":
+                with temporary.open("rb") as image:
+                    header = image.read(12)
+                    if header[:4] != b"RIFF" or header[8:] != b"WEBP":
+                        raise ServiceError("INVALID_IMAGE", "WebP 文件签名无效。", status_code=422)
             final_path = task_dir / f"{artifact_id}{suffix}"
             os.replace(temporary, final_path)
             temporary = None
@@ -130,15 +137,83 @@ class ArtifactService:
             raise ServiceError("NOT_FOUND", "产物不存在。", status_code=404) from error
 
     def metadata_row(self, row: object) -> dict[str, object]:
+        task_id: str = row["task_id"]  # type: ignore[index]
+        run_id: str | None = row["run_id"]  # type: ignore[index]
         return {
             "artifact_id": row["artifact_id"],  # type: ignore[index]
-            "task_id": row["task_id"],  # type: ignore[index]
-            "run_id": row["run_id"],  # type: ignore[index]
+            "task_id": task_id,
+            "run_id": run_id,
+            "result_invalidation_ids": self.store.artifact_result_invalidations(row["artifact_id"]),  # type: ignore[index]
             "filename": row["filename"],  # type: ignore[index]
             "media_type": row["media_type"],  # type: ignore[index]
             "size_bytes": row["size_bytes"],  # type: ignore[index]
             "sha256": row["sha256"],  # type: ignore[index]
         }
+
+    def replace_input(self, task_id: str, previous_id: str, source_id: str) -> str:
+        """Bind a fresh upstream result to a new, hash-verified local input."""
+        destination: Path | None = None
+        try:
+            with self.store.database.transaction():
+                task = self.store.task(task_id)
+                prior = self.store._connection.execute(
+                    "SELECT json_extract(payload_json, '$.replacement_artifact_id'), "
+                    "json_extract(payload_json, '$.source_artifact_id') FROM management_events "
+                    "WHERE kind='task_input_replaced' AND entity_id=? "
+                    "AND json_extract(payload_json, '$.previous_artifact_id')=?", (task_id, previous_id),
+                ).fetchone()
+                if prior:
+                    if prior[1] != source_id:
+                        raise ServiceError("REPLACEMENT_INPUT_CHANGED", "该输入已绑定到另一份替换产物。", status_code=409)
+                    return str(prior[0])
+                self.store.projects._idle(task_id=task_id)
+                previous = self.store.artifact(previous_id)
+                source = self.store.artifact(source_id)
+                if (previous["task_id"] != task_id or previous["run_id"] is not None
+                        or previous["origin_artifact_id"] is None or previous_id not in task.attachment_ids
+                        or not self.store.artifact_result_invalidations(previous_id)):
+                    raise ServiceError("REPLACEMENT_INPUT_NOT_STALE", "请选择当前任务中已失效的关联输入。", status_code=409)
+                origin = previous
+                visited = {previous_id}
+                while origin["origin_artifact_id"] is not None:
+                    origin_id = origin["origin_artifact_id"]
+                    if origin_id in visited:
+                        raise ServiceError("REPLACEMENT_ORIGIN_INVALID", "输入来源存在循环。", status_code=409)
+                    visited.add(origin_id)
+                    origin = self.store.artifact(origin_id)
+                if (source_id in visited or source["task_id"] == task_id
+                        or source["task_id"] != origin["task_id"] or source["media_type"] != previous["media_type"]
+                        or source["run_id"] is None or self.store.run(source["run_id"]).status != "SUCCEEDED"
+                        or self.store.artifact_result_invalidations(source_id)):
+                    raise ServiceError("REPLACEMENT_SOURCE_INVALID", "请选择原上游任务成功运行产生的当前同类产物。", status_code=409)
+                snapshot, media, _ = self.content(source_id)
+                identifier = "artifact_" + uuid.uuid4().hex
+                directory = self.upload_root / task_id
+                with snapshot:
+                    if self.upload_root != self.workspace_root / ".photomatagent" / "workbench" / "uploads":
+                        raise ServiceError("INVALID_TASK_PATH", "上传根目录不能是符号链接。", status_code=400)
+                    directory.mkdir(parents=True, exist_ok=True)
+                    if directory.resolve() != directory:
+                        raise ServiceError("INVALID_TASK_PATH", "任务上传目录不能是符号链接。", status_code=400)
+                    path = directory / (identifier + Path(source["filename"]).suffix.lower())
+                    with path.open("xb") as out:
+                        destination = path
+                        shutil.copyfileobj(snapshot, out)
+                        out.flush()
+                        os.fsync(out.fileno())
+                self.store.register_attachment(
+                    artifact_id=identifier, task_id=task_id, path=destination.relative_to(self.workspace_root).as_posix(),
+                    filename=source["filename"], sha256=source["sha256"], media_type=media, size_bytes=source["size_bytes"],
+                )
+                self.store._connection.execute("UPDATE artifacts SET origin_artifact_id=? WHERE artifact_id=?", (source_id, identifier))
+                self.store.bind_replacement_input(task_id, previous_id, identifier, source_id)
+                return identifier
+        except BaseException as exc:
+            if destination is not None:
+                destination.unlink(missing_ok=True)
+            if isinstance(exc, KeyError):
+                raise ServiceError("NOT_FOUND", "任务或产物不存在。", status_code=404) from exc
+            raise
 
     def content(self, artifact_id: str) -> tuple[tempfile.SpooledTemporaryFile[bytes], str, str]:
         try:

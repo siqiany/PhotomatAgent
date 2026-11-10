@@ -8,6 +8,7 @@ import inspect
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from photomatagent.application.models import (
@@ -30,6 +31,7 @@ from photomatagent.application.store import (
 from photomatagent.redaction import redact_text
 from photomatagent.scientific.evolution.models import FeedbackDelta
 from photomatagent.web.artifacts import ArtifactService
+from photomatagent.workspace import Workspace
 
 _MAX_RUN_TEXT_CHARS = 30_000
 _MAX_PLAN_CHARS = 64_000
@@ -53,7 +55,8 @@ class _SourceSnapshot:
 class _ProviderFeedbackPlanner:
     """Adapter to the existing tool-free Evolution feedback compiler."""
 
-    def __init__(self, provider: str, model: str | None) -> None:
+    def __init__(self, provider: str, model: str | None, workspace: Workspace | Path | str | None = None) -> None:
+        self.workspace = workspace.root if isinstance(workspace, Workspace) else workspace
         self.provider = provider
         self.model_name = model
 
@@ -61,7 +64,12 @@ class _ProviderFeedbackPlanner:
         from photomatagent.models.factory import create_provider
         from photomatagent.scientific.evolution.feedback import FeedbackCompiler
 
-        model = create_provider(self.provider, self.model_name)
+        from photomatagent.model_settings import public_settings
+        settings = public_settings(self.workspace) if self.workspace else {}
+        main = settings.get("main", {}).get("provider") or self.provider
+        feedback = settings.get("feedback", {}).get("provider")
+        model = create_provider("fake" if main == "fake" and not feedback else None,
+                                role="feedback", workspace=self.workspace)
         try:
             compilation = await FeedbackCompiler(model).compile_workbench_feedback(
                 goal=str(context["goal"]),
@@ -119,9 +127,11 @@ class RevisionService:
         options: Mapping[str, object] = manager.runtime_options
         configured_provider = options.get("provider", "fake")
         configured_model = options.get("model")
+        workspace = options.get("workspace") or options.get("workspace_root")
         self.compiler = compiler or _ProviderFeedbackPlanner(
             configured_provider if isinstance(configured_provider, str) else "fake",
             configured_model if isinstance(configured_model, str) else None,
+            workspace if isinstance(workspace, (Workspace, Path, str)) else None,
         )
 
     async def prepare(
@@ -208,6 +218,7 @@ class RevisionService:
                 source_diagnostic=snapshot.diagnostic,
                 source_artifacts=snapshot.artifacts,
                 feedback_text=feedback.text,
+                carried_feedback=self.store.revision_carried_feedback(plan_id),
                 issues=issues,
                 warnings=analysis.warnings,
             )
@@ -290,6 +301,8 @@ class RevisionService:
                 next_action="保留现有反馈并重新生成计划。",
             )
         if strategy == "qd":
+            if plan.carried_feedback_plan_ids:
+                raise ServiceError("QD_COMBINED_FEEDBACK_UNSUPPORTED", "合并纠正意见需要按标准修订流程重新检查。", status_code=409)
             from photomatagent.application.qd_strategy import QDRevisionOptions, QDStrategyService
             if not isinstance(self.qd_service, QDStrategyService) or not isinstance(qd, QDRevisionOptions):
                 raise ServiceError("QD_UNSUPPORTED", "请选择来源执行、可信检查器及有界参数空间。", status_code=409)
@@ -320,6 +333,8 @@ class RevisionService:
             raise ServiceError("NOT_FOUND", "反馈来源运行不存在。", status_code=404) from error
         if run.task_id != task_id:
             raise ServiceError("FEEDBACK_SOURCE_TASK_MISMATCH", "反馈来源运行属于其他任务。", status_code=409)
+        if run.request.host_operation == {"operation": "context_compaction"}:
+            raise ServiceError("FEEDBACK_SOURCE_INVALID", "上下文压缩没有科研结果，请选择此前的研究运行。", status_code=409)
         if run.status not in {"SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "INTERRUPTED"}:
             raise ServiceError("FEEDBACK_SOURCE_NOT_COMPLETE", "只能对已结束的运行结果提交反馈。", status_code=409)
         request_chain = self._source_request_chain(task_id, feedback.source_run_id)
@@ -416,7 +431,7 @@ def _source_diagnostic(events: list[WorkbenchEvent]) -> str | None:
                 return redact_text(": ".join(pieces))[:500]
         if event.type in {"run_interrupted", "run_cancelled", "loop_completed"}:
             reason = event.payload.get("reason")
-            if isinstance(reason, str) and reason not in {"completed", "final_response"}:
+            if isinstance(reason, str) and reason not in {"completed", "final_response", "research_delivery"}:
                 return redact_text(reason)[:500]
     return None
 
@@ -478,6 +493,7 @@ def _revision_instruction(
     source_diagnostic: str | None,
     source_artifacts: list[dict[str, object]],
     feedback_text: str,
+    carried_feedback: list[dict[str, str]] | None = None,
     issues: list[WorkbenchRevisionIssue],
     warnings: list[str],
 ) -> str:
@@ -485,9 +501,11 @@ def _revision_instruction(
         "Continue the existing research task in a new round.",
         f"Workbench task: {task_id}",
         f"Original goal (immutable): {goal}",
-        f"Original scientific request (preserve its stated constraints): {original_request or goal}",
-        "Keep the original request and its stated constraints unchanged; do not invent additional numeric acceptance criteria.",
-        "The original request describes earlier workflow steps. For this revision, follow the current reviewer feedback for actions and output filenames while preserving the scientific target.",
+        "This is an incremental revision of the source run, not a new or independent initial proposal.",
+        "The historical source request below is context for scientific targets and constraints only. Its earlier workflow steps and deliverable paths are superseded for this round.",
+        "Retain original scientific targets and constraints unless reviewer feedback explicitly changes them. "
+        "Re-check affected evidence and do not invent additional numeric acceptance criteria.",
+        f"Historical source request (quoted context; do not execute its earlier steps or recreate its deliverables): {original_request or goal}",
         f"Source run: {source_run_id} (snapshot sha256: {source_digest})",
         "The snapshot sha256 is an identity check, not a filename or text to search for. Read explicitly listed artifact paths; avoid broad workspace searches for this digest.",
         f"Source run status: {source_run_status}",
@@ -505,6 +523,12 @@ def _revision_instruction(
             f"- {item['artifact_id']} {item['path']} sha256={item['sha256']}"
             for item in source_artifacts[:50]
         )
+    if carried_feedback:
+        lines.append(
+            "This source still depends on earlier corrections. Apply and re-check each of these alongside "
+            "the current feedback. Report any conflicts or items you cannot verify as UNKNOWN."
+        )
+        lines.extend(f"- [{item['plan_id']}] {item['feedback_text']}" for item in carried_feedback)
     essential_end = len("\n".join(lines))
     lines.append("Structured issues:")
     for item in issues:
@@ -521,6 +545,9 @@ def _revision_instruction(
         lines.append("Compiler uncertainty:")
         lines.extend(f"- {warning[:500]}" for warning in warnings[:20])
     lines.append(
+        "For this round, execute only the actions and deliverables requested in the reviewer feedback above. "
+        "Do not recreate, rewrite, or update files requested only by the historical source request; "
+        "do not label this revision as an independent initial plan. Preserve earlier deliverables as source artifacts. "
         "Create a new report in the task output directory and state item by item what changed, "
         "what evidence was newly verified, what remains only a textual correction, and what remains UNKNOWN."
     )

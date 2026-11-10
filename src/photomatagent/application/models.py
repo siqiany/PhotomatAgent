@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, field_validator, model_serializer
@@ -17,7 +19,18 @@ class BudgetSpec(BaseModel):
     wall_seconds: int = Field(default=1800, ge=1)
 
 
+class ContextCompactRequest(BaseModel):
+    """Host-requested maintenance; never a research instruction or tool call."""
+
+    model_config = ConfigDict(extra="forbid")
+    budget: BudgetSpec = Field(default_factory=lambda: BudgetSpec(
+        max_model_calls=16, max_tokens=100_000, wall_seconds=300,
+    ))
+
+
 class TaskCreate(BaseModel):
+    project_id: str = "project_unclassified"
+    tags: list[str] = Field(default_factory=list, max_length=30)
     title: str = Field(min_length=1, max_length=500)
     goal: str = Field(min_length=1, max_length=20_000)
     attachment_ids: list[str] = Field(default_factory=list)
@@ -63,9 +76,10 @@ class EvolutionOptions(BaseModel):
 class RunRequest(BaseModel):
     text: str = Field(min_length=1, max_length=100_000)
     budget: BudgetSpec = Field(default_factory=BudgetSpec)
-    strategy: Literal["standard", "feedback", "qd", "skill_replay"] = "standard"
+    strategy: Literal["standard", "feedback", "qd", "skill_replay", "capability_evolution", "capability_benchmark"] = "standard"
     host_operation: dict[str, object] | None = None
     evolution: EvolutionOptions = Field(default_factory=EvolutionOptions)
+    image_attachment_ids: list[str] = Field(default_factory=list, max_length=4)
 
     @model_serializer(mode="wrap")
     def preserve_ordinary_request_identity(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -74,7 +88,16 @@ class RunRequest(BaseModel):
             payload.pop("host_operation", None)
         if self.evolution == EvolutionOptions():
             payload.pop("evolution", None)
+        if not self.image_attachment_ids:
+            payload.pop("image_attachment_ids", None)
         return payload
+
+    @field_validator("image_attachment_ids")
+    @classmethod
+    def valid_image_attachment_ids(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values) or any(not re.fullmatch(r"artifact_[0-9a-f]{32}", value) for value in values):
+            raise ValueError("INVALID_IMAGE_ATTACHMENT_IDS")
+        return values
 
     @field_validator("text")
     @classmethod
@@ -126,6 +149,12 @@ class RevisionArtifactSource(BaseModel):
     path: str
 
 
+class AutomaticFeedbackRequest(FeedbackRequest):
+    """Separate, visible budgets for feedback compilation and research repair."""
+
+    revision_budget: BudgetSpec = Field(default_factory=BudgetSpec)
+
+
 class WorkbenchRevisionIssue(BaseModel):
     issue_id: str
     category: FeedbackCategory
@@ -162,6 +191,7 @@ class WorkbenchRevisionPlan(BaseModel):
     status: Literal["PREPARING", "READY", "UNAVAILABLE"]
     issues: list[WorkbenchRevisionIssue] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    carried_feedback_plan_ids: list[str] = Field(default_factory=list)
     compiler_provider: str | None = None
     compiler_model: str | None = None
     error: str | None = None
@@ -185,6 +215,14 @@ class RunRef(BaseModel):
     run_id: str
 
 
+class AutomaticRevisionResponse(BaseModel):
+    plan: WorkbenchRevisionPlan
+    status: Literal["STARTED", "NEEDS_CLARIFICATION", "PLAN_UNAVAILABLE", "PREPARING", "EXECUTION_BLOCKED"]
+    run: RunRef | None = None
+    diagnostic: str | None = None
+    error_code: str | None = None
+
+
 class WorkbenchEvent(BaseModel):
     task_id: str
     run_id: str
@@ -195,6 +233,12 @@ class WorkbenchEvent(BaseModel):
 
 
 class ResearchTask(BaseModel):
+    tags: list[str] = Field(default_factory=list)
+    project_id: str = "project_unclassified"
+    management_status: str = "OPEN"
+    updated_at: str = ""
+    archived_at: str | None = None
+    revision: int = 1
     task_id: str
     session_id: str
     title: str
@@ -204,6 +248,11 @@ class ResearchTask(BaseModel):
 
 
 class RunRecord(BaseModel):
+    base_checkpoint_id: str | None = None
+    final_checkpoint_id: str | None = None
+    recovery_status: str | None = None
+    resumes_run_id: str | None = None
+    result_invalidation_ids: list[str] = Field(default_factory=list)
     run_id: str
     task_id: str
     request: RunRequest

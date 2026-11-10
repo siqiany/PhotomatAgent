@@ -16,6 +16,7 @@ export function ClosedLoopProgress({ events }: { events: WorkbenchEvent[] }) {
   const relevant = events.filter((event) => [
     "closed_loop_round_started", "closed_loop_checked", "closed_loop_completed",
     "evolution_guidance_retrieved", "evolution_observation", "evolution_candidate_captured",
+    "research_contract",
   ].includes(event.type));
   if (!relevant.length) return null;
 
@@ -35,6 +36,7 @@ export function ClosedLoopProgress({ events }: { events: WorkbenchEvent[] }) {
     <details className="closed-loop-progress">
       <summary>自动修订进度 <span>{completion ? TERMINAL_LABELS[stringValue(completion.payload.status) ?? ""] ?? "运行结束" : `${rounds.size} 轮已记录`}</span></summary>
       <div className="closed-loop-body">
+        {relevant.filter((event) => event.type === "research_contract").slice(-1).map((event) => <section key={event.seq}><strong>本轮固定研究目标</strong><p>{String(event.payload.original_goal ?? event.payload.goal ?? "以原任务为准")}</p><p className="small-copy">未给出的数值目标不自动编造；目标覆盖与科学有效性需独立评审。</p></section>)}
         {[...rounds.entries()].sort(([left], [right]) => left - right).map(([roundIndex, round]) => (
           <section className="closed-loop-round" key={roundIndex}>
             <strong>第 {roundIndex} 轮{round.phase ? ` · ${phaseLabel(round.phase)}` : ""}</strong>

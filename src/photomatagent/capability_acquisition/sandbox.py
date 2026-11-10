@@ -8,7 +8,7 @@ import os
 import re
 import stat
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -20,6 +20,7 @@ from photomatagent.capability_acquisition.models import (
     ExecutionRequest,
     InstallPlan,
     SandboxResult,
+    SourceTreeLayout,
 )
 from photomatagent.workspace import Workspace
 
@@ -46,6 +47,8 @@ class SandboxService:
         input_bindings: dict[str, str] | None = None,
         artifact_limit_bytes: int = 64 * 1024 * 1024,
         dynamic_script_prefix: str | None = None,
+        restore_persisted_podman: bool = False,
+        restore_persisted_local_dev: bool = False,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.trial_id = trial_id
@@ -55,6 +58,8 @@ class SandboxService:
         self.backend = backend
         self.artifact_limit_bytes = artifact_limit_bytes
         self.dynamic_script_prefix = dynamic_script_prefix
+        self.restore_persisted_podman = restore_persisted_podman
+        self.restore_persisted_local_dev = restore_persisted_local_dev
         self._environments: dict[str, EnvironmentRecord] = {}
         self._requests: dict[str, ExecutionRequest] = {}
         self._output_directories: dict[str, Path] = {}
@@ -64,6 +69,47 @@ class SandboxService:
     def environment(self, environment_id: str) -> EnvironmentRecord | None:
         return self._environments.get(environment_id)
 
+    def available_environments(self) -> tuple[EnvironmentRecord, ...]:
+        """Return registered environments and safely restore persisted ones for this backend."""
+        storage = getattr(self.backend, "storage_root", None)
+        if storage is not None and (self.restore_persisted_podman or self.restore_persisted_local_dev):
+            try:
+                for entry in sorted(Path(storage).iterdir(), key=lambda path: path.name)[:100]:
+                    if re.fullmatch(r"env_[0-9a-f]{24}", entry.name) and entry.name not in self._environments:
+                        self._restore_persisted_environment(entry.name)
+            except OSError:
+                pass
+        return tuple(sorted(self._environments.values(), key=lambda item: item.environment_id))
+
+    def environment_packages(self, environment: EnvironmentRecord) -> tuple[tuple[tuple[str, str], ...], str]:
+        """Read installed distribution metadata only from a hash-verified backend environment."""
+        import importlib.metadata
+        from photomatagent.capability_acquisition.container_backend import PodmanSandboxBackend, _tree_sha256
+        from photomatagent.capability_acquisition.local_backend import LocalDevBackend
+
+        if not isinstance(self.backend, (PodmanSandboxBackend, LocalDevBackend)):
+            return (), "unavailable"
+        root = self.backend.storage_root / environment.environment_id / "python"
+        try:
+            if _contains_symlink(self.backend.storage_root, root) or _tree_sha256(root) != environment.environment_sha256:
+                return (), "changed"
+            sites = sorted(root.glob("lib/python*/site-packages"))
+            if not sites:
+                return (), "unavailable"
+            packages = []
+            for distribution in importlib.metadata.distributions(path=[str(site) for site in sites]):
+                name, version = distribution.metadata.get("Name"), distribution.version
+                if not name or not version or len(name) > 200 or len(version) > 100:
+                    return (), "unavailable"
+                packages.append((name, version))
+                if len(packages) > 256:
+                    return (), "unavailable"
+            if _tree_sha256(root) != environment.environment_sha256:
+                return (), "changed"
+            return tuple(sorted(packages, key=lambda item: item[0].lower())), "verified"
+        except (OSError, ValueError, TypeError):
+            return (), "unavailable"
+
     def register_environment(self, environment: EnvironmentRecord, *, plan: InstallPlan | None = None) -> None:
         if environment.status != "READY":
             raise ValueError("ENVIRONMENT_NOT_READY")
@@ -72,6 +118,26 @@ class SandboxService:
                 raise ValueError("INSTALL_PLAN_CHANGED")
             self._plans[environment.environment_id] = plan
         self._environments[environment.environment_id] = environment
+
+    def _restore_persisted_environment(self, environment_id: str) -> EnvironmentRecord | None:
+        if not (self.restore_persisted_podman or self.restore_persisted_local_dev) or not re.fullmatch(r"env_[0-9a-f]{24}", environment_id):
+            return None
+        from photomatagent.capability_acquisition.container_backend import PodmanSandboxBackend
+        from photomatagent.capability_acquisition.local_backend import LocalDevBackend
+
+        if not ((self.restore_persisted_podman and isinstance(self.backend, PodmanSandboxBackend)) or
+                (self.restore_persisted_local_dev and isinstance(self.backend, LocalDevBackend))):
+            return None
+        try:
+            environment = self.backend.restore_environment(environment_id)
+            plan = load_persisted_install_plan(self.workspace, environment.plan_sha256,
+                execution_backend='local_dev' if isinstance(self.backend, LocalDevBackend) else 'podman')
+            if plan is None or (isinstance(self.backend, LocalDevBackend) and plan.execution_backend != 'local_dev'):
+                return None
+            self.register_environment(environment, plan=plan)
+            return environment
+        except (OSError, ValueError, TypeError):
+            return None
 
     def execution_inputs(self, execution_id: str) -> tuple[dict[str, Path], dict[str, str]]:
         """Return hash-verified input snapshots bound to an actual execution.
@@ -185,12 +251,21 @@ class SandboxService:
         argv: list[str] | tuple[str, ...] = (),
         timeout_seconds: int = 60,
         output_limit_bytes: int = 65_536,
+        execution_id: str | None = None,
+        expected_script_sha256: str | None = None,
+        expected_environment_sha256: str | None = None,
+        expected_input_sha256: dict[str, str] | None = None,
+        source_tree: SourceTreeLayout | None = None,
     ) -> SandboxResult:
         if self.backend is None:
             return SandboxResult(code="SANDBOX_UNAVAILABLE", diagnostics=("BACKEND_NOT_CONFIGURED",))
         environment = self._environments.get(environment_id)
+        if environment is None:
+            environment = self._restore_persisted_environment(environment_id)
         if environment is None or environment.status != "READY":
             return SandboxResult(code="ENVIRONMENT_NOT_READY")
+        if expected_environment_sha256 is not None and environment.environment_sha256 != expected_environment_sha256:
+            return SandboxResult(code="ENVIRONMENT_CHANGED")
         if not 1 <= timeout_seconds <= 120 or not 1024 <= output_limit_bytes <= 1_048_576:
             return SandboxResult(code="INVALID_EXECUTION_LIMIT")
         if len(argv) > MAX_SCRIPT_ARGV_TOKENS or any(not isinstance(value, str) or len(value) > 1000 or "\x00" in value for value in argv):
@@ -211,8 +286,17 @@ class SandboxService:
             script_digest = _sha256_file(script)
             if expected_digest is not None and script_digest != expected_digest:
                 return SandboxResult(code="GENOME_MISMATCH")
+        if expected_script_sha256 is not None and script_digest != expected_script_sha256:
+            return SandboxResult(code="SCRIPT_CHANGED")
+        if source_tree is not None:
+            from photomatagent.capability_acquisition.container_backend import PodmanSandboxBackend
+
+            if (not isinstance(self.backend, PodmanSandboxBackend) or environment.backend != "podman-rootless"
+                    or expected_input_sha256 is None or not set(source_tree.inputs) <= set(input_refs or {})):
+                return SandboxResult(code="SOURCE_TREE_BINDING_INVALID")
         validated_inputs: dict[str, str] = {}
         input_digests: dict[str, str] = {}
+        input_size = 0
         for key, path in (input_refs or {}).items():
             if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", key):
                 return SandboxResult(code="INVALID_INPUT_BINDING")
@@ -221,17 +305,26 @@ class SandboxService:
             input_file = self._bound_file(path)
             if input_file is None or not input_file.is_file():
                 return SandboxResult(code="INVALID_INPUT_BINDING")
-            if input_file.stat().st_size > self.artifact_limit_bytes:
+            size = input_file.stat().st_size
+            input_size += size
+            if size > self.artifact_limit_bytes or (source_tree and input_size > self.artifact_limit_bytes):
                 return SandboxResult(code="INPUT_LIMIT_EXCEEDED")
             validated_inputs[key] = path
             input_digests[key] = _sha256_file(input_file)
-        execution_id = f"exec_{uuid4().hex}"
+        if expected_input_sha256 is not None and expected_input_sha256 != input_digests:
+            return SandboxResult(code="INPUT_BINDING_CHANGED")
+        execution_id = execution_id or f"exec_{uuid4().hex}"
+        if not re.fullmatch(r"exec_[0-9a-f]{32}", execution_id):
+            return SandboxResult(code="INVALID_EXECUTION_ID")
         output_root = self.workspace / "tmp" / "capability-executions"
         if _contains_symlink(self.workspace, output_root):
             return SandboxResult(code="INVALID_OUTPUT_PATH")
         output_root.mkdir(parents=True, exist_ok=True)
         output_directory = output_root / execution_id
-        output_directory.mkdir()
+        try:
+            output_directory.mkdir()
+        except FileExistsError:
+            return SandboxResult(code="EXECUTION_ALREADY_CLAIMED")
         request = ExecutionRequest(
             execution_id=execution_id,
             trial_id=self.trial_id,
@@ -246,6 +339,7 @@ class SandboxService:
             output_limit_bytes=output_limit_bytes,
             artifact_limit_bytes=self.artifact_limit_bytes,
             workspace_root=str(self.workspace),
+            source_tree=source_tree,
         )
         self._requests[execution_id] = request
         try:
@@ -335,6 +429,52 @@ class SandboxService:
             code = "OK"
         return SandboxResult(code=code, record=record)
 
+    async def reconcile_persisted_podman(
+        self, execution_id: str, *, expected_script_sha256: str,
+        expected_environment_sha256: str, expected_source_tree: SourceTreeLayout | None,
+        expected_input_sha256: dict[str, str],
+    ) -> SandboxResult:
+        from photomatagent.capability_acquisition.container_backend import PodmanSandboxBackend
+
+        if not isinstance(self.backend, PodmanSandboxBackend) or not re.fullmatch(r"exec_[0-9a-f]{32}", execution_id):
+            return SandboxResult(code="EXECUTION_BACKEND_UNAVAILABLE")
+        try:
+            root = self._provenance_root(execution_id)
+            request_path = _safe_output_file(root, "request.json")
+            if request_path is None:
+                return SandboxResult(code="EXECUTION_STATE_UNKNOWN")
+            persisted = json.loads(request_path.read_bytes())
+            request = ExecutionRequest.model_validate(persisted["request"])
+            environment = EnvironmentRecord.model_validate(persisted["environment"])
+            if (request.execution_id != execution_id or request.workspace_root != str(self.workspace)
+                    or request.environment_id != environment.environment_id
+                    or request.script_digest != expected_script_sha256
+                    or environment.environment_sha256 != expected_environment_sha256
+                    or request.source_tree != expected_source_tree or request.input_sha256 != expected_input_sha256
+                    or environment.backend != "podman-rootless"):
+                return SandboxResult(code="EXECUTION_BINDING_MISMATCH")
+            record, code = await self.backend.recover_execution(request)
+            if record is None:
+                return SandboxResult(code=code)
+            if (record.execution_id != execution_id or record.backend != "podman"
+                    or record.script_sha256 != expected_script_sha256
+                    or record.environment_sha256 != expected_environment_sha256
+                    or len(record.stdout.encode("utf-8")) > request.output_limit_bytes
+                    or len(record.stderr.encode("utf-8")) > request.output_limit_bytes
+                    or sum(item.size for item in record.artifacts) > request.artifact_limit_bytes):
+                return SandboxResult(code="EXECUTION_BINDING_MISMATCH")
+            output = self.workspace / "tmp" / "capability-executions" / execution_id
+            if _contains_symlink(self.workspace, output) or not output.is_dir():
+                return SandboxResult(code="EXECUTION_ARTIFACTS_UNAVAILABLE")
+            for item in record.artifacts:
+                path = _safe_output_file(output, item.path)
+                if path is None or path.stat().st_size != item.size or _sha256_file(path) != item.sha256:
+                    return SandboxResult(code="EXECUTION_ARTIFACTS_CHANGED")
+            self._persist_record(record)
+            return SandboxResult(code="OK", record=record)
+        except (OSError, ValueError, KeyError, TypeError):
+            return SandboxResult(code="EXECUTION_PROVENANCE_INVALID")
+
     def _provenance_root(self, execution_id: str) -> Path:
         root = self.workspace / ".photomatagent" / "executions" / execution_id
         if _contains_symlink(self.workspace, root):
@@ -347,7 +487,10 @@ class SandboxService:
         root = self._provenance_root(request.execution_id)
         script = self._bound_file(request.script_path)
         if script is not None:
-            (root / "script.py").write_bytes(script.read_bytes())
+            snapshot = root / "script.py"
+            snapshot.write_bytes(script.read_bytes())
+            if _sha256_file(snapshot) != request.script_digest:
+                raise ValueError("SCRIPT_BINDING_CHANGED")
         inputs: dict[str, str] = {}
         for key, relative in request.input_refs.items():
             source = self._bound_file(relative)
@@ -413,6 +556,34 @@ def _contains_symlink(root: Path, path: Path) -> bool:
         if current.is_symlink():
             return True
     return False
+
+
+def load_persisted_install_plan(workspace: Path, plan_sha256: str, *, execution_backend: str = 'podman') -> InstallPlan | None:
+    """Verify the original plan for provenance of an already installed environment."""
+    if not re.fullmatch(r"[0-9a-f]{64}", plan_sha256):
+        return None
+    path = workspace / ".photomatagent" / "capability-plans" / f"{plan_sha256}.json"
+    if _contains_symlink(workspace, path):
+        return None
+    try:
+        if not path.is_file() or path.stat().st_size > 1_000_000:
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        original_expiry = datetime.fromisoformat(raw["expires_at"].replace("Z", "+00:00"))
+        if original_expiry.tzinfo is None:
+            return None
+        validation_raw = dict(raw)
+        if original_expiry <= datetime.now(timezone.utc):
+            # Validation checks the frozen fields and content hash. The plan
+            # registered for provenance keeps its original expiry, so it cannot
+            # authorize another installation after expiration.
+            validation_raw["expires_at"] = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+        validated = InstallPlan.model_validate(validation_raw)
+        if validated.plan_sha256 != plan_sha256 or validated.execution_backend != execution_backend:
+            return None
+        return validated.model_copy(update={"expires_at": original_expiry})
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 
 def _safe_output_file(output_root: Path, relative_path: str) -> Path | None:

@@ -6,7 +6,6 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import importlib.util
-import os
 from pathlib import Path
 import shutil
 import socket
@@ -14,10 +13,11 @@ import sys
 import time
 from typing import Sequence
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 import webbrowser
 
-from photomatagent.config import DotEnvConfig, normalize_provider
+from photomatagent.config import normalize_provider
+from photomatagent.model_settings import values as model_values
 
 LOCAL_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -89,38 +89,24 @@ def preflight(
     config_path = root / ".env"
     if config_path.exists() and not config_path.is_file():
         raise PreflightError("工作区的 .env 路径不是普通文件；请检查配置路径。")
-    values = DotEnvConfig(root).values(environ=dict(os.environ))
+    values = model_values(root)
     if demo:
         provider, model = "fake", "fake"
     else:
         provider_value = values.get("PHOTOMATAGENT_PROVIDER", "").strip()
         if not provider_value:
-            raise PreflightError(
-                "尚未配置模型。请在现有 .env 或进程环境中设置 "
-                "PHOTOMATAGENT_PROVIDER=openai/anthropic、对应的模型变量 "
-                "OPENAI_MODEL/ANTHROPIC_MODEL 及 OPENAI_API_KEY/ANTHROPIC_API_KEY；"
-                "启动器不会创建或修改 .env。"
-            )
-        try:
-            provider = normalize_provider(provider_value)
-        except ValueError as error:
-            raise PreflightError(
-                "PHOTOMATAGENT_PROVIDER 只能设置为 openai 或 anthropic。"
-            ) from error
-        if provider == "fake":
-            raise PreflightError(
-                "Fake provider 只能通过显式的 --demo 启动；演示模式不代表科研验证。"
-            )
-        model_field, key_field = _MODEL_FIELDS[provider]
-        model = values.get(model_field, "").strip()
-        if not model:
-            raise PreflightError(
-                f"已选择 {provider}，但未设置 {model_field}。请在现有 .env 或进程环境中补齐。"
-            )
-        if not values.get(key_field, "").strip():
-            raise PreflightError(
-                f"已选择 {provider}，但未设置 {key_field}。请在现有 .env 或进程环境中补齐。"
-            )
+            provider, model = "unconfigured", ""
+        else:
+            try:
+                provider = normalize_provider(provider_value)
+            except ValueError as error:
+                raise PreflightError("PHOTOMATAGENT_PROVIDER 只能设置为 openai 或 anthropic。") from error
+            if provider == "fake":
+                raise PreflightError("Fake provider 只能通过显式的 --demo 启动；演示模式不代表科研验证。")
+            model_field, key_field = _MODEL_FIELDS[provider]
+            model = values.get(model_field, "").strip()
+            if not model or not values.get(key_field, "").strip():
+                provider, model = "unconfigured", ""
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -132,19 +118,6 @@ def preflight(
         ) from error
 
     return StartupConfig(root, port, provider, model, ui, demo)
-
-
-def _load_runtime_environment(startup: StartupConfig) -> None:
-    """Load just the selected provider settings into process memory."""
-    if startup.demo:
-        return
-    values = DotEnvConfig(startup.workspace).values(environ=dict(os.environ))
-    os.environ["PHOTOMATAGENT_PROVIDER"] = startup.provider
-    model_field, key_field = _MODEL_FIELDS[startup.provider]
-    os.environ[model_field] = values[model_field]
-    os.environ[key_field] = values[key_field]
-    if startup.provider == "openai" and values.get("OPENAI_BASE_URL"):
-        os.environ["OPENAI_BASE_URL"] = values["OPENAI_BASE_URL"]
 
 
 def _create_app(startup: StartupConfig):
@@ -210,7 +183,9 @@ async def _serve(startup: StartupConfig, *, no_browser: bool) -> None:
 
 
 def _probe_ready(address: str) -> None:
-    with urlopen(address, timeout=1) as response:
+    # This loopback check must bypass proxies without changing model/API traffic.
+    opener = build_opener(ProxyHandler({}))
+    with opener.open(address, timeout=1) as response:
         if response.status != 200:
             raise URLError(f"unexpected status: {response.status}")
 
@@ -244,12 +219,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("启动检查通过：Python 3.12、Web 依赖、构建界面和本地端口。")
     if startup.demo:
         print("演示模式：Fake 模型（仅工程演示，不代表科研验证）。")
+    elif startup.provider == "unconfigured":
+        print("模型尚未配置：打开工作台后点击“模型配置”，保存后即可运行任务。")
     else:
         print(f"模型配置已就绪：{startup.provider}（具体配置值不会显示）。")
     if args.check:
         return 0
 
-    _load_runtime_environment(startup)
     try:
         asyncio.run(_serve(startup, no_browser=args.no_browser))
     except KeyboardInterrupt:

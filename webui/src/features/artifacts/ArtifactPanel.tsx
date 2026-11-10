@@ -115,6 +115,7 @@ export function ArtifactPanel({ report, artifacts, taskId, runId, status, error 
                 <span className="file-copy">
                   <strong>{artifact.filename}</strong>
                   <span>{formatBytes(artifact.size_bytes)} · {artifact.media_type}</span>
+                  {Boolean(artifact.result_invalidation_ids?.length) && <span>历史产物 · 待重新验证</span>}
                 </span>
                 <a
                   className="icon-link"

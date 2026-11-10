@@ -241,7 +241,7 @@ export function ProcedurePanel({ taskId, artifacts, runs = [], disabled = false,
 }
 
 function procedureStatus(status: Procedure["status"]): string {
-  return ({ CANDIDATE: "候选 · 待审阅", APPROVED_PROCEDURE: "已批准 · 可检索", DISABLED: "已停用" })[status];
+  return ({ CANDIDATE: "候选 · 待审阅", APPROVED_PROCEDURE: "已批准 · 可检索", VALIDATED_PROCEDURE: "独立验证 · 自动启用", DISABLED: "已停用" })[status];
 }
 
 function messageOf(reason: unknown): string {

@@ -1,8 +1,8 @@
 """Transport capability pack backed by AMSET (namespace ``transport``).
 
-V1 exposes capabilities metadata and an analysis wrapper. Without first-
-principles input data (or the AMSET dependency) the tools return
-prerequisites; expensive DFT is never auto-launched.
+Exposes capabilities metadata and a prerequisite-only analysis wrapper.
+The AMSET solver integration is not implemented; importing AMSET does not
+make this wrapper executable. Expensive DFT is never auto-launched.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from photomatagent.workspace import Workspace
 
 class TransportProbe(CapabilityPack):
     name = "transport"
-    description = "Carrier transport (mobility, conductivity, Seebeck) via AMSET."
+    description = "AMSET transport prerequisites; full analysis is not implemented."
 
     def probe(self) -> ProbeResult:
         try:
@@ -40,6 +40,7 @@ class TransportProbe(CapabilityPack):
             )
         return ProbeResult(
             status=CapabilityStatus.AVAILABLE,
+            detail="AMSET dependency importable; transport.analyze is prerequisite-only.",
             version=importlib.metadata.version("amset"),
         )
 
@@ -56,9 +57,8 @@ class TransportProbe(CapabilityPack):
 class TransportCapabilitiesTool(Tool):
     name = "transport.capabilities"
     description = (
-        "Describe what the transport capability can compute (carrier mobility, "
-        "conductivity, Seebeck coefficient vs temperature/doping) and its "
-        "first-principles prerequisites."
+        "Describe the current prerequisite-only AMSET wrapper, upstream transport "
+        "quantities and first-principles inputs. The full solver is not implemented."
     )
     short_description = "Transport analysis capabilities and prerequisites."
     exposure = ToolExposure.DEFERRED
@@ -70,6 +70,11 @@ class TransportCapabilitiesTool(Tool):
     async def execute(self, arguments: dict[str, Any]) -> ScientificToolResult:
         payload = {
             "capabilities": [
+                "describe AMSET inputs and prerequisites",
+                "check AMSET dependency and vasprun.xml presence",
+            ],
+            "implementation_status": {"transport.analyze": "PREREQUISITE_ONLY"},
+            "upstream_capabilities": [
                 "carrier mobility vs temperature and doping",
                 "electrical conductivity and Seebeck coefficient",
                 "scattering analysis (electron-phonon, ionized impurity)",
@@ -81,7 +86,11 @@ class TransportCapabilitiesTool(Tool):
                 "DFT dielectric constant and elastic constants",
                 "doping grid / temperature range settings",
             ],
-            "note": "AMSET runs on existing DFT results; it never launches DFT.",
+            "note": (
+                "The current wrapper does not run AMSET or produce transport values. "
+                "Installing AMSET or providing a vasprun.xml does not complete the "
+                "missing solver integration. No DFT is launched."
+            ),
         }
         return ScientificToolResult(
             output=json.dumps(payload, ensure_ascii=False),
@@ -92,11 +101,11 @@ class TransportCapabilitiesTool(Tool):
 class TransportAnalyzeTool(Tool):
     name = "transport.analyze"
     description = (
-        "Run AMSET transport analysis on an existing DFT vasprun.xml; returns "
-        "mobility/conductivity/Seebeck summaries. Reports prerequisites when "
-        "data or the dependency is missing."
+        "Check AMSET dependency and vasprun.xml prerequisites only. The full solver "
+        "is not implemented; this tool does not return mobility, conductivity or "
+        "Seebeck values. Use transport.capabilities for implementation limits."
     )
-    short_description = "Run AMSET transport analysis on a vasprun.xml."
+    short_description = "Check AMSET prerequisites; transport solver not implemented."
     exposure = ToolExposure.DEFERRED
     namespace = "transport"
     source = "amset"
@@ -143,13 +152,14 @@ class TransportAnalyzeTool(Tool):
             )
         return ScientificToolResult(
             output=(
-                "missing prerequisite: AMSET needs deformation-potential and "
-                "dielectric/elastic DFT data in addition to this vasprun.xml. "
-                "See transport.capabilities for the full input list; no mobility "
-                "is reported without them."
+                "transport.analyze is prerequisite-only: full AMSET solver integration "
+                "is not implemented. AMSET also needs deformation-potential and "
+                "dielectric/elastic inputs, which this schema cannot consume. Use a "
+                "supported separately executable method or report the implementation "
+                "gap; adding dependencies or retrying this wrapper cannot produce mobility."
             ),
             is_error=True,
-            data={"error": "MISSING_PREREQUISITE"},
+            data={"error": "NOT_IMPLEMENTED", "implementation_status": "PREREQUISITE_ONLY"},
         )
 
 

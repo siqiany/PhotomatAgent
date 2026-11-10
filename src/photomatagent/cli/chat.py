@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import signal
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Any
+from collections.abc import Coroutine
 
 from prompt_toolkit.shortcuts import PromptSession
 from rich.console import Console
@@ -87,14 +90,21 @@ async def run_goal(
     goal: str,
     *,
     session_dir: Path | str | None = None,
+    intent: Literal["auto", "supplement", "replace"] = "auto",
+    image_paths: tuple[str, ...] = (),
 ) -> None:
     renderer = ChatRenderer(
         console, pause_summary_provider=runtime.pause_summary
     )
     try:
-        async for event in runtime.run(goal):
+        events = runtime.run(goal, intent=intent, image_paths=image_paths) if image_paths else runtime.run(goal, intent=intent)
+        async for event in events:
             renderer.handle(event)
-    except Exception:
+    except asyncio.CancelledError:
+        console.print("[yellow]本轮已中止，已有历史会保存。输入纠偏意见继续；/goal 明确更换目标。[/]")
+    except Exception as exc:
+        if image_paths:
+            console.print(f"图像输入失败（{getattr(exc, 'code', type(exc).__name__)}）", markup=False)
         # Runtime has already emitted ProviderFailed/LoopFailed. The CLI keeps
         # the session alive and does not expose an SDK traceback by default.
         pass
@@ -121,6 +131,7 @@ async def run_interactive_chat(
     session: PromptSession,
     *,
     logger: EventLogger | None = None,
+    resume_task: str | None = None,
 ) -> None:
     from photomatagent.cli.commands import ChatCommandRouter
 
@@ -134,26 +145,62 @@ async def run_interactive_chat(
     )
     console.print(
         "[dim]Type your research goal or [/][bold]/help[/][dim] for commands; "
-        "[/][bold]/exit[/][dim] quits.[/]"
+        "[/][bold]/exit[/][dim] quits. /research 自动研究与专家返修；/make skill 提炼历史经验。\n"
+        "普通后续输入补充原目标；/goal 更换目标。运行中 Ctrl+C 中止当前轮并返回输入。[/]"
     )
-    while True:
-        try:
-            goal = await session.prompt_async("❯ ")
-        except (EOFError, KeyboardInterrupt):
-            break
-        normalized = goal.strip().lower()
-        if normalized in {"/exit", "/quit", "exit", "quit"}:
-            break
-        if goal.strip().startswith("/"):
-            await commands.execute(goal.strip())
-            continue
-        if goal.strip():
-            await run_goal(
-                console,
-                runtime,
-                goal,
-                session_dir=logger.session_dir if logger is not None else None,
-            )
+    try:
+        if resume_task is not None:
+            await commands.execute(f"/research --task {resume_task}")
+        while True:
+            try:
+                prompt = ("专家评审 ❯ " if commands.research_mode.task_id else "研究问题 ❯ ") if commands.research_mode is not None else "❯ "
+                goal = await session.prompt_async(prompt)
+            except (EOFError, KeyboardInterrupt):
+                break
+            normalized = goal.strip().lower()
+            if normalized in {"/exit", "/quit", "exit", "quit"}:
+                break
+            try:
+                if goal.strip().startswith("/goal "):
+                    if commands.research_mode is not None:
+                        console.print("科研任务原目标保持冻结；请 /back 后使用 /goal 开始新目标。")
+                        continue
+                    text = goal.strip()[6:].strip()
+                    intent: Literal["auto", "supplement", "replace"] = "replace"
+                elif goal.strip().startswith("/"):
+                    await _interruptible(commands.execute(goal.strip()))
+                    continue
+                else:
+                    text = goal.strip()
+                    intent = "supplement"
+                if not text:
+                    continue
+                if commands.research_mode is not None:
+                    await _interruptible(commands.research_mode.submit(text))
+                else:
+                    await _interruptible(run_goal(console, runtime, text, intent=intent,
+                        session_dir=logger.session_dir if logger is not None else None))
+            except asyncio.CancelledError:
+                if commands.research_mode is not None:
+                    await commands.research_mode.stop()
+                else:
+                    console.print("已中止当前操作，可继续输入。")
+            except Exception as exc:
+                console.print(f"操作未完成：{exc}", markup=False)
+    finally:
+        from photomatagent.application.runtime_factory import RuntimeResources
+        await RuntimeResources((runtime.model_provider,)).aclose()
+
+
+async def _interruptible(operation: Coroutine[Any, Any, Any]) -> Any:
+    """SIGINT cancels only the foreground operation, keeping chat alive."""
+    task = asyncio.create_task(operation)
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, lambda *_: task.cancel())
+        return await task
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def _load_resume_snapshot(
@@ -216,10 +263,16 @@ async def run_chat(
     )
     prompt_session = make_prompt_session() if goal is None or approval == "ask" else None
     resume_session_dir: Path | None = None
+    resume_task: str | None = None
     if resume is not None:
-        resume_session_dir, snapshot = _load_resume_snapshot(
-            resume, console, sessions_dir=configured_sessions_dir
-        )
+        from photomatagent.observability.trace import resolve_session_path
+        from photomatagent.sessions.binding import managed_task
+        candidate = resolve_session_path(resume, configured_sessions_dir)
+        resume_task = managed_task(candidate)
+        if resume_task is None:
+            resume_session_dir, snapshot = _load_resume_snapshot(
+                resume, console, sessions_dir=configured_sessions_dir
+            )
     sessions_base = resume_session_dir.parent if resume_session_dir is not None else None
     resumed_session_id = resume_session_dir.name if resume_session_dir is not None else None
     runtime, logger = build_runtime(
@@ -236,20 +289,27 @@ async def run_chat(
         context_limit_tokens=context_limit_tokens,
         compact_trigger_tokens=compact_trigger_tokens,
     )
-    if resume is not None:
+    if resume_session_dir is not None:
         assert resume_session_dir is not None
         runtime.restore_session(snapshot)
-    if goal is not None:
-        await run_goal(
-            console, runtime, goal, session_dir=logger.session_dir if logger else None
-        )
-    else:
-        assert prompt_session is not None
-        await run_interactive_chat(
-            console,
-            runtime,
-            prompt_session,
-            logger=logger,
-        )
-    if logger is not None:
-        console.print(f"[dim]events logged: {logger.events_path}[/]")
+    try:
+        if goal is not None:
+            if resume_task is not None:
+                from photomatagent.cli.research_mode import ResearchMode
+                mode = ResearchMode(console, prompt_session or make_prompt_session())
+                await mode.select(["--task", resume_task])
+                await mode.submit(goal)
+            else:
+                await run_goal(
+                    console, runtime, goal, session_dir=logger.session_dir if logger else None
+                )
+        else:
+            assert prompt_session is not None
+            await run_interactive_chat(
+                console, runtime, prompt_session, logger=logger, resume_task=resume_task,
+            )
+        if logger is not None:
+            console.print(f"[dim]events logged: {logger.events_path}[/]")
+    finally:
+        from photomatagent.application.runtime_factory import RuntimeResources
+        await RuntimeResources((runtime.model_provider, logger)).aclose()

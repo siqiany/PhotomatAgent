@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from datetime import UTC, datetime
@@ -88,6 +89,35 @@ class TargetConstraintDraft(ConstraintSpec):
         if self.basis != "EXPLICIT_GOAL" and not self.requires_confirmation:
             raise ValueError("inferred or proposed constraints require confirmation")
         return self
+
+
+def _eqe_bounds_conflict(constraints: tuple[TargetConstraintDraft, ...]) -> bool:
+    lower = (0.0, False)
+    upper = (1.0, True)
+    for item in constraints:
+        if item.severity != "HARD" or item.property.casefold() not in {
+            "eqe", "external_quantum_efficiency",
+        }:
+            continue
+        unit = item.unit.casefold()
+        if unit not in {"%", "percent", "fraction", "1"}:
+            continue
+        scale = 100.0 if unit in {"%", "percent"} else 1.0
+        if item.operator == "between":
+            bounds = item.value
+            if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+                continue
+        else:
+            bounds = (item.value, item.value)
+        if not all(type(value) in (int, float) and math.isfinite(value) for value in bounds):
+            continue
+        if item.operator in {"gt", "ge", "eq", "between"}:
+            lower = max(lower, (bounds[0] / scale, item.operator == "gt"))
+        if item.operator in {"lt", "le", "eq", "between"}:
+            upper = min(upper, (bounds[1] / scale, item.operator != "lt"))
+    return lower[0] > upper[0] or (
+        lower[0] == upper[0] and (lower[1] or not upper[1])
+    )
 
 
 class TargetSpecDraft(BaseModel):
@@ -217,6 +247,8 @@ class TargetSpecCompiler:
             raise ValueError(
                 f"automatic TargetSpec output did not match the required schema ({type(exc).__name__})"
             ) from exc
+        if _eqe_bounds_conflict(draft.constraints):
+            raise ValueError("EQE_CONSTRAINTS_CONFLICT")
         # The user-selected mode and hard discovery constraints are runtime
         # authority. Never accept a model rewrite of either field.
         draft = draft.model_copy(

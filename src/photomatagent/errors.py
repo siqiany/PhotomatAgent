@@ -8,8 +8,9 @@ class PhotomatAgentError(Exception):
 
 
 class ProviderError(PhotomatAgentError):
-    def __init__(self, provider: str, message: str) -> None:
+    def __init__(self, provider: str, message: str, *, code: str = "PROVIDER_ERROR") -> None:
         self.provider = provider
+        self.code = code
         super().__init__(f"{provider}: {message}")
 
 

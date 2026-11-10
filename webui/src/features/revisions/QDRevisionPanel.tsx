@@ -11,7 +11,7 @@ interface Props {
   onRun: (qd: RevisionQDRequest) => void;
 }
 
-type CheckerId = "" | "json_numeric_sum" | "json_numeric_bounds";
+type CheckerId = "" | "json_numeric_sum" | "json_numeric_bounds" | "mwir_noise_budget";
 
 export function QDRevisionPanel({ taskId, disabled, busy, events, runId, onRun }: Props) {
   const [sources, setSources] = useState<SkillExecutionSource[]>([]);
@@ -60,8 +60,14 @@ export function QDRevisionPanel({ taskId, disabled, busy, events, runId, onRun }
     setFormError(null);
     try {
       if (!source || !checkerId) throw new Error("选择真实脚本执行来源和独立数值检查器后，才能启用 QD。");
-      if (!outputPath || !field.trim()) throw new Error("请选择来源产物并填写 JSON 数值字段。");
-      if (!units.trim()) throw new Error("请明确填写检查结果的单位。");
+      if (checkerId === "mwir_noise_budget") {
+        if (!source.input_keys.includes("data") || !source.artifacts.includes("result.json")) {
+          throw new Error("中红外噪声核验需要来源输入 data 和产物 result.json。");
+        }
+      } else {
+        if (!outputPath || !field.trim()) throw new Error("请选择来源产物并填写 JSON 数值字段。");
+        if (!units.trim()) throw new Error("请明确填写检查结果的单位。");
+      }
       if (alternatives.split(/\r?\n/).filter((line) => line.trim()).length === 0) throw new Error("至少填写一个备选参数组合；来源原始参数会自动作为基线。");
       if (choices.length > 32 || choices.some((choice) => choice.length === 0 || choice.length > 32
         || choice.some((token) => token.length > 200 || !/^[A-Za-z0-9_.:=+-]+$/.test(token)))) {
@@ -72,19 +78,16 @@ export function QDRevisionPanel({ taskId, disabled, busy, events, runId, onRun }
       const parsedSeed = Number(seed);
       if (!Number.isInteger(parsedMaxTrials) || parsedMaxTrials < 1 || parsedMaxTrials > 32) throw new Error("最大试验数需为 1–32 的整数。");
       if (!Number.isSafeInteger(parsedSeed) || parsedSeed < 0 || parsedSeed > 2147483647) throw new Error("随机种子需为 0–2147483647 的整数。");
-      const checker: RevisionQDChecker = {
-        checker_id: checkerId,
-        output_path: outputPath,
-        field: field.trim(),
-        units: units.trim(),
-      };
+      const checker: RevisionQDChecker = checkerId === "mwir_noise_budget"
+        ? { checker_id: checkerId, input_key: "data", output_path: "result.json", field: "detectivity_jones", units: "Jones" }
+        : { checker_id: checkerId, output_path: outputPath, field: field.trim(), units: units.trim() };
       if (checkerId === "json_numeric_sum") {
         if (!inputKey) throw new Error("求和检查器需要选择一个输入项。");
         const parsedTolerance = Number(tolerance);
         if (!Number.isFinite(parsedTolerance) || parsedTolerance < 0 || parsedTolerance > 0.001) throw new Error("容差需为 0 到 0.001 之间的有限数值。");
         checker.input_key = inputKey;
         checker.tolerance = parsedTolerance;
-      } else {
+      } else if (checkerId === "json_numeric_bounds") {
         const low = minimum.trim() ? Number(minimum) : undefined;
         const high = maximum.trim() ? Number(maximum) : undefined;
         if (low === undefined && high === undefined) throw new Error("范围检查至少需要设置一个边界。");
@@ -111,13 +114,13 @@ export function QDRevisionPanel({ taskId, disabled, busy, events, runId, onRun }
       {sources.map((item) => <option key={item.execution_id} value={item.execution_id}>{(item.run_id ?? item.trial_id ?? item.execution_id).slice(-8)} · {item.script_path.split("/").at(-1)} · 基线参数 {(item.argv ?? []).join(" ") || "(空)"}</option>)}
           </select></label>
           <label>独立检查器<select aria-label="独立检查器" value={checkerId} onChange={(event) => setCheckerId(event.target.value as CheckerId)} disabled={disabled || busy}>
-            <option value="">选择检查器</option><option value="json_numeric_bounds">JSON 数值范围</option><option value="json_numeric_sum">JSON 数值求和</option>
+            <option value="">选择检查器</option><option value="json_numeric_bounds">JSON 数值范围</option><option value="json_numeric_sum">JSON 数值求和</option><option value="mwir_noise_budget">中红外噪声预算核验</option>
           </select></label>
           <label>搜索方式<select aria-label="搜索方式" value={searchMode} onChange={(event) => setSearchMode(event.target.value as "directed" | "random")} disabled={disabled || busy}>
             <option value="directed">反馈定向变异（模型在白名单内提案）</option>
             <option value="random">随机候选（固定种子、白名单内抽样）</option>
           </select></label>
-          {checkerId ? <>
+          {checkerId === "mwir_noise_budget" ? <p className="revision-muted">固定核验合同：输入 data，产物 result.json，独立复算面积换算、NEP 和探测率。仅比较软件输出精度，不验证材料性能。</p> : checkerId ? <>
             <label>检查产物<select value={outputPath} onChange={(event) => setOutputPath(event.target.value)} disabled={disabled || busy}><option value="">选择来源中声明的产物</option>{outputOptions.map((path) => <option key={path} value={path}>{path}</option>)}</select></label>
             <label>JSON 数值字段<input value={field} onChange={(event) => setField(event.target.value)} disabled={disabled || busy} placeholder="例如 result.value" /></label>
             <label>单位<input value={units} onChange={(event) => setUnits(event.target.value)} disabled={disabled || busy} placeholder="例如 eV 或 count" /></label>

@@ -57,7 +57,7 @@ async function render(taskId: string, artifacts: Artifact[] = [], onRunQueued = 
   await act(async () => {
     root.render(<SkillPanel taskId={taskId} artifacts={artifacts} disabled={disabled} onRunQueued={onRunQueued} />);
   });
-  return { host, onRunQueued };
+  return { host, root, onRunQueued };
 }
 
 async function click(element: Element | null) {
@@ -74,6 +74,26 @@ async function change(element: HTMLInputElement | HTMLSelectElement | null, valu
 }
 
 describe("SkillPanel", () => {
+  it("keeps a fresh source when an older invalidation response arrives last", async () => {
+    vi.spyOn(api, "skills").mockResolvedValue({ items: [] });
+    let finishOldRequest!: (result: Awaited<ReturnType<typeof api.skillSources>>) => void;
+    const oldRequest = new Promise<Awaited<ReturnType<typeof api.skillSources>>>((resolve) => {
+      finishOldRequest = resolve;
+    });
+    vi.spyOn(api, "skillSources")
+      .mockReturnValueOnce(oldRequest)
+      .mockResolvedValue({ items: [source()], invalidated_by_task: { [taskA]: 1 } });
+    const { host, root } = await render(taskA);
+
+    await act(async () => {
+      root.render(<SkillPanel taskId={taskA} artifacts={[]} refreshKey="new-run-succeeded" />);
+    });
+    expect(host.querySelector<HTMLSelectElement>("[aria-label='来源执行']")?.value).toBe(executionId);
+
+    await act(async () => { finishOldRequest({ items: [], invalidated_by_task: { [taskA]: 1 } }); });
+    expect(host.querySelector<HTMLSelectElement>("[aria-label='来源执行']")?.value).toBe(executionId);
+  });
+
   it("keeps missing source evidence UNKNOWN and prevents replay", async () => {
     vi.spyOn(api, "skills").mockResolvedValue({ items: [skill({ source_evidence: { status: "UNKNOWN", gap: "CHECKER_NOT_SELECTED" } })] });
     vi.spyOn(api, "skillSources").mockResolvedValue({ items: [] });
@@ -133,6 +153,41 @@ describe("SkillPanel", () => {
     expect(host.textContent).toContain("范围检查不验证科学假设");
   });
 
+  it("freezes the fixed MWIR noise-budget checker contract", async () => {
+    vi.spyOn(api, "skills").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "skillSources").mockResolvedValue({ items: [source(taskB)] });
+    const create = vi.spyOn(api, "createSkill").mockResolvedValue(skill());
+    const { host } = await render(taskB);
+
+    await click(host.querySelector(".skill-create-details summary"));
+    await change(host.querySelector<HTMLSelectElement>("[aria-label='独立规则检查']"), "mwir_noise_budget");
+    await change(host.querySelector<HTMLInputElement>("[aria-label='技能名称']"), "mwir-noise-method");
+    await change(host.querySelector<HTMLInputElement>("[aria-label='方法说明']"), "计算中红外噪声预算指标");
+    await change(host.querySelector<HTMLInputElement>("[aria-label='适用范围']"), "中红外探测器噪声预算");
+    const form = host.querySelector(".skill-create-form");
+    if (!form) throw new Error("Candidate form was not rendered.");
+    await act(async () => { form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      checker: { checker_id: "mwir_noise_budget", input_key: "data", output_path: "result.json", field: "detectivity_jones" },
+    }));
+    expect(host.textContent).toContain("科研结论保持 UNKNOWN");
+  });
+
+  it("requires the fixed MWIR input and output to exist in source provenance", async () => {
+    vi.spyOn(api, "skills").mockResolvedValue({ items: [] });
+    vi.spyOn(api, "skillSources").mockResolvedValue({ items: [{ ...source(taskB), input_keys: ["other"], artifacts: ["summary.json"] }] });
+    const create = vi.spyOn(api, "createSkill");
+    const { host } = await render(taskB);
+
+    await click(host.querySelector(".skill-create-details summary"));
+    await change(host.querySelector<HTMLSelectElement>("[aria-label='独立规则检查']"), "mwir_noise_budget");
+
+    expect(host.textContent).toContain("当前来源必须实际执行并记录 data 输入和 result.json 产物");
+    expect(host.querySelector<HTMLButtonElement>("button[type='submit']")?.disabled).toBe(true);
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("refreshes persisted skill-use status while the associated run is active", async () => {
     vi.useFakeTimers();
     const candidate = skill();
@@ -151,4 +206,34 @@ describe("SkillPanel", () => {
     await click(host.querySelector("[aria-expanded='false']"));
     expect(host.textContent).toContain("user_output/task_b/result.json");
   });
+});
+
+it.each(["rc_network", "report_tables"] as const)("captures %s with fixed input binding and parent version", async (checker) => {
+  const parent = skill({ logical_name: "rc-network", version: `skill_${"b".repeat(32)}` });
+  vi.spyOn(api, "skills").mockResolvedValue({ items: [parent] });
+  vi.spyOn(api, "skillSources").mockResolvedValue({ items: [{ ...source(taskB), input_keys: ["data", "report"] }] });
+  const create = vi.spyOn(api, "createSkill").mockResolvedValue(skill());
+  const { host } = await render(taskB);
+  await click(host.querySelector(".skill-create-details summary"));
+  await change(host.querySelector<HTMLSelectElement>("[aria-label='父版本']"), parent.skill_id);
+  await change(host.querySelector<HTMLSelectElement>("[aria-label='独立规则检查']"), checker);
+  await change(host.querySelector<HTMLInputElement>("[aria-label='方法说明']"), "独立验算");
+  await change(host.querySelector<HTMLInputElement>("[aria-label='适用范围']"), "新案例");
+  await act(async () => { host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+  expect(create).toHaveBeenCalledWith(expect.objectContaining({
+    name: "rc-network", parent_skill_id: parent.skill_id,
+    checker: { checker_id: checker, input_key: "data", output_path: "result.json", field: checker === "rc_network" ? "samples" : "mismatches" },
+  }));
+});
+
+it("restores a disabled fixed version through the shared API", async () => {
+  const item = skill({ status: "DISABLED", version: `skill_${"b".repeat(32)}` });
+  vi.spyOn(api, "skills").mockResolvedValue({ items: [item] });
+  vi.spyOn(api, "skillSources").mockResolvedValue({ items: [] });
+  const enable = vi.spyOn(api, "enableSkill").mockResolvedValue({ skill_id: item.skill_id, status: "TRIALABLE" });
+  const { host } = await render(taskB);
+  await click(host.querySelector("[aria-expanded='false']"));
+  await click([...host.querySelectorAll("button")].find((button) => button.textContent?.includes("恢复此版本")) ?? null);
+  expect(enable).toHaveBeenCalledWith(item.skill_id);
+  expect(host.textContent).toContain("已恢复此固定版本");
 });

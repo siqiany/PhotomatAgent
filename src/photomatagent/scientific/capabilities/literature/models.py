@@ -153,6 +153,16 @@ class DocumentManifest:
         }
 
 
+STRUCTURED_INDEX_PREFIX = PurePosixPath(".photomatagent/literature/structured-index")
+
+
+class StructuredPassageReference(BaseModel, frozen=True):
+    document_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    object_id: str = Field(min_length=1, max_length=200)
+    text_offset: int = Field(ge=0)
+
+
 @dataclass(frozen=True)
 class PassagePoint:
     """A dense-vector passage plus its provenance payload."""
@@ -190,6 +200,8 @@ class PassagePoint:
     pmcid: str = ""
     journal: str = ""
     relevance_tier: str = ""
+
+    structured_ref: StructuredPassageReference | None = None
 
     def __post_init__(self) -> None:
         validate_relative_source_path(self.relative_source_path)
@@ -244,6 +256,7 @@ class PassagePoint:
             "pmcid": self.pmcid,
             "journal": self.journal,
             "relevance_tier": self.relevance_tier,
+            **({"structured_ref": self.structured_ref.model_dump(mode="json")} if self.structured_ref else {}),
         }
 
 
@@ -272,11 +285,15 @@ class PassageRecord(BaseModel):
     year: int | None = None
     section: str = ""
     page: int | None = None
+    page_start: int | None = None
+    page_end: int | None = None
     chunk_id: str = ""
     text: str = ""
     heading_path: str = ""
     previous_chunk_id: str = ""
     next_chunk_id: str = ""
+
+    structured_ref: StructuredPassageReference | None = None
 
     def to_retrieval_row(self) -> dict[str, Any]:
         """Flat compatibility mapping for passage conversion."""

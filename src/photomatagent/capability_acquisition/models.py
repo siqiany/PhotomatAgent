@@ -5,16 +5,45 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Literal
+from pathlib import PurePosixPath
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, field_validator, model_serializer, model_validator
+from photomatagent.scientific.applicability import Regime
 
 MAX_SCRIPT_ARGV_TOKENS = 32
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+NeedInput = Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class MethodNeed(StrictModel):
+    schema_version: Literal[1] = 1
+    query: str = Field(min_length=1, max_length=500)
+    known_inputs: tuple[NeedInput, ...] = Field(default=(), max_length=20)
+    exclusions: tuple[NeedInput, ...] = Field(default=(), max_length=20)
+    unavailable_inputs: tuple[NeedInput, ...] = Field(default=(), max_length=20)
+    fixed_unavailable_inputs: tuple[NeedInput, ...] = Field(default=(), max_length=20)
+    allowed_licenses: tuple[NeedInput, ...] = Field(default=(), max_length=20)
+    required_platform: NeedInput | None = None
+    regimes: tuple[Regime, ...] = Field(default=(), max_length=9)
+    operation: NeedInput | None = None
+    scale: NeedInput | None = None
+    desired_outputs: tuple[NeedInput, ...] = Field(default=(), max_length=12)
+    conditions: tuple[NeedInput, ...] = Field(default=(), max_length=12)
+
+    @model_serializer(mode="wrap")
+    def serialize_need(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload: dict[str, Any] = handler(self)
+        for key in ("operation", "scale", "desired_outputs", "conditions", "fixed_unavailable_inputs"):
+            if not payload.get(key):
+                payload.pop(key, None)
+        return payload
 
 
 class PackageCandidate(StrictModel):
@@ -120,6 +149,30 @@ class EnvironmentRecord(StrictModel):
     reason_code: str | None = Field(default=None, max_length=100)
 
 
+def validate_source_tree_path(value: str) -> str:
+    path = PurePosixPath(value)
+    if (not 0 < len(value) <= 250 or not path.parts or path.is_absolute() or path.as_posix() != value
+            or any(part.startswith(".") for part in path.parts)
+            or any(ord(ch) < 32 or ch in "\\:" for ch in value)):
+        raise ValueError("SOURCE_TREE_PATH_INVALID")
+    return value
+
+
+class SourceTreeLayout(StrictModel):
+    entry: str
+    inputs: dict[str, str] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> SourceTreeLayout:
+        paths = [validate_source_tree_path(path) for path in (self.entry, *self.inputs.values())]
+        if not self.entry.endswith(".py") or len({path.casefold() for path in paths}) != len(paths):
+            raise ValueError("SOURCE_TREE_PATH_INVALID")
+        for path in paths:
+            if any(other.casefold().startswith(path.casefold() + "/") for other in paths):
+                raise ValueError("SOURCE_TREE_PATH_INVALID")
+        return self
+
+
 class ExecutionRequest(StrictModel):
     """Server-bound execution contract; created by SandboxService, not model input."""
 
@@ -136,6 +189,30 @@ class ExecutionRequest(StrictModel):
     output_limit_bytes: int = Field(ge=1024, le=1_048_576)
     artifact_limit_bytes: int = Field(default=67_108_864, ge=1024, le=1_073_741_824)
     workspace_root: str
+
+    source_tree: SourceTreeLayout | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_request(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        payload: dict[str, object] = handler(self)
+        if self.source_tree is None:
+            payload.pop("source_tree", None)
+        return payload
+
+    @model_validator(mode="after")
+    def validate_source_inputs(self) -> ExecutionRequest:
+        if self.source_tree is not None and (
+            not set(self.source_tree.inputs) <= set(self.input_refs)
+            or set(self.input_sha256) != set(self.input_refs)
+            or any(not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", key) for key in self.input_refs)
+        ):
+            raise ValueError("SOURCE_TREE_BINDING_INVALID")
+        return self
+
+    @property
+    def replay_input_keys(self) -> tuple[str, ...]:
+        source_keys = self.source_tree.inputs if self.source_tree else ()
+        return tuple(key for key in self.input_refs if key not in source_keys)
 
     @field_validator("argv")
     @classmethod

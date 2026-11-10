@@ -12,6 +12,7 @@ from photomatagent.tools.surface import ToolCatalog, compact_parameter_help
 
 
 class ToolSearchTool(Tool):
+    effect_class = "READ_ONLY"
     name = "tool_search"
     description = "Search deferred capabilities by keywords without loading their full schemas."
     exposure = ToolExposure.DIRECT
@@ -55,6 +56,7 @@ class ToolSearchTool(Tool):
 
 
 class ToolDescribeTool(Tool):
+    effect_class = "READ_ONLY"
     name = "tool_describe"
     description = "Load calling instructions for one deferred capability returned by tool_search."
     exposure = ToolExposure.DIRECT
@@ -119,8 +121,9 @@ class ToolCallBridge(Tool):
 
 
 class SkillViewTool(Tool):
+    effect_class = "READ_ONLY"
     name = "skill_view"
-    description = "Load one skill's SKILL.md or a named reference only when needed."
+    description = "Load static skill/procedure instructions or a safe reference. For executable, independently validated local methods, use skill_search to discover the exact ID and contract, then skill_run."
     exposure = ToolExposure.DIRECT
     namespace = "skills"
     tags = ("skill", "instructions", "reference")

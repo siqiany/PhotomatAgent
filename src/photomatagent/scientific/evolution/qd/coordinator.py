@@ -244,12 +244,15 @@ class EvolutionCoordinator:
             return ProposalBatch(proposals=(), diagnostics=(), usage=ProposalUsage(model_calls=0, model_tokens=0)), {}, (), "BUDGET_EXHAUSTED"
         all_entries = self.archive.entries()
         genomes_by_id = self.archive.genomes_by_id()
+        required = self.contract.descriptor_config.get("required_applicability")
+        required_scope = required if isinstance(required, str) and required else None
         selected_entries = select_parent_entries(
             all_entries, genomes_by_id, self.seed + batch_index, 2,
-            task_family=self.contract.task_family,
+            task_family=self.contract.task_family, applicability=required_scope,
         )
         parents = tuple(genomes_by_id[entry.genome_id] for entry in selected_entries)
-        if not parents and self.baseline.task_family == self.contract.task_family:
+        if (not parents and self.baseline.task_family == self.contract.task_family
+                and (required_scope is None or required_scope in self.baseline.applicability)):
             # A failed or UNKNOWN baseline is not an elite, but its diagnostics
             # must still be able to seed a bounded repair proposal.
             parents = (self.baseline,)

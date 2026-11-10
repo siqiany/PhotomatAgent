@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
     "pydantic>=2.7",
+    "jsonschema>=4.23,<5",
     "typer>=0.12",
     "rich>=13.7",
     "prompt-toolkit>=3.0",
@@ -106,7 +107,7 @@ packages = ["src/photomatagent"]
 addopts = "--capture=no"
 asyncio_mode = "auto"
 pythonpath = ["tests"]
-testpaths = ["tests"]
+testpaths = ["tests", "scripts/validation"]
 
 [tool.mypy]
 python_version = "3.12"

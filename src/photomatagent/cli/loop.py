@@ -122,7 +122,7 @@ def run_scientific_loop_cli(
         sinks.append(logger.log)
 
     try:
-        judge = _build_judge(judge_provider, judge_model, console)
+        judge = _build_judge(judge_provider, judge_model, console, workspace=workspace)
     except ValueError as exc:
         console.print(f"[red]{exc}[/]")
         return 1
@@ -167,20 +167,23 @@ def _build_judge(
     judge_provider: str | None,
     judge_model: str | None,
     console: Console,
+    *, workspace: Path | None = None,
 ):
     """Build the isolated advisory LLM judge when a judge provider is given."""
-    if judge_provider is None:
+    from photomatagent.model_settings import public_settings
+    configured = public_settings(workspace or Path.cwd())["judge"]
+    if judge_provider is None and not configured["provider"]:
         console.print("[dim]scientific judge: disabled (--judge-provider to enable)[/]")
         return None
     from photomatagent.models.factory import create_provider
     from photomatagent.scientific.loop.judge import ScientificJudge
 
     try:
-        model = create_provider(judge_provider, judge_model)
+        model = create_provider(judge_provider, judge_model, role="judge", workspace=workspace)
     except ValueError as exc:
         raise ValueError(f"invalid --judge-provider: {exc}") from exc
     console.print(
-        f"[dim]scientific judge: {judge_provider} / "
+        f"[dim]scientific judge: {getattr(model, 'provider', judge_provider)} / "
         f"{getattr(model, 'model', 'unknown')} (advisory, read-only)[/]"
     )
     return ScientificJudge(model=model)
@@ -238,6 +241,9 @@ def _render_summary(console: Console, summary) -> None:
         ("Score", f"{summary.best_score:.3f}"),
         ("Termination reason", summary.termination_reason or "—"),
     ]
+    if delivery_status := getattr(summary, "delivery_status", ""):
+        rows.extend((("Research delivery", delivery_status),
+                     ("Search stop", getattr(summary, "research_stop_reason", "") or "—")))
     judge = summary.judge_report
     if judge is not None:
         if judge.available:

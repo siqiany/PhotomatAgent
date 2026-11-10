@@ -38,10 +38,16 @@ export function RevisionPlan({ plan, busy, runDisabled, onRun, onClarify, onRetr
           <h3>修订计划</h3>
         </div>
         <span className={`revision-plan-state state-${plan.status.toLowerCase()}`}>
-          {plan.status === "READY" ? "待开始" : plan.status === "PREPARING" ? "正在分析" : "暂不可用"}
+          {plan.status === "READY" ? (hasRun ? (activeRun ? "返修进行中" : runStatusLabel(latestRunStatus ?? "")) : "待开始") : plan.status === "PREPARING" ? "正在分析" : "暂不可用"}
         </span>
       </div>
       <blockquote>{plan.feedback_text}</blockquote>
+      {Boolean(plan.carried_feedback_plan_ids?.length) && (
+        <div className="revision-manual-note">
+          <strong>本次一并复验的历史反馈</strong>
+          {plan.carried_feedback_plan_ids?.map((id) => <code key={id}>{id}</code>)}
+        </div>
+      )}
       {plan.error ? <p className="inline-error" role="alert">{plan.error}</p> : null}
       {plan.warnings?.map((warning, index) => <p className="revision-warning" key={`${index}:${warning}`}>{warning}</p>)}
       {planDetails.compiler_cost ? <CompilerCost cost={planDetails.compiler_cost} /> : null}

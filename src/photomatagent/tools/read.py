@@ -12,6 +12,7 @@ from photomatagent.workspace import Workspace
 
 
 class ReadTool(Tool):
+    effect_class = "READ_ONLY"
     name = "read"
     description = "Read a UTF-8 text file inside the workspace, optionally by line range."
     exposure = ToolExposure.DIRECT

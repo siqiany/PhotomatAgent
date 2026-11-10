@@ -1,19 +1,24 @@
+import { ProjectControls } from "./features/tasks/InformationPanel";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
 import { api, type HistorySession, type TaskCreate, type TaskSummary } from "./api";
 import { TaskList } from "./features/tasks/TaskList";
 import { TaskWorkspace } from "./features/tasks/TaskWorkspace";
 import "./styles.css";
+import { ModelSettingsPanel } from "./features/settings/ModelSettingsPanel";
 
 type MobilePanel = "tasks" | "workspace" | "details";
 
 export default function App() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
+  const [filters, setFilters] = useState<Record<string, string>>({});
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>("workspace");
   const [loading, setLoading] = useState(true);
   const [initialLoadAttempt, setInitialLoadAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [history, setHistory] = useState<HistorySession[]>([]);
@@ -23,14 +28,15 @@ export default function App() {
   const [creating, setCreating] = useState(false);
 
   const refreshTasks = useCallback(async () => {
-    const result = await api.tasks();
+    const result = await api.tasks(filters);
+    setNextCursor(result.next_cursor ?? null);
     setTasks(result.items);
     setSelectedTaskId((current) => {
       const saved = current ?? localStorage.getItem("photomatagent.selectedTask");
       if (saved && result.items.some((task) => task.task_id === saved)) return saved;
       return result.items[0]?.task_id ?? null;
     });
-  }, []);
+  }, [filters]);
 
   const retryTaskList = async () => {
     setError(null);
@@ -45,10 +51,11 @@ export default function App() {
     let mounted = true;
     setLoading(true);
     setError(null);
-    void api.tasks()
+    void api.tasks(filters)
       .then((result) => {
         if (!mounted) return;
         setTasks(result.items);
+        setNextCursor(result.next_cursor ?? null);
         const saved = localStorage.getItem("photomatagent.selectedTask");
         setSelectedTaskId(
           saved && result.items.some((task) => task.task_id === saved)
@@ -65,7 +72,7 @@ export default function App() {
     return () => {
       mounted = false;
     };
-  }, [initialLoadAttempt]);
+  }, [initialLoadAttempt, filters]);
 
   const selectTask = (taskId: string) => {
     setSelectedTaskId(taskId);
@@ -79,6 +86,7 @@ export default function App() {
     const body: TaskCreate = {
       title: String(data.get("title") ?? "").trim(),
       goal: String(data.get("goal") ?? "").trim(),
+      project_id: filters.project_id ?? "project_unclassified",
     };
     if (!body.title || !body.goal) return;
     setCreating(true);
@@ -131,13 +139,16 @@ export default function App() {
         <button role="tab" aria-selected={mobilePanel === "tasks"} onClick={() => setMobilePanel("tasks")}>任务</button>
         <button role="tab" aria-selected={mobilePanel === "workspace"} onClick={() => setMobilePanel("workspace")}>工作区</button>
         <button role="tab" aria-selected={mobilePanel === "details"} onClick={() => setMobilePanel("details")}>详情</button>
+        <button onClick={() => setShowSettings(true)}>模型配置</button>
       </div>
       <TaskList
+        managementControls={<><ProjectControls refreshKey={tasks} onFilter={(project, query, archived, status) => setFilters({ ...(project ? { project_id: project } : {}), q: query, archived: String(archived), ...(status ? { management_status: status } : {}) })} />{nextCursor && <button className="button button-subtle" onClick={() => void api.tasks({ ...filters, cursor: nextCursor }).then((result) => { setTasks((previous) => [...new Map([...previous, ...result.items].map((task) => [task.task_id, task])).values()]); setNextCursor(result.next_cursor ?? null); }).catch((reason) => setError(String(reason)))}>加载更多任务</button>}</>}
         tasks={tasks}
         selectedTaskId={selectedTaskId}
         onSelect={selectTask}
         onCreate={() => setShowCreate(true)}
         onImportHistory={() => void openHistory()}
+        onConfigure={() => setShowSettings(true)}
         loading={loading}
       />
 
@@ -174,6 +185,8 @@ export default function App() {
           <button onClick={() => setError(null)} aria-label="关闭错误">×</button>
         </div>
       ) : null}
+
+      {showSettings && <ModelSettingsPanel onClose={() => setShowSettings(false)} />}
 
       {showCreate ? (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {

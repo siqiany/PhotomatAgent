@@ -1,4 +1,4 @@
 interface:
   display_name: "ML Potential Screening"
-  short_description: "Screen crystal structures with CHGNet before gated DFT"
-  default_prompt: "Use $ml-potential-screening to screen a small set of crystal structures with CHGNet, preserve evidence limits, and route finalists to gated VASP validation."
+  short_description: "Screen or pre-relax structures with CHGNet when needed"
+  default_prompt: "Use $ml-potential-screening for the requested CHGNet screening or pre-relaxation, preserve evidence limits, and consider gated VASP only when new DFT evidence is needed."

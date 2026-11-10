@@ -142,14 +142,17 @@ class FakeFeedbackPlanner:
 
 class FixtureProvider(FakeModelProvider):
     async def stream(self, request):
-        user_messages = [message for message in request.messages if isinstance(message, UserMessage)]
-        latest_request = user_messages[-1].content if user_messages else ""
-        tool_results = [message for message in request.messages if isinstance(message, ToolResultMessage)]
+        user_index = next((index for index in range(len(request.messages) - 1, -1, -1)
+                           if isinstance(message := request.messages[index], UserMessage)
+                           and not message.context_only), -1)
+        latest_request = request.messages[user_index].content if user_index >= 0 else ""
+        tool_results = any(isinstance(message, ToolResultMessage) for message in request.messages[user_index + 1:])
+        current_instruction = latest_request.partition("\n\nUser's current request:\n")[2].partition("\n")[0]
         if "故意触发运行失败" in latest_request:
             raise RuntimeError("fixture revision failed")
         if "开始一轮长时间分析" in latest_request:
             await asyncio.sleep(2)
-        if "执行教学求和脚本" in latest_request and not tool_results:
+        if "执行教学求和脚本" in current_instruction and not tool_results:
             match = re.search(r"tmp/workbench/(task_[0-9a-f]{32})/", latest_request)
             if match is None:
                 raise RuntimeError("fixture task binding missing")
@@ -161,7 +164,7 @@ class FixtureProvider(FakeModelProvider):
                     "input_refs": {"data": f"tmp/workbench/{task_id}/data.json"},
                 }},
             )])])
-        elif "执行教学求和脚本" in latest_request:
+        elif "执行教学求和脚本" in current_instruction:
             self.set_responses([FakeResponse(text="工程演示：本地脚本已执行；求和仅验证程序路径，不代表材料科学结论。")])
         elif "补充两篇可核验原始研究" in latest_request:
             self.set_responses([FakeResponse(text="修订演示：新增来源仍待核对，当前不能当作已验证结论。")])
@@ -189,7 +192,7 @@ class FixtureEvaluationRunner:
 
 
 def build_app(root: Path):
-    runtime_factory_module.create_provider = lambda _provider, _model=None: FixtureProvider()
+    runtime_factory_module.create_provider = lambda _provider, _model=None, **_kwargs: FixtureProvider()
     original_build_owned = RuntimeFactory.build_owned
     plan = fixture_plan()
     backend = LocalScriptBackend()

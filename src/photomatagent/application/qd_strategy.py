@@ -21,7 +21,9 @@ from photomatagent.capability_acquisition.models import (
     ExecutionRequest,
     InstallPlan,
 )
-from photomatagent.capability_acquisition.sandbox import SandboxService, _sha256_file
+from photomatagent.capability_acquisition.sandbox import (
+    SandboxBackend, SandboxService, _sha256_file, load_persisted_install_plan,
+)
 from photomatagent.scientific.evolution.qd.config import (
     EvolutionBudget,
     MutableParameterRule,
@@ -78,12 +80,54 @@ class QDRevisionOptions(BaseModel):
                 and self.checker.minimum > self.checker.maximum
             ):
                 raise ValueError("QD_CHECKER_BOUNDS_INVALID")
+        if self.checker.checker_id == "mwir_noise_budget" and (
+            self.checker.input_key != "data"
+            or self.checker.output_path != "result.json"
+            or self.checker.field != "detectivity_jones"
+            or self.checker.units != "Jones"
+        ):
+            raise ValueError("QD_MWIR_CHECKER_CONTRACT_INVALID")
         MutableParameterRule(
             step_id="execute",
             binding_id="script_run",
             parameters={"argv": self.argv_choices},
         )
         return self
+
+
+def _source_backend(
+    workspace: Workspace, task_id: str, environment: EnvironmentRecord,
+    binding: dict[str, Any], backend_factory: Any = None,
+) -> SandboxBackend:
+    """Bind QD execution to the source environment's verified storage."""
+    from photomatagent.capability_acquisition.local_backend import LocalDevBackend
+    from photomatagent.capability_acquisition.container_backend import PodmanSandboxBackend
+
+    storage = workspace.root / ".photomatagent" / "capabilities" / task_id
+    if backend_factory is not None:
+        return backend_factory(storage, environment.backend)
+    if environment.backend == "local_dev":
+        return LocalDevBackend(storage)
+    if environment.backend != "podman-rootless":
+        raise ValueError("QD_SOURCE_BACKEND_UNSUPPORTED")
+    config_path = workspace.root / ".photomatagent" / "qd.json"
+    if (config_path.is_symlink() or not config_path.is_file()
+            or not workspace.contains(config_path.resolve())):
+        raise ValueError("QD_SOURCE_ENVIRONMENT_UNAVAILABLE")
+    config = QDConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+    if not config.enabled or config.sandbox != "podman":
+        raise ValueError("QD_SOURCE_ENVIRONMENT_UNAVAILABLE")
+    storage = workspace.resolve(config.environment_storage, must_exist=True)
+    if not storage.is_dir() or storage.is_symlink():
+        raise ValueError("QD_SOURCE_ENVIRONMENT_UNAVAILABLE")
+    backend = PodmanSandboxBackend(storage)
+    restored = backend.restore_environment(environment.environment_id)
+    plan = load_persisted_install_plan(workspace.root, environment.plan_sha256)
+    if (restored != environment or plan is None
+            or plan.plan_sha256 != binding["install_plan_sha256"]
+            or environment.environment_sha256 != binding["environment_sha256"]):
+        raise ValueError("QD_SOURCE_ENVIRONMENT_CHANGED")
+    return backend
 
 
 class QDStrategyService:
@@ -170,7 +214,7 @@ class QDStrategyService:
             ):
                 raise ValueError("QD_OUTPUT_PATH_UNSUPPORTED")
             if (
-                checker.checker_id == "json_numeric_sum"
+                checker.checker_id in {"json_numeric_sum", "mwir_noise_budget"}
                 and checker.input_key not in inputs
             ):
                 raise ValueError("QD_CHECKER_INPUT_UNAVAILABLE")
@@ -351,9 +395,10 @@ class QDStrategyService:
         task = QDTaskRecord.model_validate(operation["task"])
         environment = EnvironmentRecord.model_validate(operation["environment"])
         options = self.manager.runtime_options
-        model = (self.model_factory or create_provider)(
-            str(options.get("provider", "fake")), options.get("model")
-        )
+        if self.model_factory:
+            model = self.model_factory(str(options.get("provider", "fake")), options.get("model"))
+        else:
+            model = create_provider(str(options.get("provider", "fake")), options.get("model"), workspace=self.workspace.root)
         try:
             await self._execute_qd_run(
                 run, operation, binding, task, environment, model
@@ -374,10 +419,6 @@ class QDStrategyService:
         environment: EnvironmentRecord,
         model: Any,
     ) -> None:
-        from photomatagent.capability_acquisition.local_backend import LocalDevBackend
-        from photomatagent.capability_acquisition.container_backend import (
-            PodmanSandboxBackend,
-        )
         from photomatagent.scientific.evolution.qd.store import QDStore
         from photomatagent.scientific.evolution.qd.budget import BudgetLedger
 
@@ -415,17 +456,8 @@ class QDStrategyService:
                     yield event
 
         try:
-            storage = (
-                self.workspace.root / ".photomatagent" / "capabilities" / run.task_id
-            )
-            backend = (
-                self.backend_factory(storage, environment.backend)
-                if self.backend_factory
-                else (
-                    LocalDevBackend(storage)
-                    if environment.backend == "local_dev"
-                    else PodmanSandboxBackend(storage)
-                )
+            backend = _source_backend(
+                self.workspace, run.task_id, environment, binding, self.backend_factory,
             )
             rules = _mutable_allowlist(task.mutable_parameters)
             proposal_engine = (

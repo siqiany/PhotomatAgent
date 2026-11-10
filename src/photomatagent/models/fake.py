@@ -97,7 +97,7 @@ class FakeModelProvider:
         yield ModelCompleted(response=response)
 
     def _auto_response(self, request: ModelRequest) -> ModelResponse:
-        user_messages = [m for m in request.messages if isinstance(m, UserMessage)]
+        user_messages = [m for m in request.messages if isinstance(m, UserMessage) and not m.context_only]
         goal = user_messages[-1].content if user_messages else ""
         material = _extract_material(goal)
         results = [m for m in request.messages if isinstance(m, ToolResultMessage)]

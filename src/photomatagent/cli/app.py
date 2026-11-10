@@ -18,8 +18,9 @@ from photomatagent import __version__
 from photomatagent.cli.chat import run_chat
 from photomatagent.cli.evolve import evolve_app
 from photomatagent.cli.rag import rag_app
+from photomatagent.cli.research import research_app
 from photomatagent.cli.render import print_skill_list
-from photomatagent.config import DotEnvConfig, read_preferred_config, resolve_llm_config
+from photomatagent.config import DotEnvConfig, normalize_provider, read_preferred_config, resolve_llm_config
 from photomatagent.experiments.compare import compare_summaries
 from photomatagent.experiments.loader import (
     ExperimentConfigError,
@@ -41,7 +42,6 @@ from photomatagent.scientific.capabilities.status import (
     probe_all_capabilities,
 )
 from photomatagent.sessions.store import session_is_resumable
-from photomatagent.models.factory import api_key_status
 from photomatagent.models.fake import FakeModelProvider, FakeResponse, scripted_tool_call
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context_budget import resolve_thresholds
@@ -64,6 +64,9 @@ app = typer.Typer(
 console = Console()
 app.add_typer(evolve_app, name="evolve")
 app.add_typer(rag_app, name="rag")
+app.add_typer(research_app, name="research")
+from photomatagent.cli.information import app as data_app
+app.add_typer(data_app, name="data")
 
 
 @app.callback(invoke_without_command=True)
@@ -214,26 +217,31 @@ def configure_llm(
         None, "--provider", help="openai | anthropic"
     ),
     model: str | None = typer.Option(None, "--model"),
+    role: str = typer.Option("main", "--role", help="main | judge | feedback"),
+    base_url: str | None = typer.Option(None, "--base-url"),
     workspace: Path = typer.Option(Path.cwd(), "--workspace", exists=True, file_okay=False),
 ) -> None:
     """Create or complete workspace LLM configuration without starting a chat."""
+    from photomatagent.model_settings import ModelSettingsUpdate, ROLES, public_settings, save_settings
+    if role not in ROLES:
+        raise typer.BadParameter("role must be main, judge or feedback")
     try:
-        store = DotEnvConfig(workspace)
-        config, created = resolve_llm_config(
-            store,
-            prompt=_prompt_config_value,
-            provider=provider,
-            model=model,
-        )
+        current = public_settings(workspace)[role]
+        selected = provider or _prompt_config_value("提供商 openai / anthropic", False, str(current["provider"]) or "openai")
+        selected_model = model or _prompt_config_value("模型名称", False, str(current["model"]) or None)
+        selected_url = base_url
+        if selected_url is None:
+            selected_url = _prompt_config_value("Base URL（可留空使用官方服务）", False, str(current["base_url"]) or "")
+        # Always allow replacement; blank retains the configured secret.
+        from pydantic import SecretStr
+        key = _prompt_config_value("API Key（隐藏输入；留空保留现有 key）", True, "")
+        update = ModelSettingsUpdate.model_validate({"provider": normalize_provider(selected), "model": selected_model,
+                                     "base_url": selected_url, "api_key": SecretStr(key) if key else None})
+        save_settings(workspace, role, update)  # type: ignore[arg-type]
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    action = "已创建" if created else "已更新"
-    console.print(f"[green]{action}配置：{store.path}[/]")
-    console.print(f"Provider: {config.provider}")
-    console.print(f"Model: {config.model}")
-    if config.base_url:
-        console.print(f"Base URL: {config.base_url}")
-    console.print("API Key: configured（不会显示明文）")
+    console.print(f"[green]已保存 {role} 配置：{DotEnvConfig(workspace).path}[/]")
+    console.print("API Key 不会显示明文；新配置用于后续运行。")
 
 
 tools_app = typer.Typer(help="Inspect the local tool registry.")
@@ -385,11 +393,11 @@ def scientific_scnet_doctor(
     """Read-only SCNet diagnostics: SSH, Slurm, VASP/NAMD/MAGUS probes."""
     import json as _json
 
-    from dotenv import load_dotenv
+    from photomatagent.config import load_integration_environment
 
     from photomatagent.mcp_servers.scnet.server import build_doctor_report
 
-    load_dotenv(workspace / ".env", override=False)
+    load_integration_environment(workspace)
     report = asyncio.run(build_doctor_report())
     # plain print: rich wraps long lines and would break the JSON output
     print(_json.dumps(report, ensure_ascii=False, indent=2))
@@ -624,19 +632,22 @@ app.add_typer(sessions_app, name="sessions")
 
 
 @sessions_app.command("list")
-def sessions_list() -> None:
-    sessions = list_sessions()
-    table = Table("Session ID", "Resumable", "Model", "Iterations", "Tools", "Duration", "Stop")
+def sessions_list(sessions_dir: Path | None = typer.Option(None, "--sessions-dir")) -> None:
+    from photomatagent.logging.session_stats import read_session_overview
+    sessions = list_sessions(sessions_dir)
+    from rich.table import Column
+    table = Table(Column("Session ID", min_width=max((len(p.name) for p in sessions), default=10)), "Resumable", "Model", "Stop")
     for session in sessions:
-        stats = read_session_stats(session)
+        try:
+            stats = read_session_overview(session)
+        except (ValueError, OSError) as exc:
+            table.add_row(session.name, "error", "—", type(exc).__name__)
+            continue
         resumable = "yes" if session_is_resumable(session) else "—"
         table.add_row(
             session.name,
             resumable,
             f"{stats.provider}/{stats.model}",
-            str(stats.iterations),
-            str(stats.tool_calls),
-            f"{stats.duration_seconds:.1f}s",
             stats.stop_reason or "—",
         )
     console.print(table)
@@ -1063,7 +1074,7 @@ def doctor(
     configured_provider = config.provider if config else "missing"
     configured_model = config.model if config else ""
     configured_base_url = config.base_url if config else None
-    key_status = api_key_status(configured_provider)
+    key_status = "not required" if configured_provider == "fake" else "configured" if config and config.api_key_env else "missing"
     key_ok = configured_provider == "fake" or (
         configured_provider in {"openai", "anthropic"} and key_status == "configured"
     )

@@ -154,9 +154,9 @@ export function FeedbackForm({
         disabled={disabled || submitting || eligibleRuns.length === 0}
       />
       <div className="revision-form-footer">
-        <p>原运行和产物会保留；修订结果会作为同一任务中的新一轮运行。</p>
+        <p>提交后自动整理意见并返修；原运行和产物保留。目标不明确时先请你补充。</p>
         <button className="button button-primary" disabled={disabled || submitting || !sourceRunId || !feedback.trim()}>
-          {submitting ? "正在分析意见…" : "分析意见并生成计划"}
+          {submitting ? "正在整理并启动返修…" : "提交意见并自动返修"}
         </button>
       </div>
     </form>

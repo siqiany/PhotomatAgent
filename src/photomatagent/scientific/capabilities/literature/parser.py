@@ -8,6 +8,7 @@ Qdrant service layers.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -29,11 +30,45 @@ _YEAR_RE = re.compile(r"(?:^|[_\s])(\d{4})(?:[_\s]|$)")
 _CLEAN_TITLE_RE = re.compile(r"[_-]+")
 
 
-@lru_cache(maxsize=1)
-def _converter():
+def document_timeout_seconds() -> int:
+    value = os.environ.get("PHOTOMATAGENT_DOCLING_TIMEOUT_SECONDS", "90")
+    try:
+        return min(900, max(30, int(value)))
+    except ValueError:
+        return 90
+
+
+@lru_cache(maxsize=2)
+def _converter(artifacts: str | None = None, *, document_timeout: int = 90):
     """Shared docling converter: layout models load once per process."""
     from docling.document_converter import DocumentConverter
 
+    if artifacts or os.environ.get("PHOTOMATAGENT_DOCLING_LOW_MEMORY") == "1":
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.document_converter import PdfFormatOption
+
+        pdf_option = PdfFormatOption()
+        options = pdf_option.pipeline_options
+        assert isinstance(options, PdfPipelineOptions)
+        if artifacts:
+            import shutil
+
+            from docling.datamodel.pipeline_options import TesseractCliOcrOptions
+
+            options.artifacts_path = Path(artifacts)
+            options.enable_remote_services = False
+            options.do_ocr = shutil.which("tesseract") is not None
+            options.ocr_options = TesseractCliOcrOptions()
+            options.document_timeout = document_timeout
+        if os.environ.get("PHOTOMATAGENT_DOCLING_LOW_MEMORY") == "1":
+            options.ocr_batch_size = 1
+            options.layout_batch_size = 1
+            options.table_batch_size = 1
+            options.queue_max_size = 1
+        return DocumentConverter(
+            format_options={InputFormat.PDF: pdf_option}
+        )
     return DocumentConverter()
 
 
@@ -131,6 +166,8 @@ def parse_pdf(pdf_path: Path) -> tuple[PaperRecord, list[PassageRecord]]:
             year=year,
             section=headings[-1] if headings else "",
             page=pages[0] if pages else None,
+            page_start=pages[0] if pages else None,
+            page_end=pages[-1] if pages else None,
             chunk_id=passage_id,
             text=text,
             heading_path=heading_path,
@@ -199,8 +236,8 @@ def passage_points_for(
                 year=passage.year if passage.year is not None else paper.year,
                 section=passage.section,
                 heading_path=passage.heading_path,
-                page_start=passage.page,
-                page_end=passage.page,
+                page_start=passage.page_start if passage.page_start is not None else passage.page,
+                page_end=passage.page_end if passage.page_end is not None else passage.page,
                 previous_passage_id=passage_ids[index - 1] if index else None,
                 next_passage_id=(
                     passage_ids[index + 1] if index + 1 < len(passages) else None
@@ -211,6 +248,7 @@ def passage_points_for(
                 # PaperRecord owns one ingestion timestamp, so every passage
                 # in this revision receives the same UTC value.
                 indexed_at=paper.indexed_at,
+                structured_ref=passage.structured_ref,
             )
         )
     return points

@@ -3,12 +3,40 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SerializerFunctionWrapHandler, model_serializer
 
 from photomatagent.errors import ToolError
+from photomatagent.models.types import ImageReference
 from photomatagent.tools.exposure import ToolExposure
+
+
+@dataclass(frozen=True)
+class DeliveryReview:
+    """A scoped presentation check from a registered capability."""
+
+    key: str
+    check: Callable[[str], str | None]
+    guidance: str = ""
+    summary: str = ""
+    ambiguous_scope: str = ""
+    explicit_scope: str = ""
+    check_explicit: Callable[[str], str | None] | None = None
+
+
+class DeliveryReviewSource:
+    """Opt-in hooks for host-owned tools. Tool payloads cannot install hooks."""
+
+    proposal_registration = False
+
+    def review_request(self, goal: str) -> DeliveryReview | None:
+        return None
+
+    def review_result(self, result: ToolResult) -> DeliveryReview | None:
+        return None
 
 
 class ToolResult(BaseModel):
@@ -23,6 +51,14 @@ class ToolResult(BaseModel):
     is_error: bool = False
     data: dict[str, Any] = Field(default_factory=dict)
     state_updates: list[BaseModel] = Field(default_factory=list)
+    images: tuple[ImageReference, ...] = Field(default=(), max_length=4)
+
+    @model_serializer(mode="wrap")
+    def serialize_result(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        payload: dict[str, object] = handler(self)
+        if not self.images:
+            payload.pop("images", None)
+        return payload
 
 
 class Tool(ABC):
@@ -33,6 +69,7 @@ class Tool(ABC):
     """
 
     name: str
+    effect_class: str = "UNKNOWN"
     description: str = ""
     short_description: str = ""
     input_schema: dict[str, Any] = {"type": "object", "properties": {}}

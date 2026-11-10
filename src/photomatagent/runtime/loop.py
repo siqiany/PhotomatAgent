@@ -7,16 +7,18 @@ context -> provider stream -> tool calls -> permission -> execution -> results
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
 import re
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeVar
 from uuid import uuid4
 
 from photomatagent.errors import ProviderError, ToolError, ToolValidationError
@@ -29,6 +31,7 @@ from photomatagent.models.types import (
     AssistantMessage,
     ModelCompleted,
     ModelMessage,
+    ImageReference,
     ModelRequest,
     ModelResponse,
     ModelStreamStarted as ProviderStreamStarted,
@@ -95,9 +98,13 @@ from photomatagent.runtime.permissions import (
     default_permission_policy,
 )
 from photomatagent.runtime.observation import ObservationPolicy
+from photomatagent.runtime.research_delivery import (
+    SEARCH_TOOLS, adopt_stop, current_delivery, digest, record_search, refresh_delivery, render_delivery,
+)
 from photomatagent.runtime.sensitive import SensitiveAccessError, SensitivePathPolicy
 from photomatagent.runtime.state import ConversationState
 from photomatagent.runtime.stop_policy import StopPolicy
+from photomatagent.tools.exposure import ToolExposure
 from photomatagent.scientific.calculations import CalculationRecord
 from photomatagent.scientific.claims import ScientificClaim
 from photomatagent.scientific.evidence import Evidence
@@ -109,6 +116,8 @@ from photomatagent.scientific.capabilities.structure.artifacts import (
     verify_structure_derivation,
     verify_structure_derivations,
 )
+from photomatagent.scientific.process import DecisionRecord, MethodNeedRecord, ProcessPlan, ResearchDelivery
+from photomatagent.capability_acquisition.models import MethodNeed
 from photomatagent.scientific.state import (
     EvidenceAttestation,
     ScientificReferenceUpdate,
@@ -130,7 +139,7 @@ from photomatagent.scientific.discovery.registration import (
 from photomatagent.skills.loader import SkillLoader
 from photomatagent.scientific.tasks import ScientificTask
 from photomatagent.sessions.store import SessionSnapshot
-from photomatagent.tools.base import ToolResult
+from photomatagent.tools.base import DeliveryReview, DeliveryReviewSource, ToolResult
 from photomatagent.tools.registry import ToolRegistry
 from photomatagent.tools.exposure import ToolExposure
 from photomatagent.tools.surface import (
@@ -141,6 +150,44 @@ from photomatagent.tools.surface import (
 from photomatagent.workspace import Workspace
 
 EventSink = Callable[[RuntimeEvent], Awaitable[None] | None]
+_T = TypeVar("_T")
+
+
+class _TurnDeadline(TimeoutError):
+    """The host's turn budget expired during a runtime operation."""
+
+
+async def _before_deadline(operation: Awaitable[_T], deadline: float | None) -> _T:
+    if deadline is None:
+        return await operation
+    limit = asyncio.timeout_at(deadline)
+    try:
+        async with limit:
+            return await operation
+    except TimeoutError as exc:
+        if not limit.expired():
+            raise
+        raise _TurnDeadline from exc
+
+
+async def _bounded_events(events: AsyncIterator[_T], deadline: float | None) -> AsyncIterator[_T]:
+    # Keep the timeout inside each await so it cannot cancel the caller while
+    # the caller is processing an event yielded by the runtime.
+    if deadline is None:
+        async for event in events:
+            yield event
+        return
+    close = getattr(events, "aclose", None)
+    try:
+        while True:
+            try:
+                yield await _before_deadline(anext(events), deadline)
+            except StopAsyncIteration:
+                return
+    finally:
+        if close is not None:
+            await close()
+
 _HYPOTHESIS_REGISTRATION_TOOL = "generation.register_hypothesis"
 # Scheduler states that mean a real calculation is still progressing.  A
 # controlled wait is only trustworthy while its workflow is in one of these.
@@ -341,6 +388,7 @@ class AgentRuntime:
         diagnostic_observation_budget: int = 12,
         diagnostic_warning_at: int = 8,
     ) -> None:
+        self.persistence: Any = None
         self._model = model
         self._tools = tools
         self._workspace = (
@@ -431,6 +479,19 @@ class AgentRuntime:
         """Provider available to bounded, tool-free host workflows."""
 
         return self._model
+
+    def replace_model_provider(self, model: ModelProvider) -> ModelProvider:
+        """Host-only reconfiguration between turns; retain state and tool authority.
+
+        The caller owns closing the returned provider and the new provider.
+        This operation is not registered as a model-visible tool.
+        """
+        previous = self._model
+        self._model = model
+        summarizer = self._context_engine.summarizer
+        if isinstance(summarizer, ProviderContextSummarizer):
+            summarizer.provider = model
+        return previous
 
     @property
     def conversation_state(self) -> ConversationState:
@@ -709,8 +770,22 @@ class AgentRuntime:
                 )
         return payload
 
-    async def run(self, goal: str) -> AsyncIterator[RuntimeEvent]:
+    async def run(
+        self, goal: str, *, intent: Literal["auto", "supplement", "replace"] = "auto",
+        image_paths: tuple[str, ...] = (), image_references: tuple[ImageReference, ...] = (),
+        wall_seconds: float | None = None,
+    ) -> AsyncIterator[RuntimeEvent]:
         """Run one user turn while preserving conversation and scientific state."""
+        if intent not in {"auto", "supplement", "replace"}:
+            raise ValueError("invalid user turn intent")
+        if wall_seconds is not None and not 0 < wall_seconds < float("inf"):
+            raise ValueError("wall_seconds must be finite and positive")
+        now = asyncio.get_running_loop().time
+        work_until = finish_by = None
+        if wall_seconds is not None:
+            deadline = now() + wall_seconds
+            finish_by = deadline - min(2.0, wall_seconds / 10)
+            work_until = finish_by - min(90.0, wall_seconds / 3)
         self._close_pending_tool_calls()
         self._run_id = uuid4().hex
         self._run_observed_keys: set[tuple[object, ...]] = set()
@@ -745,7 +820,7 @@ class AgentRuntime:
         if not self._scientific.goal:
             self._scientific.goal = goal
             self._scientific.active_subtask = goal
-        elif _is_explicit_task_switch(goal):
+        elif intent == "replace" or (intent == "auto" and _is_explicit_task_switch(goal)):
             # An explicit task switch replaces the old research objective and
             # clears stale workflow pointers.  A plain continuation/refinement
             # below never overwrites the durable original goal.
@@ -756,20 +831,53 @@ class AgentRuntime:
             self._scientific.evidence_gaps = []
         else:
             self._scientific.active_subtask = goal
-        self._conversation.add(UserMessage(content=goal))
+        self._research_request_key = digest(goal)
+        self._delivery_reviews: dict[str, DeliveryReview] = {}
+        for tool in self._tools.list_tools():
+            if isinstance(tool, DeliveryReviewSource) and tool.exposure != ToolExposure.HIDDEN:
+                if review := tool.review_request(goal):
+                    self._delivery_reviews[review.key] = review
+        continuation = goal.strip().rstrip("。.!！").casefold() in {"继续", "请继续", "continue", "resume"}
+        refresh_delivery(self._scientific, self._research_request_key,
+                         reopen_request=intent != "supplement" and not continuation)
+        images = image_references
+        if image_paths or images:
+            if (len(image_paths) + len(images) > 4
+                    or self._model.provider not in {"openai", "anthropic"}):
+                raise ProviderError(self._model.provider, "Image input is unavailable", code="IMAGE_INPUT_UNAVAILABLE")
+            if image_paths:
+                from photomatagent.models.image_assets import register_image
+
+                images += tuple([await asyncio.to_thread(register_image, self._workspace, name) for name in image_paths])
+        self._conversation.add(UserMessage(content=goal, images=images))
+        if self.persistence is not None:
+            await self.persistence.checkpoint(self, "user_request")
         iteration = 0
+        initial_tool_calls = self._budget.tool_calls
         original_context_config = self._context_engine.config
         output_recoveries = 0
+        delivery_recoveries = 0
+        retained_delivery_draft = ""
+        proposal_synthesis: str | None = None
+        request_unsettled = False
+        search_closed_at: int | None = None
         try:
             yield await self._emit(
                 LoopStarted(
-                    goal=goal,
+                    goal=self._scientific.goal,
+                    turn_intent=intent,
+                    request_preview=redact_text(goal)[:500],
                     provider=self._model.provider,
                     model=self._model.model,
                     workspace=str(self._workspace.root),
                 )
             )
             while True:
+                if finish_by is not None and now() >= finish_by:
+                    raise _TurnDeadline
+                if proposal_synthesis is None and work_until is not None and now() >= work_until:
+                    proposal_synthesis = "WALL_BUDGET"
+                operation_deadline = finish_by if proposal_synthesis else work_until
                 iteration += 1
                 self._budget.record_iteration()
                 progress_before = self._progress_fingerprint()
@@ -779,6 +887,16 @@ class AgentRuntime:
                 self._run_meta["new_observation_seen"] = False
                 self._run_meta["new_diagnostic_observations"] = 0
                 self._run_meta["new_wait_observations"] = 0
+                if proposal_synthesis is None and iteration >= self._budget.max_iterations:
+                    delivery = self._scientific.research_delivery
+                    if (
+                        not (delivery and delivery.decision_id)
+                        and (
+                            self._run_meta.get("proposal_registration_attempted") or (delivery and delivery.attempts)
+                            or (wall_seconds is not None and self._budget.tool_calls > initial_tool_calls)
+                        )
+                    ):
+                        proposal_synthesis = "RUNTIME_BUDGET"
                 if diagnostic_notice_pending:
                     # Deterministic, factual budget notice: the model is told
                     # its remaining diagnostic budget and that it must report
@@ -789,6 +907,7 @@ class AgentRuntime:
                     )
                     self._conversation.add(
                         UserMessage(
+                            context_only=True,
                             content=(
                                 "runtime_notice: diagnostic exploration budget "
                                 f"exhausted ({self._diagnostic_budget} distinct "
@@ -805,14 +924,19 @@ class AgentRuntime:
 
                 surface = self._tool_surface.plan()
                 try:
-                    context = await self._context_engine.build(
+                    context = await _before_deadline(self._context_engine.build(
                         conversation=self._conversation,
                         scientific=self._scientific,
                         context_builder=self._context_builder,
                         capability_manifest=surface.manifest.text,
                         surface=surface.stats,
                         session_id=self._session_id,
-                    )
+                    ), operation_deadline)
+                except _TurnDeadline:
+                    if proposal_synthesis is None and iteration < self._budget.max_iterations:
+                        proposal_synthesis = "WALL_BUDGET"
+                        continue
+                    raise
                 except ContextBuildCancelled as exc:
                     for context_event in await self._consume_context_result(
                         exc.result
@@ -824,7 +948,21 @@ class AgentRuntime:
                     yield context_event
                 if not context.request_allowed:
                     raise self._context_limit_error(context, context_events)
+                if context.compaction_model_calls and self._budget.model_calls >= self._budget.max_iterations:
+                    # Summary calls consume the same model-call budget. Do not
+                    # issue an extra research request after compaction uses it.
+                    if delivery := self._scientific.research_delivery:
+                        async for event in self._finish_research_delivery(delivery, iteration, run_started, "RUNTIME_BUDGET"):
+                            yield event
+                    else:
+                        yield await self._emit(LoopCompleted(iterations=iteration, reason="max_iterations"))
+                    return
                 messages = context.messages
+                guidance = [review.guidance for review in self._delivery_reviews.values() if review.guidance]
+                if guidance:
+                    messages = [*messages, UserMessage(context_only=True, content=(
+                        "runtime_scientific_scope: " + "\n".join(guidance[-8:])
+                    ))]
                 context_budget = account_context(
                     messages,
                     surface.stats,
@@ -832,7 +970,17 @@ class AgentRuntime:
                 )
                 max_output_tokens = self._context_engine.config.response_reserve_tokens
                 fallback_model_tokens = 0
-                request_tools = surface.definitions
+                request_tools = [] if proposal_synthesis else surface.definitions
+                if proposal_synthesis:
+                    messages = [*messages, UserMessage(context_only=True, content=(
+                        "runtime_proposal_delivery: research tools stopped without a complete proposal. "
+                        "Answer the original request in ordinary prose from existing evidence. Start with a usable "
+                        "candidate or conditional branches, design variables and a decisive validation test. "
+                        "Check the answer against the original conditions and reconcile tables and totals. "
+                        "Use a registered draft only if it answers the original request. Report remaining gaps. "
+                        "No tools are available."
+                    ))]
+                delivery_tool_names: set[str] = set()
                 delivery_only = False
                 estimated_input_tokens: int | None = None
                 if self._budget.max_total_tokens is not None:
@@ -841,10 +989,27 @@ class AgentRuntime:
                     if (self._prompt_token_estimator.calibrated and remaining_tokens > 0
                             and remaining_tokens < 2 * (estimated_input_tokens + max_output_tokens)):
                         delivery_only = True
-                        request_tools = []
-                        messages = [*messages, UserMessage(content=(
+                        # Reserve the final interaction for a concise answer,
+                        # while retaining only the already-visible workspace
+                        # file delivery tools. Runtime permission, validation,
+                        # and workspace checks still apply when they execute.
+                        direct_tool_names = {
+                            definition.name
+                            for definition in self._tool_surface.registry.definitions(ToolExposure.DIRECT)
+                        }
+                        request_tools = [] if proposal_synthesis else [
+                            definition for definition in surface.definitions
+                            if output_recoveries == 0
+                            and definition.name in {"write", "edit"}
+                            and definition.name in direct_tool_names
+                        ]
+                        delivery_tool_names = {definition.name for definition in request_tools}
+                        messages = [*messages, UserMessage(context_only=True, content=(
                             "runtime_budget_notice: remaining budget is reserved for final delivery. "
-                            "Do not call tools or start new searches. Deliver a complete concise answer "
+                            + ("You may only use the exposed write/edit tools to save requested deliverable files; "
+                               "do not use any other tools or start new searches. " if request_tools else
+                               "Do not call tools or start new searches. ")
+                            + "Deliver a complete concise answer "
                             "from existing observations, distinguish completed work from drafts, and "
                             "mark missing evidence UNKNOWN. Explain any blocker and the next step."
                         ))]
@@ -853,6 +1018,12 @@ class AgentRuntime:
                         max_output_tokens, remaining_tokens - estimated_input_tokens,
                     )
                     if max_output_tokens <= 0:
+                        if delivery := self._scientific.research_delivery:
+                            async for event in self._finish_research_delivery(
+                                delivery, iteration, run_started, "RUNTIME_BUDGET",
+                            ):
+                                yield event
+                            return
                         raise RuntimeError(
                             "TOKEN_BUDGET_EXHAUSTED: "
                             f"total_limit={self._budget.max_total_tokens}, "
@@ -866,11 +1037,18 @@ class AgentRuntime:
                     # application runners at the full remaining case budget.
                     fallback_model_tokens = min(remaining_tokens,
                         prompt_token_upper_bound(messages, request_tools) + max_output_tokens)
+                from photomatagent.models.image_assets import load_latest_images
+
+                image_assets = await asyncio.to_thread(load_latest_images, self._workspace, messages) if any(
+                    isinstance(message, (UserMessage, ToolResultMessage)) and message.images for message in messages
+                ) else {}
                 request = ModelRequest(
                     messages=messages,
+                    image_assets=image_assets,
                     tools=request_tools,
                     max_output_tokens=max_output_tokens,
                 )
+                request_unsettled = True
                 yield await self._emit(
                     ModelRequestStarted(
                         iteration=iteration,
@@ -998,8 +1176,10 @@ class AgentRuntime:
                     return drain_resolved_stream_events()
 
                 stream_event: RuntimeEvent
+                guard_scientific_text = bool(self._delivery_reviews) or proposal_synthesis is not None
+                synthesis_deltas: list[str] = []
                 try:
-                    async for model_event in self._model.stream(request):
+                    async for model_event in _bounded_events(self._model.stream(request), operation_deadline):
                         if isinstance(model_event, ProviderStreamStarted):
                             stream_event = ModelStreamStarted(
                                 iteration=iteration,
@@ -1010,6 +1190,10 @@ class AgentRuntime:
                             for ready in queue_stream_event(stream_event):
                                 yield await self._emit(ready)
                         elif isinstance(model_event, ModelTextDelta):
+                            if proposal_synthesis:
+                                synthesis_deltas.append(model_event.text)
+                            if guard_scientific_text:
+                                continue
                             stream_event = TextDelta(
                                 iteration=iteration, text=model_event.text
                             )
@@ -1071,7 +1255,7 @@ class AgentRuntime:
                             continue
                         elif isinstance(model_event, ModelCompleted):
                             response = model_event.response
-                except ProviderError as exc:
+                except (ProviderError, _TurnDeadline) as exc:
                     for ready in withhold_unconfirmed_arguments():
                         yield await self._emit(ready)
                     yield await self._emit(
@@ -1080,10 +1264,29 @@ class AgentRuntime:
                             provider=self._model.provider,
                             model=self._model.model,
                             error=str(exc),
-                            error_type=type(exc).__name__,
+                            error_type=exc.code if isinstance(exc, ProviderError) and exc.code != "PROVIDER_ERROR" else type(exc).__name__,
                             duration_ms=(time.monotonic() - model_started) * 1000,
                         )
                     )
+                    delivery = self._scientific.research_delivery
+                    wall_expired = isinstance(exc, _TurnDeadline)
+                    if wall_expired or (isinstance(exc, ProviderError) and exc.code == "NETWORK_TIMEOUT" and (
+                        proposal_synthesis or delivery or self._run_meta.get("proposal_registration_attempted")
+                    )):
+                        reason = "WALL_BUDGET" if wall_expired else "PROVIDER_TIMEOUT"
+                        self._budget.record_model_call(None, fallback_tokens=fallback_model_tokens)
+                        request_unsettled = False
+                        if proposal_synthesis is None and iteration < self._budget.max_iterations:
+                            proposal_synthesis = reason
+                            continue
+                        delivery = current_delivery(self._scientific, self._research_request_key)
+                        async for event in self._finish_research_delivery(
+                            delivery, iteration, run_started, reason,
+                            proposal_draft="".join(synthesis_deltas).rpartition("\n")[0] or retained_delivery_draft,
+                            issue="模型响应超时。 / The model response timed out.",
+                        ):
+                            yield event
+                        return
                     raise
 
                 if response is None:
@@ -1107,17 +1310,29 @@ class AgentRuntime:
                 self._budget.record_model_call(
                     response.usage, fallback_tokens=fallback_model_tokens,
                 )
+                request_unsettled = False
                 if response.usage.resolved_total_tokens >= response.usage.input_tokens:
                     self._prompt_token_estimator.observe(
                         messages, request_tools, input_tokens=response.usage.input_tokens,
                     )
+                complete_prose = response.finish_reason == "stop" and not response.tool_calls
+                scientific_error = self._review_delivery(response.text) if complete_prose else None
+                synthesis_handoff = proposal_synthesis is not None and (
+                    self._scientific.research_delivery is not None
+                    or proposal_synthesis in {"RUNTIME_BUDGET", "WALL_BUDGET", "OUTPUT_TRUNCATED"}
+                )
+                if (guard_scientific_text and complete_prose and response.text and not scientific_error
+                        and not synthesis_handoff):
+                    if not self._scientific.research_delivery and (facts := self._delivery_facts()):
+                        response = response.model_copy(update={"text": response.text + "\n\n" + facts})
+                    yield await self._emit(TextDelta(iteration=iteration, text=response.text))
                 yield await self._emit(
                     ModelResponseCompleted(
                         iteration=iteration,
                         provider=self._model.provider,
                         model=self._model.model,
                         response_id=response.response_id,
-                        finish_reason=response.finish_reason,
+                        finish_reason="delivery_rejected" if scientific_error else response.finish_reason,
                         tool_call_count=len(response.tool_calls),
                         usage=response.usage.model_dump(),
                         duration_ms=(time.monotonic() - model_started) * 1000,
@@ -1125,16 +1340,88 @@ class AgentRuntime:
                         response_text_chars=len(response.text),
                     )
                 )
+                if scientific_error:
+                    reviewed = self._retain_reviewed_lines(response.text)
+                    if len(reviewed) > len(retained_delivery_draft):
+                        retained_delivery_draft = reviewed
+                    self._conversation.add(UserMessage(context_only=True, content=(
+                        "runtime_delivery_constraint_notice: " + scientific_error
+                        + " Preserve unaffected proposal and validation sections when correcting the scoped claim."
+                    )))
+                    if delivery_recoveries >= 2 or iteration >= self._budget.max_iterations:
+                        delivery = current_delivery(self._scientific, self._research_request_key)
+                        async for event in self._finish_research_delivery(
+                            delivery, iteration, run_started, "SCIENTIFIC_DELIVERY_CONTRADICTION",
+                            proposal_draft=retained_delivery_draft, issue=scientific_error,
+                        ):
+                            yield event
+                        return
+                    delivery_recoveries += 1
+                    yield await self._emit_budget(iteration)
+                    continue
                 self._conversation.add(
-                    AssistantMessage(text=response.text, tool_calls=response.tool_calls)
+                    AssistantMessage(text=response.text, tool_calls=response.tool_calls,
+                                     continuation=response.continuation)
                 )
-                if delivery_only and response.tool_calls:
-                    self._close_tool_calls(response.tool_calls, "not executed: final delivery budget reserve")
-                    raise RuntimeError("DELIVERY_TOOLS_NOT_ALLOWED: final answer required within remaining budget")
+                if not response.tool_calls and self.persistence is not None:
+                    await self.persistence.checkpoint(self, "assistant_reply")
+                if response.finish_reason == "stop" and not response.tool_calls:
+                    from photomatagent.runtime.commitments import collect_user_commitments, delivery_constraint_error
+                    delivery_error = delivery_constraint_error(response.text, collect_user_commitments(self._conversation.messages, self._scientific))
+                    if delivery_error:
+                        if delivery_recoveries >= 2 or iteration >= self._budget.max_iterations:
+                            yield await self._emit(LoopCompleted(iterations=iteration, reason="delivery_constraint_violation"))
+                            return
+                        delivery_recoveries += 1
+                        self._conversation.add(UserMessage(context_only=True, content="runtime_delivery_constraint_notice: " + delivery_error))
+                        yield await self._emit_budget(iteration)
+                        continue
+                if delivery_only and any(
+                    call.name not in delivery_tool_names for call in response.tool_calls
+                ):
+                    self._close_tool_calls(
+                        response.tool_calls,
+                        "not executed: only exposed write/edit delivery tools are allowed",
+                    )
+                    raise RuntimeError(
+                        "DELIVERY_TOOLS_NOT_ALLOWED: only exposed write/edit tools are allowed within remaining budget"
+                    )
+                if proposal_synthesis and response.tool_calls:
+                    self._close_tool_calls(response.tool_calls, "not executed: proposal synthesis has no exposed tools")
+                    delivery = current_delivery(self._scientific, self._research_request_key)
+                    async for event in self._finish_research_delivery(
+                        delivery, iteration, run_started, proposal_synthesis,
+                        proposal_draft=response.text or retained_delivery_draft,
+                        issue="本轮未完成方案综合，保留现有结果。 / Proposal synthesis did not complete.",
+                    ):
+                        yield event
+                    return
 
                 decision = self._stop_policy.should_stop(
                     iteration=iteration, response=response, budget=self._budget
                 )
+                if (decision.reason == "invalid_tool_markup"
+                        and output_recoveries < max(1, original_context_config.output_recovery_attempts)
+                        and self._budget.model_calls < self._budget.max_iterations):
+                    output_recoveries += 1
+                    self._conversation.add(UserMessage(context_only=True, content=(
+                        "runtime_output_recovery: tool protocol markup in answer text was discarded and did not run. "
+                        "Give a concise answer in ordinary prose. If a tool is essential, use only a native call "
+                        "to a tool actually exposed in this turn. With no such tool, answer from available facts."
+                    )))
+                    yield await self._emit_budget(iteration)
+                    continue
+                recover_as_prose = (decision.reason == "output_truncated" and proposal_synthesis is None
+                        and iteration < self._budget.max_iterations
+                        and (self._scientific.research_delivery is not None
+                             or self._run_meta.get("proposal_registration_attempted")
+                             or (wall_seconds is not None and self._budget.tool_calls > initial_tool_calls)))
+                if recover_as_prose:
+                    self._close_tool_calls(response.tool_calls, "not executed: output_truncated")
+                    retained = self._retain_reviewed_lines(response.text.rpartition("\n")[0])
+                    if len(retained) > len(retained_delivery_draft):
+                        retained_delivery_draft = retained
+                    proposal_synthesis = "OUTPUT_TRUNCATED"
                 if (decision.reason == "output_truncated"
                         and output_recoveries < original_context_config.output_recovery_attempts
                         and self._budget.model_calls < self._budget.max_iterations):
@@ -1142,7 +1429,7 @@ class AgentRuntime:
                     # the failed transaction and request a fresh, bounded response.
                     self._close_tool_calls(response.tool_calls, "not executed: output_truncated")
                     next_cap = min(
-                        max_output_tokens * 2, 32_768,
+                        max_output_tokens * 2, 65_536,
                         original_context_config.context_limit_tokens
                         - original_context_config.safety_margin_tokens - 1_025,
                     )
@@ -1154,11 +1441,11 @@ class AgentRuntime:
                         recovery_action = (
                             "Do not call tools or start new searches. Deliver a concise final answer "
                             "from existing observations, with blockers and unfinished work explicit. "
-                            if delivery_only else
+                            if delivery_only or proposal_synthesis else
                             "Continue with fresh complete tool requests, save small intermediate "
                             "artifacts early, and give a concise final answer. "
                         )
-                        self._conversation.add(UserMessage(content=(
+                        self._conversation.add(UserMessage(context_only=True, content=(
                             "runtime_output_recovery: the preceding response was truncated; "
                             "its tool fragments were not executed and its text is incomplete. "
                             "Do not treat it as verified evidence. " + recovery_action +
@@ -1171,11 +1458,40 @@ class AgentRuntime:
                         ))
                         yield await self._emit_budget(iteration)
                         continue
+                if recover_as_prose:
+                    continue
                 if decision.should_stop:
                     self._close_tool_calls(
                         response.tool_calls,
                         f"not executed because loop stopped: {decision.reason}",
                     )
+                    delivery = self._scientific.research_delivery
+                    if synthesis_handoff and delivery is None:
+                        delivery = current_delivery(self._scientific, self._research_request_key)
+                    if (decision.reason == "output_truncated"
+                            or (proposal_synthesis and response.finish_reason == "max_tokens")) and (
+                        synthesis_handoff or (delivery and delivery.plan_ids)
+                        or (guard_scientific_text and response.text.rpartition("\n")[0])
+                    ):
+                        delivery = current_delivery(self._scientific, self._research_request_key)
+                        async for event in self._finish_research_delivery(
+                            delivery, iteration, run_started, "OUTPUT_TRUNCATED",
+                            proposal_draft=response.text.rpartition("\n")[0] or retained_delivery_draft,
+                            issue="输出已截断，以下保留已取得的候选及验证信息。 / Output was truncated.",
+                        ):
+                            yield event
+                        return
+                    if delivery and response.finish_reason not in {"error", "cancelled", "unknown"} and (
+                        decision.reason in {"max_iterations", "max_total_tokens"}
+                        or (decision.reason == "final_response" and (delivery.stop_reason or delivery.plan_ids or synthesis_handoff))
+                    ):
+                        reason = proposal_synthesis or ("MODEL_FINISHED" if decision.reason == "final_response" else "RUNTIME_BUDGET")
+                        async for event in self._finish_research_delivery(
+                            delivery, iteration, run_started, reason,
+                            proposal_draft=response.text if synthesis_handoff and complete_prose else "",
+                        ):
+                            yield event
+                        return
                     self._run_meta["termination_reason"] = decision.reason
                     yield await self._emit_budget(iteration)
                     yield await self._emit(
@@ -1198,11 +1514,33 @@ class AgentRuntime:
                     return
 
                 tool_calls_seen = False
-                for tool_call in response.tool_calls:
-                    tool_calls_seen = True
-                    async for event in self._handle_tool_call(tool_call, iteration):
-                        yield event
+                try:
+                    for tool_call in response.tool_calls:
+                        tool_calls_seen = True
+                        async for event in _bounded_events(self._handle_tool_call(tool_call, iteration), operation_deadline):
+                            yield event
+                except _TurnDeadline:
+                    self._close_tool_calls(response.tool_calls, "turn deadline interrupted tool group; outcome unconfirmed")
+                    proposal_synthesis = "WALL_BUDGET"
+                    continue
+                if self.persistence is not None:
+                    await self.persistence.checkpoint(self, "tool_group")
                 yield await self._emit_budget(iteration)
+                refresh_delivery(self._scientific, self._research_request_key)
+                delivery = self._scientific.research_delivery
+                if delivery and delivery.stop_reason:
+                    if search_closed_at is None:
+                        search_closed_at = iteration
+                    if delivery.decision_id or iteration - search_closed_at >= 2:
+                        if (not delivery.decision_id and not proposal_synthesis
+                                and iteration < self._budget.max_iterations):
+                            proposal_synthesis = delivery.stop_reason
+                            continue
+                        async for event in self._finish_research_delivery(delivery, iteration, run_started):
+                            yield event
+                        return
+                else:
+                    search_closed_at = None
                 scientific_progress = (
                     self._progress_fingerprint() != progress_before
                 )
@@ -1331,6 +1669,16 @@ class AgentRuntime:
                 # stop; a restored budget lets ordinary stall accounting apply
                 # again.  A stall with no tool call at all is always reported.
                 if no_progress_streak >= self._max_no_progress_iterations:
+                    if (not proposal_synthesis and iteration < self._budget.max_iterations
+                            and not (delivery and delivery.decision_id)
+                            and (self._run_meta.get("proposal_registration_attempted")
+                                 or (delivery and delivery.stop_reason))):
+                        proposal_synthesis = delivery.stop_reason if delivery and delivery.stop_reason else "PROPOSAL_REGISTRATION_STALLED"
+                        continue
+                    if delivery and (delivery.stop_reason or delivery.plan_ids):
+                        async for event in self._finish_research_delivery(delivery, iteration, run_started, "NO_TASK_PROGRESS"):
+                            yield event
+                        return
                     blocker = (
                         f"runtime_no_progress: workflow="
                         f"{self._scientific.workflow_id or 'unknown'}; "
@@ -1375,6 +1723,21 @@ class AgentRuntime:
                         )
                     )
                     return
+        except _TurnDeadline:
+            delivery = current_delivery(self._scientific, self._research_request_key)
+            async for event in self._finish_research_delivery(
+                delivery, iteration, run_started, "WALL_BUDGET", proposal_draft=retained_delivery_draft,
+                issue="本轮墙钟预算已到。 / The turn reached its wall-clock budget.",
+            ):
+                yield event
+        except asyncio.CancelledError:
+            if request_unsettled:
+                remaining = (max(0, self._budget.max_total_tokens - self._budget.total_tokens)
+                             if self._budget.max_total_tokens is not None else fallback_model_tokens)
+                self._budget.record_model_call(None, fallback_tokens=remaining)
+            await self._emit(LoopFailed(error="User interrupted the current turn", error_type="CancelledError",
+                duration_ms=(time.monotonic() - run_started) * 1000))
+            raise
         except Exception as exc:
             yield await self._emit(
                 LoopFailed(
@@ -1403,7 +1766,7 @@ class AgentRuntime:
         return emitted
 
     async def compact_working_context(self) -> list[RuntimeEvent]:
-        """Developer hook used by the interactive ``/compact`` command."""
+        """Host-only compaction shared by interactive chat and the workbench."""
         surface = self._tool_surface.plan()
         try:
             result = await self._context_engine.build(
@@ -1641,6 +2004,34 @@ class AgentRuntime:
                     )
                 )
 
+    def _check_delivery_write(self, name: str, arguments: dict[str, Any]) -> str | None:
+        """Check presentation only after normal permission/path argument checks.
+
+        Raw tables, code and scientific input files retain their full precision.
+        Violations are returned to the model; no evidence is silently rounded.
+        """
+        if name not in {"write", "edit"}:
+            return None
+        from pathlib import Path
+        from photomatagent.runtime.commitments import collect_user_commitments, delivery_constraint_error, is_report_path
+        relative = Path(str(arguments.get("path", "")))
+        requirements = collect_user_commitments(self._conversation.messages, self._scientific)
+        if not relative.parts or relative.parts[0] != "user_output" or not is_report_path(relative.as_posix(), requirements):
+            return None
+        try:
+            path = self._workspace.resolve(relative.as_posix(), must_exist=name == "edit")
+            if name == "write":
+                text = str(arguments["content"])
+            else:
+                text = path.read_text(encoding="utf-8")
+                old = str(arguments["old_text"])
+                if text.count(old) != 1:
+                    return None  # The authoritative edit tool reports this error.
+                text = text.replace(old, str(arguments["new_text"]), 1)
+        except (OSError, UnicodeError, ToolError, ValueError):
+            return None  # Normal workspace/tool validation remains authoritative.
+        return delivery_constraint_error(text, requirements)
+
     async def _handle_tool_call(
         self, tool_call: ToolCall, iteration: int
     ) -> AsyncIterator[RuntimeEvent]:
@@ -1777,6 +2168,18 @@ class AgentRuntime:
                 yield event
             return
 
+        research_search = name in SEARCH_TOOLS and registered.source in {"builtin", "arxiv", "qdrant", "photomatagent"}
+        if research_search:
+            refresh_delivery(self._scientific, self._research_request_key)
+            delivery = self._scientific.research_delivery
+            if delivery and delivery.stop_reason:
+                async for event in self._record_tool_failure(
+                    tool_call, iteration, f"RESEARCH_SEARCH_CLOSED: {delivery.stop_reason}. "
+                    "Use existing observations to register a proposal, validation plan or conflict.",
+                    error_type="ResearchSearchClosed", bridge_tool=bridge_tool, protocol_tool_name=protocol_tool_name,
+                ):
+                    yield event
+                return
         permission = await self._permission.check(name, tool_call.arguments)
         if permission.decision is PermissionDecision.DENY:
             if name == _HYPOTHESIS_REGISTRATION_TOOL:
@@ -1825,6 +2228,8 @@ class AgentRuntime:
                     yield event
                 return
 
+        if isinstance(registered, DeliveryReviewSource) and registered.proposal_registration:
+            self._run_meta["proposal_registration_attempted"] = True
         try:
             arguments = self._tools.validate_arguments(name, tool_call.arguments)
         except (ToolValidationError, KeyError) as exc:
@@ -1848,6 +2253,15 @@ class AgentRuntime:
                 yield event
             return
 
+        delivery_error = self._check_delivery_write(name, arguments)
+        if delivery_error:
+            async for event in self._record_tool_failure(
+                tool_call, iteration, delivery_error, error_type="DeliveryConstraintViolation",
+                bridge_tool=bridge_tool, protocol_tool_name=protocol_tool_name,
+            ):
+                yield event
+            return
+
         yield await self._emit(
             ToolStarted(
                 iteration=iteration,
@@ -1858,10 +2272,15 @@ class AgentRuntime:
             )
         )
         self._budget.record_tool_call()
+        journal_required = self.persistence is not None and self._tools.get(name).effect_class != "READ_ONLY"
+        operation_id = await self.persistence.intent(tool_call.id, name, arguments) if journal_required else None
         tool_started = time.monotonic()
         try:
             result = await self._tools.get(name).execute(arguments)
         except Exception as exc:
+            if research_search:
+                record_search(current_delivery(self._scientific, self._research_request_key), name,
+                              ToolResult(output="SOURCE_ERROR", is_error=True))
             observation = self._observation.apply(
                 name, f"{type(exc).__name__}: {exc}"
             )
@@ -1880,8 +2299,14 @@ class AgentRuntime:
                 observation=observation,
             ):
                 yield event
+            if operation_id is not None:
+                raise RuntimeError("RECONCILIATION_REQUIRED: tool raised after its durable intent") from exc
             return
 
+        if operation_id is not None:
+            await self.persistence.result(operation_id, result)
+        if research_search:
+            record_search(current_delivery(self._scientific, self._research_request_key), name, result)
         duration_ms = (time.monotonic() - tool_started) * 1000
         # Granting and revoking a wait exemption are deliberately separate.
         # A trusted application result that names this workflow and reports an
@@ -1930,6 +2355,24 @@ class AgentRuntime:
                         )
                         + 1
                     )
+        diagnostic = next((result.data.get(key) for key in ("error_type", "diagnostic", "error")
+                           if isinstance(result.data.get(key), str)), None)
+        method_gap = {
+            "missing_prerequisites", "MISSING_DEPENDENCY", "external_solver_unavailable",
+            "INCOMPATIBLE_SCIENTIFIC_PARAMETER", "NOT_APPLICABLE",
+            "INSUFFICIENT_EVIDENCE", "REFERENCE_OUTPUT_UNAVAILABLE", "DOCUMENT_EVIDENCE_TEXT_EXCEEDS_BUDGET",
+        }
+        no_tool_match = name == "tool_search" and result.data.get("matches") == []
+        if (no_tool_match or diagnostic in method_gap) and any(tool.name == "method_search" for tool in self._tools.list_tools()):
+            query = arguments.get("query") if no_tool_match else self._scientific.active_subtask or self._scientific.goal
+            if isinstance(query, str) and query.strip():
+                need_record = MethodNeedRecord(
+                    goal=self._scientific.goal, need=MethodNeed(query=query[:500]), origin=name,
+                    basis="NO_REGISTERED_TOOL_MATCH" if no_tool_match else str(diagnostic), status="needs_search",
+                )
+                if need_record not in self._scientific.method_needs:
+                    self._scientific.add_method_need(need_record)
+                    yield await self._emit(ScientificStateUpdated(summary=need_record.model_dump_json()))
         if result.is_error:
             observation = self._observation.apply(name, result.output)
             if name == _HYPOTHESIS_REGISTRATION_TOOL:
@@ -1976,9 +2419,19 @@ class AgentRuntime:
             return
 
         self._record_innovation_meta(name, registered.namespace, result, bridge_tool)
+        if isinstance(registered, DeliveryReviewSource):
+            if review := registered.review_result(result):
+                self._delivery_reviews[review.key] = review
         if prepared_updates:
             for update in prepared_updates:
                 self._apply_state_update(update)
+                if isinstance(update, ProcessPlan):
+                    delivery = current_delivery(self._scientific, self._research_request_key)
+                    if update.id not in delivery.plan_ids:
+                        delivery.plan_ids = (*delivery.plan_ids[-7:], update.id)
+                elif isinstance(update, DecisionRecord) and update.research_stop:
+                    refresh_delivery(self._scientific, self._research_request_key)
+                    adopt_stop(current_delivery(self._scientific, self._research_request_key), update)
         observation = self._observation.apply(name, result.output)
         yield await self._emit(
             ToolCompleted(
@@ -2065,6 +2518,8 @@ class AgentRuntime:
                 tool_name=protocol_tool_name,
                 content=observation.content,
                 is_error=False,
+                images=(result.images if name == "literature.read_object"
+                        and self._model.provider in {"openai", "anthropic"} else ()),
             )
         )
 
@@ -2233,6 +2688,12 @@ class AgentRuntime:
             self._scientific.add_calculation(update)
         elif isinstance(update, ScientificTask):
             self._scientific.add_task(update)
+        elif isinstance(update, ProcessPlan):
+            self._scientific.add_process_plan(update)
+        elif isinstance(update, DecisionRecord):
+            self._scientific.add_decision(update)
+        elif isinstance(update, MethodNeedRecord):
+            self._scientific.add_method_need(update)
         elif isinstance(update, ScientificReferenceUpdate):
             self._apply_scientific_reference(self._scientific, update)
         elif isinstance(update, ScientificHypothesis):
@@ -2339,6 +2800,14 @@ class AgentRuntime:
                 shadow.add_structure_derivation(structure_record)
                 if len(shadow.structure_derivations) > existing_count:
                     prepared.append(structure_record)
+            elif isinstance(update, (DecisionRecord, MethodNeedRecord)):
+                allowed = {"decision.record"} if isinstance(update, DecisionRecord) else {
+                    "decision.record", "method_search", "method_search_external",
+                }
+                if tool_name not in allowed:
+                    raise ToolError("decision and method needs require the registered research tools")
+                self._apply_state_update_to(shadow, update)
+                prepared.append(update)
             elif isinstance(
                 update,
                 (
@@ -2348,6 +2817,7 @@ class AgentRuntime:
                     CalculationRecord,
                     ScientificTask,
                     ScientificReferenceUpdate,
+                    ProcessPlan,
                 ),
             ):
                 self._apply_state_update_to(shadow, update)
@@ -2375,6 +2845,12 @@ class AgentRuntime:
             state.add_calculation(update)
         elif isinstance(update, ScientificTask):
             state.add_task(update)
+        elif isinstance(update, ProcessPlan):
+            state.add_process_plan(update)
+        elif isinstance(update, DecisionRecord):
+            state.add_decision(update)
+        elif isinstance(update, MethodNeedRecord):
+            state.add_method_need(update)
         elif isinstance(update, ScientificReferenceUpdate):
             self._apply_scientific_reference(state, update)
         elif isinstance(update, StructureDerivation):
@@ -2455,6 +2931,79 @@ class AgentRuntime:
                 output_tokens=self._budget.output_tokens,
             )
         )
+
+    def _review_delivery(self, text: str) -> str | None:
+        reviews = self._delivery_reviews.values()
+        counts = Counter(review.ambiguous_scope for review in reviews if review.ambiguous_scope)
+        explicit = Counter(review.explicit_scope for review in reviews if review.explicit_scope)
+        for review in reviews:
+            if counts[review.ambiguous_scope] <= 1:
+                issue = review.check(text)
+            elif review.check_explicit and explicit[review.explicit_scope] == 1:
+                issue = review.check_explicit(text)
+            else:
+                continue
+            if issue:
+                return issue
+        return None
+
+    def _delivery_facts(self) -> str:
+        return "\n\n".join(review.summary for review in list(self._delivery_reviews.values())[-8:] if review.summary)
+
+    def _retain_reviewed_lines(self, text: str) -> str:
+        retained: list[str] = []
+        for is_table, lines in groupby(text.splitlines(), key=lambda line: line.lstrip().startswith("|")):
+            # Table cells can depend on a header for their meaning.
+            blocks = ["\n".join(lines)] if is_table else lines
+            retained.extend(block for block in blocks if not self._review_delivery(block))
+        return "\n".join(retained).strip()
+
+    async def _finish_research_delivery(
+        self, delivery: ResearchDelivery, iteration: int, started: float, fallback_reason: str = "",
+        *, proposal_draft: str = "", issue: str | None = None,
+    ) -> AsyncIterator[RuntimeEvent]:
+        delivery.stop_reason = delivery.stop_reason or fallback_reason
+        text = render_delivery(self._scientific, delivery, partial=bool(issue))
+        from photomatagent.runtime.commitments import collect_user_commitments, delivery_constraint_error
+
+        commitments = collect_user_commitments(self._conversation.messages, self._scientific)
+        scientific_error = issue or self._review_delivery(text)
+        if scientific_error:
+            delivery.status = "PARTIAL"
+            text = render_delivery(self._scientific, delivery, partial=True)
+            text = self._retain_reviewed_lines(text)
+        if retained := self._retain_reviewed_lines(proposal_draft):
+            text += "\n\n**保留的候选方案 / Retained proposal**\n\n" + retained
+        if scientific_error:
+            text += "\n\n**待复核 / Unresolved** — " + scientific_error
+        if facts := self._delivery_facts():
+            if facts not in text:
+                text += "\n\n" + facts
+        if delivery_constraint_error(text, commitments):
+            delivery.status = "PARTIAL"
+            text = (
+                f"Research delivery is partial ({delivery.stop_reason}). Scientific validation: UNKNOWN. "
+                "The registered plans require presentation review against the user's delivery constraints. "
+                f"Plan IDs: {', '.join(delivery.plan_ids) or 'none'}."
+            )
+        self._conversation.add(AssistantMessage(text=text))
+        reason = "research_partial" if delivery.status == "PARTIAL" else "research_delivery"
+        self._run_meta.update(termination_reason=reason, controlled_wait_active=False,
+                              research_delivery_status=delivery.status, research_stop_reason=delivery.stop_reason)
+        if self.persistence is not None:
+            await self.persistence.checkpoint(self, "research_delivery")
+        yield await self._emit(TextDelta(iteration=iteration, text=text, research_delivery=delivery.status))
+        yield await self._emit(LoopCompleted(
+            iterations=iteration, reason=reason, duration_ms=(time.monotonic() - started) * 1000,
+        ))
+        yield await self._emit(ScientificTraceMeta(
+            skills_loaded=self._run_meta["skills_loaded"],
+            scientific_tools_used=self._run_meta["scientific_tools_used"],
+            evidence_created=self._run_meta["evidence_created"],
+            evidence_sources=self._run_meta["evidence_sources"],
+            evidence_gaps_identified=self._run_meta["evidence_gaps_identified"],
+            capability_escalations=self._run_meta["capability_escalations"],
+        ))
 
     async def _emit(self, event: RuntimeEvent) -> RuntimeEvent:
         event.session_id = self._session_id

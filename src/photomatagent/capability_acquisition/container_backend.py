@@ -25,6 +25,7 @@ from photomatagent.capability_acquisition.models import (
     InstallPlan,
 )
 from photomatagent.capability_acquisition.sandbox import SandboxBackend
+from photomatagent.persistence.atomic import atomic_write
 
 _IMAGE_NAME = "python:3.12-slim"
 _MAX_ENVIRONMENT_BYTES = 4 * 1024 * 1024 * 1024
@@ -248,9 +249,13 @@ class PodmanSandboxBackend:
         if script is None or _sha256_file(script) != request.script_digest:
             return _execution_failure(request, started, "GENOME_MISMATCH")
         stage = output_directory.parent / f".{request.execution_id}-inputs"
+        name = None
         try:
             stage.mkdir(mode=0o700)
-            staged_script = stage / "main.py"
+            source_tree = request.source_tree
+            entry = f"source/{source_tree.entry}" if source_tree else "main.py"
+            staged_script = stage / entry
+            staged_script.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(script, staged_script)
             if _sha256_file(staged_script) != request.script_digest:
                 raise ValueError("GENOME_MISMATCH")
@@ -260,38 +265,39 @@ class PodmanSandboxBackend:
                 source = _safe_workspace_file(workspace, relative)
                 if source is None:
                     raise ValueError("INPUT_BINDING_UNAUTHORIZED")
-                shutil.copyfile(source, input_dir / key)
-                if request.input_sha256 and _sha256_file(input_dir / key) != request.input_sha256.get(key):
+                destination = input_dir / key
+                if source_tree is not None and key in source_tree.inputs:
+                    destination = stage / "source" / source_tree.inputs[key]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                if request.input_sha256 and _sha256_file(destination) != request.input_sha256.get(key):
                     raise ValueError("INPUT_BINDING_CHANGED")
             image = self._image_for_environment(request.environment_id)
             name = f"photomat-{request.execution_id.removeprefix('exec_')[:20]}"
             command = [
-                str(self.executable), "run", "--name", name,
+                str(self.executable), "run", "--pull=never", "--name", name,
+                "--label", f"photomatagent.execution={request.execution_id}",
                 "--network=none", "--read-only", "--cap-drop=all",
                 "--security-opt=no-new-privileges", "--pids-limit=128",
                 "--memory=1g", "--cpus=2", "--userns=keep-id",
                 "--user", f"{os.getuid()}:{os.getgid()}",
                 "--tmpfs", "/tmp:rw,noexec,nosuid,size=128m,mode=1777",
                 "--env", "HOME=/tmp", "--env", "PYTHONNOUSERSITE=1",
+                "--env", "PHOTOMAT_INPUT_DIR=/input/inputs",
                 "--volume", f"{stage}:/input:ro,Z",
                 "--volume", f"{environment}:/opt/environment:ro,Z",
                 "--volume", f"{output_directory}:/output:rw,Z",
                 "--workdir", "/output", image,
-                "/opt/environment/bin/python", "/input/main.py", *request.argv,
+                "/opt/environment/bin/python", f"/input/{entry}", *request.argv,
             ]
-            try:
-                exit_code, stdout, stderr, timed_out, output_overflow = await _run_bounded_process(
-                    command, timeout_seconds=request.timeout_seconds,
-                    output_limit=request.output_limit_bytes,
-                    env=_podman_environment(),
-                )
-            finally:
-                await self._cleanup_container(name)
-            artifacts = _collect_artifacts(output_directory, request.artifact_limit_bytes)
-            if timed_out or output_overflow:
-                artifacts = ()
+            exit_code, stdout, stderr, timed_out, output_overflow = await _run_bounded_process(
+                command, timeout_seconds=request.timeout_seconds,
+                output_limit=request.output_limit_bytes,
+                env=_podman_environment(),
+            )
+            artifacts = () if timed_out or output_overflow else _collect_artifacts(output_directory, request.artifact_limit_bytes)
             state: ExecutionState = "INTERRUPTED" if timed_out else "FAILED" if output_overflow or exit_code != 0 else "COMPLETED"
-            return ExecutionRecord(
+            record = ExecutionRecord(
                 execution_id=request.execution_id, backend="podman", state=state, exit_code=exit_code,
                 timed_out=timed_out,
                 stdout=stdout.decode("utf-8", errors="replace"),
@@ -301,10 +307,55 @@ class PodmanSandboxBackend:
                 ended_at=datetime.now(timezone.utc),
                 reason_code="EXECUTION_TIMEOUT" if timed_out else "OUTPUT_LIMIT_EXCEEDED" if output_overflow else None,
             )
+            receipt = self._receipt_path(request)
+            if receipt.with_name("request.json").is_file() and not _path_has_symlink(receipt):
+                atomic_write(receipt, record.model_dump_json().encode())
+            return record
         except Exception as exc:
             return _execution_failure(request, started, _reason_code(exc))
         finally:
-            shutil.rmtree(stage, ignore_errors=True)
+            try:
+                if name is not None:
+                    await self._cleanup_container(name)
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
+
+    @staticmethod
+    def _receipt_path(request: ExecutionRequest) -> Path:
+        return Path(request.workspace_root) / ".photomatagent" / "executions" / request.execution_id / "podman-record.json"
+
+    async def recover_execution(self, request: ExecutionRequest) -> tuple[ExecutionRecord | None, str]:
+        """Recover a durable Podman receipt or observe the existing container."""
+        if not re.fullmatch(r"exec_[0-9a-f]{32}", request.execution_id):
+            return None, "INVALID_EXECUTION_ID"
+        receipt = self._receipt_path(request)
+        if _path_has_symlink(receipt):
+            return None, "EXECUTION_PROVENANCE_INVALID"
+        if receipt.is_file():
+            try:
+                with receipt.open("rb") as handle:
+                    return ExecutionRecord.model_validate_json(handle.read(4 * 1024 * 1024)), "OK"
+            except (OSError, ValueError):
+                return None, "EXECUTION_PROVENANCE_INVALID"
+        if self.executable is None:
+            return None, "EXECUTION_BACKEND_UNAVAILABLE"
+        name = f"photomat-{request.execution_id.removeprefix('exec_')[:20]}"
+        status, stdout, _, timed_out, overflow = await _run_bounded_process(
+            [str(self.executable), "container", "inspect", name],
+            timeout_seconds=8, output_limit=64_000, env=_podman_environment(),
+        )
+        if status or timed_out or overflow:
+            return None, "EXECUTION_STATE_UNKNOWN"
+        try:
+            item = json.loads(stdout)[0]
+            if item["Config"]["Labels"]["photomatagent.execution"] != request.execution_id:
+                return None, "EXECUTION_BINDING_MISMATCH"
+            state = item["State"]
+            if state.get("Running") is True:
+                return None, "EXECUTION_RUNNING"
+            return None, "EXECUTION_TERMINATED_WITHOUT_RECEIPT"
+        except (ValueError, IndexError, KeyError, AttributeError, TypeError):
+            return None, "EXECUTION_STATE_UNKNOWN"
 
     async def reconcile(self, execution_id: str) -> ExecutionRecord | None:
         return None
@@ -347,7 +398,7 @@ class PodmanSandboxBackend:
             return 127, b"", b"", False, False
         name = f"photomat-install-{uuid4().hex[:20]}"
         arguments = [
-            str(self.executable), "run", "--name", name, "--network=none", "--read-only",
+            str(self.executable), "run", "--pull=never", "--name", name, "--network=none", "--read-only",
             "--cap-drop=all", "--security-opt=no-new-privileges", "--pids-limit=128",
             "--memory=2g", "--cpus=2", "--userns=keep-id", "--user",
             f"{os.getuid()}:{os.getgid()}", "--tmpfs",
@@ -394,6 +445,17 @@ class PodmanSandboxBackend:
         if payload.get("image_ref") != expected_image:
             raise ValueError("INSTALL_PLAN_CHANGED")
         return expected_image
+
+    def restored_image_digest(self) -> str | None:
+        """Return the pinned image digest when restored environments agree."""
+        try:
+            images = {self._image_for_environment(environment_id)
+                      for environment_id in self._environments}
+        except (OSError, ValueError, TypeError):
+            return None
+        if len(images) != 1:
+            return None
+        return next(iter(images)).rsplit("@", 1)[1]
 
 
 def _podman_environment() -> dict[str, str]:

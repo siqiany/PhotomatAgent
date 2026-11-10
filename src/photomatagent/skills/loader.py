@@ -28,9 +28,35 @@ def _parse_frontmatter(content: str) -> dict[str, str]:
     match = _FRONTMATTER_RE.match(content)
     if not match:
         return {}
+    # Parse metadata only: folded descriptions, quoting and nested metadata
+    # must not leak YAML syntax or nested keys into the model's skill index.
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    try:
+        metadata = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        # Older native skills use unquoted descriptions containing ': '. Keep
+        # these readable while accepting standard YAML for newer skills.
+        return _parse_legacy_frontmatter(match.group(1))
+    if not isinstance(metadata, dict):
+        return {}
     fields: dict[str, str] = {}
-    for line in match.group(1).splitlines():
-        if ":" in line:
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(value, str):
+            fields[key] = value.strip()
+        elif key == "tags" and isinstance(value, list):
+            fields[key] = ", ".join(item for item in value if isinstance(item, str))
+    return fields
+
+
+def _parse_legacy_frontmatter(content: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in content.splitlines():
+        if line and not line[0].isspace() and ":" in line:
             key, _, value = line.partition(":")
             fields[key.strip()] = value.strip()
     return fields

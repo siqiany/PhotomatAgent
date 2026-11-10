@@ -211,9 +211,45 @@ class CapabilityInstallTool(Tool):
         )
 
 
+class CapabilityPlanTool(Tool):
+    name = "capability_plan"
+    description = "Resolve 1 to 32 previously searched PyPI candidate IDs together into one exact hashed wheel installation plan. Use capability_install with the returned plan_id and plan_sha256."
+    short_description = "Plan an environment for multiple Python dependencies."
+    exposure = ToolExposure.DEFERRED
+    namespace = "capability"
+    tags = ("capability", "plan", "install", "dependencies", "packages")
+    input_schema = {"type": "object", "additionalProperties": False, "properties": {
+        "candidate_ids": {"type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": True,
+                          "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+    }, "required": ["candidate_ids"]}
+
+    def __init__(self, discovery: CapabilityDiscoveryService) -> None:
+        self.discovery = discovery
+
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        ids = arguments.get("candidate_ids")
+        if set(arguments) != {"candidate_ids"} or not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
+            return ToolResult(output="INVALID_SCHEMA", is_error=True)
+        try:
+            plan = await self.discovery.resolve_install_plan_many(ids)
+        except Exception as exc:
+            code = "CANDIDATE_NOT_FOUND" if isinstance(exc, LookupError) else "INVALID_INSTALL_PLAN" if isinstance(exc, ValueError) else "INSTALL_RESOLUTION_UNAVAILABLE"
+            import re
+            detail = str(exc)
+            diagnostics = [detail] if re.fullmatch(r"[A-Z][A-Z0-9_]{1,99}", detail) else []
+            error_payload: dict[str, Any] = {"code": code, "diagnostics": diagnostics}
+            return ToolResult(output=json.dumps(error_payload), data=error_payload, is_error=True)
+        payload = {"code": "OK", "plan_id": plan.plan_id, "plan_sha256": plan.plan_sha256,
+                   "direct_requirements": list(plan.direct_requirements),
+                   "dependencies": [{"name": wheel.distribution, "version": wheel.version, "sha256": wheel.sha256} for wheel in plan.wheels],
+                   "estimated_bytes": plan.estimated_bytes, "execution_backend": plan.execution_backend,
+                   "expires_at": plan.expires_at.isoformat()}
+        return ToolResult(output=_bounded_json(payload, max_chars=8000), data={"code": "OK", "plan_id": plan.plan_id, "plan_sha256": plan.plan_sha256})
+
+
 class ScriptRunTool(Tool):
     name = "script_run"
-    description = "Run a bound relative Python script, or entrypoint:<name> from an installed local_dev wheel, using argv without a shell. Bound inputs are at PHOTOMAT_INPUT_DIR/<key>. local_dev runs on the host and is not OS-isolated."
+    description = "Run a Python script using argv without a shell. If environment_id is omitted or unavailable, return READY environment choices without executing; retry with an exact suitable ID. READY does not guarantee dependencies. script_path and input_refs values are relative to workspace root; task files use full tmp/workbench/<task_id>/... paths. Bound inputs are available at PHOTOMAT_INPUT_DIR/<key>. Write artifacts in the current working directory or PHOTOMAT_OUTPUT_DIR; the staged __file__ directory is temporary and is not collected. Outputs are collected automatically; there is no artifacts argument. entrypoint:<name> is supported for installed local_dev wheels. local_dev runs on the host and is not OS-isolated."
     short_description = "Run a task Python script or installed CLI entrypoint."
     exposure = ToolExposure.DEFERRED
     namespace = "capability"
@@ -230,7 +266,7 @@ class ScriptRunTool(Tool):
             },
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120},
         },
-        "required": ["script_path", "environment_id"],
+        "required": ["script_path"],
     }
 
     def __init__(self, sandbox: SandboxService, published_skill_source: Any = None) -> None:
@@ -242,6 +278,9 @@ class ScriptRunTool(Tool):
         if set(arguments) - allowed:
             return ToolResult(output="INVALID_SCHEMA", is_error=True)
         script_path = str(arguments.get("script_path", ""))
+        environment_id = str(arguments.get("environment_id", ""))
+        if not environment_id:
+            return self._environment_choices("ENVIRONMENT_SELECTION_REQUIRED" if self.sandbox.backend is not None else "SANDBOX_UNAVAILABLE")
         authorized_skill = None
         if self.published_skill_source is not None:
             try:
@@ -253,11 +292,13 @@ class ScriptRunTool(Tool):
                 )
         result = await self.sandbox.run(
             script_path=script_path,
-            environment_id=str(arguments.get("environment_id", "")),
+            environment_id=environment_id,
             input_refs=arguments.get("input_refs", {}),
             argv=arguments.get("argv", []),
             timeout_seconds=int(arguments.get("timeout_seconds", 60)),
         )
+        if result.code == "ENVIRONMENT_NOT_READY" and result.record is None:
+            return self._environment_choices(result.code)
         record = result.record
         attributed_skill = None
         if record is not None and self.published_skill_source is not None:
@@ -294,6 +335,24 @@ class ScriptRunTool(Tool):
             },
         )
 
+    def _environment_choices(self, code: str) -> ToolResult:
+        environments = self.sandbox.available_environments()
+        choices = []
+        for item in environments[:20]:
+            if item.status != "READY":
+                continue
+            packages, status = self.sandbox.environment_packages(item)
+            choices.append({"environment_id": item.environment_id, "status": item.status, "backend": item.backend,
+                            "packages": [{"name": name, "version": version} for name, version in packages[:64]],
+                            "packages_status": status, "packages_omitted": max(0, len(packages) - 64)})
+        payload = {
+            "code": code,
+            "execution_id": None,
+            "environments": choices,
+            "environments_omitted": max(0, len(environments) - 20),
+        }
+        return ToolResult(output=_bounded_json(payload, max_chars=8000), data=payload, is_error=True)
+
 
 def _bounded_json(payload: dict[str, Any], *, max_chars: int) -> str:
     """Return valid bounded JSON even when external summaries are unusually long."""
@@ -302,7 +361,7 @@ def _bounded_json(payload: dict[str, Any], *, max_chars: int) -> str:
         encoded = json.dumps(bounded, ensure_ascii=False, separators=(",", ":"))
         if len(encoded) <= max_chars:
             return encoded
-        for key in ("candidates", "artifacts", "wheels"):
+        for key in ("candidates", "artifacts", "wheels", "dependencies", "environments"):
             values = bounded.get(key)
             if isinstance(values, list) and values:
                 bounded[key] = values[:-1]

@@ -7,7 +7,7 @@ import json
 from pydantic import BaseModel, Field
 
 from photomatagent.models.types import AssistantMessage, ModelMessage, ToolResultMessage
-from photomatagent.redaction import redact_text
+from photomatagent.redaction import redact_secrets, redact_text
 
 
 class WorkingLedger(BaseModel):
@@ -50,13 +50,20 @@ def derive_working_ledger(
                 if call.name == "bash" and call.arguments.get("command"):
                     commands.append(redact_text(str(call.arguments["command"])))
         elif isinstance(message, ToolResultMessage):
-            name, _ = calls.get(message.tool_call_id, (message.tool_name, {}))
+            name, arguments = calls.get(message.tool_call_id, (message.tool_name, {}))
             first_line = next(
                 (line.strip() for line in message.content.splitlines() if line.strip()),
                 "(empty output)",
             )
             status = "failed" if message.is_error else "succeeded"
-            observations.append(f"{name} {status}: {first_line[:160]}")
+            # The result often begins with generic provenance. Retain the exact
+            # small operation arguments so a compressed summary cannot disguise
+            # a completed feature/bootstrap operation as fresh pending work.
+            small = {key: value for key, value in arguments.items()
+                     if key not in {"content", "old_text", "new_text", "command"}
+                     and isinstance(value, (str, int, float, bool, type(None)))}
+            signature = json.dumps(redact_secrets(small), ensure_ascii=False, sort_keys=True)[:160]
+            observations.append(f"{name} {status}; arguments={signature}: {first_line[:120]}")
 
     ledger = WorkingLedger(
         searched_queries=_bounded_unique(searched, max_items=max_items),

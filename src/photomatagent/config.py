@@ -94,7 +94,7 @@ class DotEnvConfig:
         self, environ: MutableMapping[str, str] | None = None
     ) -> dict[str, str]:
         """Read ``.env`` and overlay non-empty process environment values."""
-        raw = dotenv_values(self.path)
+        raw = dotenv_values(self.path, interpolate=False)
         values = {key: value or "" for key, value in raw.items()}
         source = os.environ if environ is None else environ
         for key in (PREFERRED_PROVIDER_ENV, *self.all_provider_fields()):
@@ -130,7 +130,7 @@ def resolve_llm_config(
     Explicit CLI values have highest priority, followed by process environment and
     then values loaded from ``.env``.
     """
-    target_environ = os.environ if environ is None else environ
+    target_environ = dict(os.environ) if environ is None else environ
     created = store.ensure_exists()
     values = store.values(target_environ)
 
@@ -207,7 +207,7 @@ def read_preferred_config(
     environ: MutableMapping[str, str] | None = None,
 ) -> LLMConfig | None:
     """Read configuration without prompting, for diagnostics."""
-    target_environ = os.environ if environ is None else environ
+    target_environ = dict(os.environ) if environ is None else environ
     values = store.values(target_environ)
     selected_value = provider or values.get(PREFERRED_PROVIDER_ENV, "")
     if not selected_value:
@@ -236,3 +236,16 @@ def read_preferred_config(
         api_key_env=api_key_env if api_key else None,
         base_url=base_url,
     )
+
+
+def load_integration_environment(workspace: Path | str) -> None:
+    """Load integration settings without leaking workspace LLM identities globally."""
+    from photomatagent.model_settings import ROLES, fields
+    model_fields = {key for role in ROLES for provider in ("openai", "anthropic")
+                    for key in fields(role, provider)}
+    path = DotEnvConfig(workspace).path
+    if path.is_symlink():
+        raise ValueError(".env must not be a symbolic link")
+    for key, value in dotenv_values(path).items():
+        if key not in model_fields and value is not None:
+            os.environ.setdefault(key, value)

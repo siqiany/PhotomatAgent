@@ -86,6 +86,11 @@ def save_session_snapshot(
         scientific=scientific,
         engine=EngineSnapshot.model_validate(engine) if engine else None,
     )
+    from photomatagent.sessions.reader import database_session
+    with database_session(Path(session_dir)) as repository:
+        if repository is not None:
+            repository.checkpoint(Path(session_dir).name, snapshot, boundary="compatibility_save")
+            return repository.db.path
     payload = redact_secrets(json.loads(snapshot.model_dump_json()))
     path = snapshot_path(session_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +118,10 @@ def save_session_snapshot(
 
 def load_session_snapshot(session_dir: Path | str) -> SessionSnapshot:
     """Load a previously saved session snapshot from a session directory."""
+    from photomatagent.sessions.reader import database_session
+    with database_session(Path(session_dir)) as repository:
+        if repository is not None:
+            return repository.load(Path(session_dir).name)
     path = snapshot_path(session_dir)
     if not path.is_file():
         raise FileNotFoundError(f"session snapshot not found: {path}")
@@ -144,7 +153,21 @@ def parse_session_snapshot(content: bytes | str) -> SessionSnapshot:
 
 
 def session_is_resumable(session_dir: Path | str) -> bool:
-    return snapshot_path(session_dir).is_file()
+    from photomatagent.sessions.reader import database_session
+    with database_session(Path(session_dir)) as repository:
+        if repository is not None:
+            with repository.db.lock:
+                row = repository.conn.execute("SELECT latest_checkpoint_id FROM sessions WHERE session_id=?", (Path(session_dir).name,)).fetchone()
+                return bool(row and row[0])
+    if not snapshot_path(session_dir).is_file():
+        return False
+    try:
+        snapshot = load_session_snapshot(session_dir)
+        from photomatagent.runtime.context_segments import split_atomic_spans
+        split_atomic_spans(snapshot.conversation.messages)
+    except (ValueError, OSError):
+        return False
+    return True
 
 
 def migration_diagnostic_codes(

@@ -10,6 +10,7 @@ from photomatagent.runtime.events import RuntimeEvent
 def runtime_event_payload(event: RuntimeEvent) -> tuple[str, dict[str, object]]:
     """Return a JSON-safe, UI-neutral projection without changing the source event."""
     payload = event.model_dump(mode="json")
+    payload["trace_event_id"] = event.trace_event_id
     payload.pop("kind", None)
     return event.kind, payload
 

@@ -482,3 +482,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   border-radius: 0.5rem;
   background: var(--bg-soft, rgba(128, 128, 128, 0.08));
 }
+
+.model-settings-button { margin-top: 10px; }
+
+.information-panel { padding: 0.75rem; display: grid; gap: 0.6rem; max-height: 42vh; overflow: auto; font-size: .85rem; }
+.information-panel form, .information-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+.information-panel input:not([type=checkbox]), .information-panel select { max-width: 100%; min-width: 0; width: 100%; border: 1px solid var(--border, #d8dce2); border-radius: 6px; padding: .4rem; }
+.information-panel button, .task-objective button { padding: .35rem .6rem; border-radius: 5px; border: 1px solid #d8dce2; background: transparent; cursor: pointer; }
+.information-result { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .75rem; }

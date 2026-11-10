@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
+from photomatagent.config import load_integration_environment
 
 from photomatagent.mcp.config import MCPServerConfig, load_mcp_servers
 
@@ -373,14 +373,14 @@ class ScientificConfig:
 
 
 def _load_dotenv_if_present(root: Path) -> None:
-    """Load ``root/.env`` into the process environment without overriding.
+    """Load integration fields without overriding or exporting LLM credentials.
 
     Missing files are ignored; existing environment variables always win so
     explicit exports (or CI secrets) take precedence over the file.
     """
     env_path = root / ".env"
     if env_path.is_file():
-        load_dotenv(env_path, override=False)
+        load_integration_environment(root)
 
 
 def _mattergen_pretrained_name() -> str:

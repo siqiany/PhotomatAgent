@@ -1,6 +1,6 @@
 ---
 name: infrared-material-screening
-description: Use when screening infrared candidates and choosing among known-material retrieval, mechanism hypotheses, or explicit model generation before a bounded MatterGen → CHGNet → VASP evidence funnel.
+description: Shortlist infrared materials using explicit constraints and evidence. Choose retrieval, hypotheses or requested generation; ML screening and DFT are conditional follow-ups.
 category: ir
 tags: [infrared, screening, materials project, band gap]
 license: MIT
@@ -12,7 +12,7 @@ license: MIT
 
 A spectral band and a need to shortlist candidate materials.
 
-## Route before the funnel
+## Select a candidate source
 
 - Explicit mechanism request: load `mechanism-guided-material-design`, register
   hypotheses, and keep them unvalidated until evidence exists.
@@ -21,30 +21,36 @@ A spectral band and a need to shortlist candidate materials.
 - Known-material request: search materials/literature and label results as
   known priors, never as new candidates or validation.
 
-## Evidence hierarchy and funnel
+## Select evidence needed for this shortlist
 
 Use the cheapest evidence that can answer the current question, and preserve
 the source and fidelity of every result:
 
-1. Compile constraints with `ir.compile_constraints` (cutoff gap, thermal
-   limits), then search `materials` (Materials Project) and `literature` for
-   known candidates. A database match is a prior, not validation.
-2. Retrieve or generate candidate formulas. Use `generation.vae_formula` for
-   inverse composition proposals; do not use retrieval as a substitute for
-   generation.
-3. Generate structures only when needed. Route to `generation.mattergen` with
+1. Compile or reuse `ir.compile_constraints` when numeric targets need cutoff
+   or thermal bounds. Use relevant supplied data, `materials` and `literature`
+   for known candidates; do not repeat searches already supported by current
+   evidence. A database match is a prior, not validation.
+2. For requested inverse composition proposals use `generation.vae_formula`;
+   mechanism-based proposals use hypothesis registration. Neither route is
+   required when the task asks for known materials or an existing-data shortlist.
+3. Generate structures only when the requested analysis needs unavailable
+   structures; prefer a suitable supplied or retrieved structure when it exists.
+   For requested model generation, route to `generation.mattergen` with
    `pretrained_name=dft_band_gap` for a gap/cutoff target or
    `pretrained_name=chemical_system` for an explicit element system. The two
    checkpoints are not joint-condition models. All outputs are
    `UNVALIDATED_GENERATED_STRUCTURE`.
-4. Run `chgnet.screen` on small batches and rank energies only within the same
+4. When a structure comparison needs ML-potential estimates, use `chgnet.screen`
+   on small batches and rank energies only within the same
    reduced composition. The tool recomputes the input file SHA-256 and
    canonical structure hash. Label this evidence
    `source_type=ml_interatomic_potential`, `fidelity=ml_potential`; it is not
    DFT formation energy, energy above hull, stability, or detector evidence.
-5. Run `chgnet.relax` only on finalists. A changed geometry receives a new
+5. Use `chgnet.relax` only if finalist geometry refinement serves the current
+   question. A changed geometry receives a new
    structure candidate ID and must be rechecked by scope before downstream
-   evidence is attached. Send a much smaller, explicitly approved set through
+   evidence is attached. If DFT is needed and computation is authorized, send
+   a much smaller set through
    the existing VASP prepare/validate/`SubmitOnceSession` gates; scheduler
    completion or command success alone is not scientific success.
 6. For each candidate, list known versus missing transport, defects, optical
@@ -54,8 +60,9 @@ the source and fidelity of every result:
 ## Rules
 
 - A database match is not a validated detector.
-- Cheap evidence first: database/literature -> formula -> MatterGen structure
-  (when required) -> CHGNet screen -> CHGNet finalist relaxation -> gated VASP.
+- Finish when the requested shortlist is supported. A literature comparison,
+  formula proposal or existing-structure comparison need not traverse all the
+  steps above. Cheap sufficient evidence takes priority over added computation.
 - Explicitly mark candidates whose gap only partially covers the band.
 - Report which missing evidence is most decision-relevant.
 - Report unsupported or out-of-domain structures; never silently promote a
@@ -63,11 +70,11 @@ the source and fidelity of every result:
 - Structure evidence must carry both `candidate_id` and `structure_hash` from
   the bytes actually read. Reject model-supplied identity claims that disagree
   with those hashes. File renames preserve identity, while different ordered
-structures of one composition remain separately checkable.
-Energy/force evidence with a valid chemical-formula subject is projected into
-that structure candidate. Changed CHGNet/VASP results retain the attested input
-candidate as parent; `cif_hash` is the trusted file-byte SHA-256, not the
-canonical geometry hash.
+  structures of one composition remain separately checkable. Energy/force
+  evidence with a valid chemical-formula subject is projected into that
+  structure candidate. Changed CHGNet/VASP results retain the attested input
+  candidate as parent; `cif_hash` is the trusted file-byte SHA-256, not the
+  canonical geometry hash.
 - A fixture, fake CHGNet result, x=0.25 ratio check, or local VASP simulation
   validates software boundaries only. It does not predict performance or
   establish DFT, experimental, stability, or synthesizability conclusions.

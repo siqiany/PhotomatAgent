@@ -26,6 +26,7 @@ export function RunStatus({ run }: { run: RunRecord | null }) {
     <span className={`run-status status-${status?.toLowerCase() ?? "draft"}`} role="status">
       <span className="status-dot" aria-hidden="true" />
       {statusLabel(status)}
+      {Boolean(run?.result_invalidation_ids?.length) && " · 结果待重新验证"}
     </span>
   );
 }

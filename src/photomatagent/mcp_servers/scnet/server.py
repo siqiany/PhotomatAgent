@@ -716,9 +716,9 @@ def main() -> None:
     # diagnostic never makes an unexpected network connection.
     if "--load-dotenv" in sys.argv:
         try:
-            from dotenv import load_dotenv
+            from photomatagent.config import load_integration_environment
 
-            load_dotenv(os.path.join(os.getcwd(), ".env"), override=False)
+            load_integration_environment(os.getcwd())
         except Exception:
             pass
         sys.argv.remove("--load-dotenv")

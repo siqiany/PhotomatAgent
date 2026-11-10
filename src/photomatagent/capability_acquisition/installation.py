@@ -26,6 +26,7 @@ _PINNED_REQUIREMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za
 
 class InstallPlanResolver(Protocol):
     async def resolve(self, package_name: str, version: str) -> InstallPlan: ...
+    async def resolve_many(self, requirements: list[tuple[str, str]]) -> InstallPlan: ...
 
 
 def create_install_plan(
@@ -109,8 +110,16 @@ class UVPlanResolver:
         self.command_runner = command_runner or self._run_uv
 
     async def resolve(self, package_name: str, version: str) -> InstallPlan:
-        if not _PINNED_REQUIREMENT.fullmatch(f"{package_name}=={version}"):
+        return await self.resolve_many([(package_name, version)])
+
+    async def resolve_many(self, requirements: list[tuple[str, str]]) -> InstallPlan:
+        if not 1 <= len(requirements) <= 32 or any(
+            not _PINNED_REQUIREMENT.fullmatch(f"{name}=={version}") for name, version in requirements
+        ):
             raise ValueError("INVALID_INSTALL_ARGUMENT")
+        normalized = [name.lower().replace("_", "-").replace(".", "-") for name, _ in requirements]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("DUPLICATE_DISTRIBUTION")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", self.image_digest):
             raise ValueError("IMAGE_DIGEST_REQUIRED")
         python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -132,13 +141,14 @@ class UVPlanResolver:
             "--index-url", "https://pypi.org/simple", "--python-version", python_version,
             "--python-platform", platform_triple,
         ]
-        code, stdout, _ = await self.command_runner(arguments, f"{package_name}=={version}\n".encode())
+        direct = [f"{name}=={version}" for name, version in requirements]
+        code, stdout, _ = await self.command_runner(arguments, ("\n".join(direct) + "\n").encode())
         if code != 0:
             raise RuntimeError("DEPENDENCY_RESOLUTION_FAILED")
         if len(stdout) > 1_000_000:
             raise ValueError("INSTALL_LOCK_TOO_LARGE")
         locked = _parse_hashed_requirements(stdout.decode("utf-8", errors="strict"))
-        if (package_name.lower().replace("_", "-").replace(".", "-"), version) not in locked:
+        if any((name, version) not in locked for name, (_, version) in zip(normalized, requirements)):
             raise ValueError("DIRECT_REQUIREMENT_NOT_LOCKED")
         try:
             from packaging.tags import sys_tags
@@ -192,7 +202,7 @@ class UVPlanResolver:
             wheels.append(wheel)
             total_bytes += size
         return create_install_plan(
-            wheels=wheels, direct_requirements=[f"{package_name}=={version}"],
+            wheels=wheels, direct_requirements=direct,
             python_version=python_version, platform_tag=sysconfig.get_platform(),
             image_digest=self.image_digest, installer_version=installer_version,
             estimated_bytes=total_bytes, compatible_wheel_tags=supported,

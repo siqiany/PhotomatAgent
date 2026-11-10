@@ -1,6 +1,9 @@
 ---
 name: optical-response-analysis
-description: Evaluate optical response evidence for IR candidates: absorption coefficient at target wavelengths, quantum efficiency; absorption onset from band gap is necessary but not sufficient.
+description: >-
+  Evaluate optical response evidence for IR candidates: absorption coefficient
+  at target wavelengths, quantum efficiency; absorption onset from band gap
+  is necessary but not sufficient.
 category: ir
 tags: [optical, absorption, quantum efficiency, spectra]
 license: MIT
@@ -10,13 +13,18 @@ license: MIT
 
 ## Evidence to collect
 
+Select evidence for the requested optical observable and supplied material or
+device. Existing spectra or literature may suffice; transient absorption,
+steady-state absorption and device EQE are distinct analyses.
+
 - Absorption coefficient alpha(lambda) across the spectral band (orders of
   magnitude matter: e.g. >1e3 /cm for thin-film detectors).
 - Quantum efficiency or external quantum efficiency at the target
   wavelengths.
 - Optical transitions: direct vs indirect gap determines absorption strength.
 - Optional transient absorption analysis via `optics.transient_absorption`
-  when spectra exist.
+  when the task and required inputs match; it is not a general absorption or
+  EQE solver. Discover the actual schema before selecting it.
 
 ## Rules
 

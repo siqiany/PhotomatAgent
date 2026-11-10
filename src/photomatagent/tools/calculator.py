@@ -36,6 +36,7 @@ def _eval(node: ast.AST) -> float:
 
 
 class CalculatorTool(Tool):
+    effect_class = "READ_ONLY"
     name = "calculator"
     description = "Evaluate a simple arithmetic expression (e.g. '2.5 * (3 + 4)')."
     tags = ("math", "arithmetic", "calculate")

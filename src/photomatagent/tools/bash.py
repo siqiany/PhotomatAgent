@@ -132,6 +132,13 @@ class BashTool(Tool):
                         self._kill_group(process, signal.SIGKILL)
                     break
                 await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            # A user interrupt must stop the command group, not just its reader.
+            self._kill_group(process, signal.SIGTERM)
+            await asyncio.sleep(0.1)
+            self._kill_group(process, signal.SIGKILL)
+            process.wait(timeout=2)
+            raise
         finally:
             for fd in (stdout_fd, stderr_fd):
                 try:

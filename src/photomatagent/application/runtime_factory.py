@@ -17,6 +17,7 @@ from photomatagent.logging.event_logger import EventLogger
 from photomatagent.models.factory import create_provider
 from photomatagent.runtime.budget import BudgetState
 from photomatagent.runtime.context_config import resolve_context_config
+from photomatagent.runtime.context import ContextBuilder
 from photomatagent.runtime.context_engine import ContextEngineConfig
 from photomatagent.runtime.loop import AgentRuntime, EventSink
 from photomatagent.runtime.state import ConversationState
@@ -87,7 +88,7 @@ class _WorkbenchCapabilityPolicy(PermissionPolicy):
         self._fallback = fallback
 
     async def check(self, tool_name: str, arguments: dict[str, object]) -> PermissionResult:
-        if tool_name in {"capability_search", "capability_inspect", "capability_install", "script_run", "skill_run"}:
+        if tool_name in {"capability_search", "capability_inspect", "capability_plan", "capability_install", "script_run", "skill_run"}:
             return PermissionResult(PermissionDecision.ALLOW, "task-local capability workflow")
         if tool_name in {"write", "edit"}:
             path = arguments.get("path")
@@ -142,6 +143,7 @@ class RuntimeFactory:
         context_limit_tokens: int | None = None,
         compact_trigger_tokens: int | None = None,
         evaluation_isolation: bool = False,
+        context_builder: ContextBuilder | None = None,
         resource_owners: list[object] | None = None,
     ) -> tuple[AgentRuntime, EventLogger | None]:
         """Construct the runtime and optional session event logger.
@@ -172,16 +174,57 @@ class RuntimeFactory:
             import hashlib
             import re
             from photomatagent.capability_acquisition.local_backend import LocalDevBackend
-            from photomatagent.capability_acquisition.sandbox import SandboxService
+            from photomatagent.capability_acquisition.models import InstallPlan
+            from photomatagent.capability_acquisition.sandbox import (
+                SandboxBackend, SandboxService, load_persisted_install_plan,
+            )
+            from photomatagent.errors import ToolExecutionError
 
             if not re.fullmatch(r"task_[0-9a-f]{32}", capability_task_id) or not re.fullmatch(r"run_[0-9a-f]{32}", capability_run_id):
                 raise ValueError("INVALID_WORKBENCH_ID")
+            backend: SandboxBackend | None = LocalDevBackend(boundary.root / ".photomatagent" / "capabilities" / capability_task_id)
+            restore_persisted_podman = False
+            configured_environment = None
+            configured_plan: InstallPlan | None = None
+            config_path = boundary.root / ".photomatagent" / "qd.json"
+            if config_path.exists() or config_path.is_symlink():
+                # An explicit but unusable configuration must not switch execution
+                # back to host Python. The sandbox then reports typed unavailability.
+                backend = None
+                try:
+                    from photomatagent.scientific.evolution.qd.config import QDConfig
+
+                    if not config_path.is_symlink() and boundary.contains(config_path.resolve()):
+                        config = QDConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+                        if not config.enabled or config.sandbox == "local_dev":
+                            backend = LocalDevBackend(boundary.root / ".photomatagent" / "capabilities" / capability_task_id)
+                        elif config.sandbox == "podman":
+                            from photomatagent.capability_acquisition.container_backend import PodmanSandboxBackend
+
+                            storage = boundary.resolve(config.environment_storage, must_exist=True)
+                            if storage.is_dir() and not storage.is_symlink():
+                                backend = PodmanSandboxBackend(storage)
+                                restore_persisted_podman = True
+                                if config.environment_id:
+                                    try:
+                                        configured_environment = backend.restore_environment(config.environment_id)
+                                        configured_plan = load_persisted_install_plan(
+                                            boundary.root, configured_environment.plan_sha256
+                                        )
+                                    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                                        pass
+                except (OSError, ValueError, TypeError, ToolExecutionError):
+                    pass
             sandbox = SandboxService(
                 workspace=boundary.root, trial_id=capability_run_id,
                 genome_sha256=hashlib.sha256(capability_run_id.encode()).hexdigest(),
                 scripts={}, dynamic_script_prefix=f"tmp/workbench/{capability_task_id}",
-                backend=LocalDevBackend(boundary.root / ".photomatagent" / "capabilities" / capability_task_id),
+                backend=backend,
+                restore_persisted_podman=restore_persisted_podman,
+                restore_persisted_local_dev=isinstance(backend, LocalDevBackend),
             )
+            if configured_environment is not None:
+                sandbox.register_environment(configured_environment, plan=configured_plan)
         registry = create_default_registry(
             scientific,
             boundary,
@@ -193,12 +236,14 @@ class RuntimeFactory:
             local_skill_run_id=capability_run_id,
             local_skill_service=services.get("local_skill_service"),
         )
-        model_provider = create_provider(provider, model)
+        model_provider = create_provider(provider, model, workspace=boundary.root)
         if resource_owners is not None:
             resource_owners.append(model_provider)
         effective_budget = budget or BudgetState(max_iterations=max_iterations)
         if evaluation_isolation:
-            effective_context_config = ContextEngineConfig()
+            # Trusted runners may explicitly freeze a shared response/recovery
+            # profile; evaluation still never reads live context settings.
+            effective_context_config = context_engine_config or ContextEngineConfig()
         elif context_engine_config is not None:
             effective_context_config = context_engine_config
         else:
@@ -206,10 +251,9 @@ class RuntimeFactory:
                 context_limit_tokens=context_limit_tokens,
                 compact_trigger_tokens=compact_trigger_tokens,
             )
-            if capability_task_id is not None:
-                effective_context_config = effective_context_config.model_copy(
-                    update={"output_recovery_attempts": 1}
-                )
+            effective_context_config = effective_context_config.model_copy(
+                update={"output_recovery_attempts": 3}
+            )
 
         policy = strategy.permission_policy or permission_policy or default_permission_policy()
         if capability_task_id is not None and strategy.permission_policy is None and permission_policy is None:
@@ -249,7 +293,13 @@ class RuntimeFactory:
             fresh_approval=strategy.fresh_approval,
             application_approval_root=resolved_approval_root,
             context_engine_config=effective_context_config,
+            context_builder=context_builder,
         )
+        if logger is not None and capability_task_id is None and sessions_base == boundary.root / ".photomatagent/sessions":
+            from photomatagent.sessions.binding import attach_session
+            attach_session(runtime, logger, logger.session_dir)
+            if resource_owners is not None:
+                resource_owners.append(logger)
         return runtime, logger
 
 
